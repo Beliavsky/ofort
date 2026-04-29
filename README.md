@@ -1,11 +1,10 @@
 # ofort
 
 `ofort` is a small tree-walking interpreter for a subset of Fortran 90/95/2003.
-It is extracted from the [CodeBench](https://github.com/yu314-coder/CodeBench) project into a standalone C command-line
+It is extracted from the [CodeBench](https://github.com/yu314-coder/CodeBench) project of [yu314-coder](https://github.com/yu314-coder) into a standalone C command-line
 project.
 
-It is not `gfortran` and does not aim to compile full Fortran projects. `REAL`
-and `DOUBLE PRECISION` are distinguished by type tag/kind, but both are
+`REAL` and `DOUBLE PRECISION` are distinguished by type tag/kind, but both are
 currently stored using C `double` internally.
 
 ## Build
