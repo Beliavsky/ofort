@@ -35,6 +35,7 @@ typedef struct {
 typedef struct OfortScope {
     OfortVar vars[OFORT_MAX_VARS];
     int n_vars;
+    int implicit_none;
     struct OfortScope *parent;
 } OfortScope;
 
@@ -96,6 +97,9 @@ struct OfortInterpreter {
     int has_error;
     /* source */
     const char *source;
+    int current_line;
+    int print_expr_statements;
+    int suppress_output;
     /* node pool for memory management */
     OfortNode **node_pool;
     int node_pool_len;
@@ -111,11 +115,17 @@ static int is_intrinsic(const char *name);
 
 /* ── Helpers ─────────────────────────────────── */
 
-static void out_append(OfortInterpreter *I, const char *s) {
+static void out_append_raw(OfortInterpreter *I, const char *s) {
     int len = (int)strlen(s);
     if (I->out_len + len >= OFORT_MAX_OUTPUT - 1) len = OFORT_MAX_OUTPUT - 1 - I->out_len;
     if (len > 0) { memcpy(I->output + I->out_len, s, len); I->out_len += len; }
     I->output[I->out_len] = '\0';
+}
+
+static void out_append(OfortInterpreter *I, const char *s) {
+    if (!I->suppress_output) {
+        out_append_raw(I, s);
+    }
 }
 
 static void out_appendf(OfortInterpreter *I, const char *fmt, ...) {
@@ -127,11 +137,64 @@ static void out_appendf(OfortInterpreter *I, const char *fmt, ...) {
     out_append(I, buf);
 }
 
+static int infer_error_line(const char *message) {
+    const char *p = message;
+
+    while ((p = strstr(p, "line ")) != NULL) {
+        const char *n = p + 5;
+        if (isdigit((unsigned char)*n)) {
+            return atoi(n);
+        }
+        p = n;
+    }
+
+    return 0;
+}
+
+static void append_source_line_to_error(OfortInterpreter *I, int line) {
+    const char *p;
+    const char *start;
+    const char *end;
+    int current = 1;
+    int used;
+
+    if (!I->source || line <= 0) {
+        return;
+    }
+
+    p = I->source;
+    while (*p && current < line) {
+        if (*p == '\n') {
+            current++;
+        }
+        p++;
+    }
+
+    if (current != line || !*p) {
+        return;
+    }
+
+    start = p;
+    end = start;
+    while (*end && *end != '\n' && *end != '\r') {
+        end++;
+    }
+
+    used = (int)strlen(I->error);
+    if (used < (int)sizeof(I->error) - 1) {
+        snprintf(I->error + used, sizeof(I->error) - (size_t)used,
+                 "\nline %d: %.*s", line, (int)(end - start), start);
+    }
+}
+
 static void ofort_error(OfortInterpreter *I, const char *fmt, ...) {
+    int line;
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(I->error, sizeof(I->error), fmt, ap);
     va_end(ap);
+    line = I->current_line > 0 ? I->current_line : infer_error_line(I->error);
+    append_source_line_to_error(I, line);
     I->has_error = 1;
     longjmp(I->err_jmp, 1);
 }
@@ -296,6 +359,66 @@ static OfortVar *find_var(OfortInterpreter *I, const char *name) {
     return NULL;
 }
 
+static int current_scope_has_implicit_none(OfortInterpreter *I) {
+    return I->current_scope && I->current_scope->implicit_none;
+}
+
+static const char *value_type_name(OfortValType type) {
+    switch (type) {
+        case FVAL_INTEGER: return "INTEGER";
+        case FVAL_REAL: return "REAL";
+        case FVAL_DOUBLE: return "DOUBLE PRECISION";
+        case FVAL_COMPLEX: return "COMPLEX";
+        case FVAL_CHARACTER: return "CHARACTER";
+        case FVAL_LOGICAL: return "LOGICAL";
+        case FVAL_ARRAY: return "ARRAY";
+        case FVAL_DERIVED: return "DERIVED";
+        case FVAL_VOID: return "VOID";
+        default: return "UNKNOWN";
+    }
+}
+
+static int is_numeric_type(OfortValType type) {
+    return type == FVAL_INTEGER || type == FVAL_REAL ||
+           type == FVAL_DOUBLE || type == FVAL_COMPLEX;
+}
+
+static OfortValue coerce_assignment_value(OfortInterpreter *I, const char *name,
+                                          OfortValType target_type, OfortValue val) {
+    if (target_type == val.type) {
+        return val;
+    }
+
+    if (is_numeric_type(target_type) && is_numeric_type(val.type)) {
+        OfortValue converted;
+        memset(&converted, 0, sizeof(converted));
+        switch (target_type) {
+            case FVAL_INTEGER:
+                converted = make_integer(val_to_int(val));
+                break;
+            case FVAL_REAL:
+                converted = make_real(val_to_real(val));
+                break;
+            case FVAL_DOUBLE:
+                converted = make_double(val_to_real(val));
+                break;
+            case FVAL_COMPLEX:
+                if (val.type == FVAL_COMPLEX) converted = make_complex(val.v.cx.re, val.v.cx.im);
+                else converted = make_complex(val_to_real(val), 0.0);
+                break;
+            default:
+                converted = val;
+                break;
+        }
+        free_value(&val);
+        return converted;
+    }
+
+    ofort_error(I, "Cannot assign %s to %s variable '%s'",
+                value_type_name(val.type), value_type_name(target_type), name);
+    return val;
+}
+
 static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) {
     /* look in current scope first */
     OfortScope *s = I->current_scope;
@@ -306,6 +429,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
         char vu[256];
         str_upper(vu, s->vars[i].name, 256);
         if (strcmp(upper, vu) == 0) {
+            val = coerce_assignment_value(I, name, s->vars[i].val.type, val);
             free_value(&s->vars[i].val);
             s->vars[i].val = val;
             return &s->vars[i];
@@ -320,6 +444,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
             if (strcmp(upper, vu) == 0) {
                 if (ps->vars[i].is_parameter)
                     ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
+                val = coerce_assignment_value(I, name, ps->vars[i].val.type, val);
                 free_value(&ps->vars[i].val);
                 ps->vars[i].val = val;
                 return &ps->vars[i];
@@ -328,6 +453,10 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
         ps = ps->parent;
     }
     /* create new in current scope */
+    if (current_scope_has_implicit_none(I)) {
+        free_value(&val);
+        ofort_error(I, "Variable '%s' has no implicit type", name);
+    }
     if (s->n_vars >= OFORT_MAX_VARS) ofort_error(I, "Too many variables");
     OfortVar *v = &s->vars[s->n_vars++];
     strncpy(v->name, name, 255);
@@ -1616,20 +1745,52 @@ static OfortNode *parse_write(OfortInterpreter *I) {
     int cap = 0;
     n->format_str[0] = '\0';
 
-    /* WRITE(unit, fmt) ... */
+    /* WRITE(unit, fmt) or WRITE(unit, fmt=...) */
     expect(I, FTOK_LPAREN);
     /* unit: * or number */
     if (check(I, FTOK_STAR)) advance(I);
     else if (check(I, FTOK_INT_LIT)) advance(I);
-    expect(I, FTOK_COMMA);
-    /* format: * or string or int (format label) */
-    if (check(I, FTOK_STAR)) {
+    if (check(I, FTOK_COMMA)) {
         advance(I);
-    } else if (check(I, FTOK_STRING_LIT)) {
-        strncpy(n->format_str, peek(I)->str_val, 511);
-        advance(I);
-    } else if (check(I, FTOK_INT_LIT)) {
-        advance(I); /* format label number, ignore */
+    }
+    /* control list: positional fmt or named fmt=... */
+    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+        if (check(I, FTOK_IDENT) && peek_ahead(I, 1)->type == FTOK_ASSIGN) {
+            OfortToken *name = advance(I);
+            advance(I); /* = */
+            if (str_eq_nocase(name->str_val, "fmt")) {
+                if (check(I, FTOK_STAR)) {
+                    advance(I);
+                } else if (check(I, FTOK_STRING_LIT)) {
+                    strncpy(n->format_str, peek(I)->str_val, 511);
+                    advance(I);
+                } else if (check(I, FTOK_INT_LIT)) {
+                    advance(I); /* format label number, ignore */
+                }
+            } else {
+                /* Other WRITE controls are currently ignored. */
+                if (check(I, FTOK_STAR) || check(I, FTOK_INT_LIT) ||
+                    check(I, FTOK_STRING_LIT) || check(I, FTOK_IDENT)) {
+                    advance(I);
+                } else {
+                    parse_expr(I);
+                }
+            }
+        } else if (check(I, FTOK_STAR)) {
+            advance(I);
+        } else if (check(I, FTOK_STRING_LIT)) {
+            strncpy(n->format_str, peek(I)->str_val, 511);
+            advance(I);
+        } else if (check(I, FTOK_INT_LIT)) {
+            advance(I); /* format label number, ignore */
+        } else {
+            parse_expr(I);
+        }
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+        } else {
+            break;
+        }
     }
     expect(I, FTOK_RPAREN);
 
@@ -2016,10 +2177,16 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return NULL;
     }
 
-    /* Expression statement or assignment: ident = expr, or ident(args) = expr, or call */
-    if (t->type == FTOK_IDENT) {
+    /* Expression statement or assignment: ident = expr, ident(args) = expr, or bare expr */
+    if (t->type == FTOK_IDENT || t->type == FTOK_INT_LIT || t->type == FTOK_REAL_LIT ||
+        t->type == FTOK_STRING_LIT || t->type == FTOK_TRUE || t->type == FTOK_FALSE ||
+        t->type == FTOK_LPAREN || t->type == FTOK_MINUS || t->type == FTOK_PLUS ||
+        t->type == FTOK_NOT) {
         OfortNode *expr = parse_expr(I);
         if (check(I, FTOK_ASSIGN)) {
+            if (expr->type != FND_IDENT && expr->type != FND_FUNC_CALL && expr->type != FND_MEMBER) {
+                ofort_error(I, "Invalid assignment target at line %d", t->line);
+            }
             advance(I);
             OfortNode *rhs = parse_expr(I);
             OfortNode *n = alloc_node(I, FND_ASSIGN);
@@ -2430,6 +2597,7 @@ static int needs_complex_promotion(OfortValue a, OfortValue b) {
 /* Evaluate expression node */
 static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
     if (!n) return make_void_val();
+    if (n->line > 0) I->current_line = n->line;
 
     switch (n->type) {
     case FND_INT_LIT:
@@ -2903,6 +3071,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 static void exec_node(OfortInterpreter *I, OfortNode *n) {
     if (!n) return;
     if (I->returning || I->exiting || I->cycling || I->stopping) return;
+    if (n->line > 0) I->current_line = n->line;
 
     switch (n->type) {
     case FND_BLOCK: {
@@ -3004,7 +3173,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_IMPLICIT_NONE:
-        /* No-op at runtime */
+        if (I->current_scope) I->current_scope->implicit_none = 1;
         break;
 
     case FND_VARDECL:
@@ -3459,6 +3628,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
     case FND_EXPR_STMT: {
         OfortValue v = eval_node(I, n->children[0]);
+        if (I->print_expr_statements && v.type != FVAL_VOID) {
+            char buf[1024];
+            value_to_string(I, v, buf, sizeof(buf));
+            out_append_raw(I, buf);
+            out_append_raw(I, "\n");
+        }
         free_value(&v);
         break;
     }
@@ -4028,6 +4203,7 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     interp->exiting = 0;
     interp->cycling = 0;
     interp->stopping = 0;
+    interp->current_line = 0;
 
     if (setjmp(interp->err_jmp) != 0) {
         return -1;
@@ -4066,6 +4242,18 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     return interp->has_error ? -1 : 0;
 }
 
+void ofort_set_print_expr_statements(OfortInterpreter *interp, int enabled) {
+    if (interp) {
+        interp->print_expr_statements = enabled ? 1 : 0;
+    }
+}
+
+void ofort_set_suppress_output(OfortInterpreter *interp, int enabled) {
+    if (interp) {
+        interp->suppress_output = enabled ? 1 : 0;
+    }
+}
+
 const char *ofort_get_output(OfortInterpreter *interp) {
     return interp ? interp->output : "";
 }
@@ -4084,4 +4272,5 @@ void ofort_reset(OfortInterpreter *interp) {
     interp->exiting = 0;
     interp->cycling = 0;
     interp->stopping = 0;
+    interp->current_line = 0;
 }
