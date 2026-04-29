@@ -120,7 +120,8 @@ static void ofort_error(OfortInterpreter *I, const char *fmt, ...);
 static OfortValue eval_node(OfortInterpreter *I, OfortNode *n);
 static const char *type_token_intrinsic_name(OfortTokenType t);
 static void exec_node(OfortInterpreter *I, OfortNode *n);
-static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs);
+static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs,
+                                char arg_names[OFORT_MAX_PARAMS][256]);
 static int is_intrinsic(const char *name);
 
 /* ── Helpers ─────────────────────────────────── */
@@ -956,6 +957,21 @@ static int check_end_ident(OfortInterpreter *I, const char *name) {
     return peek(I)->type == FTOK_END && token_ident_upper(peek_ahead(I, 1), name);
 }
 
+static const char *token_arg_name(OfortToken *t) {
+    if (!t) return NULL;
+    if (t->type == FTOK_IDENT) return t->str_val;
+    if (t->type == FTOK_DIMENSION) return "dim";
+    if (t->type == FTOK_INTENT) return "intent";
+    if (t->type == FTOK_RESULT) return "result";
+    if (t->type == FTOK_ALLOCATABLE) return "allocatable";
+    if (t->type == FTOK_IN || t->type == FTOK_OUT || t->type == FTOK_INOUT) return NULL;
+    return NULL;
+}
+
+static int check_keyword_arg(OfortInterpreter *I) {
+    return token_arg_name(peek(I)) != NULL && peek_ahead(I, 1)->type == FTOK_ASSIGN;
+}
+
 static void skip_interface_block(OfortInterpreter *I) {
     advance(I); /* INTERFACE */
     skip_to_next_line(I);
@@ -1144,11 +1160,17 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
             int cap2 = 0;
 
             while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                const char *arg_name = NULL;
+                if (check_keyword_arg(I)) {
+                    arg_name = token_arg_name(advance(I));
+                    advance(I); /* = */
+                }
                 OfortNode *arg = parse_expr(I);
                 if (call_node->n_stmts >= cap2) {
                     cap2 = cap2 ? cap2 * 2 : 8;
                     call_node->stmts = (OfortNode **)realloc(call_node->stmts, sizeof(OfortNode *) * cap2);
                 }
+                if (arg_name) strncpy(call_node->param_names[call_node->n_stmts], arg_name, 255);
                 call_node->stmts[call_node->n_stmts++] = arg;
                 if (check(I, FTOK_COMMA)) advance(I);
             }
@@ -1158,10 +1180,12 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
 
         return n;
     }
-    if (t->type == FTOK_IDENT) {
+    if (t->type == FTOK_IDENT || t->type == FTOK_IN || t->type == FTOK_OUT) {
         advance(I);
         OfortNode *n = alloc_node(I, FND_IDENT);
-        strncpy(n->name, t->str_val, 255);
+        if (t->type == FTOK_IN) strncpy(n->name, "in", 255);
+        else if (t->type == FTOK_OUT) strncpy(n->name, "out", 255);
+        else strncpy(n->name, t->str_val, 255);
         n->line = t->line;
 
         /* function call / array reference: ident( ... ) */
@@ -1179,6 +1203,11 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
             int cap2 = 0;
 
             while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                const char *arg_name = NULL;
+                if (check_keyword_arg(I)) {
+                    arg_name = token_arg_name(advance(I));
+                    advance(I); /* = */
+                }
                 /* Check for slice notation: expr:expr or expr:expr:expr or just : */
                 OfortNode *arg = parse_expr(I);
                 if (check(I, FTOK_COLON)) {
@@ -1203,6 +1232,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
                     cap2 = cap2 ? cap2 * 2 : 8;
                     call_node->stmts = (OfortNode **)realloc(call_node->stmts, sizeof(OfortNode *) * cap2);
                 }
+                if (arg_name) strncpy(call_node->param_names[call_node->n_stmts], arg_name, 255);
                 call_node->stmts[call_node->n_stmts++] = arg;
                 if (check(I, FTOK_COMMA)) advance(I);
             }
@@ -1833,26 +1863,23 @@ static OfortNode *parse_write(OfortInterpreter *I) {
     n->format_str[0] = '\0';
     n->bool_val = 0; /* unit-only WRITE(unit) stream-style extension */
 
-    /* WRITE(unit, fmt) or WRITE(unit, fmt=...) */
+    /* WRITE(unit, fmt) or WRITE(unit=..., fmt=...) */
     expect(I, FTOK_LPAREN);
-    /* unit: * or number */
-    if (check(I, FTOK_STAR)) {
-        advance(I);
-    } else {
-        n->children[0] = parse_expr(I);
-        n->n_children = 1;
-    }
-    if (check(I, FTOK_COMMA)) {
-        advance(I);
-    } else {
-        n->bool_val = 1;
-    }
-    /* control list: positional fmt or named fmt=... */
+    int positional = 0;
+    int saw_fmt = 0;
     while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
-        if (check(I, FTOK_IDENT) && peek_ahead(I, 1)->type == FTOK_ASSIGN) {
-            OfortToken *name = advance(I);
+        if (check_keyword_arg(I)) {
+            const char *name = token_arg_name(advance(I));
             advance(I); /* = */
-            if (str_eq_nocase(name->str_val, "fmt")) {
+            if (str_eq_nocase(name, "unit")) {
+                if (check(I, FTOK_STAR)) {
+                    advance(I);
+                } else {
+                    n->children[0] = parse_expr(I);
+                    if (n->n_children < 1) n->n_children = 1;
+                }
+            } else if (str_eq_nocase(name, "fmt")) {
+                saw_fmt = 1;
                 if (check(I, FTOK_STAR)) {
                     advance(I);
                 } else if (check(I, FTOK_STRING_LIT)) {
@@ -1860,6 +1887,8 @@ static OfortNode *parse_write(OfortInterpreter *I) {
                     advance(I);
                 } else if (check(I, FTOK_INT_LIT)) {
                     advance(I); /* format label number, ignore */
+                } else {
+                    parse_expr(I);
                 }
             } else {
                 /* Other WRITE controls are currently ignored. */
@@ -1871,15 +1900,22 @@ static OfortNode *parse_write(OfortInterpreter *I) {
                 }
             }
         } else if (check(I, FTOK_STAR)) {
+            if (positional > 0) saw_fmt = 1;
             advance(I);
         } else if (check(I, FTOK_STRING_LIT)) {
+            if (positional > 0) saw_fmt = 1;
             strncpy(n->format_str, peek(I)->str_val, 511);
             advance(I);
         } else if (check(I, FTOK_INT_LIT)) {
+            if (positional > 0) saw_fmt = 1;
             advance(I); /* format label number, ignore */
+        } else if (positional == 0) {
+            n->children[0] = parse_expr(I);
+            n->n_children = 1;
         } else {
             parse_expr(I);
         }
+        positional++;
         if (check(I, FTOK_COMMA)) {
             advance(I);
         } else if (check(I, FTOK_RPAREN)) {
@@ -1889,6 +1925,9 @@ static OfortNode *parse_write(OfortInterpreter *I) {
         }
     }
     expect(I, FTOK_RPAREN);
+    if (n->children[0] && !saw_fmt && positional == 1) {
+        n->bool_val = 1;
+    }
 
     /* output items */
     while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
@@ -1912,26 +1951,55 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
     n->format_str[0] = '\0';
     n->bool_val = 0; /* unit-only READ(unit) stream-style extension */
 
-    /* READ(unit, fmt) or READ *, ... */
+    /* READ(unit, fmt) or READ(unit=..., fmt=..., iostat=...) */
     if (check(I, FTOK_LPAREN)) {
         advance(I);
-        if (check(I, FTOK_STAR)) {
-            advance(I);
-        } else {
-            n->children[0] = parse_expr(I);
-            n->n_children = 1;
-        }
-        if (check(I, FTOK_COMMA)) {
-            advance(I);
-            if (check(I, FTOK_STAR)) advance(I);
-            else if (check(I, FTOK_STRING_LIT)) {
+        int positional = 0;
+        int saw_fmt = 0;
+        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            if (check_keyword_arg(I)) {
+                const char *name = token_arg_name(advance(I));
+                advance(I); /* = */
+                if (str_eq_nocase(name, "unit")) {
+                    if (check(I, FTOK_STAR)) {
+                        advance(I);
+                    } else {
+                        n->children[0] = parse_expr(I);
+                        n->n_children = 1;
+                    }
+                } else if (str_eq_nocase(name, "fmt")) {
+                    saw_fmt = 1;
+                    if (check(I, FTOK_STAR)) advance(I);
+                    else if (check(I, FTOK_STRING_LIT)) {
+                        strncpy(n->format_str, peek(I)->str_val, 511);
+                        advance(I);
+                    } else {
+                        parse_expr(I);
+                    }
+                } else {
+                    parse_expr(I);
+                }
+            } else if (check(I, FTOK_STAR)) {
+                if (positional > 0) saw_fmt = 1;
+                advance(I);
+            } else if (check(I, FTOK_STRING_LIT)) {
+                if (positional > 0) saw_fmt = 1;
                 strncpy(n->format_str, peek(I)->str_val, 511);
                 advance(I);
+            } else if (positional == 0) {
+                n->children[0] = parse_expr(I);
+                n->n_children = 1;
+            } else {
+                parse_expr(I);
             }
-        } else {
-            n->bool_val = 1;
+            positional++;
+            if (check(I, FTOK_COMMA)) advance(I);
+            else break;
         }
         expect(I, FTOK_RPAREN);
+        if (n->children[0] && !saw_fmt && positional == 1) {
+            n->bool_val = 1;
+        }
     } else if (check(I, FTOK_STAR)) {
         advance(I);
         if (check(I, FTOK_COMMA)) advance(I);
@@ -2216,10 +2284,28 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* USE module_name */
     if (t->type == FTOK_USE) {
         advance(I);
+        while (check(I, FTOK_COMMA)) {
+            advance(I);
+            while (!check(I, FTOK_DCOLON) && !check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+                advance(I);
+                if (check(I, FTOK_COMMA)) {
+                    advance(I);
+                } else if (check(I, FTOK_DCOLON)) {
+                    break;
+                } else {
+                    break;
+                }
+            }
+            if (check(I, FTOK_DCOLON)) break;
+        }
+        if (check(I, FTOK_DCOLON)) advance(I);
         OfortToken *mn = expect(I, FTOK_IDENT);
         OfortNode *n = alloc_node(I, FND_USE);
         strncpy(n->name, mn->str_val, 255);
         n->line = t->line;
+        while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+            advance(I);
+        }
         return n;
     }
 
@@ -2319,11 +2405,17 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         if (check(I, FTOK_LPAREN)) {
             advance(I);
             while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                const char *arg_name = NULL;
+                if (check_keyword_arg(I)) {
+                    arg_name = token_arg_name(advance(I));
+                    advance(I); /* = */
+                }
                 OfortNode *arg = parse_expr(I);
                 if (n->n_stmts >= cap) {
                     cap = cap ? cap * 2 : 8;
                     n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
                 }
+                if (arg_name) strncpy(n->param_names[n->n_stmts], arg_name, 255);
                 n->stmts[n->n_stmts++] = arg;
                 if (check(I, FTOK_COMMA)) advance(I);
             }
@@ -3399,7 +3491,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 
         /* Check for intrinsic */
         if (is_intrinsic(n->name)) {
-            OfortValue result = call_intrinsic(I, n->name, args, nargs);
+            OfortValue result = call_intrinsic(I, n->name, args, nargs, n->param_names);
             for (int i = 0; i < nargs; i++) free_value(&args[i]);
             return result;
         }
@@ -3591,7 +3683,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             str_upper(mu, I->modules[i].name, 256);
             if (strcmp(upper, mu) == 0) { mod = &I->modules[i]; break; }
         }
-        if (!mod) ofort_error(I, "Module '%s' not found", n->name);
+        if (!mod) {
+            if (strcmp(upper, "ISO_FORTRAN_ENV") == 0) {
+                declare_var(I, "output_unit", make_integer(6));
+                declare_var(I, "input_unit", make_integer(5));
+                declare_var(I, "error_unit", make_integer(0));
+                declare_var(I, "real64", make_integer(8));
+                declare_var(I, "int64", make_integer(8));
+                break;
+            }
+            if (strcmp(upper, "IEEE_ARITHMETIC") == 0) {
+                break;
+            }
+            ofort_error(I, "Module '%s' not found", n->name);
+        }
         /* import variables */
         for (int i = 0; i < mod->n_vars; i++) {
             declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
@@ -3911,9 +4016,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             int unit = (int)val_to_int(uv);
             OfortUnitFile *entry = find_unit_file(I, unit);
             free_value(&uv);
-            if (!entry) ofort_error(I, "Unit %d is not open", unit);
-            if (n->bool_val) write_values_to_stream_file(I, entry->path, vals, nvals);
-            else write_values_to_file(I, entry->path, vals, nvals);
+            if (!entry && unit == 6) {
+                format_output(I, n->format_str, vals, nvals);
+            } else {
+                if (!entry) ofort_error(I, "Unit %d is not open", unit);
+                if (n->bool_val) write_values_to_stream_file(I, entry->path, vals, nvals);
+                else write_values_to_file(I, entry->path, vals, nvals);
+            }
         } else {
             format_output(I, n->format_str, vals, nvals);
         }
@@ -3975,6 +4084,31 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_CALL: {
         char call_upper[256];
         str_upper(call_upper, n->name, 256);
+        if (strcmp(call_upper, "RANDOM_SEED") == 0) {
+            for (int i = 0; i < n->n_stmts; i++) {
+                if (n->param_names[i][0] && str_eq_nocase(n->param_names[i], "size") &&
+                    n->stmts[i]->type == FND_IDENT) {
+                    set_var(I, n->stmts[i]->name, make_integer(1));
+                }
+            }
+            break;
+        }
+        if (strcmp(call_upper, "SYSTEM_CLOCK") == 0) {
+            long long now = (long long)time(NULL);
+            for (int i = 0; i < n->n_stmts; i++) {
+                if (n->stmts[i]->type != FND_IDENT) continue;
+                if (n->param_names[i][0] == '\0' && i == 0) {
+                    set_var(I, n->stmts[i]->name, make_integer(now));
+                } else if (str_eq_nocase(n->param_names[i], "count")) {
+                    set_var(I, n->stmts[i]->name, make_integer(now));
+                } else if (str_eq_nocase(n->param_names[i], "count_rate")) {
+                    set_var(I, n->stmts[i]->name, make_integer(1));
+                } else if (str_eq_nocase(n->param_names[i], "count_max")) {
+                    set_var(I, n->stmts[i]->name, make_integer(LLONG_MAX));
+                }
+            }
+            break;
+        }
         if (strcmp(call_upper, "RANDOM_NUMBER") == 0) {
             if (n->n_stmts != 1 || n->stmts[0]->type != FND_IDENT)
                 ofort_error(I, "RANDOM_NUMBER requires a variable argument");
@@ -4214,6 +4348,16 @@ static int is_elemental_unary_intrinsic(const char *upper) {
            strcmp(upper, "LOGICAL") == 0;
 }
 
+static int intrinsic_arg_index(char arg_names[OFORT_MAX_PARAMS][256], int nargs, const char *name) {
+    if (!arg_names || !name) return -1;
+    for (int i = 0; i < nargs; i++) {
+        if (arg_names[i][0] && str_eq_nocase(arg_names[i], name)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static OfortValType elemental_result_type(const char *upper, OfortValType input_type) {
     if (strcmp(upper, "ABS") == 0 && input_type == FVAL_INTEGER) return FVAL_INTEGER;
     if (strcmp(upper, "FLOOR") == 0 ||
@@ -4226,7 +4370,8 @@ static OfortValType elemental_result_type(const char *upper, OfortValType input_
     return FVAL_REAL;
 }
 
-static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs) {
+static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs,
+                                char arg_names[OFORT_MAX_PARAMS][256]) {
     char upper[256];
     str_upper(upper, name, 256);
 
@@ -4236,7 +4381,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
 
         for (int i = 0; i < result.v.arr.len; i++) {
             OfortValue elem_arg = copy_value(args[0].v.arr.data[i]);
-            OfortValue elem_result = call_intrinsic(I, name, &elem_arg, 1);
+            OfortValue elem_result = call_intrinsic(I, name, &elem_arg, 1, NULL);
             free_value(&elem_arg);
             free_value(&result.v.arr.data[i]);
             result.v.arr.data[i] = elem_result;
@@ -4470,8 +4615,10 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     /* === Array intrinsics === */
     if (strcmp(upper, "SIZE") == 0) {
         if (args[0].type != FVAL_ARRAY) ofort_error(I, "SIZE requires an array argument");
-        if (nargs >= 2) {
-            int dim = (int)val_to_int(args[1]);
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        if (dim_idx < 0 && nargs >= 2) dim_idx = 1;
+        if (dim_idx >= 0) {
+            int dim = (int)val_to_int(args[dim_idx]);
             if (dim >= 1 && dim <= args[0].v.arr.n_dims)
                 return make_integer(args[0].v.arr.dims[dim - 1]);
             return make_integer(0);
@@ -4636,7 +4783,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     }
     if (strcmp(upper, "LBOUND") == 0) {
         /* Fortran arrays always start at 1 in our implementation */
-        if (nargs >= 2) return make_integer(1);
+        if (intrinsic_arg_index(arg_names, nargs, "dim") >= 0 || nargs >= 2) return make_integer(1);
         if (args[0].type == FVAL_ARRAY) {
             int nd = args[0].v.arr.n_dims;
             int dims[1] = {nd};
@@ -4651,8 +4798,10 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     }
     if (strcmp(upper, "UBOUND") == 0) {
         if (args[0].type != FVAL_ARRAY) return make_integer(0);
-        if (nargs >= 2) {
-            int dim = (int)val_to_int(args[1]);
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        if (dim_idx < 0 && nargs >= 2) dim_idx = 1;
+        if (dim_idx >= 0) {
+            int dim = (int)val_to_int(args[dim_idx]);
             if (dim >= 1 && dim <= args[0].v.arr.n_dims)
                 return make_integer(args[0].v.arr.dims[dim - 1]);
             return make_integer(0);
