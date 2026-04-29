@@ -118,6 +118,7 @@ struct OfortInterpreter {
 /* ── Forward declarations ────────────────────── */
 static void ofort_error(OfortInterpreter *I, const char *fmt, ...);
 static OfortValue eval_node(OfortInterpreter *I, OfortNode *n);
+static const char *type_token_intrinsic_name(OfortTokenType t);
 static void exec_node(OfortInterpreter *I, OfortNode *n);
 static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs);
 static int is_intrinsic(const char *name);
@@ -937,6 +938,39 @@ static int check_ident_upper(OfortInterpreter *I, const char *name) {
     return strcmp(upper, name) == 0;
 }
 
+static int token_ident_upper(OfortToken *t, const char *name) {
+    char upper[256];
+    if (!t || t->type != FTOK_IDENT) return 0;
+    str_upper(upper, t->str_val, 256);
+    return strcmp(upper, name) == 0;
+}
+
+static void skip_to_next_line(OfortInterpreter *I) {
+    while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        advance(I);
+    }
+    skip_newlines(I);
+}
+
+static int check_end_ident(OfortInterpreter *I, const char *name) {
+    return peek(I)->type == FTOK_END && token_ident_upper(peek_ahead(I, 1), name);
+}
+
+static void skip_interface_block(OfortInterpreter *I) {
+    advance(I); /* INTERFACE */
+    skip_to_next_line(I);
+    while (!check(I, FTOK_EOF)) {
+        if (check_end_ident(I, "INTERFACE")) {
+            advance(I); /* END */
+            advance(I); /* INTERFACE */
+            if (check(I, FTOK_IDENT)) advance(I); /* optional generic name */
+            skip_newlines(I);
+            return;
+        }
+        advance(I);
+    }
+}
+
 /* Check if current token is END followed by a keyword (END PROGRAM, END DO, etc.) */
 static int check_end(OfortInterpreter *I, const char *what) {
     if (peek(I)->type != FTOK_END) return 0;
@@ -1093,6 +1127,37 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         return parse_primary(I);
     }
     /* identifier — could be variable, function call, or array ref */
+    if (type_token_intrinsic_name(t->type) && peek_ahead(I, 1)->type == FTOK_LPAREN) {
+        const char *intrinsic_name = type_token_intrinsic_name(t->type);
+        advance(I);
+        OfortNode *n = alloc_node(I, FND_IDENT);
+        strncpy(n->name, intrinsic_name, 255);
+        n->line = t->line;
+
+        while (check(I, FTOK_LPAREN)) {
+            advance(I);
+            OfortNode *call_node = alloc_node(I, FND_FUNC_CALL);
+            strncpy(call_node->name, n->name, 255);
+            call_node->line = n->line;
+            call_node->stmts = NULL;
+            call_node->n_stmts = 0;
+            int cap2 = 0;
+
+            while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                OfortNode *arg = parse_expr(I);
+                if (call_node->n_stmts >= cap2) {
+                    cap2 = cap2 ? cap2 * 2 : 8;
+                    call_node->stmts = (OfortNode **)realloc(call_node->stmts, sizeof(OfortNode *) * cap2);
+                }
+                call_node->stmts[call_node->n_stmts++] = arg;
+                if (check(I, FTOK_COMMA)) advance(I);
+            }
+            expect(I, FTOK_RPAREN);
+            n = call_node;
+        }
+
+        return n;
+    }
     if (t->type == FTOK_IDENT) {
         advance(I);
         OfortNode *n = alloc_node(I, FND_IDENT);
@@ -1980,13 +2045,14 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
     return n;
 }
 
-static OfortNode *parse_function(OfortInterpreter *I) {
+static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType result_type) {
     OfortToken *ft = advance(I); /* FUNCTION */
     OfortToken *name = expect(I, FTOK_IDENT);
 
     OfortNode *n = alloc_node(I, FND_FUNCTION);
     strncpy(n->name, name->str_val, 255);
     n->line = ft->line;
+    n->val_type = result_type;
     n->n_params = 0;
     n->result_name[0] = '\0';
 
@@ -2019,6 +2085,26 @@ static OfortNode *parse_function(OfortInterpreter *I) {
     n->n_children = 1;
     consume_end(I, "FUNCTION");
     return n;
+}
+
+static OfortNode *parse_function(OfortInterpreter *I) {
+    return parse_function_with_type(I, FVAL_INTEGER);
+}
+
+static OfortNode *parse_typed_function(OfortInterpreter *I) {
+    OfortToken *type_tok = advance(I);
+    OfortValType result_type = token_to_valtype(type_tok->type);
+
+    if (check(I, FTOK_LPAREN)) {
+        int depth = 0;
+        do {
+            if (check(I, FTOK_LPAREN)) depth++;
+            else if (check(I, FTOK_RPAREN)) depth--;
+            advance(I);
+        } while (depth > 0 && !check(I, FTOK_EOF));
+    }
+
+    return parse_function_with_type(I, result_type);
 }
 
 static OfortNode *parse_module(OfortInterpreter *I) {
@@ -2144,8 +2230,18 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return NULL;
     }
 
+    /* Generic INTERFACE blocks are skipped for now. */
+    if (token_ident_upper(t, "INTERFACE")) {
+        skip_interface_block(I);
+        return NULL;
+    }
+
     /* declarations */
     if (is_type_keyword(t->type)) {
+        if (peek_ahead(I, 1)->type == FTOK_FUNCTION ||
+            (peek_ahead(I, 1)->type == FTOK_LPAREN && peek_ahead(I, 3)->type == FTOK_FUNCTION)) {
+            return parse_typed_function(I);
+        }
         /* Could be a declaration or a function with type prefix */
         /* Look ahead for :: or ident followed by = or ( or , */
         /* Check if this is "TYPE :: name" (type definition) when token is FTOK_TYPE */
@@ -2285,7 +2381,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     if (t->type == FTOK_DEALLOCATE) return parse_deallocate(I);
 
     /* END (bare) — shouldn't be reached normally */
-    if (t->type == FTOK_END) return NULL;
+    if (t->type == FTOK_END) {
+        skip_to_next_line(I);
+        return NULL;
+    }
 
     /* DATA statement: DATA var /value/ — simplified */
     if (t->type == FTOK_DATA) {
@@ -2507,6 +2606,14 @@ static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bu
         default:
             buf[0] = '\0';
             break;
+    }
+}
+
+static const char *type_token_intrinsic_name(OfortTokenType t) {
+    switch (t) {
+        case FTOK_REAL: return "REAL";
+        case FTOK_LOGICAL: return "LOGICAL";
+        default: return NULL;
     }
 }
 
@@ -3308,7 +3415,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             }
             /* Set up result variable */
             const char *res_name = fn->result_name[0] ? fn->result_name : fn->name;
-            declare_var(I, res_name, make_integer(0));
+            declare_var(I, res_name, default_value(fn->val_type, 1));
 
             /* Execute body */
             exec_node(I, fn->children[0]);
@@ -4651,6 +4758,26 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
         }
     }
 
+    return interp->has_error ? -1 : 0;
+}
+
+int ofort_check(OfortInterpreter *interp, const char *source) {
+    if (!interp || !source) return -1;
+    interp->source = source;
+    interp->has_error = 0;
+    interp->returning = 0;
+    interp->exiting = 0;
+    interp->cycling = 0;
+    interp->stopping = 0;
+    interp->current_line = 0;
+
+    if (setjmp(interp->err_jmp) != 0) {
+        return -1;
+    }
+
+    tokenize(interp, source);
+    interp->tok_pos = 0;
+    interp->ast = parse_program(interp);
     return interp->has_error ? -1 : 0;
 }
 
