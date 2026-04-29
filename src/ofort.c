@@ -1605,6 +1605,18 @@ static OfortNode *parse_do(OfortInterpreter *I) {
         return n;
     }
 
+    /* DO forever, terminated by EXIT or END DO */
+    if (check(I, FTOK_NEWLINE) || check(I, FTOK_SEMICOLON)) {
+        OfortNode *n = alloc_node(I, FND_DO_FOREVER);
+        n->line = dot->line;
+        skip_newlines(I);
+        OfortNode *body = parse_block_until_end(I, "DO");
+        n->children[0] = body;
+        n->n_children = 1;
+        consume_end(I, "DO");
+        return n;
+    }
+
     /* DO i = start, end [, step] */
     OfortNode *n = alloc_node(I, FND_DO_LOOP);
     n->line = dot->line;
@@ -3702,6 +3714,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             free_value(&cond);
             if (!is_true) break;
             exec_node(I, n->children[1]);
+            if (I->returning || I->stopping) break;
+            if (I->exiting) { I->exiting = 0; break; }
+            if (I->cycling) { I->cycling = 0; }
+        }
+        break;
+    }
+
+    case FND_DO_FOREVER: {
+        int max_iter = 1000000;
+        while (max_iter-- > 0) {
+            exec_node(I, n->children[0]);
             if (I->returning || I->stopping) break;
             if (I->exiting) { I->exiting = 0; break; }
             if (I->cycling) { I->cycling = 0; }
