@@ -2538,6 +2538,25 @@ static int read_next_token(FILE *fp, char *buf, int bufsize) {
     return 1;
 }
 
+static int read_next_string_token(const char **p, char *buf, int bufsize) {
+    int len = 0;
+
+    while (**p && isspace((unsigned char)**p)) {
+        (*p)++;
+    }
+    if (!**p) {
+        return 0;
+    }
+    while (**p && !isspace((unsigned char)**p)) {
+        if (len < bufsize - 1) {
+            buf[len++] = **p;
+        }
+        (*p)++;
+    }
+    buf[len] = '\0';
+    return 1;
+}
+
 static void assign_token_to_value(OfortValue *dest, const char *token) {
     if (dest->type == FVAL_INTEGER) {
         dest->v.i = strtoll(token, NULL, 10);
@@ -2551,10 +2570,39 @@ static void assign_token_to_value(OfortValue *dest, const char *token) {
     }
 }
 
+static int format_is_character_line_read(const char *fmt) {
+    while (*fmt) {
+        if (*fmt == 'a' || *fmt == 'A') {
+            return 1;
+        }
+        fmt++;
+    }
+    return 0;
+}
+
+static void assign_line_to_character_target(OfortInterpreter *I, OfortNode *target, const char *line) {
+    if (target->type != FND_IDENT) return;
+    OfortVar *v = find_var(I, target->name);
+    if (!v) ofort_error(I, "Undefined variable '%s'", target->name);
+    if (v->val.type != FVAL_CHARACTER)
+        ofort_error(I, "READ '(A)' target must be CHARACTER");
+    free_value(&v->val);
+    v->val = make_character(line ? line : "");
+}
+
 static void read_values_from_file(OfortInterpreter *I, const char *path, OfortNode *n) {
     FILE *fp = fopen(path, "r");
     char tok[1024];
     if (!fp) ofort_error(I, "Cannot open '%s' for reading", path);
+
+    if (format_is_character_line_read(n->format_str) && n->n_stmts > 0) {
+        char line[OFORT_MAX_STRLEN];
+        if (!fgets(line, sizeof(line), fp)) line[0] = '\0';
+        line[strcspn(line, "\r\n")] = '\0';
+        assign_line_to_character_target(I, n->stmts[0], line);
+        fclose(fp);
+        return;
+    }
 
     for (int i = 0; i < n->n_stmts; i++) {
         if (n->stmts[i]->type != FND_IDENT) continue;
@@ -2572,6 +2620,32 @@ static void read_values_from_file(OfortInterpreter *I, const char *path, OfortNo
         }
     }
     fclose(fp);
+}
+
+static void read_values_from_string(OfortInterpreter *I, const char *text, OfortNode *n) {
+    const char *p = text ? text : "";
+    char tok[1024];
+
+    if (format_is_character_line_read(n->format_str) && n->n_stmts > 0) {
+        assign_line_to_character_target(I, n->stmts[0], p);
+        return;
+    }
+
+    for (int i = 0; i < n->n_stmts; i++) {
+        if (n->stmts[i]->type != FND_IDENT) continue;
+        OfortVar *v = find_var(I, n->stmts[i]->name);
+        if (!v) ofort_error(I, "Undefined variable '%s'", n->stmts[i]->name);
+        if (v->val.type == FVAL_ARRAY) {
+            for (int j = 0; j < v->val.v.arr.len; j++) {
+                if (!read_next_string_token(&p, tok, sizeof(tok))) break;
+                assign_token_to_value(&v->val.v.arr.data[j], tok);
+            }
+        } else {
+            if (read_next_string_token(&p, tok, sizeof(tok))) {
+                assign_token_to_value(&v->val, tok);
+            }
+        }
+    }
 }
 
 static void format_descriptors(OfortInterpreter *I, const char *p, const char *end,
@@ -3638,11 +3712,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_READ_STMT:
         if (n->children[0]) {
             OfortValue uv = eval_node(I, n->children[0]);
-            int unit = (int)val_to_int(uv);
-            OfortUnitFile *entry = find_unit_file(I, unit);
-            free_value(&uv);
-            if (!entry) ofort_error(I, "Unit %d is not open", unit);
-            read_values_from_file(I, entry->path, n);
+            if (uv.type == FVAL_CHARACTER) {
+                read_values_from_string(I, uv.v.s ? uv.v.s : "", n);
+                free_value(&uv);
+            } else {
+                int unit = (int)val_to_int(uv);
+                OfortUnitFile *entry = find_unit_file(I, unit);
+                free_value(&uv);
+                if (!entry) ofort_error(I, "Unit %d is not open", unit);
+                read_values_from_file(I, entry->path, n);
+            }
             break;
         }
         /* READ without an external unit is a no-op in this interpreter. */
