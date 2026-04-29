@@ -15,6 +15,9 @@
 #define FILENO(fp) fileno(fp)
 #endif
 
+static void normalize_newlines(char *source);
+static char *maybe_wrap_loose_source(char *source);
+
 static int append_text(char **buf, size_t *len, size_t *cap, const char *text) {
     size_t n = strlen(text);
 
@@ -84,14 +87,91 @@ static char *read_stream(FILE *fp, const char *name) {
     return buf;
 }
 
-static char *read_interactive(void) {
+static char *copy_string(const char *text) {
+    size_t len = strlen(text);
+    char *copy = (char *)malloc(len + 1);
+
+    if (!copy) {
+        fprintf(stderr, "out of memory\n");
+        return NULL;
+    }
+
+    memcpy(copy, text, len + 1);
+    return copy;
+}
+
+static int is_command(const char *line, const char *command) {
+    size_t n = strlen(command);
+
+    return strncmp(line, command, n) == 0 &&
+           (line[n] == '\0' || line[n] == '\n' || line[n] == '\r');
+}
+
+static void list_source(const char *source) {
+    const char *line = source;
+    int line_no = 1;
+
+    while (*line) {
+        const char *end = strchr(line, '\n');
+
+        if (end) {
+            printf("%4d  %.*s\n", line_no, (int)(end - line), line);
+            line = end + 1;
+        } else {
+            printf("%4d  %s\n", line_no, line);
+            break;
+        }
+        line_no++;
+    }
+}
+
+static int execute_source_text(const char *text) {
+    char *source = copy_string(text);
+    OfortInterpreter *interp;
+    int rc;
+
+    if (!source) {
+        return 2;
+    }
+
+    normalize_newlines(source);
+    source = maybe_wrap_loose_source(source);
+    if (!source) {
+        return 2;
+    }
+
+    interp = ofort_create();
+    if (!interp) {
+        free(source);
+        fprintf(stderr, "failed to create Fortran interpreter\n");
+        return 2;
+    }
+
+    rc = ofort_execute(interp, source);
+    if (rc == 0) {
+        const char *output = ofort_get_output(interp);
+        if (output && output[0] != '\0') {
+            fputs(output, stdout);
+        }
+    } else {
+        const char *error = ofort_get_error(interp);
+        fprintf(stderr, "%s\n", (error && error[0] != '\0') ? error : "Fortran execution failed");
+    }
+
+    ofort_destroy(interp);
+    free(source);
+    return rc == 0 ? 0 : 1;
+}
+
+static int run_interactive(void) {
     char line[4096];
     char *buf = NULL;
     size_t len = 0;
     size_t cap = 0;
+    int last_rc = 0;
 
-    printf("Enter Fortran source. Type a single . on its own line to run.\n");
-    printf("Windows EOF also works: Ctrl+Z then Enter.\n");
+    printf("Enter Fortran source.\n");
+    printf("Commands: . runs, .runq runs and quits, .quit quits, .clear clears, .list lists.\n");
 
     for (;;) {
         fputs("ofort> ", stdout);
@@ -101,31 +181,52 @@ static char *read_interactive(void) {
             if (ferror(stdin)) {
                 free(buf);
                 fprintf(stderr, "failed to read stdin\n");
-                return NULL;
+                return 2;
             }
             break;
         }
 
-        if (strcmp(line, ".\n") == 0 || strcmp(line, ".\r\n") == 0 || strcmp(line, ".") == 0) {
-            break;
+        if (is_command(line, ".")) {
+            last_rc = execute_source_text(buf ? buf : "");
+            continue;
+        }
+
+        if (is_command(line, ".runq")) {
+            last_rc = execute_source_text(buf ? buf : "");
+            free(buf);
+            return last_rc;
+        }
+
+        if (is_command(line, ".quit")) {
+            free(buf);
+            return 0;
+        }
+
+        if (is_command(line, ".clear")) {
+            free(buf);
+            buf = NULL;
+            len = 0;
+            cap = 0;
+            continue;
+        }
+
+        if (is_command(line, ".list")) {
+            list_source(buf ? buf : "");
+            continue;
         }
 
         if (!append_text(&buf, &len, &cap, line)) {
             free(buf);
-            return NULL;
+            return 2;
         }
     }
 
-    if (!buf) {
-        buf = (char *)malloc(1);
-        if (!buf) {
-            fprintf(stderr, "out of memory\n");
-            return NULL;
-        }
-        buf[0] = '\0';
+    if (buf && buf[0] != '\0') {
+        last_rc = execute_source_text(buf);
     }
 
-    return buf;
+    free(buf);
+    return last_rc;
 }
 
 static char *read_file(const char *path) {
@@ -263,8 +364,6 @@ static void print_usage(const char *program) {
 
 int main(int argc, char **argv) {
     char *source;
-    OfortInterpreter *interp;
-    int rc;
 
     if (argc > 2) {
         print_usage(argv[0]);
@@ -274,38 +373,16 @@ int main(int argc, char **argv) {
     if (argc == 2) {
         source = read_file(argv[1]);
     } else if (ISATTY(FILENO(stdin))) {
-        source = read_interactive();
+        return run_interactive();
     } else {
         source = read_stream(stdin, "stdin");
     }
     if (!source) {
         return 2;
     }
-    normalize_newlines(source);
-    source = maybe_wrap_loose_source(source);
-    if (!source) {
-        return 2;
-    }
-
-    interp = ofort_create();
-    if (!interp) {
+    {
+        int rc = execute_source_text(source);
         free(source);
-        fprintf(stderr, "failed to create Fortran interpreter\n");
-        return 2;
+        return rc;
     }
-
-    rc = ofort_execute(interp, source);
-    if (rc == 0) {
-        const char *output = ofort_get_output(interp);
-        if (output && output[0] != '\0') {
-            fputs(output, stdout);
-        }
-    } else {
-        const char *error = ofort_get_error(interp);
-        fprintf(stderr, "%s\n", (error && error[0] != '\0') ? error : "Fortran execution failed");
-    }
-
-    ofort_destroy(interp);
-    free(source);
-    return rc == 0 ? 0 : 1;
 }
