@@ -1,7 +1,7 @@
 # ofort
 
 `ofort` is a small tree-walking interpreter for a subset of Fortran 90/95/2003.
-It is extracted from the CodeBench project into a standalone C command-line
+It is extracted from the [CodeBench](https://github.com/yu314-coder/CodeBench) project into a standalone C command-line
 project.
 
 It is not `gfortran` and does not aim to compile full Fortran projects. `REAL`
