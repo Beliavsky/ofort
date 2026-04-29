@@ -4059,7 +4059,7 @@ static const char *intrinsic_names[] = {
     /* Math */
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MAX", "MIN", "FLOOR", "CEILING", "NINT",
-    "REAL", "INT", "DBLE", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
+    "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
@@ -4253,6 +4253,10 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     }
     if (strcmp(upper, "DBLE") == 0 || strcmp(upper, "DFLOAT") == 0) {
         return make_double(val_to_real(args[0]));
+    }
+    if (strcmp(upper, "DPROD") == 0) {
+        if (nargs < 2) ofort_error(I, "DPROD requires 2 arguments");
+        return make_double(val_to_real(args[0]) * val_to_real(args[1]));
     }
     if (strcmp(upper, "CMPLX") == 0) {
         double re = nargs > 0 ? val_to_real(args[0]) : 0.0;
