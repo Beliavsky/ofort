@@ -64,6 +64,11 @@ typedef struct {
     int n_types;
 } OfortModule;
 
+typedef struct {
+    int unit;
+    char path[512];
+} OfortUnitFile;
+
 struct OfortInterpreter {
     /* output */
     char output[OFORT_MAX_OUTPUT];
@@ -86,6 +91,9 @@ struct OfortInterpreter {
     /* derived type definitions */
     OfortTypeDef type_defs[64];
     int n_type_defs;
+    /* simple external-unit file table */
+    OfortUnitFile unit_files[32];
+    int n_unit_files;
     /* control flow */
     int returning;
     OfortValue return_val;
@@ -559,6 +567,7 @@ static const KeywordEntry fortran_keywords[] = {
     {"INOUT", FTOK_INOUT}, {"RESULT", FTOK_RESULT},
     {"SAVE", FTOK_SAVE}, {"DATA", FTOK_DATA},
     {"PRINT", FTOK_PRINT}, {"WRITE", FTOK_WRITE}, {"READ", FTOK_READ},
+    {"OPEN", FTOK_OPEN}, {"CLOSE", FTOK_CLOSE},
     {NULL, FTOK_EOF}
 };
 
@@ -1748,8 +1757,12 @@ static OfortNode *parse_write(OfortInterpreter *I) {
     /* WRITE(unit, fmt) or WRITE(unit, fmt=...) */
     expect(I, FTOK_LPAREN);
     /* unit: * or number */
-    if (check(I, FTOK_STAR)) advance(I);
-    else if (check(I, FTOK_INT_LIT)) advance(I);
+    if (check(I, FTOK_STAR)) {
+        advance(I);
+    } else {
+        n->children[0] = parse_expr(I);
+        n->n_children = 1;
+    }
     if (check(I, FTOK_COMMA)) {
         advance(I);
     }
@@ -1818,8 +1831,12 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
     /* READ(unit, fmt) or READ *, ... */
     if (check(I, FTOK_LPAREN)) {
         advance(I);
-        if (check(I, FTOK_STAR)) advance(I);
-        else if (check(I, FTOK_INT_LIT)) advance(I);
+        if (check(I, FTOK_STAR)) {
+            advance(I);
+        } else {
+            n->children[0] = parse_expr(I);
+            n->n_children = 1;
+        }
         expect(I, FTOK_COMMA);
         if (check(I, FTOK_STAR)) advance(I);
         else if (check(I, FTOK_STRING_LIT)) {
@@ -1843,6 +1860,69 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
         if (check(I, FTOK_COMMA)) advance(I);
         else break;
     }
+    return n;
+}
+
+static OfortNode *parse_open_stmt(OfortInterpreter *I) {
+    OfortToken *ot = advance(I); /* OPEN */
+    OfortNode *n = alloc_node(I, FND_OPEN);
+    n->line = ot->line;
+
+    expect(I, FTOK_LPAREN);
+    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+        if (check(I, FTOK_IDENT) && peek_ahead(I, 1)->type == FTOK_ASSIGN) {
+            OfortToken *name = advance(I);
+            advance(I); /* = */
+            if (str_eq_nocase(name->str_val, "unit")) {
+                n->children[0] = parse_expr(I);
+                if (n->n_children < 1) n->n_children = 1;
+            } else if (str_eq_nocase(name->str_val, "file")) {
+                n->children[1] = parse_expr(I);
+                if (n->n_children < 2) n->n_children = 2;
+            } else {
+                parse_expr(I);
+            }
+        } else {
+            if (!n->children[0]) {
+                n->children[0] = parse_expr(I);
+                if (n->n_children < 1) n->n_children = 1;
+            } else {
+                parse_expr(I);
+            }
+        }
+        if (check(I, FTOK_COMMA)) advance(I);
+        else break;
+    }
+    expect(I, FTOK_RPAREN);
+    return n;
+}
+
+static OfortNode *parse_close_stmt(OfortInterpreter *I) {
+    OfortToken *ct = advance(I); /* CLOSE */
+    OfortNode *n = alloc_node(I, FND_CLOSE);
+    n->line = ct->line;
+
+    expect(I, FTOK_LPAREN);
+    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+        if (check(I, FTOK_IDENT) && peek_ahead(I, 1)->type == FTOK_ASSIGN) {
+            OfortToken *name = advance(I);
+            advance(I); /* = */
+            if (str_eq_nocase(name->str_val, "unit")) {
+                n->children[0] = parse_expr(I);
+                n->n_children = 1;
+            } else {
+                parse_expr(I);
+            }
+        } else if (!n->children[0]) {
+            n->children[0] = parse_expr(I);
+            n->n_children = 1;
+        } else {
+            parse_expr(I);
+        }
+        if (check(I, FTOK_COMMA)) advance(I);
+        else break;
+    }
+    expect(I, FTOK_RPAREN);
     return n;
 }
 
@@ -2094,6 +2174,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
 
     /* READ */
     if (t->type == FTOK_READ) return parse_read_stmt(I);
+
+    /* OPEN/CLOSE */
+    if (t->type == FTOK_OPEN) return parse_open_stmt(I);
+    if (t->type == FTOK_CLOSE) return parse_close_stmt(I);
 
     /* CALL */
     if (t->type == FTOK_CALL) {
@@ -2390,6 +2474,104 @@ static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bu
             buf[0] = '\0';
             break;
     }
+}
+
+static OfortUnitFile *find_unit_file(OfortInterpreter *I, int unit) {
+    for (int i = 0; i < I->n_unit_files; i++) {
+        if (I->unit_files[i].unit == unit) {
+            return &I->unit_files[i];
+        }
+    }
+    return NULL;
+}
+
+static void set_unit_file(OfortInterpreter *I, int unit, const char *path) {
+    OfortUnitFile *entry = find_unit_file(I, unit);
+    if (!entry) {
+        if (I->n_unit_files >= 32) ofort_error(I, "Too many open units");
+        entry = &I->unit_files[I->n_unit_files++];
+        entry->unit = unit;
+    }
+    strncpy(entry->path, path, sizeof(entry->path) - 1);
+    entry->path[sizeof(entry->path) - 1] = '\0';
+}
+
+static void remove_unit_file(OfortInterpreter *I, int unit) {
+    for (int i = 0; i < I->n_unit_files; i++) {
+        if (I->unit_files[i].unit == unit) {
+            I->unit_files[i] = I->unit_files[I->n_unit_files - 1];
+            I->n_unit_files--;
+            return;
+        }
+    }
+}
+
+static void write_values_to_file(OfortInterpreter *I, const char *path, OfortValue *vals, int nvals) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) ofort_error(I, "Cannot open '%s' for writing", path);
+    for (int i = 0; i < nvals; i++) {
+        char buf[4096];
+        if (i > 0) fputc(' ', fp);
+        value_to_string(I, vals[i], buf, sizeof(buf));
+        fputs(buf, fp);
+    }
+    fputc('\n', fp);
+    fclose(fp);
+}
+
+static int read_next_token(FILE *fp, char *buf, int bufsize) {
+    int c;
+    int len = 0;
+
+    do {
+        c = fgetc(fp);
+        if (c == EOF) return 0;
+    } while (isspace(c));
+
+    while (c != EOF && !isspace(c)) {
+        if (len < bufsize - 1) {
+            buf[len++] = (char)c;
+        }
+        c = fgetc(fp);
+    }
+    buf[len] = '\0';
+    return 1;
+}
+
+static void assign_token_to_value(OfortValue *dest, const char *token) {
+    if (dest->type == FVAL_INTEGER) {
+        dest->v.i = strtoll(token, NULL, 10);
+    } else if (dest->type == FVAL_REAL || dest->type == FVAL_DOUBLE) {
+        dest->v.r = strtod(token, NULL);
+    } else if (dest->type == FVAL_CHARACTER) {
+        free_value(dest);
+        *dest = make_character(token);
+    } else if (dest->type == FVAL_LOGICAL) {
+        dest->v.b = token[0] == 'T' || token[0] == 't' || strcmp(token, ".true.") == 0;
+    }
+}
+
+static void read_values_from_file(OfortInterpreter *I, const char *path, OfortNode *n) {
+    FILE *fp = fopen(path, "r");
+    char tok[1024];
+    if (!fp) ofort_error(I, "Cannot open '%s' for reading", path);
+
+    for (int i = 0; i < n->n_stmts; i++) {
+        if (n->stmts[i]->type != FND_IDENT) continue;
+        OfortVar *v = find_var(I, n->stmts[i]->name);
+        if (!v) ofort_error(I, "Undefined variable '%s'", n->stmts[i]->name);
+        if (v->val.type == FVAL_ARRAY) {
+            for (int j = 0; j < v->val.v.arr.len; j++) {
+                if (!read_next_token(fp, tok, sizeof(tok))) break;
+                assign_token_to_value(&v->val.v.arr.data[j], tok);
+            }
+        } else {
+            if (read_next_token(fp, tok, sizeof(tok))) {
+                assign_token_to_value(&v->val, tok);
+            }
+        }
+    }
+    fclose(fp);
 }
 
 static void format_descriptors(OfortInterpreter *I, const char *p, const char *end,
@@ -3438,15 +3620,32 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int nvals = n->n_stmts;
         OfortValue *vals = (OfortValue *)calloc(nvals ? nvals : 1, sizeof(OfortValue));
         for (int i = 0; i < nvals; i++) vals[i] = eval_node(I, n->stmts[i]);
-        format_output(I, n->format_str, vals, nvals);
+        if (n->children[0]) {
+            OfortValue uv = eval_node(I, n->children[0]);
+            int unit = (int)val_to_int(uv);
+            OfortUnitFile *entry = find_unit_file(I, unit);
+            free_value(&uv);
+            if (!entry) ofort_error(I, "Unit %d is not open", unit);
+            write_values_to_file(I, entry->path, vals, nvals);
+        } else {
+            format_output(I, n->format_str, vals, nvals);
+        }
         for (int i = 0; i < nvals; i++) free_value(&vals[i]);
         free(vals);
         break;
     }
 
     case FND_READ_STMT:
-        /* READ is a no-op in this interpreter (no stdin) */
-        /* Initialize variables with default values */
+        if (n->children[0]) {
+            OfortValue uv = eval_node(I, n->children[0]);
+            int unit = (int)val_to_int(uv);
+            OfortUnitFile *entry = find_unit_file(I, unit);
+            free_value(&uv);
+            if (!entry) ofort_error(I, "Unit %d is not open", unit);
+            read_values_from_file(I, entry->path, n);
+            break;
+        }
+        /* READ without an external unit is a no-op in this interpreter. */
         for (int i = 0; i < n->n_stmts; i++) {
             if (n->stmts[i]->type == FND_IDENT) {
                 OfortVar *v = find_var(I, n->stmts[i]->name);
@@ -3456,6 +3655,29 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
         }
         break;
+
+    case FND_OPEN: {
+        if (!n->children[0] || !n->children[1])
+            ofort_error(I, "OPEN requires UNIT and FILE");
+        OfortValue uv = eval_node(I, n->children[0]);
+        OfortValue fv = eval_node(I, n->children[1]);
+        int unit = (int)val_to_int(uv);
+        if (fv.type != FVAL_CHARACTER)
+            ofort_error(I, "OPEN FILE must be CHARACTER");
+        set_unit_file(I, unit, fv.v.s ? fv.v.s : "");
+        free_value(&uv);
+        free_value(&fv);
+        break;
+    }
+
+    case FND_CLOSE: {
+        if (n->children[0]) {
+            OfortValue uv = eval_node(I, n->children[0]);
+            remove_unit_file(I, (int)val_to_int(uv));
+            free_value(&uv);
+        }
+        break;
+    }
 
     case FND_CALL: {
         char call_upper[256];
