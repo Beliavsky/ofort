@@ -2109,6 +2109,15 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     OfortToken *t = peek(I);
     if (t->type == FTOK_EOF) return NULL;
 
+    /* Statement label/name prefix, e.g. "outer: do ..." */
+    if (t->type == FTOK_IDENT && peek_ahead(I, 1)->type == FTOK_COLON) {
+        advance(I);
+        advance(I);
+        skip_newlines(I);
+        t = peek(I);
+        if (t->type == FTOK_EOF) return NULL;
+    }
+
     /* IMPLICIT NONE */
     if (t->type == FTOK_IMPLICIT) {
         advance(I);
@@ -2238,6 +2247,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* EXIT */
     if (t->type == FTOK_EXIT) {
         advance(I);
+        if (check(I, FTOK_IDENT)) advance(I); /* optional construct name */
         OfortNode *n = alloc_node(I, FND_EXIT);
         n->line = t->line;
         return n;
@@ -2246,6 +2256,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* CYCLE */
     if (t->type == FTOK_CYCLE) {
         advance(I);
+        if (check(I, FTOK_IDENT)) advance(I); /* optional construct name */
         OfortNode *n = alloc_node(I, FND_CYCLE);
         n->line = t->line;
         return n;
