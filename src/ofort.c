@@ -30,6 +30,7 @@ typedef struct {
     OfortValue val;
     int is_parameter; /* PARAMETER = const */
     int intent;       /* 0=none,1=IN,2=OUT,3=INOUT */
+    int char_len;     /* declared CHARACTER length, 0 if not CHARACTER */
 } OfortVar;
 
 typedef struct OfortScope {
@@ -322,6 +323,19 @@ static OfortValue copy_value(OfortValue v) {
     return r;
 }
 
+static OfortValue resize_character_value(OfortValue val, int char_len) {
+    if (val.type != FVAL_CHARACTER || char_len <= 0) return val;
+    char *buf = (char *)calloc((size_t)char_len + 1, 1);
+    int src_len = val.v.s ? (int)strlen(val.v.s) : 0;
+    int copy_len = src_len < char_len ? src_len : char_len;
+    if (copy_len > 0) memcpy(buf, val.v.s, (size_t)copy_len);
+    if (copy_len < char_len) memset(buf + copy_len, ' ', (size_t)(char_len - copy_len));
+    free_value(&val);
+    OfortValue resized = make_character(buf);
+    free(buf);
+    return resized;
+}
+
 /* ── Node allocation (tracked for cleanup) ───── */
 static OfortNode *alloc_node(OfortInterpreter *I, OfortNodeType type) {
     OfortNode *n = (OfortNode *)calloc(1, sizeof(OfortNode));
@@ -441,6 +455,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
         str_upper(vu, s->vars[i].name, 256);
         if (strcmp(upper, vu) == 0) {
             val = coerce_assignment_value(I, name, s->vars[i].val.type, val);
+            val = resize_character_value(val, s->vars[i].char_len);
             free_value(&s->vars[i].val);
             s->vars[i].val = val;
             return &s->vars[i];
@@ -456,6 +471,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 if (ps->vars[i].is_parameter)
                     ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
                 val = coerce_assignment_value(I, name, ps->vars[i].val.type, val);
+                val = resize_character_value(val, ps->vars[i].char_len);
                 free_value(&ps->vars[i].val);
                 ps->vars[i].val = val;
                 return &ps->vars[i];
@@ -474,6 +490,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->val = val;
     v->is_parameter = 0;
     v->intent = 0;
+    v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     return v;
 }
 
@@ -490,6 +507,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
         if (strcmp(upper, vu) == 0) {
             free_value(&s->vars[i].val);
             s->vars[i].val = val;
+            s->vars[i].char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
             return &s->vars[i];
         }
     }
@@ -498,6 +516,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->val = val;
     v->is_parameter = 0;
     v->intent = 0;
+    v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     return v;
 }
 
@@ -1456,6 +1475,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     OfortToken *type_tok = advance(I); /* consume type keyword */
     OfortValType vtype = token_to_valtype(type_tok->type);
     int char_len = 1;
+    OfortNode *char_len_expr = NULL;
     int is_allocatable = 0;
     int is_parameter = 0;
     int intent = 0;
@@ -1473,8 +1493,9 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                 advance(I);
                 char_len = OFORT_MAX_STRLEN - 1;
             } else {
-                OfortToken *lt = expect(I, FTOK_INT_LIT);
-                char_len = (int)lt->int_val;
+                char_len_expr = parse_expr(I);
+                if (char_len_expr->type == FND_INT_LIT)
+                    char_len = (int)char_len_expr->int_val;
             }
         } else if (check(I, FTOK_STAR)) {
             advance(I);
@@ -1568,10 +1589,26 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         strncpy(decl->name, name_tok->str_val, 255);
         decl->val_type = vtype;
         decl->char_len = char_len;
+        decl->char_len_expr = char_len_expr;
         decl->is_allocatable = is_allocatable;
         decl->is_parameter = is_parameter;
         decl->intent = intent;
         decl->line = name_tok->line;
+
+        if (vtype == FVAL_CHARACTER && check(I, FTOK_STAR)) {
+            advance(I);
+            if (check(I, FTOK_LPAREN)) {
+                advance(I);
+                decl->char_len_expr = parse_expr(I);
+                if (decl->char_len_expr->type == FND_INT_LIT)
+                    decl->char_len = (int)decl->char_len_expr->int_val;
+                expect(I, FTOK_RPAREN);
+            } else {
+                OfortToken *len_tok = expect(I, FTOK_INT_LIT);
+                decl->char_len = (int)len_tok->int_val;
+                decl->char_len_expr = NULL;
+            }
+        }
 
         /* copy dimension info */
         memcpy(decl->dims, decl_dims, sizeof(decl_dims));
@@ -2639,7 +2676,19 @@ static OfortValue default_value(OfortValType vtype, int char_len) {
     }
 }
 
-static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims) {
+static int eval_character_length(OfortInterpreter *I, OfortNode *n) {
+    int char_len = n->char_len;
+    if (n->char_len_expr) {
+        OfortValue v = eval_node(I, n->char_len_expr);
+        char_len = (int)val_to_int(v);
+        free_value(&v);
+    }
+    if (char_len < 0) char_len = 0;
+    if (char_len >= OFORT_MAX_STRLEN) char_len = OFORT_MAX_STRLEN - 1;
+    return char_len;
+}
+
+static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, int n_dims, int char_len) {
     OfortValue v; memset(&v, 0, sizeof(v));
     v.type = FVAL_ARRAY;
     int total = 1;
@@ -2655,8 +2704,12 @@ static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims) {
     v.v.arr.allocated = 1;
     v.v.arr.data = (OfortValue *)calloc(total, sizeof(OfortValue));
     for (i = 0; i < total; i++)
-        v.v.arr.data[i] = default_value(elem_type, 1);
+        v.v.arr.data[i] = default_value(elem_type, char_len);
     return v;
+}
+
+static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims) {
+    return make_array_with_char_len(elem_type, dims, n_dims, 1);
 }
 
 static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
@@ -2673,7 +2726,7 @@ static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
         if (dims[i] < 0) dims[i] = 0;
     }
 
-    return make_array(n->val_type, dims, ndims);
+    return make_array_with_char_len(n->val_type, dims, ndims, eval_character_length(I, n));
 }
 
 typedef struct {
@@ -2947,7 +3000,13 @@ static void set_unit_file(OfortInterpreter *I, int unit, const char *path) {
         entry = &I->unit_files[I->n_unit_files++];
         entry->unit = unit;
     }
-    strncpy(entry->path, path, sizeof(entry->path) - 1);
+    char trimmed[sizeof(entry->path)];
+    size_t len = path ? strlen(path) : 0;
+    while (len > 0 && path[len - 1] == ' ') len--;
+    if (len >= sizeof(trimmed)) len = sizeof(trimmed) - 1;
+    if (len > 0) memcpy(trimmed, path, len);
+    trimmed[len] = '\0';
+    strncpy(entry->path, trimmed, sizeof(entry->path) - 1);
     entry->path[sizeof(entry->path) - 1] = '\0';
     entry->stream_pos = 0;
 }
@@ -3897,6 +3956,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_VARDECL:
     case FND_PARAMDECL: {
         OfortValue val;
+        int decl_char_len = n->val_type == FVAL_CHARACTER ? eval_character_length(I, n) : 0;
         OfortVar *existing = find_var(I, n->name);
         if (existing && n->n_dims > 0) {
             int has_assumed_shape = 0;
@@ -3924,8 +3984,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         } else if (n->n_children > 0 && n->children[0]) {
             val = eval_node(I, n->children[0]);
         } else {
-            val = default_value(n->val_type, n->char_len);
+            val = default_value(n->val_type, n->val_type == FVAL_CHARACTER ? decl_char_len : n->char_len);
         }
+
+        if (n->val_type == FVAL_CHARACTER)
+            val = resize_character_value(val, decl_char_len);
 
         /* If there's an initializer and it's an array, set elements */
         if (n->n_dims > 0 && !n->is_allocatable && n->n_children > 0 && n->children[0]) {
@@ -3944,6 +4007,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortVar *v = declare_var(I, n->name, val);
         if (n->is_parameter || n->type == FND_PARAMDECL) v->is_parameter = 1;
         v->intent = n->intent;
+        v->char_len = decl_char_len;
         break;
     }
 
