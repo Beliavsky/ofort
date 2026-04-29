@@ -1,0 +1,19 @@
+# Build products
+ofort.exe
+*.o
+*.obj
+*.exe
+*.out
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+
+# Python test artifacts
+__pycache__/
+.pytest_cache/
+*.py[cod]
+
+# Local helper scripts
+gpush.bat
