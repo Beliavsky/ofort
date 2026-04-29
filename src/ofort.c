@@ -1208,23 +1208,58 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
                     arg_name = token_arg_name(advance(I));
                     advance(I); /* = */
                 }
-                /* Check for slice notation: expr:expr or expr:expr:expr or just : */
-                OfortNode *arg = parse_expr(I);
-                if (check(I, FTOK_COLON)) {
+                /* Check for slice notation: expr:expr, :expr, expr:, or : */
+                OfortNode *arg = NULL;
+                if (check(I, FTOK_DCOLON)) {
+                    OfortNode *slice = alloc_node(I, FND_SLICE);
+                    slice->children[0] = NULL;
+                    slice->children[1] = NULL;
+                    slice->n_children = 2;
+                    advance(I);
+                    if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA)) {
+                        slice->children[2] = parse_expr(I);
+                        slice->n_children = 3;
+                    }
+                    arg = slice;
+                } else if (check(I, FTOK_COLON)) {
+                    OfortNode *slice = alloc_node(I, FND_SLICE);
+                    slice->children[0] = NULL;
+                    slice->n_children = 2;
+                    advance(I);
+                    if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA) && !check(I, FTOK_COLON)) {
+                        slice->children[1] = parse_expr(I);
+                    } else {
+                        slice->children[1] = NULL;
+                    }
+                    if (check(I, FTOK_COLON)) {
+                        advance(I);
+                        if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA)) {
+                            slice->children[2] = parse_expr(I);
+                            slice->n_children = 3;
+                        }
+                    }
+                    arg = slice;
+                } else {
+                    arg = parse_expr(I);
+                }
+                if (arg && arg->type != FND_SLICE && (check(I, FTOK_COLON) || check(I, FTOK_DCOLON))) {
+                    int double_colon = check(I, FTOK_DCOLON);
                     advance(I);
                     OfortNode *slice = alloc_node(I, FND_SLICE);
                     slice->children[0] = arg;
                     slice->n_children = 2;
-                    if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA)) {
+                    if (!double_colon && !check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA) && !check(I, FTOK_COLON)) {
                         slice->children[1] = parse_expr(I);
                     } else {
                         slice->children[1] = NULL; /* open-ended slice */
                     }
                     /* optional stride: start:end:stride */
-                    if (check(I, FTOK_COLON)) {
-                        advance(I);
-                        slice->children[2] = parse_expr(I);
-                        slice->n_children = 3;
+                    if (double_colon || check(I, FTOK_COLON)) {
+                        if (!double_colon) advance(I);
+                        if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA)) {
+                            slice->children[2] = parse_expr(I);
+                            slice->n_children = 3;
+                        }
                     }
                     arg = slice;
                 }
@@ -1507,6 +1542,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             if (check(I, FTOK_IN)) { advance(I); intent = 1; }
             else if (check(I, FTOK_OUT)) { advance(I); intent = 2; }
             else if (check(I, FTOK_INOUT)) { advance(I); intent = 3; }
+            if (intent == 1 && check(I, FTOK_OUT)) { advance(I); intent = 3; }
             expect(I, FTOK_RPAREN);
         } else if (check(I, FTOK_SAVE)) {
             advance(I); /* just note it */
@@ -2640,6 +2676,192 @@ static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
     return make_array(n->val_type, dims, ndims);
 }
 
+typedef struct {
+    int start;
+    int end;
+    int step;
+    int is_slice;
+    int count;
+} OfortSubscriptRange;
+
+static int eval_subscript_range(OfortInterpreter *I, OfortNode *sub, int dim_extent,
+                                OfortSubscriptRange *range) {
+    range->start = 1;
+    range->end = dim_extent;
+    range->step = 1;
+    range->is_slice = 0;
+    range->count = 1;
+
+    if (sub->type == FND_SLICE) {
+        range->is_slice = 1;
+        if (sub->children[0]) {
+            OfortValue v = eval_node(I, sub->children[0]);
+            range->start = (int)val_to_int(v);
+            free_value(&v);
+        }
+        if (sub->children[1]) {
+            OfortValue v = eval_node(I, sub->children[1]);
+            range->end = (int)val_to_int(v);
+            free_value(&v);
+        }
+        if (sub->n_children >= 3 && sub->children[2]) {
+            OfortValue v = eval_node(I, sub->children[2]);
+            range->step = (int)val_to_int(v);
+            free_value(&v);
+            if (range->step == 0) ofort_error(I, "Array section stride cannot be zero");
+        }
+        range->count = 0;
+        for (int i = range->start; range->step > 0 ? i <= range->end : i >= range->end; i += range->step) {
+            range->count++;
+        }
+        return 1;
+    }
+
+    OfortValue v = eval_node(I, sub);
+    range->start = (int)val_to_int(v);
+    range->end = range->start;
+    free_value(&v);
+    return 0;
+}
+
+static int section_linear_index(OfortValue *arr, int *subscripts, int nsubs) {
+    int index = 0;
+    int stride = 1;
+    for (int i = 0; i < nsubs; i++) {
+        index += (subscripts[i] - 1) * stride;
+        if (i < arr->v.arr.n_dims) {
+            stride *= arr->v.arr.dims[i];
+        }
+    }
+    return index;
+}
+
+static void copy_section_recursive(OfortInterpreter *I, OfortValue *src, OfortValue *dst,
+                                   OfortSubscriptRange *ranges, int nranges,
+                                   int dim, int *subscripts, int *out_index) {
+    if (dim == nranges) {
+        int src_index = section_linear_index(src, subscripts, nranges);
+        if (src_index < 0 || src_index >= src->v.arr.len)
+            ofort_error(I, "Array section index out of bounds");
+        free_value(&dst->v.arr.data[*out_index]);
+        dst->v.arr.data[*out_index] = copy_value(src->v.arr.data[src_index]);
+        (*out_index)++;
+        return;
+    }
+
+    for (int idx = ranges[dim].start;
+         ranges[dim].step > 0 ? idx <= ranges[dim].end : idx >= ranges[dim].end;
+         idx += ranges[dim].step) {
+        subscripts[dim] = idx;
+        copy_section_recursive(I, src, dst, ranges, nranges, dim + 1, subscripts, out_index);
+        if (!ranges[dim].is_slice) break;
+    }
+}
+
+static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNode *n) {
+    int nargs = n->n_stmts;
+    OfortSubscriptRange ranges[7];
+    int result_dims[7];
+    int n_result_dims = 0;
+    int has_slice = 0;
+
+    for (int i = 0; i < nargs; i++) {
+        int extent = i < var->val.v.arr.n_dims ? var->val.v.arr.dims[i] : var->val.v.arr.len;
+        if (eval_subscript_range(I, n->stmts[i], extent, &ranges[i])) {
+            has_slice = 1;
+            result_dims[n_result_dims++] = ranges[i].count;
+        }
+    }
+
+    if (!has_slice) {
+        int subscripts[7];
+        for (int i = 0; i < nargs; i++) subscripts[i] = ranges[i].start;
+        int index = section_linear_index(&var->val, subscripts, nargs);
+        if (index < 0 || index >= var->val.v.arr.len)
+            ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, var->val.v.arr.len);
+        return copy_value(var->val.v.arr.data[index]);
+    }
+
+    if (n_result_dims == 0) n_result_dims = 1;
+    OfortValue result = make_array(var->val.v.arr.elem_type, result_dims, n_result_dims);
+    int subscripts[7] = {0};
+    int out_index = 0;
+    copy_section_recursive(I, &var->val, &result, ranges, nargs, 0, subscripts, &out_index);
+    return result;
+}
+
+static int section_element_count(OfortSubscriptRange *ranges, int nranges) {
+    int count = 1;
+    for (int i = 0; i < nranges; i++) {
+        if (ranges[i].is_slice) count *= ranges[i].count;
+    }
+    return count;
+}
+
+static void assign_section_recursive(OfortInterpreter *I, OfortValue *dst, OfortValue *rhs,
+                                     OfortSubscriptRange *ranges, int nranges,
+                                     int dim, int *subscripts, int *rhs_index) {
+    if (dim == nranges) {
+        int dst_index = section_linear_index(dst, subscripts, nranges);
+        if (dst_index < 0 || dst_index >= dst->v.arr.len)
+            ofort_error(I, "Array section index out of bounds");
+
+        OfortValue value;
+        if (rhs->type == FVAL_ARRAY) {
+            if (*rhs_index >= rhs->v.arr.len)
+                ofort_error(I, "Array assignment shape mismatch");
+            value = copy_value(rhs->v.arr.data[*rhs_index]);
+            (*rhs_index)++;
+        } else {
+            value = copy_value(*rhs);
+        }
+
+        free_value(&dst->v.arr.data[dst_index]);
+        dst->v.arr.data[dst_index] = value;
+        return;
+    }
+
+    for (int idx = ranges[dim].start;
+         ranges[dim].step > 0 ? idx <= ranges[dim].end : idx >= ranges[dim].end;
+         idx += ranges[dim].step) {
+        subscripts[dim] = idx;
+        assign_section_recursive(I, dst, rhs, ranges, nranges, dim + 1, subscripts, rhs_index);
+        if (!ranges[dim].is_slice) break;
+    }
+}
+
+static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs, OfortValue *rhs) {
+    int nargs = lhs->n_stmts;
+    OfortSubscriptRange ranges[7];
+    int has_slice = 0;
+
+    for (int i = 0; i < nargs; i++) {
+        int extent = i < var->val.v.arr.n_dims ? var->val.v.arr.dims[i] : var->val.v.arr.len;
+        if (eval_subscript_range(I, lhs->stmts[i], extent, &ranges[i])) {
+            has_slice = 1;
+        }
+    }
+
+    if (!has_slice) {
+        int subscripts[7];
+        for (int i = 0; i < nargs; i++) subscripts[i] = ranges[i].start;
+        int index = section_linear_index(&var->val, subscripts, nargs);
+        if (index < 0 || index >= var->val.v.arr.len)
+            ofort_error(I, "Array index out of bounds");
+        free_value(&var->val.v.arr.data[index]);
+        var->val.v.arr.data[index] = copy_value(*rhs);
+        return;
+    }
+
+    int selected = section_element_count(ranges, nargs);
+    if (rhs->type == FVAL_ARRAY && rhs->v.arr.len != selected)
+        ofort_error(I, "Array assignment shape mismatch");
+
+    int subscripts[7] = {0};
+    int rhs_index = 0;
+    assign_section_recursive(I, &var->val, rhs, ranges, nargs, 0, subscripts, &rhs_index);
+}
+
 static double random_unit(void) {
     static int seeded = 0;
     if (!seeded) {
@@ -3413,77 +3635,11 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         /* Evaluate arguments */
         int nargs = n->n_stmts;
         OfortValue args[OFORT_MAX_PARAMS];
-        int has_slice = 0;
-
-        /* check for slices */
-        for (int i = 0; i < nargs; i++) {
-            if (n->stmts[i]->type == FND_SLICE) { has_slice = 1; break; }
-        }
 
         /* Check if this is an array variable reference */
         OfortVar *var = find_var(I, n->name);
         if (var && var->val.type == FVAL_ARRAY) {
-            if (has_slice) {
-                /* Array slice: arr(start:end) */
-                /* For now support 1-D slicing */
-                OfortNode *slice = n->stmts[0];
-                OfortValue start_v = eval_node(I, slice->children[0]);
-                int start = (int)val_to_int(start_v);
-                int end;
-                if (slice->children[1]) {
-                    OfortValue end_v = eval_node(I, slice->children[1]);
-                    end = (int)val_to_int(end_v);
-                    free_value(&end_v);
-                } else {
-                    end = var->val.v.arr.dims[0];
-                }
-                free_value(&start_v);
-                int step = 1;
-                if (slice->n_children >= 3 && slice->children[2]) {
-                    OfortValue step_v = eval_node(I, slice->children[2]);
-                    step = (int)val_to_int(step_v);
-                    free_value(&step_v);
-                }
-                /* 1-based indexing */
-                int count = 0;
-                for (int idx = start; step > 0 ? idx <= end : idx >= end; idx += step) count++;
-                int dims[1] = {count};
-                OfortValue result = make_array(var->val.v.arr.elem_type, dims, 1);
-                int ri = 0;
-                for (int idx = start; step > 0 ? idx <= end : idx >= end; idx += step) {
-                    int ai = idx - 1; /* convert to 0-based */
-                    if (ai >= 0 && ai < var->val.v.arr.len) {
-                        free_value(&result.v.arr.data[ri]);
-                        result.v.arr.data[ri] = copy_value(var->val.v.arr.data[ai]);
-                    }
-                    ri++;
-                }
-                return result;
-            }
-
-            /* Array element access: 1-based indexing */
-            int index = 0;
-            if (nargs == 1) {
-                /* 1-D or linear index */
-                for (int i = 0; i < nargs; i++) args[i] = eval_node(I, n->stmts[i]);
-                index = (int)val_to_int(args[0]) - 1; /* convert to 0-based */
-                for (int i = 0; i < nargs; i++) free_value(&args[i]);
-            } else {
-                /* Multi-dimensional: column-major (Fortran order) */
-                for (int i = 0; i < nargs; i++) args[i] = eval_node(I, n->stmts[i]);
-                index = 0;
-                int stride = 1;
-                for (int i = 0; i < nargs; i++) {
-                    int idx = (int)val_to_int(args[i]) - 1;
-                    index += idx * stride;
-                    if (i < var->val.v.arr.n_dims)
-                        stride *= var->val.v.arr.dims[i];
-                }
-                for (int i = 0; i < nargs; i++) free_value(&args[i]);
-            }
-            if (index < 0 || index >= var->val.v.arr.len)
-                ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, var->val.v.arr.len);
-            return copy_value(var->val.v.arr.data[index]);
+            return eval_array_section(I, var, n);
         }
 
         /* Evaluate all args */
@@ -3807,60 +3963,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (var->val.type != FVAL_ARRAY)
                 ofort_error(I, "'%s' is not an array", lhs->name);
 
-            int nargs = lhs->n_stmts;
-            /* Check for slice assignment */
-            int has_slice = 0;
-            for (int i = 0; i < nargs; i++) {
-                if (lhs->stmts[i]->type == FND_SLICE) { has_slice = 1; break; }
-            }
-
-            if (has_slice) {
-                /* Slice assignment: arr(start:end) = rhs_array */
-                OfortNode *slice = lhs->stmts[0];
-                OfortValue sv = eval_node(I, slice->children[0]);
-                int start = (int)val_to_int(sv) - 1;
-                free_value(&sv);
-                int end;
-                if (slice->children[1]) {
-                    OfortValue ev = eval_node(I, slice->children[1]);
-                    end = (int)val_to_int(ev) - 1;
-                    free_value(&ev);
-                } else {
-                    end = var->val.v.arr.dims[0] - 1;
-                }
-                if (rhs.type == FVAL_ARRAY) {
-                    int ri = 0;
-                    for (int idx = start; idx <= end && ri < rhs.v.arr.len; idx++, ri++) {
-                        if (idx >= 0 && idx < var->val.v.arr.len) {
-                            free_value(&var->val.v.arr.data[idx]);
-                            var->val.v.arr.data[idx] = copy_value(rhs.v.arr.data[ri]);
-                        }
-                    }
-                }
-                free_value(&rhs);
-            } else {
-                /* Single element */
-                OfortValue indices[7];
-                for (int i = 0; i < nargs; i++) indices[i] = eval_node(I, lhs->stmts[i]);
-
-                int index = 0;
-                if (nargs == 1) {
-                    index = (int)val_to_int(indices[0]) - 1;
-                } else {
-                    int stride = 1;
-                    for (int i = 0; i < nargs; i++) {
-                        index += ((int)val_to_int(indices[i]) - 1) * stride;
-                        if (i < var->val.v.arr.n_dims)
-                            stride *= var->val.v.arr.dims[i];
-                    }
-                }
-                for (int i = 0; i < nargs; i++) free_value(&indices[i]);
-
-                if (index < 0 || index >= var->val.v.arr.len)
-                    ofort_error(I, "Array index out of bounds");
-                free_value(&var->val.v.arr.data[index]);
-                var->val.v.arr.data[index] = rhs;
-            }
+            assign_array_ref(I, var, lhs, &rhs);
+            free_value(&rhs);
         } else if (lhs->type == FND_MEMBER) {
             /* Derived type member assignment: obj%field = val */
             OfortValue obj = eval_node(I, lhs->children[0]);
