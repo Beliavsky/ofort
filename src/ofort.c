@@ -5194,7 +5194,7 @@ static const char *intrinsic_names[] = {
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
-    "BIT_SIZE", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SCALE",
+    "BIT_SIZE", "BTEST", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
     "SET_EXPONENT",
     "SELECTED_INT_KIND", "SELECTED_REAL_KIND",
     /* String */
@@ -5459,6 +5459,20 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (kind == 8) return make_integer(64);
         return make_integer(32);
     }
+    if (strcmp(upper, "BTEST") == 0) {
+        int kind, bits;
+        long long pos;
+        unsigned long long value;
+        if (nargs < 2) ofort_error(I, "BTEST requires 2 arguments");
+        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER)
+            ofort_error(I, "BTEST requires integer arguments");
+        kind = args[0].kind ? args[0].kind : 4;
+        bits = kind == 1 ? 8 : kind == 2 ? 16 : kind == 8 ? 64 : 32;
+        pos = args[1].v.i;
+        if (pos < 0 || pos >= bits) ofort_error(I, "BTEST bit position out of range");
+        value = (unsigned long long)args[0].v.i;
+        return make_logical(((value >> (unsigned int)pos) & 1ULL) != 0);
+    }
     if (strcmp(upper, "DIGITS") == 0) {
         int kind;
         if (nargs < 1) ofort_error(I, "DIGITS requires 1 argument");
@@ -5572,6 +5586,22 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         scale = ldexp(1.0, (args[0].type == FVAL_DOUBLE || args[0].kind == 8) ? 53 : 24);
         if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(frac * scale);
         return make_real(frac * scale);
+    }
+    if (strcmp(upper, "SPACING") == 0) {
+        double x;
+        int exp = 0;
+        if (nargs < 1) ofort_error(I, "SPACING requires 1 argument");
+        if (args[0].type != FVAL_REAL && args[0].type != FVAL_DOUBLE)
+            ofort_error(I, "SPACING requires a real argument");
+        x = val_to_real(args[0]);
+        if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) {
+            if (x == 0.0) return make_double(DBL_MIN);
+            (void)frexp(x, &exp);
+            return make_double(ldexp(1.0, exp - 53));
+        }
+        if (x == 0.0) return make_real(FLT_MIN);
+        (void)frexp((float)x, &exp);
+        return make_real(ldexp(1.0, exp - 24));
     }
     if (strcmp(upper, "SCALE") == 0) {
         double x;
