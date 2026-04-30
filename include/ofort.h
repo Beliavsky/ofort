@@ -52,7 +52,7 @@ typedef enum {
     FTOK_PARAMETER, FTOK_INTENT, FTOK_IN, FTOK_OUT, FTOK_INOUT,
     FTOK_RESULT, FTOK_SAVE, FTOK_DATA,
     /* I/O keywords */
-    FTOK_PRINT, FTOK_WRITE, FTOK_READ,
+    FTOK_PRINT, FTOK_WRITE, FTOK_READ, FTOK_OPEN, FTOK_CLOSE,
     /* logical literal keywords */
     FTOK_TRUE, FTOK_FALSE,
     /* operators */
@@ -134,9 +134,9 @@ typedef enum {
     FND_VARDECL, FND_PARAMDECL,
     FND_SUBROUTINE, FND_FUNCTION, FND_MODULE,
     FND_TYPE_DEF,
-    FND_IF, FND_DO_LOOP, FND_DO_WHILE, FND_SELECT_CASE, FND_CASE_BLOCK,
+    FND_IF, FND_DO_LOOP, FND_DO_WHILE, FND_DO_FOREVER, FND_SELECT_CASE, FND_CASE_BLOCK,
     FND_RETURN, FND_EXIT, FND_CYCLE, FND_STOP,
-    FND_CALL, FND_PRINT, FND_WRITE, FND_READ_STMT,
+    FND_CALL, FND_PRINT, FND_WRITE, FND_READ_STMT, FND_OPEN, FND_CLOSE,
     FND_ALLOCATE, FND_DEALLOCATE, FND_USE,
     FND_EXPR_STMT,
     /* expressions */
@@ -151,6 +151,7 @@ typedef enum {
     FND_LOGICAL_LIT, FND_COMPLEX_LIT,
     FND_IDENT,
     FND_ARRAY_CONSTRUCTOR,
+    FND_IMPLIED_DO,
 } OfortNodeType;
 
 typedef struct OfortNode {
@@ -162,6 +163,7 @@ typedef struct OfortNode {
     char str_val[OFORT_MAX_STRLEN];
     OfortValType val_type;
     int bool_val;
+    char implicit_types[26];
     int char_len;           /* CHARACTER(LEN=n) */
     int intent;             /* 0=none, 1=IN, 2=OUT, 3=INOUT */
     int is_allocatable;
@@ -182,6 +184,7 @@ typedef struct OfortNode {
     /* array dimensions in declarations */
     int dims[7];
     int n_dims;
+    struct OfortNode *char_len_expr;
     /* source location */
     int line;
 } OfortNode;
@@ -196,6 +199,15 @@ void ofort_destroy(OfortInterpreter *interp);
 
 /* Execute Fortran source code. Returns 0 on success, -1 on error. */
 int ofort_execute(OfortInterpreter *interp, const char *source);
+
+/* Check syntax by lexing/parsing only. Returns 0 on success, -1 on error. */
+int ofort_check(OfortInterpreter *interp, const char *source);
+
+/* If enabled, bare expression statements write their value to output. */
+void ofort_set_print_expr_statements(OfortInterpreter *interp, int enabled);
+
+/* If enabled, normal program output is suppressed. Bare expression output remains enabled. */
+void ofort_set_suppress_output(OfortInterpreter *interp, int enabled);
 
 /* Get output (stdout from PRINT/WRITE etc.) */
 const char *ofort_get_output(OfortInterpreter *interp);
