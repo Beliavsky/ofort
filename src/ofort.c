@@ -5185,7 +5185,7 @@ static const char *intrinsic_names[] = {
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
-    "BIT_SIZE", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY",
+    "BIT_SIZE", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
@@ -5510,6 +5510,19 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(DBL_MIN);
         if (args[0].type == FVAL_REAL) return make_real(FLT_MIN);
         ofort_error(I, "TINY requires a real argument");
+    }
+    if (strcmp(upper, "NEAREST") == 0) {
+        double direction;
+        if (nargs < 2) ofort_error(I, "NEAREST requires 2 arguments");
+        if (args[0].type != FVAL_REAL && args[0].type != FVAL_DOUBLE)
+            ofort_error(I, "NEAREST requires a real first argument");
+        if (args[1].type != FVAL_INTEGER && args[1].type != FVAL_REAL && args[1].type != FVAL_DOUBLE)
+            ofort_error(I, "NEAREST requires a numeric second argument");
+        direction = val_to_real(args[1]);
+        if (direction == 0.0) ofort_error(I, "NEAREST direction must be nonzero");
+        if (args[0].type == FVAL_DOUBLE || args[0].kind == 8)
+            return make_double(nextafter(val_to_real(args[0]), direction > 0.0 ? INFINITY : -INFINITY));
+        return make_real(nextafterf((float)val_to_real(args[0]), direction > 0.0 ? INFINITY : -INFINITY));
     }
     if (strcmp(upper, "COMMAND_ARGUMENT_COUNT") == 0) {
         return make_integer(I->command_argc);
