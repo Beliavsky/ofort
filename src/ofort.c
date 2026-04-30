@@ -5194,7 +5194,7 @@ static const char *intrinsic_names[] = {
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
-    "BIT_SIZE", "BTEST", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
+    "BIT_SIZE", "BTEST", "IAND", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
     "SET_EXPONENT",
     "SELECTED_INT_KIND", "SELECTED_REAL_KIND",
     /* String */
@@ -5472,6 +5472,14 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (pos < 0 || pos >= bits) ofort_error(I, "BTEST bit position out of range");
         value = (unsigned long long)args[0].v.i;
         return make_logical(((value >> (unsigned int)pos) & 1ULL) != 0);
+    }
+    if (strcmp(upper, "IAND") == 0) {
+        int kind;
+        if (nargs < 2) ofort_error(I, "IAND requires 2 arguments");
+        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER)
+            ofort_error(I, "IAND requires integer arguments");
+        kind = args[0].kind ? args[0].kind : 4;
+        return make_integer_kind(args[0].v.i & args[1].v.i, kind);
     }
     if (strcmp(upper, "DIGITS") == 0) {
         int kind;
