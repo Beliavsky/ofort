@@ -5194,7 +5194,7 @@ static const char *intrinsic_names[] = {
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
-    "BIT_SIZE", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION",
+    "BIT_SIZE", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
@@ -5538,6 +5538,22 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_integer(15);
         if (args[0].type == FVAL_REAL || args[0].type == FVAL_COMPLEX) return make_integer(6);
         ofort_error(I, "PRECISION requires a real or complex argument");
+    }
+    if (strcmp(upper, "RANGE") == 0) {
+        int kind;
+        if (nargs < 1) ofort_error(I, "RANGE requires 1 argument");
+        kind = args[0].kind ? args[0].kind : 4;
+        if (args[0].type == FVAL_INTEGER) {
+            if (kind == 1) return make_integer(2);
+            if (kind == 2) return make_integer(4);
+            if (kind == 8) return make_integer(18);
+            return make_integer(9);
+        }
+        if (args[0].type == FVAL_DOUBLE || args[0].type == FVAL_REAL || args[0].type == FVAL_COMPLEX) {
+            if (args[0].type == FVAL_DOUBLE || kind == 8) return make_integer(307);
+            return make_integer(37);
+        }
+        ofort_error(I, "RANGE requires an integer, real, or complex argument");
     }
     if (strcmp(upper, "COMMAND_ARGUMENT_COUNT") == 0) {
         return make_integer(I->command_argc);
