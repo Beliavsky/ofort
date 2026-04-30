@@ -246,7 +246,12 @@ static int str_eq_nocase(const char *a, const char *b) {
 /* ── Value constructors ─────────────────────── */
 static OfortValue make_integer(long long v) {
     OfortValue r; memset(&r, 0, sizeof(r));
-    r.type = FVAL_INTEGER; r.v.i = v; return r;
+    r.type = FVAL_INTEGER; r.kind = 4; r.v.i = v; return r;
+}
+static OfortValue make_integer_kind(long long v, int kind) {
+    OfortValue r = make_integer(v);
+    r.kind = kind > 0 ? kind : 4;
+    return r;
 }
 static OfortValue make_real(double v) {
     OfortValue r; memset(&r, 0, sizeof(r));
@@ -727,6 +732,7 @@ static void tokenize(OfortInterpreter *I, const char *src) {
         t->line = line;
         t->num_val = 0;
         t->int_val = 0;
+        t->kind = 0;
         t->str_val[0] = '\0';
 
         /* dot-operators: .AND. .OR. .NOT. .EQ. .NE. .LT. .GT. .LE. .GE.
@@ -779,6 +785,7 @@ static void tokenize(OfortInterpreter *I, const char *src) {
             const char *start = p;
             int is_real = 0;
             int is_double_lit = 0;
+            int literal_kind = 0;
             while (isdigit((unsigned char)*p)) p++;
             if (*p == '.' && *(p+1) != '.') { /* avoid confusing with .. if ever */
                 is_real = 1;
@@ -794,8 +801,20 @@ static void tokenize(OfortInterpreter *I, const char *src) {
             }
             t->length = (int)(p - start);
             if (*p == '_') {
+                const char *kind_start;
+                char kindbuf[32];
+                int kind_len;
                 p++;
+                kind_start = p;
                 while (isalnum((unsigned char)*p) || *p == '_') p++;
+                kind_len = (int)(p - kind_start);
+                if (kind_len > 0 && kind_len < (int)sizeof(kindbuf)) {
+                    memcpy(kindbuf, kind_start, (size_t)kind_len);
+                    kindbuf[kind_len] = '\0';
+                    if (isdigit((unsigned char)kindbuf[0])) {
+                        literal_kind = atoi(kindbuf);
+                    }
+                }
             }
             /* parse the number */
             char numbuf[128];
@@ -810,10 +829,12 @@ static void tokenize(OfortInterpreter *I, const char *src) {
                 t->type = FTOK_REAL_LIT;
                 t->num_val = strtod(numbuf, NULL);
                 t->int_val = is_double_lit ? 1 : 0;
+                t->kind = literal_kind ? literal_kind : (is_double_lit ? 8 : 4);
             } else {
                 t->type = FTOK_INT_LIT;
                 t->int_val = strtoll(numbuf, NULL, 10);
                 t->num_val = (double)t->int_val;
+                t->kind = literal_kind ? literal_kind : 4;
             }
             I->n_tokens++;
             continue;
@@ -1136,6 +1157,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         OfortNode *n = alloc_node(I, FND_INT_LIT);
         n->int_val = t->int_val;
         n->num_val = t->num_val;
+        n->kind = t->kind;
         n->line = t->line;
         return n;
     }
@@ -1144,6 +1166,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         advance(I);
         OfortNode *n = alloc_node(I, FND_REAL_LIT);
         n->num_val = t->num_val;
+        n->kind = t->kind;
         n->val_type = FVAL_REAL;
         for (int k = 0; k < t->length; k++) {
             if (t->start[k] == 'd' || t->start[k] == 'D') {
@@ -3817,7 +3840,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 
     switch (n->type) {
     case FND_INT_LIT:
-        return make_integer(n->int_val);
+        return make_integer_kind(n->int_val, n->kind);
 
     case FND_REAL_LIT:
         if (n->val_type == FVAL_DOUBLE) return make_double(n->num_val);
@@ -5160,7 +5183,7 @@ static const char *intrinsic_names[] = {
     /* Math */
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
-    "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
+    "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "BIT_SIZE", "HUGE",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
@@ -5405,13 +5428,35 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (nargs < 1) ofort_error(I, "KIND requires 1 argument");
         switch (args[0].type) {
             case FVAL_CHARACTER: return make_integer(1);
-            case FVAL_INTEGER: return make_integer(4);
+            case FVAL_INTEGER: return make_integer(args[0].kind ? args[0].kind : 4);
             case FVAL_REAL: return make_integer(4);
             case FVAL_DOUBLE: return make_integer(8);
             case FVAL_COMPLEX: return make_integer(8);
             case FVAL_LOGICAL: return make_integer(4);
             default: return make_integer(0);
         }
+    }
+    if (strcmp(upper, "BIT_SIZE") == 0) {
+        int kind;
+        if (nargs < 1) ofort_error(I, "BIT_SIZE requires 1 argument");
+        if (args[0].type != FVAL_INTEGER) ofort_error(I, "BIT_SIZE requires an integer argument");
+        kind = args[0].kind ? args[0].kind : 4;
+        if (kind == 1) return make_integer(8);
+        if (kind == 2) return make_integer(16);
+        if (kind == 8) return make_integer(64);
+        return make_integer(32);
+    }
+    if (strcmp(upper, "HUGE") == 0) {
+        int kind;
+        if (nargs < 1) ofort_error(I, "HUGE requires 1 argument");
+        if (args[0].type == FVAL_INTEGER) {
+            kind = args[0].kind ? args[0].kind : 4;
+            if (kind == 1) return make_integer_kind(127, 1);
+            if (kind == 2) return make_integer_kind(32767, 2);
+            if (kind == 8) return make_integer_kind(LLONG_MAX, 8);
+            return make_integer_kind(2147483647LL, 4);
+        }
+        return make_real(DBL_MAX);
     }
     if (strcmp(upper, "COMMAND_ARGUMENT_COUNT") == 0) {
         return make_integer(I->command_argc);
