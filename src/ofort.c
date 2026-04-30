@@ -4556,8 +4556,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 /* copy elements */
                 int count = init.v.arr.len < val.v.arr.len ? init.v.arr.len : val.v.arr.len;
                 for (int i = 0; i < count; i++) {
+                    OfortValue elem = copy_value(init.v.arr.data[i]);
+                    if (val.v.arr.elem_type == FVAL_CHARACTER)
+                        elem = resize_character_value(elem, decl_char_len);
                     free_value(&val.v.arr.data[i]);
-                    val.v.arr.data[i] = copy_value(init.v.arr.data[i]);
+                    val.v.arr.data[i] = elem;
                 }
             }
             free_value(&init);
@@ -4591,13 +4594,19 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     if (rhs.v.arr.len != v->val.v.arr.len)
                         ofort_error(I, "Array assignment shape mismatch");
                     for (int i = 0; i < v->val.v.arr.len; i++) {
+                        OfortValue elem = copy_value(rhs.v.arr.data[i]);
+                        if (v->val.v.arr.elem_type == FVAL_CHARACTER)
+                            elem = resize_character_value(elem, v->char_len);
                         free_value(&v->val.v.arr.data[i]);
-                        v->val.v.arr.data[i] = copy_value(rhs.v.arr.data[i]);
+                        v->val.v.arr.data[i] = elem;
                     }
                 } else {
                     for (int i = 0; i < v->val.v.arr.len; i++) {
+                        OfortValue elem = copy_value(rhs);
+                        if (v->val.v.arr.elem_type == FVAL_CHARACTER)
+                            elem = resize_character_value(elem, v->char_len);
                         free_value(&v->val.v.arr.data[i]);
-                        v->val.v.arr.data[i] = copy_value(rhs);
+                        v->val.v.arr.data[i] = elem;
                     }
                 }
                 free_value(&rhs);
@@ -5257,7 +5266,7 @@ static const char *intrinsic_names[] = {
     "SET_EXPONENT",
     "SELECTED_INT_KIND", "SELECTED_REAL_KIND",
     /* String */
-    "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX", "SCAN",
+    "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX", "SCAN", "VERIFY",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
     /* Array */
     "SIZE", "SHAPE", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC",
@@ -5964,6 +5973,30 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             } else {
                 for (size_t i = 0; i < len; i++) {
                     if (strchr(args[1].v.s, args[0].v.s[i]))
+                        return make_integer((long long)i + 1);
+                }
+            }
+        }
+        return make_integer(0);
+    }
+    if (strcmp(upper, "VERIFY") == 0) {
+        int back_idx = intrinsic_arg_index(arg_names, nargs, "back");
+        int back = 0;
+        if (nargs < 2) ofort_error(I, "VERIFY requires STRING and SET");
+        if (args[0].type != FVAL_CHARACTER || args[1].type != FVAL_CHARACTER)
+            ofort_error(I, "VERIFY requires character arguments");
+        if (back_idx < 0 && nargs >= 3) back_idx = 2;
+        if (back_idx >= 0) back = val_to_logical(args[back_idx]);
+        if (args[0].v.s && args[1].v.s) {
+            size_t len = strlen(args[0].v.s);
+            if (back) {
+                for (size_t i = len; i > 0; i--) {
+                    if (!strchr(args[1].v.s, args[0].v.s[i - 1]))
+                        return make_integer((long long)i);
+                }
+            } else {
+                for (size_t i = 0; i < len; i++) {
+                    if (!strchr(args[1].v.s, args[0].v.s[i]))
                         return make_integer((long long)i + 1);
                 }
             }
