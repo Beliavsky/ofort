@@ -128,6 +128,16 @@ static int is_intrinsic(const char *name);
 
 /* ── Helpers ─────────────────────────────────── */
 
+static void copy_cstr(char *dst, size_t dst_size, const char *src) {
+    size_t len;
+    if (dst_size == 0) return;
+    if (!src) src = "";
+    len = strlen(src);
+    if (len >= dst_size) len = dst_size - 1;
+    if (len > 0) memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
 static void out_append_raw(OfortInterpreter *I, const char *s) {
     int len = (int)strlen(s);
     if (I->out_len + len >= OFORT_MAX_OUTPUT - 1) len = OFORT_MAX_OUTPUT - 1 - I->out_len;
@@ -520,7 +530,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     }
     if (s->n_vars >= OFORT_MAX_VARS) ofort_error(I, "Too many variables");
     OfortVar *v = &s->vars[s->n_vars++];
-    strncpy(v->name, name, 255);
+    copy_cstr(v->name, sizeof(v->name), name);
     v->val = val;
     v->is_parameter = 0;
     v->intent = 0;
@@ -546,7 +556,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
         }
     }
     OfortVar *v = &s->vars[s->n_vars++];
-    strncpy(v->name, name, 255);
+    copy_cstr(v->name, sizeof(v->name), name);
     v->val = val;
     v->is_parameter = 0;
     v->intent = 0;
@@ -570,7 +580,7 @@ static OfortFunc *find_func(OfortInterpreter *I, const char *name) {
 static void register_func(OfortInterpreter *I, const char *name, OfortNode *node, int is_function) {
     if (I->n_funcs >= OFORT_MAX_FUNCS) ofort_error(I, "Too many functions/subroutines");
     OfortFunc *f = &I->funcs[I->n_funcs++];
-    strncpy(f->name, name, 255);
+    copy_cstr(f->name, sizeof(f->name), name);
     f->node = node;
     f->is_function = is_function;
     f->module_name[0] = '\0';
@@ -1120,7 +1130,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
     if (t->type == FTOK_STRING_LIT) {
         advance(I);
         OfortNode *n = alloc_node(I, FND_STRING_LIT);
-        strncpy(n->str_val, t->str_val, OFORT_MAX_STRLEN - 1);
+        copy_cstr(n->str_val, sizeof(n->str_val), t->str_val);
         n->line = t->line;
         return n;
     }
@@ -1204,13 +1214,13 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         const char *intrinsic_name = type_token_intrinsic_name(t->type);
         advance(I);
         OfortNode *n = alloc_node(I, FND_IDENT);
-        strncpy(n->name, intrinsic_name, 255);
+        copy_cstr(n->name, sizeof(n->name), intrinsic_name);
         n->line = t->line;
 
         while (check(I, FTOK_LPAREN)) {
             advance(I);
             OfortNode *call_node = alloc_node(I, FND_FUNC_CALL);
-            strncpy(call_node->name, n->name, 255);
+            copy_cstr(call_node->name, sizeof(call_node->name), n->name);
             call_node->line = n->line;
             call_node->stmts = NULL;
             call_node->n_stmts = 0;
@@ -1227,7 +1237,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
                     cap2 = cap2 ? cap2 * 2 : 8;
                     call_node->stmts = (OfortNode **)realloc(call_node->stmts, sizeof(OfortNode *) * cap2);
                 }
-                if (arg_name) strncpy(call_node->param_names[call_node->n_stmts], arg_name, 255);
+                if (arg_name) copy_cstr(call_node->param_names[call_node->n_stmts], sizeof(call_node->param_names[call_node->n_stmts]), arg_name);
                 call_node->stmts[call_node->n_stmts++] = arg;
                 if (check(I, FTOK_COMMA)) advance(I);
             }
@@ -1240,9 +1250,9 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
     if (t->type == FTOK_IDENT || t->type == FTOK_IN || t->type == FTOK_OUT) {
         advance(I);
         OfortNode *n = alloc_node(I, FND_IDENT);
-        if (t->type == FTOK_IN) strncpy(n->name, "in", 255);
-        else if (t->type == FTOK_OUT) strncpy(n->name, "out", 255);
-        else strncpy(n->name, t->str_val, 255);
+        if (t->type == FTOK_IN) copy_cstr(n->name, sizeof(n->name), "in");
+        else if (t->type == FTOK_OUT) copy_cstr(n->name, sizeof(n->name), "out");
+        else copy_cstr(n->name, sizeof(n->name), t->str_val);
         n->line = t->line;
 
         /* function call / array reference: ident( ... ) */
@@ -1253,7 +1263,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
             OfortNode *call_node;
             /* determine if function call or array ref later at eval time */
             call_node = alloc_node(I, FND_FUNC_CALL);
-            strncpy(call_node->name, n->name, 255);
+            copy_cstr(call_node->name, sizeof(call_node->name), n->name);
             call_node->line = n->line;
             call_node->stmts = NULL;
             call_node->n_stmts = 0;
@@ -1324,7 +1334,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
                     cap2 = cap2 ? cap2 * 2 : 8;
                     call_node->stmts = (OfortNode **)realloc(call_node->stmts, sizeof(OfortNode *) * cap2);
                 }
-                if (arg_name) strncpy(call_node->param_names[call_node->n_stmts], arg_name, 255);
+                if (arg_name) copy_cstr(call_node->param_names[call_node->n_stmts], sizeof(call_node->param_names[call_node->n_stmts]), arg_name);
                 call_node->stmts[call_node->n_stmts++] = arg;
                 if (check(I, FTOK_COMMA)) advance(I);
             }
@@ -1338,7 +1348,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
             OfortToken *mt = expect(I, FTOK_IDENT);
             OfortNode *mem = alloc_node(I, FND_MEMBER);
             mem->children[0] = n;
-            strncpy(mem->name, mt->str_val, 255);
+            copy_cstr(mem->name, sizeof(mem->name), mt->str_val);
             mem->n_children = 1;
             mem->line = mt->line;
             n = mem;
@@ -1624,7 +1634,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     do {
         OfortToken *name_tok = expect(I, FTOK_IDENT);
         OfortNode *decl = alloc_node(I, is_parameter ? FND_PARAMDECL : FND_VARDECL);
-        strncpy(decl->name, name_tok->str_val, 255);
+        copy_cstr(decl->name, sizeof(decl->name), name_tok->str_val);
         decl->val_type = vtype;
         decl->char_len = char_len;
         decl->char_len_expr = char_len_expr;
@@ -1829,7 +1839,7 @@ static OfortNode *parse_do(OfortInterpreter *I) {
 
     /* loop variable */
     OfortToken *var_tok = expect(I, FTOK_IDENT);
-    strncpy(n->name, var_tok->str_val, 255);
+    copy_cstr(n->name, sizeof(n->name), var_tok->str_val);
     expect(I, FTOK_ASSIGN);
     n->children[0] = parse_expr(I); /* start */
     expect(I, FTOK_COMMA);
@@ -1968,9 +1978,9 @@ static OfortNode *parse_implied_do(OfortInterpreter *I) {
         if ((check(I, FTOK_IDENT) || check(I, FTOK_IN) || check(I, FTOK_OUT)) &&
             peek_ahead(I, 1)->type == FTOK_ASSIGN) {
             OfortToken *var = advance(I);
-            if (var->type == FTOK_IN) strncpy(n->name, "in", 255);
-            else if (var->type == FTOK_OUT) strncpy(n->name, "out", 255);
-            else strncpy(n->name, var->str_val, 255);
+            if (var->type == FTOK_IN) copy_cstr(n->name, sizeof(n->name), "in");
+            else if (var->type == FTOK_OUT) copy_cstr(n->name, sizeof(n->name), "out");
+            else copy_cstr(n->name, sizeof(n->name), var->str_val);
             advance(I); /* = */
             n->children[0] = parse_expr(I);
             expect(I, FTOK_COMMA);
@@ -2029,7 +2039,7 @@ static OfortNode *parse_print(OfortInterpreter *I) {
         advance(I);
         n->format_str[0] = '\0'; /* list-directed */
     } else if (check(I, FTOK_STRING_LIT)) {
-        strncpy(n->format_str, peek(I)->str_val, 511);
+        copy_cstr(n->format_str, sizeof(n->format_str), peek(I)->str_val);
         advance(I);
     } else {
         n->format_str[0] = '\0';
@@ -2082,7 +2092,7 @@ static OfortNode *parse_write(OfortInterpreter *I) {
                 if (check(I, FTOK_STAR)) {
                     advance(I);
                 } else if (check(I, FTOK_STRING_LIT)) {
-                    strncpy(n->format_str, peek(I)->str_val, 511);
+                    copy_cstr(n->format_str, sizeof(n->format_str), peek(I)->str_val);
                     advance(I);
                 } else if (check(I, FTOK_INT_LIT)) {
                     advance(I); /* format label number, ignore */
@@ -2103,7 +2113,7 @@ static OfortNode *parse_write(OfortInterpreter *I) {
             advance(I);
         } else if (check(I, FTOK_STRING_LIT)) {
             if (positional > 0) saw_fmt = 1;
-            strncpy(n->format_str, peek(I)->str_val, 511);
+            copy_cstr(n->format_str, sizeof(n->format_str), peek(I)->str_val);
             advance(I);
         } else if (check(I, FTOK_INT_LIT)) {
             if (positional > 0) saw_fmt = 1;
@@ -2170,7 +2180,7 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
                     saw_fmt = 1;
                     if (check(I, FTOK_STAR)) advance(I);
                     else if (check(I, FTOK_STRING_LIT)) {
-                        strncpy(n->format_str, peek(I)->str_val, 511);
+                        copy_cstr(n->format_str, sizeof(n->format_str), peek(I)->str_val);
                         advance(I);
                     } else {
                         parse_expr(I);
@@ -2183,7 +2193,7 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
                 advance(I);
             } else if (check(I, FTOK_STRING_LIT)) {
                 if (positional > 0) saw_fmt = 1;
-                strncpy(n->format_str, peek(I)->str_val, 511);
+                copy_cstr(n->format_str, sizeof(n->format_str), peek(I)->str_val);
                 advance(I);
             } else if (positional == 0) {
                 n->children[0] = parse_expr(I);
@@ -2286,7 +2296,7 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
     OfortToken *name = expect(I, FTOK_IDENT);
 
     OfortNode *n = alloc_node(I, FND_SUBROUTINE);
-    strncpy(n->name, name->str_val, 255);
+    copy_cstr(n->name, sizeof(n->name), name->str_val);
     n->line = st->line;
     n->n_params = 0;
 
@@ -2295,7 +2305,7 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
         advance(I);
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
             OfortToken *param = expect(I, FTOK_IDENT);
-            strncpy(n->param_names[n->n_params], param->str_val, 255);
+            copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), param->str_val);
             n->param_types[n->n_params] = FVAL_VOID; /* resolved later */
             n->param_intents[n->n_params] = 0;
             n->n_params++;
@@ -2317,7 +2327,7 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
     OfortToken *name = expect(I, FTOK_IDENT);
 
     OfortNode *n = alloc_node(I, FND_FUNCTION);
-    strncpy(n->name, name->str_val, 255);
+    copy_cstr(n->name, sizeof(n->name), name->str_val);
     n->line = ft->line;
     n->val_type = result_type;
     n->n_params = 0;
@@ -2328,7 +2338,7 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
         advance(I);
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
             OfortToken *param = expect(I, FTOK_IDENT);
-            strncpy(n->param_names[n->n_params], param->str_val, 255);
+            copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), param->str_val);
             n->param_types[n->n_params] = FVAL_VOID;
             n->param_intents[n->n_params] = 0;
             n->n_params++;
@@ -2342,7 +2352,7 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
         advance(I);
         expect(I, FTOK_LPAREN);
         OfortToken *res = expect(I, FTOK_IDENT);
-        strncpy(n->result_name, res->str_val, 255);
+        copy_cstr(n->result_name, sizeof(n->result_name), res->str_val);
         expect(I, FTOK_RPAREN);
     }
     skip_newlines(I);
@@ -2379,7 +2389,7 @@ static OfortNode *parse_module(OfortInterpreter *I) {
     OfortToken *name = expect(I, FTOK_IDENT);
 
     OfortNode *n = alloc_node(I, FND_MODULE);
-    strncpy(n->name, name->str_val, 255);
+    copy_cstr(n->name, sizeof(n->name), name->str_val);
     n->line = mt->line;
     skip_newlines(I);
 
@@ -2397,7 +2407,7 @@ static OfortNode *parse_type_def(OfortInterpreter *I) {
     OfortToken *name = expect(I, FTOK_IDENT);
 
     OfortNode *n = alloc_node(I, FND_TYPE_DEF);
-    strncpy(n->name, name->str_val, 255);
+    copy_cstr(n->name, sizeof(n->name), name->str_val);
     n->line = tt->line;
     skip_newlines(I);
 
@@ -2430,7 +2440,7 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
     expect(I, FTOK_LPAREN);
     /* parse: array_name(dim1, dim2, ...) */
     OfortToken *name = expect(I, FTOK_IDENT);
-    strncpy(n->name, name->str_val, 255);
+    copy_cstr(n->name, sizeof(n->name), name->str_val);
     n->stmts = NULL; n->n_stmts = 0;
     int cap = 0;
     if (check(I, FTOK_LPAREN)) {
@@ -2475,7 +2485,7 @@ static OfortNode *parse_deallocate(OfortInterpreter *I) {
     n->line = dt->line;
     expect(I, FTOK_LPAREN);
     OfortToken *name = expect(I, FTOK_IDENT);
-    strncpy(n->name, name->str_val, 255);
+    copy_cstr(n->name, sizeof(n->name), name->str_val);
     expect(I, FTOK_RPAREN);
     return n;
 }
@@ -2609,7 +2619,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         if (check(I, FTOK_DCOLON)) advance(I);
         OfortToken *mn = expect(I, FTOK_IDENT);
         OfortNode *n = alloc_node(I, FND_USE);
-        strncpy(n->name, mn->str_val, 255);
+        copy_cstr(n->name, sizeof(n->name), mn->str_val);
         n->line = t->line;
         while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
             advance(I);
@@ -2642,7 +2652,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
             OfortToken *name = expect(I, FTOK_IDENT);
             OfortNode *param = alloc_node(I, FND_PARAMDECL);
-            strncpy(param->name, name->str_val, 255);
+            copy_cstr(param->name, sizeof(param->name), name->str_val);
             param->line = name->line;
             expect(I, FTOK_ASSIGN);
             param->children[0] = parse_expr(I);
@@ -2691,7 +2701,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         if (check(I, FTOK_IDENT)) name = advance(I);
         skip_newlines(I);
         OfortNode *n = alloc_node(I, FND_PROGRAM);
-        if (name) strncpy(n->name, name->str_val, 255);
+        if (name) copy_cstr(n->name, sizeof(n->name), name->str_val);
         n->line = t->line;
         n->children[0] = parse_block_until_end(I, "PROGRAM");
         n->n_children = 1;
@@ -2735,7 +2745,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         OfortToken *ct = advance(I);
         OfortToken *name = expect(I, FTOK_IDENT);
         OfortNode *n = alloc_node(I, FND_CALL);
-        strncpy(n->name, name->str_val, 255);
+        copy_cstr(n->name, sizeof(n->name), name->str_val);
         n->line = ct->line;
         n->stmts = NULL; n->n_stmts = 0;
         int cap = 0;
@@ -2752,7 +2762,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
                     cap = cap ? cap * 2 : 8;
                     n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
                 }
-                if (arg_name) strncpy(n->param_names[n->n_stmts], arg_name, 255);
+                if (arg_name) copy_cstr(n->param_names[n->n_stmts], sizeof(n->param_names[n->n_stmts]), arg_name);
                 n->stmts[n->n_stmts++] = arg;
                 if (check(I, FTOK_COMMA)) advance(I);
             }
@@ -2794,7 +2804,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         n->line = t->line;
         /* optional stop message */
         if (check(I, FTOK_STRING_LIT)) {
-            strncpy(n->str_val, peek(I)->str_val, OFORT_MAX_STRLEN - 1);
+            copy_cstr(n->str_val, sizeof(n->str_val), peek(I)->str_val);
             advance(I);
         } else if (check(I, FTOK_INT_LIT)) {
             snprintf(n->str_val, OFORT_MAX_STRLEN, "%lld", peek(I)->int_val);
@@ -3270,7 +3280,7 @@ static void set_unit_file(OfortInterpreter *I, int unit, const char *path) {
     if (len >= sizeof(trimmed)) len = sizeof(trimmed) - 1;
     if (len > 0) memcpy(trimmed, path, len);
     trimmed[len] = '\0';
-    strncpy(entry->path, trimmed, sizeof(entry->path) - 1);
+    copy_cstr(entry->path, sizeof(entry->path), trimmed);
     entry->path[sizeof(entry->path) - 1] = '\0';
     entry->stream_pos = 0;
 }
@@ -4107,7 +4117,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             v.v.dt.n_fields = td->n_fields;
             v.v.dt.fields = (OfortValue *)calloc(td->n_fields, sizeof(OfortValue));
             v.v.dt.field_names = (char(*)[64])calloc(td->n_fields, sizeof(char[64]));
-            strncpy(v.v.dt.type_name, td->name, 63);
+            copy_cstr(v.v.dt.type_name, sizeof(v.v.dt.type_name), td->name);
             for (int i = 0; i < td->n_fields; i++) {
                 strcpy(v.v.dt.field_names[i], td->field_names[i]);
                 if (i < nargs)
@@ -4199,7 +4209,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* Register module: execute declarations, collect functions */
         if (I->n_modules >= OFORT_MAX_MODULES) ofort_error(I, "Too many modules");
         OfortModule *mod = &I->modules[I->n_modules++];
-        strncpy(mod->name, n->name, 127);
+        copy_cstr(mod->name, sizeof(mod->name), n->name);
         mod->n_funcs = 0;
         mod->n_vars = 0;
         mod->n_types = 0;
@@ -4264,7 +4274,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* Register type definition */
         if (I->n_type_defs >= 64) ofort_error(I, "Too many type definitions");
         OfortTypeDef *td = &I->type_defs[I->n_type_defs++];
-        strncpy(td->name, n->name, 127);
+        copy_cstr(td->name, sizeof(td->name), n->name);
         td->n_fields = 0;
         /* Parse field declarations from stmts */
         for (int i = 0; i < n->n_stmts; i++) {
@@ -4274,14 +4284,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 for (int j = 0; j < s->n_stmts; j++) {
                     OfortNode *d = s->stmts[j];
                     if ((d->type == FND_VARDECL || d->type == FND_PARAMDECL) && td->n_fields < OFORT_MAX_FIELDS) {
-                        strncpy(td->field_names[td->n_fields], d->name, 63);
+                        copy_cstr(td->field_names[td->n_fields], sizeof(td->field_names[td->n_fields]), d->name);
                         td->field_types[td->n_fields] = d->val_type;
                         td->field_char_lens[td->n_fields] = d->char_len;
                         td->n_fields++;
                     }
                 }
             } else if ((s->type == FND_VARDECL || s->type == FND_PARAMDECL) && td->n_fields < OFORT_MAX_FIELDS) {
-                strncpy(td->field_names[td->n_fields], s->name, 63);
+                copy_cstr(td->field_names[td->n_fields], sizeof(td->field_names[td->n_fields]), s->name);
                 td->field_types[td->n_fields] = s->val_type;
                 td->field_char_lens[td->n_fields] = s->char_len;
                 td->n_fields++;
@@ -5167,7 +5177,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "TRIM") == 0) {
         if (args[0].type == FVAL_CHARACTER && args[0].v.s) {
             char buf[OFORT_MAX_STRLEN];
-            strncpy(buf, args[0].v.s, OFORT_MAX_STRLEN - 1);
+            copy_cstr(buf, sizeof(buf), args[0].v.s);
             buf[OFORT_MAX_STRLEN - 1] = '\0';
             int len = (int)strlen(buf);
             while (len > 0 && buf[len - 1] == ' ') len--;
@@ -5187,7 +5197,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "ADJUSTR") == 0) {
         if (args[0].type == FVAL_CHARACTER && args[0].v.s) {
             char buf[OFORT_MAX_STRLEN];
-            strncpy(buf, args[0].v.s, OFORT_MAX_STRLEN - 1);
+            copy_cstr(buf, sizeof(buf), args[0].v.s);
             buf[OFORT_MAX_STRLEN - 1] = '\0';
             int len = (int)strlen(buf);
             int trail = 0;
