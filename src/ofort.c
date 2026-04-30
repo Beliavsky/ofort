@@ -4893,7 +4893,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 static const char *intrinsic_names[] = {
     /* Math */
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
-    "EXP", "LOG", "LOG10", "MOD", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
+    "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
@@ -5037,6 +5037,31 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             return make_integer(val_to_int(args[0]) % b);
         }
         return make_real(fmod(val_to_real(args[0]), val_to_real(args[1])));
+    }
+    if (strcmp(upper, "MODULO") == 0) {
+        if (nargs < 2) ofort_error(I, "MODULO requires 2 arguments");
+        if (args[0].type == FVAL_INTEGER && args[1].type == FVAL_INTEGER) {
+            long long a = val_to_int(args[0]);
+            long long p = val_to_int(args[1]);
+            if (p == 0) ofort_error(I, "MODULO: division by zero");
+            long long r = a % p;
+            if (r != 0 && ((r < 0) != (p < 0))) r += p;
+            return make_integer(r);
+        }
+        double p = val_to_real(args[1]);
+        if (p == 0.0) ofort_error(I, "MODULO: division by zero");
+        double r = fmod(val_to_real(args[0]), p);
+        if (r != 0.0 && ((r < 0.0) != (p < 0.0))) r += p;
+        return make_real(r);
+    }
+    if (strcmp(upper, "DIM") == 0) {
+        if (nargs < 2) ofort_error(I, "DIM requires 2 arguments");
+        if (args[0].type == FVAL_INTEGER && args[1].type == FVAL_INTEGER) {
+            long long diff = val_to_int(args[0]) - val_to_int(args[1]);
+            return make_integer(diff > 0 ? diff : 0);
+        }
+        double diff = val_to_real(args[0]) - val_to_real(args[1]);
+        return make_real(diff > 0.0 ? diff : 0.0);
     }
     if (strcmp(upper, "MAX") == 0) {
         if (nargs < 2) ofort_error(I, "MAX requires at least 2 arguments");
