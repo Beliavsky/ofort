@@ -5194,7 +5194,7 @@ static const char *intrinsic_names[] = {
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
-    "BIT_SIZE", "BTEST", "IAND", "IBCLR", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
+    "BIT_SIZE", "BTEST", "IAND", "IBCLR", "IBITS", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
     "SET_EXPONENT",
     "SELECTED_INT_KIND", "SELECTED_REAL_KIND",
     /* String */
@@ -5495,6 +5495,24 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         value = (unsigned long long)args[0].v.i;
         value &= ~(1ULL << (unsigned int)pos);
         return make_integer_kind((long long)value, kind);
+    }
+    if (strcmp(upper, "IBITS") == 0) {
+        int kind, bits;
+        long long pos, len;
+        unsigned long long value, mask;
+        if (nargs < 3) ofort_error(I, "IBITS requires 3 arguments");
+        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER || args[2].type != FVAL_INTEGER)
+            ofort_error(I, "IBITS requires integer arguments");
+        kind = args[0].kind ? args[0].kind : 4;
+        bits = kind == 1 ? 8 : kind == 2 ? 16 : kind == 8 ? 64 : 32;
+        pos = args[1].v.i;
+        len = args[2].v.i;
+        if (pos < 0 || len < 0 || pos > bits || len > bits || pos + len > bits)
+            ofort_error(I, "IBITS bit range out of range");
+        if (len == 0) return make_integer_kind(0, kind);
+        value = ((unsigned long long)args[0].v.i) >> (unsigned int)pos;
+        mask = len == 64 ? ~0ULL : ((1ULL << (unsigned int)len) - 1ULL);
+        return make_integer_kind((long long)(value & mask), kind);
     }
     if (strcmp(upper, "DIGITS") == 0) {
         int kind;
