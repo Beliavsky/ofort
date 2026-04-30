@@ -5195,6 +5195,7 @@ static const char *intrinsic_names[] = {
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
     "BIT_SIZE", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SCALE",
+    "SET_EXPONENT",
     "SELECTED_INT_KIND", "SELECTED_REAL_KIND",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
@@ -5584,6 +5585,25 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         exponent = (int)args[1].v.i;
         if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(ldexp(x, exponent));
         return make_real(ldexp((float)x, exponent));
+    }
+    if (strcmp(upper, "SET_EXPONENT") == 0) {
+        double x, frac;
+        int exponent;
+        int old_exp = 0;
+        if (nargs < 2) ofort_error(I, "SET_EXPONENT requires 2 arguments");
+        if (args[0].type != FVAL_REAL && args[0].type != FVAL_DOUBLE)
+            ofort_error(I, "SET_EXPONENT requires a real first argument");
+        if (args[1].type != FVAL_INTEGER)
+            ofort_error(I, "SET_EXPONENT requires an integer second argument");
+        x = val_to_real(args[0]);
+        exponent = (int)args[1].v.i;
+        if (x == 0.0) {
+            if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(0.0);
+            return make_real(0.0);
+        }
+        frac = frexp(x, &old_exp);
+        if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(ldexp(frac, exponent));
+        return make_real(ldexp((float)frac, exponent));
     }
     if (strcmp(upper, "SELECTED_INT_KIND") == 0) {
         long long r;
