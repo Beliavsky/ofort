@@ -5194,7 +5194,7 @@ static const char *intrinsic_names[] = {
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
-    "BIT_SIZE", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE",
+    "BIT_SIZE", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SCALE",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
@@ -5554,6 +5554,35 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             return make_integer(37);
         }
         ofort_error(I, "RANGE requires an integer, real, or complex argument");
+    }
+    if (strcmp(upper, "RRSPACING") == 0) {
+        double x, frac, scale;
+        int exp = 0;
+        if (nargs < 1) ofort_error(I, "RRSPACING requires 1 argument");
+        if (args[0].type != FVAL_REAL && args[0].type != FVAL_DOUBLE)
+            ofort_error(I, "RRSPACING requires a real argument");
+        x = val_to_real(args[0]);
+        if (x == 0.0) {
+            if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(0.0);
+            return make_real(0.0);
+        }
+        frac = fabs(frexp(x, &exp));
+        scale = ldexp(1.0, (args[0].type == FVAL_DOUBLE || args[0].kind == 8) ? 53 : 24);
+        if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(frac * scale);
+        return make_real(frac * scale);
+    }
+    if (strcmp(upper, "SCALE") == 0) {
+        double x;
+        int exponent;
+        if (nargs < 2) ofort_error(I, "SCALE requires 2 arguments");
+        if (args[0].type != FVAL_REAL && args[0].type != FVAL_DOUBLE)
+            ofort_error(I, "SCALE requires a real first argument");
+        if (args[1].type != FVAL_INTEGER)
+            ofort_error(I, "SCALE requires an integer second argument");
+        x = val_to_real(args[0]);
+        exponent = (int)args[1].v.i;
+        if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(ldexp(x, exponent));
+        return make_real(ldexp((float)x, exponent));
     }
     if (strcmp(upper, "COMMAND_ARGUMENT_COUNT") == 0) {
         return make_integer(I->command_argc);
