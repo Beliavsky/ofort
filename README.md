@@ -46,6 +46,27 @@ make clang
 .\ofort.exe examples\xtry.f90
 ```
 
+Pass program arguments after `--`:
+
+```powershell
+.\ofort.exe x.f90 -- alpha beta
+```
+
+Multiple positional source files are concatenated in command-line order before
+execution:
+
+```powershell
+.\ofort.exe part1.f90 part2.f90
+```
+
+By default, undeclared variables are rejected. To enable historical implicit
+typing, where names beginning with I-N are integers and other names are real,
+use:
+
+```powershell
+.\ofort.exe --implicit-typing x.f90
+```
+
 To start an interactive session with an existing file loaded into the edit
 buffer:
 
@@ -80,20 +101,42 @@ python .\scripts\xofort.py --limit 5 "tests\cases\*.f90"
 python .\scripts\xofort.py --timeout 30 "tests\cases\*.f90"
 python .\scripts\xofort.py --max-lines 100 "tests\cases\*.f90"
 python .\scripts\xofort.py --quiet "tests\cases\*.f90"
+python .\scripts\xofort.py --filter "gfortran -c -std=f95" "tests\cases\*.f90"
 ```
+
+The batch runner prints each file name and line count before processing it,
+uses a 30-second per-file timeout by default, and reports elapsed time at the
+end. `--quiet` suppresses output for files that `ofort` handles successfully.
+`--filter` runs the given command with the source file appended and skips files
+for which that command fails.
 
 With no file argument, `ofort` starts an interactive session. Type source at the
 prompt and use these commands:
 
 ```text
 .       run the current source and continue
-.runq   run the current source and quit
+.run    run the current source; .run n repeats n times; use -- before program arguments
+.runq   run the current source and quit; accepts the same count and arguments as .run
+.time   run the current source and print elapsed-time statistics; .time n repeats n times
 .quit   quit without running
 .clear  clear the current source
+.del    delete a source line or range, such as .del 3, .del 2:4, .del :3, or .del 4:
+.ins    insert a source line before a line number, such as .ins 3 integer :: j
+.rep    replace a source line, such as .rep 5 print *, i, j
+.rename rename a variable token throughout the editable source, such as .rename i j
 .list   list the current source
+.decl   list declaration lines from the current source
+.vars   list current variable values, or selected names such as .vars i x
+.info   list declaration-style variable details, or selected names such as .info i x
+.shapes list array shapes, or selected names such as .shapes x y
+.sizes  list array sizes, or selected names such as .sizes x y
+.stats  list numeric array statistics, or selected names such as .stats x y
 .load   load a file into the current source
 .load-run load a file, run it once, and keep editing
 ```
+
+For repeated runs, command arguments can be supplied after `--`, for example
+`.run 3 -- alpha beta`.
 
 When `.load file.f90`, `.load-run file.f90`, `--load file.f90`, or
 `--load-run file.f90` loads a complete program, a final `end...` line is
