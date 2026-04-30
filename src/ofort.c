@@ -5184,7 +5184,8 @@ static const char *intrinsic_names[] = {
     /* Math */
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
-    "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "BIT_SIZE", "DIGITS", "EPSILON", "HUGE",
+    "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
+    "BIT_SIZE", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
@@ -5466,6 +5467,30 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(DBL_EPSILON);
         if (args[0].type == FVAL_REAL) return make_real(FLT_EPSILON);
         ofort_error(I, "EPSILON requires a real argument");
+    }
+    if (strcmp(upper, "FRACTION") == 0) {
+        int exp = 0;
+        double frac;
+        if (nargs < 1) ofort_error(I, "FRACTION requires 1 argument");
+        if (args[0].type != FVAL_REAL && args[0].type != FVAL_DOUBLE)
+            ofort_error(I, "FRACTION requires a real argument");
+        frac = frexp(val_to_real(args[0]), &exp);
+        if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(frac);
+        return make_real(frac);
+    }
+    if (strcmp(upper, "EXPONENT") == 0) {
+        int exp = 0;
+        if (nargs < 1) ofort_error(I, "EXPONENT requires 1 argument");
+        if (args[0].type != FVAL_REAL && args[0].type != FVAL_DOUBLE)
+            ofort_error(I, "EXPONENT requires a real argument");
+        (void)frexp(val_to_real(args[0]), &exp);
+        return make_integer(exp);
+    }
+    if (strcmp(upper, "RADIX") == 0) {
+        if (nargs < 1) ofort_error(I, "RADIX requires 1 argument");
+        if (args[0].type != FVAL_INTEGER && args[0].type != FVAL_REAL && args[0].type != FVAL_DOUBLE)
+            ofort_error(I, "RADIX requires an integer or real argument");
+        return make_integer(2);
     }
     if (strcmp(upper, "HUGE") == 0) {
         int kind;
