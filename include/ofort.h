@@ -209,6 +209,32 @@ void ofort_set_print_expr_statements(OfortInterpreter *interp, int enabled);
 /* If enabled, normal program output is suppressed. Bare expression output remains enabled. */
 void ofort_set_suppress_output(OfortInterpreter *interp, int enabled);
 
+/* If enabled, use historical Fortran implicit typing for undeclared names. Disabled by default. */
+void ofort_set_implicit_typing(OfortInterpreter *interp, int enabled);
+
+/* Set command-line arguments visible to COMMAND_ARGUMENT_COUNT/GET_COMMAND_ARGUMENT. */
+void ofort_set_command_args(OfortInterpreter *interp, int argc, const char *const *argv);
+
+/* Write visible variable values to buf. If names is NULL or n_names is 0, lists all variables. */
+int ofort_dump_variables(OfortInterpreter *interp, const char *const *names,
+                         int n_names, char *buf, size_t buf_size);
+
+/* Write declaration-style visible variable info to buf. If names is NULL or n_names is 0, lists all variables. */
+int ofort_dump_variable_info(OfortInterpreter *interp, const char *const *names,
+                             int n_names, char *buf, size_t buf_size);
+
+/* Write array shapes to buf. If names is NULL or n_names is 0, lists all visible arrays. */
+int ofort_dump_variable_shapes(OfortInterpreter *interp, const char *const *names,
+                               int n_names, char *buf, size_t buf_size);
+
+/* Write array sizes to buf. If names is NULL or n_names is 0, lists all visible arrays. */
+int ofort_dump_variable_sizes(OfortInterpreter *interp, const char *const *names,
+                              int n_names, char *buf, size_t buf_size);
+
+/* Write grouped numeric array statistics to buf. If names is NULL or n_names is 0, lists all visible numeric arrays. */
+int ofort_dump_variable_stats(OfortInterpreter *interp, const char *const *names,
+                              int n_names, char *buf, size_t buf_size);
+
 /* Get output (stdout from PRINT/WRITE etc.) */
 const char *ofort_get_output(OfortInterpreter *interp);
 
