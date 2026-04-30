@@ -263,7 +263,12 @@ static OfortValue make_double(double v) {
 }
 static OfortValue make_complex(double re, double im) {
     OfortValue r; memset(&r, 0, sizeof(r));
-    r.type = FVAL_COMPLEX; r.v.cx.re = re; r.v.cx.im = im; return r;
+    r.type = FVAL_COMPLEX; r.kind = 4; r.v.cx.re = re; r.v.cx.im = im; return r;
+}
+static OfortValue make_complex_kind(double re, double im, int kind) {
+    OfortValue r = make_complex(re, im);
+    r.kind = kind > 0 ? kind : 4;
+    return r;
 }
 static OfortValue make_character(const char *s) {
     OfortValue r; memset(&r, 0, sizeof(r));
@@ -3854,9 +3859,13 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         return make_logical(n->bool_val);
 
     case FND_COMPLEX_LIT: {
-        double re = val_to_real(eval_node(I, n->children[0]));
-        double im = val_to_real(eval_node(I, n->children[1]));
-        return make_complex(re, im);
+        OfortValue re_val = eval_node(I, n->children[0]);
+        OfortValue im_val = eval_node(I, n->children[1]);
+        int kind = (re_val.type == FVAL_DOUBLE || re_val.kind == 8 ||
+                    im_val.type == FVAL_DOUBLE || im_val.kind == 8) ? 8 : 4;
+        double re = val_to_real(re_val);
+        double im = val_to_real(im_val);
+        return make_complex_kind(re, im, kind);
     }
 
     case FND_IDENT: {
@@ -5185,7 +5194,7 @@ static const char *intrinsic_names[] = {
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
-    "BIT_SIZE", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST",
+    "BIT_SIZE", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
@@ -5523,6 +5532,12 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (args[0].type == FVAL_DOUBLE || args[0].kind == 8)
             return make_double(nextafter(val_to_real(args[0]), direction > 0.0 ? INFINITY : -INFINITY));
         return make_real(nextafterf((float)val_to_real(args[0]), direction > 0.0 ? INFINITY : -INFINITY));
+    }
+    if (strcmp(upper, "PRECISION") == 0) {
+        if (nargs < 1) ofort_error(I, "PRECISION requires 1 argument");
+        if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_integer(15);
+        if (args[0].type == FVAL_REAL || args[0].type == FVAL_COMPLEX) return make_integer(6);
+        ofort_error(I, "PRECISION requires a real or complex argument");
     }
     if (strcmp(upper, "COMMAND_ARGUMENT_COUNT") == 0) {
         return make_integer(I->command_argc);
