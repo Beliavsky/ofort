@@ -32,6 +32,7 @@ typedef struct {
     int intent;       /* 0=none,1=IN,2=OUT,3=INOUT */
     int char_len;     /* declared CHARACTER length, 0 if not CHARACTER */
     int present;      /* 0 for absent OPTIONAL dummy arguments */
+    int is_allocatable;
 } OfortVar;
 
 typedef struct OfortScope {
@@ -552,6 +553,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->intent = 0;
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     v->present = 1;
+    v->is_allocatable = 0;
     return v;
 }
 
@@ -580,6 +582,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->intent = 0;
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     v->present = val.type != FVAL_VOID;
+    v->is_allocatable = 0;
     return v;
 }
 
@@ -4013,6 +4016,51 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         OfortValue right = eval_node(I, n->children[1]);
         int result = 0;
 
+        if (left.type == FVAL_ARRAY || right.type == FVAL_ARRAY) {
+            OfortValue *array_arg = left.type == FVAL_ARRAY ? &left : &right;
+            OfortValue result_array = make_array(FVAL_LOGICAL, array_arg->v.arr.dims, array_arg->v.arr.n_dims);
+            int len = array_arg->v.arr.len;
+
+            if (left.type == FVAL_ARRAY && right.type == FVAL_ARRAY && left.v.arr.len != right.v.arr.len)
+                ofort_error(I, "Array size mismatch in comparison");
+
+            for (int i = 0; i < len; i++) {
+                OfortValue *lv = left.type == FVAL_ARRAY ? &left.v.arr.data[i] : &left;
+                OfortValue *rv = right.type == FVAL_ARRAY ? &right.v.arr.data[i] : &right;
+                int elem_result = 0;
+                if (lv->type == FVAL_CHARACTER || rv->type == FVAL_CHARACTER) {
+                    char lb[OFORT_MAX_STRLEN], rb[OFORT_MAX_STRLEN];
+                    value_to_string(I, *lv, lb, sizeof(lb));
+                    value_to_string(I, *rv, rb, sizeof(rb));
+                    int cmp = strcmp(lb, rb);
+                    switch (n->type) {
+                        case FND_EQ: elem_result = (cmp == 0); break;
+                        case FND_NEQ: elem_result = (cmp != 0); break;
+                        case FND_LT: elem_result = (cmp < 0); break;
+                        case FND_GT: elem_result = (cmp > 0); break;
+                        case FND_LE: elem_result = (cmp <= 0); break;
+                        case FND_GE: elem_result = (cmp >= 0); break;
+                        default: break;
+                    }
+                } else {
+                    double a = val_to_real(*lv), b = val_to_real(*rv);
+                    switch (n->type) {
+                        case FND_EQ: elem_result = (a == b); break;
+                        case FND_NEQ: elem_result = (a != b); break;
+                        case FND_LT: elem_result = (a < b); break;
+                        case FND_GT: elem_result = (a > b); break;
+                        case FND_LE: elem_result = (a <= b); break;
+                        case FND_GE: elem_result = (a >= b); break;
+                        default: break;
+                    }
+                }
+                free_value(&result_array.v.arr.data[i]);
+                result_array.v.arr.data[i] = make_logical(elem_result);
+            }
+            free_value(&left); free_value(&right);
+            return result_array;
+        }
+
         if (left.type == FVAL_CHARACTER || right.type == FVAL_CHARACTER) {
             char lb[OFORT_MAX_STRLEN], rb[OFORT_MAX_STRLEN];
             value_to_string(I, left, lb, sizeof(lb));
@@ -4185,6 +4233,26 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 
     case FND_MEMBER: {
         OfortValue obj = eval_node(I, n->children[0]);
+        if (str_eq_nocase(n->name, "re") || str_eq_nocase(n->name, "im")) {
+            int want_re = str_eq_nocase(n->name, "re");
+            if (obj.type == FVAL_COMPLEX) {
+                double part = want_re ? obj.v.cx.re : obj.v.cx.im;
+                free_value(&obj);
+                return make_real(part);
+            }
+            if (obj.type == FVAL_ARRAY && obj.v.arr.elem_type == FVAL_COMPLEX) {
+                OfortValue result = make_array(FVAL_REAL, obj.v.arr.dims, obj.v.arr.n_dims);
+                for (int i = 0; i < obj.v.arr.len; i++) {
+                    double part = 0.0;
+                    if (obj.v.arr.data[i].type == FVAL_COMPLEX)
+                        part = want_re ? obj.v.arr.data[i].v.cx.re : obj.v.arr.data[i].v.cx.im;
+                    free_value(&result.v.arr.data[i]);
+                    result.v.arr.data[i] = make_real(part);
+                }
+                free_value(&obj);
+                return result;
+            }
+        }
         if (obj.type != FVAL_DERIVED)
             ofort_error(I, "Cannot access member of non-derived type");
         char upper[256];
@@ -4456,6 +4524,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
         OfortVar *v = declare_var(I, n->name, val);
         if (n->is_parameter || n->type == FND_PARAMDECL) v->is_parameter = 1;
+        v->is_allocatable = n->is_allocatable;
         v->intent = n->intent;
         v->char_len = decl_char_len;
         break;
@@ -4471,7 +4540,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (v && v->is_parameter) ofort_error(I, "Cannot assign to PARAMETER '%s'", lhs->name);
             if (v && v->val.type == FVAL_ARRAY) {
                 if (rhs.type == FVAL_ARRAY) {
-                    if (!v->val.v.arr.allocated || v->val.v.arr.len == 0) {
+                    if (!v->val.v.arr.allocated || v->val.v.arr.len == 0 ||
+                        (v->is_allocatable && rhs.v.arr.len != v->val.v.arr.len)) {
                         int dims[7];
                         for (int i = 0; i < rhs.v.arr.n_dims; i++) dims[i] = rhs.v.arr.dims[i];
                         free_value(&v->val);
@@ -4504,6 +4574,33 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             free_value(&rhs);
         } else if (lhs->type == FND_MEMBER) {
             /* Derived type member assignment: obj%field = val */
+            if ((str_eq_nocase(lhs->name, "re") || str_eq_nocase(lhs->name, "im")) &&
+                lhs->children[0]->type == FND_IDENT) {
+                int want_re = str_eq_nocase(lhs->name, "re");
+                OfortVar *v = find_var(I, lhs->children[0]->name);
+                if (!v) ofort_error(I, "Undefined variable '%s'", lhs->children[0]->name);
+                if (v->val.type == FVAL_COMPLEX) {
+                    if (want_re) v->val.v.cx.re = val_to_real(rhs);
+                    else v->val.v.cx.im = val_to_real(rhs);
+                    free_value(&rhs);
+                    break;
+                }
+                if (v->val.type == FVAL_ARRAY && v->val.v.arr.elem_type == FVAL_COMPLEX) {
+                    if (rhs.type == FVAL_ARRAY && rhs.v.arr.len != v->val.v.arr.len)
+                        ofort_error(I, "Array size mismatch in complex part assignment");
+                    for (int i = 0; i < v->val.v.arr.len; i++) {
+                        double part = rhs.type == FVAL_ARRAY ? val_to_real(rhs.v.arr.data[i]) : val_to_real(rhs);
+                        if (v->val.v.arr.data[i].type != FVAL_COMPLEX) {
+                            free_value(&v->val.v.arr.data[i]);
+                            v->val.v.arr.data[i] = make_complex(0.0, 0.0);
+                        }
+                        if (want_re) v->val.v.arr.data[i].v.cx.re = part;
+                        else v->val.v.arr.data[i].v.cx.im = part;
+                    }
+                    free_value(&rhs);
+                    break;
+                }
+            }
             OfortValue obj = eval_node(I, lhs->children[0]);
             if (obj.type != FVAL_DERIVED) ofort_error(I, "Cannot access member of non-derived type");
             /* Find the variable to modify in place */
@@ -5068,7 +5165,7 @@ static const char *intrinsic_names[] = {
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
     /* Array */
-    "SIZE", "SHAPE", "MERGE", "SUM", "PRODUCT", "MAXVAL", "MINVAL",
+    "SIZE", "SHAPE", "PACK", "MERGE", "SUM", "PRODUCT", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC",
     "DOT_PRODUCT", "MATMUL", "TRANSPOSE", "RESHAPE",
     "COUNT", "ANY", "ALL", "ALLOCATED", "LBOUND", "UBOUND",
     /* Type conversion */
@@ -5153,6 +5250,36 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             result.v.arr.data[i] = elem_result;
         }
 
+        return result;
+    }
+
+    if ((strcmp(upper, "MOD") == 0 || strcmp(upper, "MODULO") == 0 ||
+         strcmp(upper, "DIM") == 0 || strcmp(upper, "SIGN") == 0) &&
+        nargs >= 2 && (args[0].type == FVAL_ARRAY || args[1].type == FVAL_ARRAY)) {
+        OfortValue *shape_arg = args[0].type == FVAL_ARRAY ? &args[0] : &args[1];
+        OfortValType result_type = FVAL_REAL;
+        OfortValue result;
+        if ((strcmp(upper, "MOD") == 0 || strcmp(upper, "MODULO") == 0 || strcmp(upper, "DIM") == 0) &&
+            ((args[0].type == FVAL_ARRAY ? args[0].v.arr.elem_type : args[0].type) == FVAL_INTEGER) &&
+            ((args[1].type == FVAL_ARRAY ? args[1].v.arr.elem_type : args[1].type) == FVAL_INTEGER)) {
+            result_type = FVAL_INTEGER;
+        }
+        if (strcmp(upper, "SIGN") == 0)
+            result_type = args[0].type == FVAL_ARRAY ? args[0].v.arr.elem_type : args[0].type;
+        result = make_array(result_type, shape_arg->v.arr.dims, shape_arg->v.arr.n_dims);
+        if (args[0].type == FVAL_ARRAY && args[1].type == FVAL_ARRAY && args[0].v.arr.len != args[1].v.arr.len)
+            ofort_error(I, "%s array arguments have different sizes", upper);
+        for (int i = 0; i < result.v.arr.len; i++) {
+            OfortValue elem_args[2];
+            OfortValue elem_result;
+            elem_args[0] = args[0].type == FVAL_ARRAY ? copy_value(args[0].v.arr.data[i]) : copy_value(args[0]);
+            elem_args[1] = args[1].type == FVAL_ARRAY ? copy_value(args[1].v.arr.data[i]) : copy_value(args[1]);
+            elem_result = call_intrinsic(I, name, elem_args, 2, NULL);
+            free_value(&elem_args[0]);
+            free_value(&elem_args[1]);
+            free_value(&result.v.arr.data[i]);
+            result.v.arr.data[i] = elem_result;
+        }
         return result;
     }
 
@@ -5433,6 +5560,51 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         }
         return result;
     }
+    if (strcmp(upper, "PACK") == 0) {
+        OfortValue *array;
+        OfortValue *mask;
+        OfortValue *vector = NULL;
+        int selected = 0;
+        int result_len;
+        int dims[1];
+        OfortValue result;
+        int out = 0;
+
+        if (nargs < 2) ofort_error(I, "PACK requires ARRAY and MASK");
+        if (args[0].type != FVAL_ARRAY) ofort_error(I, "PACK ARRAY must be an array");
+        array = &args[0];
+        mask = &args[1];
+        if (mask->type == FVAL_ARRAY && mask->v.arr.len != array->v.arr.len)
+            ofort_error(I, "PACK mask size mismatch");
+        if (nargs >= 3) {
+            if (args[2].type != FVAL_ARRAY) ofort_error(I, "PACK VECTOR must be an array");
+            vector = &args[2];
+        }
+
+        for (int i = 0; i < array->v.arr.len; i++) {
+            int take = mask->type == FVAL_ARRAY ? val_to_logical(mask->v.arr.data[i]) : val_to_logical(*mask);
+            if (take) selected++;
+        }
+
+        result_len = vector ? vector->v.arr.len : selected;
+        if (vector && selected > result_len) ofort_error(I, "PACK VECTOR is too short");
+        dims[0] = result_len;
+        result = make_array(array->v.arr.elem_type, dims, 1);
+
+        for (int i = 0; i < array->v.arr.len; i++) {
+            int take = mask->type == FVAL_ARRAY ? val_to_logical(mask->v.arr.data[i]) : val_to_logical(*mask);
+            if (!take) continue;
+            free_value(&result.v.arr.data[out]);
+            result.v.arr.data[out++] = copy_value(array->v.arr.data[i]);
+        }
+        if (vector) {
+            for (int i = out; i < result_len; i++) {
+                free_value(&result.v.arr.data[i]);
+                result.v.arr.data[i] = copy_value(vector->v.arr.data[i]);
+            }
+        }
+        return result;
+    }
     if (strcmp(upper, "MERGE") == 0) {
         if (nargs < 3) ofort_error(I, "MERGE requires 3 arguments");
         if (args[0].type != FVAL_ARRAY && args[1].type != FVAL_ARRAY && args[2].type != FVAL_ARRAY) {
@@ -5499,6 +5671,129 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         }
         if (args[0].v.arr.elem_type == FVAL_INTEGER) return make_integer((long long)mn);
         return make_real(mn);
+    }
+    if (strcmp(upper, "MAXLOC") == 0 || strcmp(upper, "MINLOC") == 0) {
+        int want_max = strcmp(upper, "MAXLOC") == 0;
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        int mask_idx = intrinsic_arg_index(arg_names, nargs, "mask");
+        OfortValue *array;
+        OfortValue *mask = NULL;
+        if (nargs < 1 || args[0].type != FVAL_ARRAY)
+            ofort_error(I, "%s requires an array argument", upper);
+        array = &args[0];
+        if (dim_idx < 0 && mask_idx < 0 && nargs >= 2 &&
+            (!arg_names || arg_names[1][0] == '\0') && args[1].type != FVAL_ARRAY)
+            dim_idx = 1;
+        if (mask_idx < 0 && nargs >= 2) {
+            for (int i = 1; i < nargs; i++) {
+                if (i != dim_idx && args[i].type == FVAL_ARRAY) {
+                    mask_idx = i;
+                    break;
+                }
+            }
+        }
+        if (mask_idx >= 0) mask = &args[mask_idx];
+
+        if (dim_idx >= 0) {
+            int dim = (int)val_to_int(args[dim_idx]);
+            if (array->v.arr.n_dims == 1) {
+                int rdims[1] = {1};
+                OfortValue result = make_array(FVAL_INTEGER, rdims, 1);
+                int best_pos = 0;
+                double best = 0.0;
+                int found = 0;
+                if (dim != 1) ofort_error(I, "%s DIM is out of range", upper);
+                for (int i = 0; i < array->v.arr.len; i++) {
+                    if (mask && !val_to_logical(mask->type == FVAL_ARRAY ? mask->v.arr.data[i] : *mask)) continue;
+                    double v = val_to_real(array->v.arr.data[i]);
+                    if (!found || (want_max ? v > best : v < best)) {
+                        best = v;
+                        best_pos = i + 1;
+                        found = 1;
+                    }
+                }
+                free_value(&result.v.arr.data[0]);
+                result.v.arr.data[0] = make_integer(found ? best_pos : 0);
+                return result;
+            }
+            if (array->v.arr.n_dims == 2) {
+                int nrow = array->v.arr.dims[0];
+                int ncol = array->v.arr.dims[1];
+                if (dim == 1) {
+                    int rdims[1] = {ncol};
+                    OfortValue result = make_array(FVAL_INTEGER, rdims, 1);
+                    for (int j = 0; j < ncol; j++) {
+                        int best_pos = 0;
+                        double best = 0.0;
+                        int found = 0;
+                        for (int i = 0; i < nrow; i++) {
+                            int idx = i + j * nrow;
+                            if (mask && !val_to_logical(mask->type == FVAL_ARRAY ? mask->v.arr.data[idx] : *mask)) continue;
+                            double v = val_to_real(array->v.arr.data[idx]);
+                            if (!found || (want_max ? v > best : v < best)) {
+                                best = v;
+                                best_pos = i + 1;
+                                found = 1;
+                            }
+                        }
+                        free_value(&result.v.arr.data[j]);
+                        result.v.arr.data[j] = make_integer(found ? best_pos : 0);
+                    }
+                    return result;
+                }
+                if (dim == 2) {
+                    int rdims[1] = {nrow};
+                    OfortValue result = make_array(FVAL_INTEGER, rdims, 1);
+                    for (int i = 0; i < nrow; i++) {
+                        int best_pos = 0;
+                        double best = 0.0;
+                        int found = 0;
+                        for (int j = 0; j < ncol; j++) {
+                            int idx = i + j * nrow;
+                            if (mask && !val_to_logical(mask->type == FVAL_ARRAY ? mask->v.arr.data[idx] : *mask)) continue;
+                            double v = val_to_real(array->v.arr.data[idx]);
+                            if (!found || (want_max ? v > best : v < best)) {
+                                best = v;
+                                best_pos = j + 1;
+                                found = 1;
+                            }
+                        }
+                        free_value(&result.v.arr.data[i]);
+                        result.v.arr.data[i] = make_integer(found ? best_pos : 0);
+                    }
+                    return result;
+                }
+                ofort_error(I, "%s DIM is out of range", upper);
+            }
+            ofort_error(I, "%s DIM is only implemented for rank 1 or 2 arrays", upper);
+        }
+
+        {
+            int nd = array->v.arr.n_dims;
+            int rdims[1] = {nd};
+            OfortValue result = make_array(FVAL_INTEGER, rdims, 1);
+            int best_index = -1;
+            double best = 0.0;
+            for (int i = 0; i < array->v.arr.len; i++) {
+                if (mask && !val_to_logical(mask->type == FVAL_ARRAY ? mask->v.arr.data[i] : *mask)) continue;
+                double v = val_to_real(array->v.arr.data[i]);
+                if (best_index < 0 || (want_max ? v > best : v < best)) {
+                    best = v;
+                    best_index = i;
+                }
+            }
+            for (int d = 0; d < nd; d++) {
+                int sub = 0;
+                if (best_index >= 0) {
+                    int stride = 1;
+                    for (int k = 0; k < d; k++) stride *= array->v.arr.dims[k];
+                    sub = (best_index / stride) % array->v.arr.dims[d] + 1;
+                }
+                free_value(&result.v.arr.data[d]);
+                result.v.arr.data[d] = make_integer(sub);
+            }
+            return result;
+        }
     }
     if (strcmp(upper, "DOT_PRODUCT") == 0) {
         if (nargs < 2) ofort_error(I, "DOT_PRODUCT requires 2 arguments");
