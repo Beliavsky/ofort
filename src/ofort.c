@@ -2630,6 +2630,35 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return NULL;
     }
 
+    /* Standalone PARAMETER statement: PARAMETER (name = expr, ...) */
+    if (t->type == FTOK_PARAMETER) {
+        OfortToken *pt = advance(I);
+        OfortNode *block = alloc_node(I, FND_BLOCK);
+        int cap = 0;
+        block->line = pt->line;
+        block->stmts = NULL;
+        block->n_stmts = 0;
+        expect(I, FTOK_LPAREN);
+        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            OfortToken *name = expect(I, FTOK_IDENT);
+            OfortNode *param = alloc_node(I, FND_PARAMDECL);
+            strncpy(param->name, name->str_val, 255);
+            param->line = name->line;
+            expect(I, FTOK_ASSIGN);
+            param->children[0] = parse_expr(I);
+            param->n_children = 1;
+            if (block->n_stmts >= cap) {
+                cap = cap ? cap * 2 : 4;
+                block->stmts = (OfortNode **)realloc(block->stmts, sizeof(OfortNode *) * cap);
+            }
+            block->stmts[block->n_stmts++] = param;
+            if (check(I, FTOK_COMMA)) advance(I);
+            else break;
+        }
+        expect(I, FTOK_RPAREN);
+        return block;
+    }
+
     /* declarations */
     if (is_type_keyword(t->type)) {
         if (peek_ahead(I, 1)->type == FTOK_FUNCTION ||
@@ -4294,6 +4323,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             existing->intent = n->intent;
             break;
         }
+        if (existing && n->type == FND_PARAMDECL && n->n_children > 0 && n->children[0]) {
+            val = eval_node(I, n->children[0]);
+            val = coerce_assignment_value(I, n->name, existing->val.type, val);
+            val = resize_character_value(val, existing->char_len);
+            free_value(&existing->val);
+            existing->val = val;
+            existing->is_parameter = 1;
+            break;
+        }
         if (n->n_dims > 0 && !n->is_allocatable) {
             /* Array declaration */
             val = make_array_from_decl(I, n);
@@ -4855,7 +4893,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 static const char *intrinsic_names[] = {
     /* Math */
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
-    "EXP", "LOG", "LOG10", "MOD", "MAX", "MIN", "FLOOR", "CEILING", "NINT",
+    "EXP", "LOG", "LOG10", "MOD", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
@@ -4892,6 +4930,7 @@ static int is_elemental_unary_intrinsic(const char *upper) {
            strcmp(upper, "LOG10") == 0 ||
            strcmp(upper, "FLOOR") == 0 ||
            strcmp(upper, "CEILING") == 0 ||
+           strcmp(upper, "AINT") == 0 ||
            strcmp(upper, "NINT") == 0 ||
            strcmp(upper, "REAL") == 0 ||
            strcmp(upper, "FLOAT") == 0 ||
@@ -5024,6 +5063,9 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     }
     if (strcmp(upper, "CEILING") == 0) {
         return make_integer((long long)ceil(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "AINT") == 0) {
+        return make_real(trunc(val_to_real(args[0])));
     }
     if (strcmp(upper, "NINT") == 0) {
         return make_integer((long long)round(val_to_real(args[0])));
