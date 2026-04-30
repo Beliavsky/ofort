@@ -1,0 +1,79 @@
+Unsupported Fortran 95 intrinsics to consider for ofort
+========================================================
+
+Baseline: this list excludes intrinsics currently registered in
+src/ofort.c and the intrinsic subroutines currently handled as CALL
+statements: random_number, random_seed, and system_clock.
+
+High priority
+-------------
+
+anint
+present
+merge
+maxloc
+minloc
+pack
+unpack
+spread
+eoshift
+cshift
+
+Numeric inquiry/model intrinsics
+--------------------------------
+
+bit_size
+digits
+epsilon
+exponent
+fraction
+huge
+maxexponent
+minexponent
+nearest
+precision
+radix
+range
+rrspacing
+scale
+selected_int_kind
+selected_real_kind
+set_exponent
+spacing
+tiny
+
+Bit intrinsics
+--------------
+
+btest
+iand
+ibclr
+ibits
+ibset
+ieor
+ior
+ishft
+ishftc
+not
+mvbits
+
+Character intrinsics
+--------------------
+
+scan
+verify
+
+Pointer/procedure/environment intrinsics
+----------------------------------------
+
+associated
+cpu_time
+date_and_time
+
+Lower priority or needs design first
+------------------------------------
+
+transfer
+maskl
+maskr
+ishft-like BOZ and kind edge cases
