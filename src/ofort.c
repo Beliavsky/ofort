@@ -33,6 +33,13 @@ typedef struct {
     int char_len;     /* declared CHARACTER length, 0 if not CHARACTER */
     int present;      /* 0 for absent OPTIONAL dummy arguments */
     int is_allocatable;
+    int is_pointer;
+    int is_target;
+    int pointer_associated;
+    char pointer_target[256];
+    int pointer_has_slice;
+    int pointer_slice_start;
+    int pointer_slice_end;
 } OfortVar;
 
 typedef struct OfortScope {
@@ -564,6 +571,13 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     v->present = 1;
     v->is_allocatable = 0;
+    v->is_pointer = 0;
+    v->is_target = 0;
+    v->pointer_associated = 0;
+    v->pointer_target[0] = '\0';
+    v->pointer_has_slice = 0;
+    v->pointer_slice_start = 0;
+    v->pointer_slice_end = 0;
     return v;
 }
 
@@ -593,6 +607,13 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     v->present = val.type != FVAL_VOID;
     v->is_allocatable = 0;
+    v->is_pointer = 0;
+    v->is_target = 0;
+    v->pointer_associated = 0;
+    v->pointer_target[0] = '\0';
+    v->pointer_has_slice = 0;
+    v->pointer_slice_start = 0;
+    v->pointer_slice_end = 0;
     return v;
 }
 
@@ -955,6 +976,10 @@ static void tokenize(OfortInterpreter *I, const char *src) {
         }
         if (*p == '=' && *(p+1) == '=') {
             t->type = FTOK_EQ; t->length = 2; p += 2;
+            I->n_tokens++; continue;
+        }
+        if (*p == '=' && *(p+1) == '>') {
+            t->type = FTOK_POINTER_ASSIGN; t->length = 2; p += 2;
             I->n_tokens++; continue;
         }
         if (*p == '<' && *(p+1) == '=') {
@@ -1590,6 +1615,8 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     int char_len = 1;
     OfortNode *char_len_expr = NULL;
     int is_allocatable = 0;
+    int is_pointer = 0;
+    int is_target = 0;
     int is_parameter = 0;
     int is_optional = 0;
     int intent = 0;
@@ -1668,6 +1695,12 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         } else if (check(I, FTOK_ALLOCATABLE)) {
             advance(I);
             is_allocatable = 1;
+        } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "pointer")) {
+            advance(I);
+            is_pointer = 1;
+        } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "target")) {
+            advance(I);
+            is_target = 1;
         } else if (check(I, FTOK_PARAMETER)) {
             advance(I);
             is_parameter = 1;
@@ -1708,6 +1741,8 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         decl->char_len = char_len;
         decl->char_len_expr = char_len_expr;
         decl->is_allocatable = is_allocatable;
+        decl->is_pointer = is_pointer;
+        decl->is_target = is_target;
         decl->is_parameter = is_parameter;
         decl->is_optional = is_optional;
         decl->intent = intent;
@@ -2911,6 +2946,19 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         t->type == FTOK_LPAREN || t->type == FTOK_MINUS || t->type == FTOK_PLUS ||
         t->type == FTOK_NOT) {
         OfortNode *expr = parse_expr(I);
+        if (check(I, FTOK_POINTER_ASSIGN)) {
+            if (expr->type != FND_IDENT && expr->type != FND_FUNC_CALL) {
+                ofort_error(I, "Invalid pointer assignment target at line %d", t->line);
+            }
+            advance(I);
+            OfortNode *rhs = parse_expr(I);
+            OfortNode *n = alloc_node(I, FND_POINTER_ASSIGN);
+            n->children[0] = expr;
+            n->children[1] = rhs;
+            n->n_children = 2;
+            n->line = t->line;
+            return n;
+        }
         if (check(I, FTOK_ASSIGN)) {
             if (expr->type != FND_IDENT && expr->type != FND_FUNC_CALL && expr->type != FND_MEMBER) {
                 ofort_error(I, "Invalid assignment target at line %d", t->line);
@@ -3187,6 +3235,52 @@ static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNo
     int out_index = 0;
     copy_section_recursive(I, &var->val, &result, ranges, nargs, 0, subscripts, &out_index);
     return result;
+}
+
+static int pointer_target_descriptor(OfortInterpreter *I, OfortNode *node,
+                                     char *name, size_t name_size,
+                                     int *has_slice, int *slice_start, int *slice_end) {
+    *has_slice = 0;
+    *slice_start = 0;
+    *slice_end = 0;
+    if (node->type == FND_IDENT) {
+        copy_cstr(name, name_size, node->name);
+        return 1;
+    }
+    if (node->type == FND_FUNC_CALL && node->n_stmts == 1 && node->stmts[0]->type == FND_SLICE) {
+        OfortVar *var = find_var(I, node->name);
+        OfortSubscriptRange range;
+        if (!var || var->val.type != FVAL_ARRAY) return 0;
+        eval_subscript_range(I, node->stmts[0], var->val.v.arr.len, &range);
+        if (!range.is_slice) return 0;
+        copy_cstr(name, name_size, node->name);
+        *has_slice = 1;
+        *slice_start = range.start;
+        *slice_end = range.end;
+        return 1;
+    }
+    return 0;
+}
+
+static int pointer_matches_target(OfortInterpreter *I, OfortVar *ptr, OfortNode *target) {
+    char target_name[256];
+    int has_slice, start, end;
+    if (!ptr || !ptr->is_pointer || !ptr->pointer_associated) return 0;
+    if (target->type == FND_IDENT) {
+        OfortVar *target_var = find_var(I, target->name);
+        if (target_var && target_var->is_pointer) {
+            return target_var->pointer_associated &&
+                   str_eq_nocase(ptr->pointer_target, target_var->pointer_target) &&
+                   ptr->pointer_has_slice == target_var->pointer_has_slice &&
+                   ptr->pointer_slice_start == target_var->pointer_slice_start &&
+                   ptr->pointer_slice_end == target_var->pointer_slice_end;
+        }
+    }
+    if (!pointer_target_descriptor(I, target, target_name, sizeof(target_name), &has_slice, &start, &end))
+        return 0;
+    return str_eq_nocase(ptr->pointer_target, target_name) &&
+           ptr->pointer_has_slice == has_slice &&
+           (!has_slice || (ptr->pointer_slice_start == start && ptr->pointer_slice_end == end));
 }
 
 static int section_element_count(OfortSubscriptRange *ranges, int nranges) {
@@ -3879,6 +3973,10 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
     case FND_IDENT: {
         OfortVar *v = find_var(I, n->name);
         if (!v) ofort_error(I, "Undefined variable '%s' at line %d", n->name, n->line);
+        if (v->is_pointer) {
+            if (!v->pointer_associated) return make_void_val();
+            return copy_value(v->val);
+        }
         return copy_value(v->val);
     }
 
@@ -4166,6 +4264,16 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         /* Evaluate arguments */
         int nargs = n->n_stmts;
         OfortValue args[OFORT_MAX_PARAMS];
+
+        if (str_eq_nocase(n->name, "associated")) {
+            OfortVar *ptr;
+            if (nargs < 1 || n->stmts[0]->type != FND_IDENT)
+                ofort_error(I, "ASSOCIATED requires a pointer argument");
+            ptr = find_var(I, n->stmts[0]->name);
+            if (!ptr || !ptr->is_pointer) return make_logical(0);
+            if (nargs == 1) return make_logical(ptr->pointer_associated);
+            return make_logical(pointer_matches_target(I, ptr, n->stmts[1]));
+        }
 
         /* Check if this is an array variable reference */
         OfortVar *var = find_var(I, n->name);
@@ -4514,6 +4622,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             if (has_assumed_shape) {
                 existing->intent = n->intent;
+                existing->is_pointer = n->is_pointer;
+                existing->is_target = n->is_target;
                 break;
             }
         }
@@ -4531,7 +4641,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             existing->is_parameter = 1;
             break;
         }
-        if (n->n_dims > 0 && !n->is_allocatable) {
+        if (n->is_pointer && n->n_dims > 0) {
+            val.type = FVAL_ARRAY;
+            memset(&val.v.arr, 0, sizeof(val.v.arr));
+            val.v.arr.elem_type = n->val_type;
+            val.v.arr.allocated = 0;
+        } else if (n->n_dims > 0 && !n->is_allocatable) {
             /* Array declaration */
             val = make_array_from_decl(I, n);
         } else if (n->is_allocatable) {
@@ -4569,8 +4684,41 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortVar *v = declare_var(I, n->name, val);
         if (n->is_parameter || n->type == FND_PARAMDECL) v->is_parameter = 1;
         v->is_allocatable = n->is_allocatable;
+        v->is_pointer = n->is_pointer;
+        v->is_target = n->is_target;
+        v->pointer_associated = 0;
+        v->pointer_target[0] = '\0';
+        v->pointer_has_slice = 0;
+        v->pointer_slice_start = 0;
+        v->pointer_slice_end = 0;
         v->intent = n->intent;
         v->char_len = decl_char_len;
+        break;
+    }
+
+    case FND_POINTER_ASSIGN: {
+        OfortNode *lhs = n->children[0];
+        OfortNode *rhs_node = n->children[1];
+        OfortVar *ptr;
+        char target_name[256];
+        int has_slice, slice_start, slice_end;
+        OfortValue rhs;
+        if (lhs->type != FND_IDENT)
+            ofort_error(I, "Pointer assignment target must be a pointer variable");
+        ptr = find_var(I, lhs->name);
+        if (!ptr || !ptr->is_pointer)
+            ofort_error(I, "'%s' is not a pointer", lhs->name);
+        if (!pointer_target_descriptor(I, rhs_node, target_name, sizeof(target_name),
+                                       &has_slice, &slice_start, &slice_end))
+            ofort_error(I, "Invalid pointer target");
+        rhs = eval_node(I, rhs_node);
+        free_value(&ptr->val);
+        ptr->val = rhs;
+        ptr->pointer_associated = 1;
+        copy_cstr(ptr->pointer_target, sizeof(ptr->pointer_target), target_name);
+        ptr->pointer_has_slice = has_slice;
+        ptr->pointer_slice_start = slice_start;
+        ptr->pointer_slice_end = slice_end;
         break;
     }
 
@@ -5236,6 +5384,24 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         break;
 
     case FND_EXPR_STMT: {
+        if (n->children[0] && n->children[0]->type == FND_FUNC_CALL &&
+            str_eq_nocase(n->children[0]->name, "nullify")) {
+            OfortNode *call = n->children[0];
+            for (int i = 0; i < call->n_stmts; i++) {
+                OfortVar *v;
+                if (call->stmts[i]->type != FND_IDENT)
+                    ofort_error(I, "NULLIFY requires pointer variable arguments");
+                v = find_var(I, call->stmts[i]->name);
+                if (!v || !v->is_pointer)
+                    ofort_error(I, "NULLIFY argument is not a pointer");
+                v->pointer_associated = 0;
+                v->pointer_target[0] = '\0';
+                v->pointer_has_slice = 0;
+                v->pointer_slice_start = 0;
+                v->pointer_slice_end = 0;
+            }
+            break;
+        }
         OfortValue v = eval_node(I, n->children[0]);
         if (I->print_expr_statements && v.type != FVAL_VOID) {
             char buf[1024];
