@@ -5046,6 +5046,23 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             break;
         }
+        if (strcmp(call_upper, "CPU_TIME") == 0) {
+            OfortVar *time_var;
+            OfortValType time_type;
+            double seconds;
+            if (n->n_stmts != 1 || n->stmts[0]->type != FND_IDENT)
+                ofort_error(I, "CPU_TIME requires a variable argument");
+            time_var = find_var(I, n->stmts[0]->name);
+            if (!time_var)
+                ofort_error(I, "Undefined variable '%s' in CPU_TIME", n->stmts[0]->name);
+            if (time_var->val.type != FVAL_REAL && time_var->val.type != FVAL_DOUBLE)
+                ofort_error(I, "CPU_TIME argument must be REAL");
+            time_type = time_var->val.type;
+            seconds = (double)clock() / (double)CLOCKS_PER_SEC;
+            free_value(&time_var->val);
+            time_var->val = time_type == FVAL_DOUBLE ? make_double(seconds) : make_real(seconds);
+            break;
+        }
         if (strcmp(call_upper, "RANDOM_NUMBER") == 0) {
             if (n->n_stmts != 1 || n->stmts[0]->type != FND_IDENT)
                 ofort_error(I, "RANDOM_NUMBER requires a variable argument");
