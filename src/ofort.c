@@ -5166,7 +5166,7 @@ static const char *intrinsic_names[] = {
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
     /* Array */
     "SIZE", "SHAPE", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC",
-    "DOT_PRODUCT", "MATMUL", "TRANSPOSE", "RESHAPE",
+    "DOT_PRODUCT", "MATMUL", "TRANSPOSE", "RESHAPE", "SPREAD",
     "COUNT", "ANY", "ALL", "ALLOCATED", "LBOUND", "UBOUND",
     /* Type conversion */
     "FLOAT", "DFLOAT", "SNGL", "LOGICAL",
@@ -5906,6 +5906,74 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                 result.v.arr.data[i] = copy_value(args[0].v.arr.data[i]);
             else
                 result.v.arr.data[i] = make_integer(0);
+        }
+        return result;
+    }
+    if (strcmp(upper, "SPREAD") == 0) {
+        int source_idx = intrinsic_arg_index(arg_names, nargs, "source");
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        int ncopies_idx = intrinsic_arg_index(arg_names, nargs, "ncopies");
+        OfortValue *source;
+        int source_rank;
+        int dim;
+        int ncopies;
+        int result_dims[7];
+        int result_rank;
+        OfortValType result_type;
+        OfortValue result;
+
+        if (source_idx < 0) source_idx = 0;
+        if (dim_idx < 0) dim_idx = 1;
+        if (ncopies_idx < 0) ncopies_idx = 2;
+        if (nargs <= source_idx || nargs <= dim_idx || nargs <= ncopies_idx)
+            ofort_error(I, "SPREAD requires SOURCE, DIM, and NCOPIES");
+
+        source = &args[source_idx];
+        source_rank = source->type == FVAL_ARRAY ? source->v.arr.n_dims : 0;
+        dim = (int)val_to_int(args[dim_idx]);
+        ncopies = (int)val_to_int(args[ncopies_idx]);
+        if (ncopies < 0) ncopies = 0;
+        if (dim < 1 || dim > source_rank + 1)
+            ofort_error(I, "SPREAD DIM is out of range");
+
+        result_rank = source_rank + 1;
+        for (int i = 0; i < result_rank; i++) {
+            if (i == dim - 1) {
+                result_dims[i] = ncopies;
+            } else if (source->type == FVAL_ARRAY) {
+                int si = i < dim - 1 ? i : i - 1;
+                result_dims[i] = source->v.arr.dims[si];
+            } else {
+                result_dims[i] = ncopies;
+            }
+        }
+        result_type = source->type == FVAL_ARRAY ? source->v.arr.elem_type : source->type;
+        result = make_array(result_type, result_dims, result_rank);
+
+        for (int out_idx = 0; out_idx < result.v.arr.len; out_idx++) {
+            OfortValue *src = source;
+            int src_idx = 0;
+            if (source->type == FVAL_ARRAY) {
+                int rem = out_idx;
+                int src_stride = 1;
+                int src_sub[7] = {0};
+                for (int d = 0; d < result_rank; d++) {
+                    int sub = result_dims[d] ? rem % result_dims[d] : 0;
+                    if (result_dims[d]) rem /= result_dims[d];
+                    if (d < dim - 1) {
+                        src_sub[d] = sub;
+                    } else if (d > dim - 1) {
+                        src_sub[d - 1] = sub;
+                    }
+                }
+                for (int d = 0; d < source_rank; d++) {
+                    src_idx += src_sub[d] * src_stride;
+                    src_stride *= source->v.arr.dims[d];
+                }
+                src = &source->v.arr.data[src_idx];
+            }
+            free_value(&result.v.arr.data[out_idx]);
+            result.v.arr.data[out_idx] = copy_value(*src);
         }
         return result;
     }
