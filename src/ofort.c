@@ -5165,7 +5165,7 @@ static const char *intrinsic_names[] = {
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
     /* Array */
-    "SIZE", "SHAPE", "PACK", "MERGE", "SUM", "PRODUCT", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC",
+    "SIZE", "SHAPE", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC",
     "DOT_PRODUCT", "MATMUL", "TRANSPOSE", "RESHAPE",
     "COUNT", "ANY", "ALL", "ALLOCATED", "LBOUND", "UBOUND",
     /* Type conversion */
@@ -5602,6 +5602,39 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                 free_value(&result.v.arr.data[i]);
                 result.v.arr.data[i] = copy_value(vector->v.arr.data[i]);
             }
+        }
+        return result;
+    }
+    if (strcmp(upper, "UNPACK") == 0) {
+        OfortValue *vector;
+        OfortValue *mask;
+        OfortValue *field;
+        OfortValType result_type;
+        OfortValue result;
+        int vin = 0;
+
+        if (nargs < 3) ofort_error(I, "UNPACK requires VECTOR, MASK, and FIELD");
+        if (args[0].type != FVAL_ARRAY) ofort_error(I, "UNPACK VECTOR must be an array");
+        if (args[1].type != FVAL_ARRAY) ofort_error(I, "UNPACK MASK must be an array");
+        vector = &args[0];
+        mask = &args[1];
+        field = &args[2];
+        if (field->type == FVAL_ARRAY && field->v.arr.len != mask->v.arr.len)
+            ofort_error(I, "UNPACK field size mismatch");
+
+        result_type = vector->v.arr.elem_type;
+        result = make_array(result_type, mask->v.arr.dims, mask->v.arr.n_dims);
+
+        for (int i = 0; i < mask->v.arr.len; i++) {
+            OfortValue *src;
+            if (val_to_logical(mask->v.arr.data[i])) {
+                if (vin >= vector->v.arr.len) ofort_error(I, "UNPACK VECTOR is too short");
+                src = &vector->v.arr.data[vin++];
+            } else {
+                src = field->type == FVAL_ARRAY ? &field->v.arr.data[i] : field;
+            }
+            free_value(&result.v.arr.data[i]);
+            result.v.arr.data[i] = copy_value(*src);
         }
         return result;
     }
