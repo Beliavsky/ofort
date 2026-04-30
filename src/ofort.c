@@ -1240,6 +1240,14 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         n->stmts = NULL;
         n->n_stmts = 0;
         int cap = 0;
+        if (peek(I)->type == FTOK_INTEGER || peek(I)->type == FTOK_REAL ||
+            peek(I)->type == FTOK_DOUBLE_PRECISION || peek(I)->type == FTOK_CHARACTER ||
+            peek(I)->type == FTOK_LOGICAL || peek(I)->type == FTOK_COMPLEX) {
+            while (!check(I, FTOK_DCOLON) && !check(I, FTOK_RBRACKET) && !check(I, FTOK_EOF)) {
+                advance(I);
+            }
+            if (check(I, FTOK_DCOLON)) advance(I);
+        }
         while (!check(I, FTOK_RBRACKET) && !check(I, FTOK_EOF)) {
             OfortNode *elem = parse_expr(I);
             if (n->n_stmts >= cap) {
@@ -5249,7 +5257,7 @@ static const char *intrinsic_names[] = {
     "SET_EXPONENT",
     "SELECTED_INT_KIND", "SELECTED_REAL_KIND",
     /* String */
-    "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
+    "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX", "SCAN",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
     /* Array */
     "SIZE", "SHAPE", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC",
@@ -5935,6 +5943,30 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (args[0].type == FVAL_CHARACTER && args[1].type == FVAL_CHARACTER) {
             const char *found = strstr(args[0].v.s, args[1].v.s);
             if (found) return make_integer((long long)(found - args[0].v.s + 1));
+        }
+        return make_integer(0);
+    }
+    if (strcmp(upper, "SCAN") == 0) {
+        int back_idx = intrinsic_arg_index(arg_names, nargs, "back");
+        int back = 0;
+        if (nargs < 2) ofort_error(I, "SCAN requires STRING and SET");
+        if (args[0].type != FVAL_CHARACTER || args[1].type != FVAL_CHARACTER)
+            ofort_error(I, "SCAN requires character arguments");
+        if (back_idx < 0 && nargs >= 3) back_idx = 2;
+        if (back_idx >= 0) back = val_to_logical(args[back_idx]);
+        if (args[0].v.s && args[1].v.s) {
+            size_t len = strlen(args[0].v.s);
+            if (back) {
+                for (size_t i = len; i > 0; i--) {
+                    if (strchr(args[1].v.s, args[0].v.s[i - 1]))
+                        return make_integer((long long)i);
+                }
+            } else {
+                for (size_t i = 0; i < len; i++) {
+                    if (strchr(args[1].v.s, args[0].v.s[i]))
+                        return make_integer((long long)i + 1);
+                }
+            }
         }
         return make_integer(0);
     }
