@@ -255,11 +255,11 @@ static OfortValue make_integer_kind(long long v, int kind) {
 }
 static OfortValue make_real(double v) {
     OfortValue r; memset(&r, 0, sizeof(r));
-    r.type = FVAL_REAL; r.v.r = v; return r;
+    r.type = FVAL_REAL; r.kind = 4; r.v.r = v; return r;
 }
 static OfortValue make_double(double v) {
     OfortValue r; memset(&r, 0, sizeof(r));
-    r.type = FVAL_DOUBLE; r.v.r = v; return r;
+    r.type = FVAL_DOUBLE; r.kind = 8; r.v.r = v; return r;
 }
 static OfortValue make_complex(double re, double im) {
     OfortValue r; memset(&r, 0, sizeof(r));
@@ -1168,6 +1168,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         n->num_val = t->num_val;
         n->kind = t->kind;
         n->val_type = FVAL_REAL;
+        if (t->kind == 8) n->val_type = FVAL_DOUBLE;
         for (int k = 0; k < t->length; k++) {
             if (t->start[k] == 'd' || t->start[k] == 'D') {
                 n->val_type = FVAL_DOUBLE;
@@ -5183,7 +5184,7 @@ static const char *intrinsic_names[] = {
     /* Math */
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
-    "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "BIT_SIZE", "HUGE",
+    "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "BIT_SIZE", "DIGITS", "HUGE",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
@@ -5445,6 +5446,20 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (kind == 2) return make_integer(16);
         if (kind == 8) return make_integer(64);
         return make_integer(32);
+    }
+    if (strcmp(upper, "DIGITS") == 0) {
+        int kind;
+        if (nargs < 1) ofort_error(I, "DIGITS requires 1 argument");
+        if (args[0].type == FVAL_INTEGER) {
+            kind = args[0].kind ? args[0].kind : 4;
+            if (kind == 1) return make_integer(7);
+            if (kind == 2) return make_integer(15);
+            if (kind == 8) return make_integer(63);
+            return make_integer(31);
+        }
+        if (args[0].type == FVAL_REAL) return make_integer(24);
+        if (args[0].type == FVAL_DOUBLE) return make_integer(53);
+        ofort_error(I, "DIGITS requires an integer or real argument");
     }
     if (strcmp(upper, "HUGE") == 0) {
         int kind;
