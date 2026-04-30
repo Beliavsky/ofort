@@ -4977,6 +4977,56 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             break;
         }
+        if (strcmp(call_upper, "MVBITS") == 0) {
+            OfortValue from_val, frompos_val, len_val, topos_val;
+            OfortVar *to_var;
+            int kind, bits;
+            long long frompos, len, topos;
+            unsigned long long source, dest, field, mask;
+            if (n->n_stmts < 5)
+                ofort_error(I, "MVBITS requires 5 arguments");
+            if (n->stmts[3]->type != FND_IDENT)
+                ofort_error(I, "MVBITS TO argument must be a variable");
+            to_var = find_var(I, n->stmts[3]->name);
+            if (!to_var)
+                ofort_error(I, "Undefined variable '%s' in MVBITS", n->stmts[3]->name);
+            if (to_var->val.type != FVAL_INTEGER)
+                ofort_error(I, "MVBITS TO argument must be integer");
+
+            from_val = eval_node(I, n->stmts[0]);
+            frompos_val = eval_node(I, n->stmts[1]);
+            len_val = eval_node(I, n->stmts[2]);
+            topos_val = eval_node(I, n->stmts[4]);
+            if (from_val.type != FVAL_INTEGER || frompos_val.type != FVAL_INTEGER ||
+                len_val.type != FVAL_INTEGER || topos_val.type != FVAL_INTEGER)
+                ofort_error(I, "MVBITS requires integer arguments");
+
+            kind = to_var->val.kind ? to_var->val.kind : 4;
+            bits = kind == 1 ? 8 : kind == 2 ? 16 : kind == 8 ? 64 : 32;
+            frompos = frompos_val.v.i;
+            len = len_val.v.i;
+            topos = topos_val.v.i;
+            if (frompos < 0 || len < 0 || topos < 0 ||
+                frompos > bits || topos > bits || len > bits ||
+                frompos + len > bits || topos + len > bits)
+                ofort_error(I, "MVBITS bit range out of range");
+
+            if (len > 0) {
+                source = (unsigned long long)from_val.v.i;
+                dest = (unsigned long long)to_var->val.v.i;
+                mask = len == 64 ? ~0ULL : ((1ULL << (unsigned int)len) - 1ULL);
+                field = (source >> (unsigned int)frompos) & mask;
+                dest &= ~(mask << (unsigned int)topos);
+                dest |= field << (unsigned int)topos;
+                free_value(&to_var->val);
+                to_var->val = make_integer_kind((long long)dest, kind);
+            }
+            free_value(&from_val);
+            free_value(&frompos_val);
+            free_value(&len_val);
+            free_value(&topos_val);
+            break;
+        }
 
         /* Evaluate arguments */
         int nargs = n->n_stmts;
@@ -5194,7 +5244,8 @@ static const char *intrinsic_names[] = {
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
-    "BIT_SIZE", "BTEST", "IAND", "IBCLR", "IBITS", "IBSET", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
+    "BIT_SIZE", "BTEST", "IAND", "IEOR", "IOR", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC",
+    "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
     "SET_EXPONENT",
     "SELECTED_INT_KIND", "SELECTED_REAL_KIND",
     /* String */
@@ -5481,6 +5532,22 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         kind = args[0].kind ? args[0].kind : 4;
         return make_integer_kind(args[0].v.i & args[1].v.i, kind);
     }
+    if (strcmp(upper, "IEOR") == 0) {
+        int kind;
+        if (nargs < 2) ofort_error(I, "IEOR requires 2 arguments");
+        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER)
+            ofort_error(I, "IEOR requires integer arguments");
+        kind = args[0].kind ? args[0].kind : 4;
+        return make_integer_kind(args[0].v.i ^ args[1].v.i, kind);
+    }
+    if (strcmp(upper, "IOR") == 0) {
+        int kind;
+        if (nargs < 2) ofort_error(I, "IOR requires 2 arguments");
+        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER)
+            ofort_error(I, "IOR requires integer arguments");
+        kind = args[0].kind ? args[0].kind : 4;
+        return make_integer_kind(args[0].v.i | args[1].v.i, kind);
+    }
     if (strcmp(upper, "IBCLR") == 0) {
         int kind, bits;
         long long pos;
@@ -5528,6 +5595,51 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         value = (unsigned long long)args[0].v.i;
         value |= 1ULL << (unsigned int)pos;
         return make_integer_kind((long long)value, kind);
+    }
+    if (strcmp(upper, "ISHFT") == 0) {
+        int kind, bits;
+        long long shift;
+        unsigned long long value;
+        if (nargs < 2) ofort_error(I, "ISHFT requires 2 arguments");
+        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER)
+            ofort_error(I, "ISHFT requires integer arguments");
+        kind = args[0].kind ? args[0].kind : 4;
+        bits = kind == 1 ? 8 : kind == 2 ? 16 : kind == 8 ? 64 : 32;
+        shift = args[1].v.i;
+        if (shift <= -bits || shift >= bits) return make_integer_kind(0, kind);
+        value = (unsigned long long)args[0].v.i;
+        if (shift > 0) value <<= (unsigned int)shift;
+        else if (shift < 0) value >>= (unsigned int)(-shift);
+        return make_integer_kind((long long)value, kind);
+    }
+    if (strcmp(upper, "ISHFTC") == 0) {
+        int kind, bits, size;
+        long long shift;
+        long long smod;
+        unsigned int rshift;
+        unsigned long long value, mask, field, rest, rotated;
+        if (nargs < 2) ofort_error(I, "ISHFTC requires at least 2 arguments");
+        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER)
+            ofort_error(I, "ISHFTC requires integer arguments");
+        kind = args[0].kind ? args[0].kind : 4;
+        bits = kind == 1 ? 8 : kind == 2 ? 16 : kind == 8 ? 64 : 32;
+        size = bits;
+        if (nargs >= 3) {
+            if (args[2].type != FVAL_INTEGER) ofort_error(I, "ISHFTC SIZE must be integer");
+            size = (int)args[2].v.i;
+        }
+        if (size <= 0 || size > bits) ofort_error(I, "ISHFTC size out of range");
+        shift = args[1].v.i;
+        smod = shift % size;
+        if (smod < 0) smod += size;
+        rshift = (unsigned int)smod;
+        mask = size == 64 ? ~0ULL : ((1ULL << (unsigned int)size) - 1ULL);
+        value = (unsigned long long)args[0].v.i;
+        field = value & mask;
+        rest = value & ~mask;
+        if (rshift == 0) rotated = field;
+        else rotated = ((field << rshift) | (field >> ((unsigned int)size - rshift))) & mask;
+        return make_integer_kind((long long)(rest | rotated), kind);
     }
     if (strcmp(upper, "DIGITS") == 0) {
         int kind;
