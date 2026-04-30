@@ -37,6 +37,7 @@ typedef struct OfortScope {
     OfortVar vars[OFORT_MAX_VARS];
     int n_vars;
     int implicit_none;
+    char implicit_types[26];
     struct OfortScope *parent;
 } OfortScope;
 
@@ -354,6 +355,10 @@ static OfortNode *alloc_node(OfortInterpreter *I, OfortNodeType type) {
 static OfortScope *push_scope(OfortInterpreter *I) {
     OfortScope *s = (OfortScope *)calloc(1, sizeof(OfortScope));
     s->parent = I->current_scope;
+    if (s->parent) {
+        s->implicit_none = s->parent->implicit_none;
+        memcpy(s->implicit_types, s->parent->implicit_types, sizeof(s->implicit_types));
+    }
     I->current_scope = s;
     return s;
 }
@@ -386,6 +391,29 @@ static OfortVar *find_var(OfortInterpreter *I, const char *name) {
 
 static int current_scope_has_implicit_none(OfortInterpreter *I) {
     return I->current_scope && I->current_scope->implicit_none;
+}
+
+static OfortValType implicit_type_for_name(OfortInterpreter *I, const char *name, int *has_type) {
+    char c = name && name[0] ? (char)toupper((unsigned char)name[0]) : '\0';
+    int idx = (c >= 'A' && c <= 'Z') ? c - 'A' : -1;
+    OfortScope *s = I->current_scope;
+    if (has_type) *has_type = 0;
+    while (s && idx >= 0) {
+        char code = s->implicit_types[idx];
+        if (code) {
+            if (has_type) *has_type = 1;
+            switch (code) {
+                case 'I': return FVAL_INTEGER;
+                case 'R': return FVAL_REAL;
+                case 'D': return FVAL_DOUBLE;
+                case 'L': return FVAL_LOGICAL;
+                case 'C': return FVAL_CHARACTER;
+                default: break;
+            }
+        }
+        s = s->parent;
+    }
+    return FVAL_VOID;
 }
 
 static const char *value_type_name(OfortValType type) {
@@ -483,6 +511,12 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     if (current_scope_has_implicit_none(I)) {
         free_value(&val);
         ofort_error(I, "Variable '%s' has no implicit type", name);
+    }
+    int has_implicit_type = 0;
+    OfortValType implicit_type = implicit_type_for_name(I, name, &has_implicit_type);
+    if (has_implicit_type) {
+        val = coerce_assignment_value(I, name, implicit_type, val);
+        val = resize_character_value(val, implicit_type == FVAL_CHARACTER ? OFORT_MAX_STRLEN - 1 : 0);
     }
     if (s->n_vars >= OFORT_MAX_VARS) ofort_error(I, "Too many variables");
     OfortVar *v = &s->vars[s->n_vars++];
@@ -1890,6 +1924,94 @@ static OfortNode *parse_select_case(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_io_item(OfortInterpreter *I);
+
+static int paren_item_has_top_level_comma(OfortInterpreter *I) {
+    int depth = 0;
+    for (int pos = I->tok_pos; pos < I->n_tokens; pos++) {
+        OfortTokenType type = I->tokens[pos].type;
+        if (type == FTOK_LPAREN) {
+            depth++;
+        } else if (type == FTOK_RPAREN) {
+            depth--;
+            if (depth == 0) return 0;
+        } else if (type == FTOK_COMMA && depth == 1) {
+            return 1;
+        } else if (type == FTOK_NEWLINE || type == FTOK_EOF) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static OfortNode *parse_implied_do(OfortInterpreter *I) {
+    OfortToken *lt = expect(I, FTOK_LPAREN);
+    OfortNode *n = alloc_node(I, FND_IMPLIED_DO);
+    int cap = 0;
+    n->line = lt->line;
+    n->stmts = NULL;
+    n->n_stmts = 0;
+
+    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+        OfortNode *item = parse_io_item(I);
+        if (n->n_stmts >= cap) {
+            cap = cap ? cap * 2 : 4;
+            n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
+        }
+        n->stmts[n->n_stmts++] = item;
+
+        expect(I, FTOK_COMMA);
+        if ((check(I, FTOK_IDENT) || check(I, FTOK_IN) || check(I, FTOK_OUT)) &&
+            peek_ahead(I, 1)->type == FTOK_ASSIGN) {
+            OfortToken *var = advance(I);
+            if (var->type == FTOK_IN) strncpy(n->name, "in", 255);
+            else if (var->type == FTOK_OUT) strncpy(n->name, "out", 255);
+            else strncpy(n->name, var->str_val, 255);
+            advance(I); /* = */
+            n->children[0] = parse_expr(I);
+            expect(I, FTOK_COMMA);
+            n->children[1] = parse_expr(I);
+            if (check(I, FTOK_COMMA)) {
+                advance(I);
+                n->children[2] = parse_expr(I);
+            } else {
+                OfortNode *one = alloc_node(I, FND_INT_LIT);
+                one->int_val = 1;
+                one->line = n->line;
+                n->children[2] = one;
+            }
+            n->n_children = 3;
+            expect(I, FTOK_RPAREN);
+            return n;
+        }
+    }
+
+    ofort_error(I, "Expected implied DO control");
+    return n;
+}
+
+static OfortNode *parse_io_item(OfortInterpreter *I) {
+    if (check(I, FTOK_LPAREN) && paren_item_has_top_level_comma(I)) {
+        return parse_implied_do(I);
+    }
+    if (check(I, FTOK_LPAREN)) {
+        OfortToken *t = advance(I);
+        OfortNode *inner = parse_expr(I);
+        expect(I, FTOK_RPAREN);
+        if (check(I, FTOK_POWER)) {
+            advance(I);
+            OfortNode *n = alloc_node(I, FND_POWER);
+            n->children[0] = inner;
+            n->children[1] = parse_power(I);
+            n->n_children = 2;
+            n->line = t->line;
+            return n;
+        }
+        return inner;
+    }
+    return parse_expr(I);
+}
+
 static OfortNode *parse_print(OfortInterpreter *I) {
     OfortToken *pt = advance(I); /* PRINT */
     OfortNode *n = alloc_node(I, FND_PRINT);
@@ -1914,7 +2036,7 @@ static OfortNode *parse_print(OfortInterpreter *I) {
 
     /* parse output items */
     while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
-        OfortNode *item = parse_expr(I);
+        OfortNode *item = parse_io_item(I);
         if (n->n_stmts >= cap) {
             cap = cap ? cap * 2 : 8;
             n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
@@ -2004,7 +2126,7 @@ static OfortNode *parse_write(OfortInterpreter *I) {
 
     /* output items */
     while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
-        OfortNode *item = parse_expr(I);
+        OfortNode *item = parse_io_item(I);
         if (n->n_stmts >= cap) {
             cap = cap ? cap * 2 : 8;
             n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
@@ -2298,24 +2420,47 @@ static OfortNode *parse_type_def(OfortInterpreter *I) {
 static OfortNode *parse_allocate(OfortInterpreter *I) {
     OfortToken *at = advance(I); /* ALLOCATE */
     OfortNode *n = alloc_node(I, FND_ALLOCATE);
+    OfortNode *source_expr = NULL;
+    OfortNode *mold_expr = NULL;
     n->line = at->line;
     expect(I, FTOK_LPAREN);
     /* parse: array_name(dim1, dim2, ...) */
     OfortToken *name = expect(I, FTOK_IDENT);
     strncpy(n->name, name->str_val, 255);
-    expect(I, FTOK_LPAREN);
     n->stmts = NULL; n->n_stmts = 0;
     int cap = 0;
-    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
-        OfortNode *dim = parse_expr(I);
-        if (n->n_stmts >= cap) {
-            cap = cap ? cap * 2 : 4;
-            n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
+    if (check(I, FTOK_LPAREN)) {
+        advance(I);
+        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            OfortNode *dim = parse_expr(I);
+            if (n->n_stmts >= cap) {
+                cap = cap ? cap * 2 : 4;
+                n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
+            }
+            n->stmts[n->n_stmts++] = dim;
+            if (check(I, FTOK_COMMA)) advance(I);
         }
-        n->stmts[n->n_stmts++] = dim;
-        if (check(I, FTOK_COMMA)) advance(I);
+        expect(I, FTOK_RPAREN);
     }
-    expect(I, FTOK_RPAREN);
+    while (check(I, FTOK_COMMA)) {
+        advance(I);
+        if (check_keyword_arg(I)) {
+            const char *arg_name = token_arg_name(advance(I));
+            advance(I); /* = */
+            if (str_eq_nocase(arg_name, "source")) {
+                source_expr = parse_expr(I);
+            } else if (str_eq_nocase(arg_name, "mold")) {
+                mold_expr = parse_expr(I);
+            } else {
+                parse_expr(I);
+            }
+        } else {
+            parse_expr(I);
+        }
+    }
+    n->children[0] = source_expr;
+    n->children[1] = mold_expr;
+    n->n_children = (source_expr || mold_expr) ? 2 : 0;
     expect(I, FTOK_RPAREN);
     return n;
 }
@@ -2328,6 +2473,96 @@ static OfortNode *parse_deallocate(OfortInterpreter *I) {
     OfortToken *name = expect(I, FTOK_IDENT);
     strncpy(n->name, name->str_val, 255);
     expect(I, FTOK_RPAREN);
+    return n;
+}
+
+static char implicit_type_code(OfortValType type) {
+    switch (type) {
+        case FVAL_INTEGER: return 'I';
+        case FVAL_REAL: return 'R';
+        case FVAL_DOUBLE: return 'D';
+        case FVAL_LOGICAL: return 'L';
+        case FVAL_CHARACTER: return 'C';
+        default: return 0;
+    }
+}
+
+static int token_letter_index(OfortToken *t) {
+    char c = '\0';
+    if (t->type == FTOK_IDENT && t->str_val[0]) {
+        c = t->str_val[0];
+    } else if (t->start && t->length > 0) {
+        c = t->start[0];
+    }
+    c = (char)toupper((unsigned char)c);
+    if (c < 'A' || c > 'Z') return -1;
+    return c - 'A';
+}
+
+static void skip_balanced_parens(OfortInterpreter *I) {
+    if (!check(I, FTOK_LPAREN)) return;
+    advance(I);
+    int depth = 1;
+    while (depth > 0 && !check(I, FTOK_EOF)) {
+        if (check(I, FTOK_LPAREN)) depth++;
+        else if (check(I, FTOK_RPAREN)) depth--;
+        advance(I);
+    }
+}
+
+static OfortNode *parse_implicit_stmt(OfortInterpreter *I) {
+    OfortToken *t = advance(I); /* IMPLICIT */
+    OfortNode *n = alloc_node(I, FND_IMPLICIT_NONE);
+    n->line = t->line;
+
+    if (check(I, FTOK_NONE)) {
+        advance(I);
+        n->bool_val = 1;
+        return n;
+    }
+
+    while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        OfortValType vtype;
+        if (!is_type_keyword(peek(I)->type))
+            ofort_error(I, "Expected type in IMPLICIT statement");
+        vtype = token_to_valtype(advance(I)->type);
+
+        if (check(I, FTOK_LPAREN) && vtype == FVAL_CHARACTER) {
+            skip_balanced_parens(I);
+        } else if (check(I, FTOK_LPAREN) &&
+                   (vtype == FVAL_INTEGER || vtype == FVAL_REAL || vtype == FVAL_DOUBLE)) {
+            OfortToken *after_lparen = peek_ahead(I, 1);
+            if (!(after_lparen->type == FTOK_IDENT || after_lparen->type == FTOK_IN || after_lparen->type == FTOK_OUT)) {
+                skip_balanced_parens(I);
+            }
+        }
+
+        expect(I, FTOK_LPAREN);
+        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            OfortToken *lo_tok = advance(I);
+            int lo = token_letter_index(lo_tok);
+            int hi = lo;
+            if (lo < 0) ofort_error(I, "Expected letter in IMPLICIT range");
+            if (check(I, FTOK_MINUS)) {
+                advance(I);
+                OfortToken *hi_tok = advance(I);
+                hi = token_letter_index(hi_tok);
+                if (hi < 0) ofort_error(I, "Expected letter in IMPLICIT range");
+            }
+            if (lo > hi) {
+                int tmp = lo;
+                lo = hi;
+                hi = tmp;
+            }
+            for (int i = lo; i <= hi; i++) n->implicit_types[i] = implicit_type_code(vtype);
+            if (check(I, FTOK_COMMA)) advance(I);
+            else break;
+        }
+        expect(I, FTOK_RPAREN);
+        if (check(I, FTOK_COMMA)) advance(I);
+        else break;
+    }
+
     return n;
 }
 
@@ -2347,11 +2582,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
 
     /* IMPLICIT NONE */
     if (t->type == FTOK_IMPLICIT) {
-        advance(I);
-        if (check(I, FTOK_NONE)) advance(I);
-        OfortNode *n = alloc_node(I, FND_IMPLICIT_NONE);
-        n->line = t->line;
-        return n;
+        return parse_implicit_stmt(I);
     }
 
     /* USE module_name */
@@ -3377,6 +3608,35 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
 
 /* Format output using Fortran format descriptors */
 static void format_output(OfortInterpreter *I, const char *fmt, OfortValue *vals, int nvals) {
+    int flattened_count = 0;
+    int needs_flatten = 0;
+    for (int i = 0; i < nvals; i++) {
+        if (vals[i].type == FVAL_ARRAY) {
+            needs_flatten = 1;
+            flattened_count += vals[i].v.arr.len;
+        } else {
+            flattened_count++;
+        }
+    }
+    if (needs_flatten) {
+        OfortValue *flat = (OfortValue *)calloc(flattened_count ? flattened_count : 1, sizeof(OfortValue));
+        int k = 0;
+        if (!flat) ofort_error(I, "Out of memory flattening output list");
+        for (int i = 0; i < nvals; i++) {
+            if (vals[i].type == FVAL_ARRAY) {
+                for (int j = 0; j < vals[i].v.arr.len; j++) {
+                    flat[k++] = copy_value(vals[i].v.arr.data[j]);
+                }
+            } else {
+                flat[k++] = copy_value(vals[i]);
+            }
+        }
+        format_output(I, fmt, flat, flattened_count);
+        for (int i = 0; i < flattened_count; i++) free_value(&flat[i]);
+        free(flat);
+        return;
+    }
+
     if (!fmt || !fmt[0]) {
         /* list-directed output */
         int i;
@@ -3412,6 +3672,54 @@ static void format_output(OfortInterpreter *I, const char *fmt, OfortValue *vals
         if (vidx < nvals) out_append(I, "\n");
     } while (vidx < nvals);
     out_append(I, "\n");
+}
+
+static void append_io_value(OfortInterpreter *I, OfortValue **vals, int *nvals, int *cap,
+                            OfortValue val) {
+    (void)I;
+    if (*nvals >= *cap) {
+        *cap = *cap ? *cap * 2 : 8;
+        *vals = (OfortValue *)realloc(*vals, sizeof(OfortValue) * (size_t)*cap);
+        if (!*vals) ofort_error(I, "Out of memory expanding I/O list");
+    }
+    (*vals)[(*nvals)++] = val;
+}
+
+static void collect_io_values(OfortInterpreter *I, OfortNode *node,
+                              OfortValue **vals, int *nvals, int *cap) {
+    if (node->type == FND_IMPLIED_DO) {
+        OfortValue start_v = eval_node(I, node->children[0]);
+        OfortValue end_v = eval_node(I, node->children[1]);
+        OfortValue step_v = eval_node(I, node->children[2]);
+        long long start = val_to_int(start_v);
+        long long end = val_to_int(end_v);
+        long long step = val_to_int(step_v);
+        free_value(&start_v);
+        free_value(&end_v);
+        free_value(&step_v);
+        if (step == 0) ofort_error(I, "Implied DO step cannot be zero");
+        for (long long iter = start; step > 0 ? iter <= end : iter >= end; iter += step) {
+            set_var(I, node->name, make_integer(iter));
+            for (int i = 0; i < node->n_stmts; i++) {
+                collect_io_values(I, node->stmts[i], vals, nvals, cap);
+            }
+        }
+        return;
+    }
+
+    append_io_value(I, vals, nvals, cap, eval_node(I, node));
+}
+
+static OfortValue *eval_io_list(OfortInterpreter *I, OfortNode *n, int *nvals_out) {
+    OfortValue *vals = NULL;
+    int nvals = 0;
+    int cap = 0;
+    for (int i = 0; i < n->n_stmts; i++) {
+        collect_io_values(I, n->stmts[i], &vals, &nvals, &cap);
+    }
+    if (!vals) vals = (OfortValue *)calloc(1, sizeof(OfortValue));
+    *nvals_out = nvals;
+    return vals;
 }
 
 /* Arithmetic promotion */
@@ -3950,7 +4258,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_IMPLICIT_NONE:
-        if (I->current_scope) I->current_scope->implicit_none = 1;
+        if (I->current_scope) {
+            if (n->bool_val) {
+                I->current_scope->implicit_none = 1;
+                memset(I->current_scope->implicit_types, 0, sizeof(I->current_scope->implicit_types));
+            } else {
+                I->current_scope->implicit_none = 0;
+                for (int i = 0; i < 26; i++) {
+                    if (n->implicit_types[i]) I->current_scope->implicit_types[i] = n->implicit_types[i];
+                }
+            }
+        }
         break;
 
     case FND_VARDECL:
@@ -4019,7 +4337,30 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             /* Simple variable assignment */
             OfortVar *v = find_var(I, lhs->name);
             if (v && v->is_parameter) ofort_error(I, "Cannot assign to PARAMETER '%s'", lhs->name);
-            set_var(I, lhs->name, rhs);
+            if (v && v->val.type == FVAL_ARRAY) {
+                if (rhs.type == FVAL_ARRAY) {
+                    if (!v->val.v.arr.allocated || v->val.v.arr.len == 0) {
+                        int dims[7];
+                        for (int i = 0; i < rhs.v.arr.n_dims; i++) dims[i] = rhs.v.arr.dims[i];
+                        free_value(&v->val);
+                        v->val = make_array(rhs.v.arr.elem_type, dims, rhs.v.arr.n_dims);
+                    }
+                    if (rhs.v.arr.len != v->val.v.arr.len)
+                        ofort_error(I, "Array assignment shape mismatch");
+                    for (int i = 0; i < v->val.v.arr.len; i++) {
+                        free_value(&v->val.v.arr.data[i]);
+                        v->val.v.arr.data[i] = copy_value(rhs.v.arr.data[i]);
+                    }
+                } else {
+                    for (int i = 0; i < v->val.v.arr.len; i++) {
+                        free_value(&v->val.v.arr.data[i]);
+                        v->val.v.arr.data[i] = copy_value(rhs);
+                    }
+                }
+                free_value(&rhs);
+            } else {
+                set_var(I, lhs->name, rhs);
+            }
         } else if (lhs->type == FND_FUNC_CALL) {
             /* Array element assignment: arr(i) = val */
             OfortVar *var = find_var(I, lhs->name);
@@ -4094,6 +4435,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (I->cycling) { I->cycling = 0; }
             iter += st;
         }
+        if (!I->returning && !I->stopping) {
+            set_var(I, n->name, make_integer(iter));
+        }
         break;
     }
 
@@ -4166,9 +4510,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_PRINT: {
-        int nvals = n->n_stmts;
-        OfortValue *vals = (OfortValue *)calloc(nvals ? nvals : 1, sizeof(OfortValue));
-        for (int i = 0; i < nvals; i++) vals[i] = eval_node(I, n->stmts[i]);
+        int nvals = 0;
+        OfortValue *vals = eval_io_list(I, n, &nvals);
         format_output(I, n->format_str, vals, nvals);
         for (int i = 0; i < nvals; i++) free_value(&vals[i]);
         free(vals);
@@ -4176,9 +4519,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_WRITE: {
-        int nvals = n->n_stmts;
-        OfortValue *vals = (OfortValue *)calloc(nvals ? nvals : 1, sizeof(OfortValue));
-        for (int i = 0; i < nvals; i++) vals[i] = eval_node(I, n->stmts[i]);
+        int nvals = 0;
+        OfortValue *vals = eval_io_list(I, n, &nvals);
         if (n->children[0]) {
             OfortValue uv = eval_node(I, n->children[0]);
             int unit = (int)val_to_int(uv);
@@ -4404,13 +4746,55 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* Get dimensions */
         int dims[7];
         int ndims = n->n_stmts;
-        for (int i = 0; i < ndims; i++) {
-            OfortValue dv = eval_node(I, n->stmts[i]);
-            dims[i] = (int)val_to_int(dv);
-            free_value(&dv);
+        OfortValType elem_type = var->val.v.arr.elem_type ? var->val.v.arr.elem_type : FVAL_REAL;
+
+        if (ndims > 0) {
+            for (int i = 0; i < ndims; i++) {
+                OfortValue dv = eval_node(I, n->stmts[i]);
+                dims[i] = (int)val_to_int(dv);
+                free_value(&dv);
+            }
+        } else if (n->children[1]) {
+            OfortValue mold = eval_node(I, n->children[1]);
+            if (mold.type != FVAL_ARRAY)
+                ofort_error(I, "ALLOCATE MOLD must be an array");
+            ndims = mold.v.arr.n_dims;
+            elem_type = mold.v.arr.elem_type;
+            for (int i = 0; i < ndims; i++) dims[i] = mold.v.arr.dims[i];
+            free_value(&mold);
+        } else if (n->children[0]) {
+            OfortValue source = eval_node(I, n->children[0]);
+            if (source.type == FVAL_ARRAY) {
+                ndims = source.v.arr.n_dims;
+                elem_type = source.v.arr.elem_type;
+                for (int i = 0; i < ndims; i++) dims[i] = source.v.arr.dims[i];
+            } else {
+                ndims = 1;
+                dims[0] = 1;
+                elem_type = source.type;
+            }
+            free_value(&source);
+        } else {
+            ofort_error(I, "ALLOCATE requires dimensions, SOURCE, or MOLD");
         }
         free_value(&var->val);
-        var->val = make_array(var->val.v.arr.elem_type ? var->val.v.arr.elem_type : FVAL_REAL, dims, ndims);
+        var->val = make_array(elem_type, dims, ndims);
+        if (n->children[0]) {
+            OfortValue source = eval_node(I, n->children[0]);
+            if (source.type == FVAL_ARRAY) {
+                int count = source.v.arr.len < var->val.v.arr.len ? source.v.arr.len : var->val.v.arr.len;
+                for (int i = 0; i < count; i++) {
+                    free_value(&var->val.v.arr.data[i]);
+                    var->val.v.arr.data[i] = copy_value(source.v.arr.data[i]);
+                }
+            } else {
+                for (int i = 0; i < var->val.v.arr.len; i++) {
+                    free_value(&var->val.v.arr.data[i]);
+                    var->val.v.arr.data[i] = copy_value(source);
+                }
+            }
+            free_value(&source);
+        }
         break;
     }
 
