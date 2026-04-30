@@ -5184,7 +5184,7 @@ static const char *intrinsic_names[] = {
     /* Math */
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
-    "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "BIT_SIZE", "DIGITS", "HUGE",
+    "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "BIT_SIZE", "DIGITS", "EPSILON", "HUGE",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
@@ -5461,6 +5461,12 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (args[0].type == FVAL_DOUBLE) return make_integer(53);
         ofort_error(I, "DIGITS requires an integer or real argument");
     }
+    if (strcmp(upper, "EPSILON") == 0) {
+        if (nargs < 1) ofort_error(I, "EPSILON requires 1 argument");
+        if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(DBL_EPSILON);
+        if (args[0].type == FVAL_REAL) return make_real(FLT_EPSILON);
+        ofort_error(I, "EPSILON requires a real argument");
+    }
     if (strcmp(upper, "HUGE") == 0) {
         int kind;
         if (nargs < 1) ofort_error(I, "HUGE requires 1 argument");
@@ -5471,7 +5477,8 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             if (kind == 8) return make_integer_kind(LLONG_MAX, 8);
             return make_integer_kind(2147483647LL, 4);
         }
-        return make_real(DBL_MAX);
+        if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(DBL_MAX);
+        return make_real(FLT_MAX);
     }
     if (strcmp(upper, "COMMAND_ARGUMENT_COUNT") == 0) {
         return make_integer(I->command_argc);
