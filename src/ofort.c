@@ -111,6 +111,8 @@ struct OfortInterpreter {
     int current_line;
     int print_expr_statements;
     int suppress_output;
+    int command_argc;
+    char command_args[OFORT_MAX_PARAMS][OFORT_MAX_STRLEN];
     /* node pool for memory management */
     OfortNode **node_pool;
     int node_pool_len;
@@ -371,6 +373,19 @@ static OfortScope *push_scope(OfortInterpreter *I) {
     }
     I->current_scope = s;
     return s;
+}
+
+static void set_scope_explicit_typing(OfortScope *s) {
+    if (!s) return;
+    s->implicit_none = 1;
+    memset(s->implicit_types, 0, sizeof(s->implicit_types));
+}
+
+static void set_scope_legacy_implicit_typing(OfortScope *s) {
+    if (!s) return;
+    s->implicit_none = 0;
+    for (int i = 0; i < 26; i++) s->implicit_types[i] = 'R';
+    for (int i = 'I' - 'A'; i <= 'N' - 'A'; i++) s->implicit_types[i] = 'I';
 }
 
 static void pop_scope(OfortInterpreter *I) {
@@ -4699,6 +4714,74 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             break;
         }
+        if (strcmp(call_upper, "GET_COMMAND_ARGUMENT") == 0) {
+            int number = 0;
+            const char *arg = "";
+            int arg_len = 0;
+            int status = 0;
+            int value_idx = -1;
+            int length_idx = -1;
+            int status_idx = -1;
+
+            if (n->n_stmts < 1)
+                ofort_error(I, "GET_COMMAND_ARGUMENT requires NUMBER");
+
+            for (int i = 0; i < n->n_stmts; i++) {
+                if (str_eq_nocase(n->param_names[i], "value")) {
+                    value_idx = i;
+                } else if (str_eq_nocase(n->param_names[i], "length")) {
+                    length_idx = i;
+                } else if (str_eq_nocase(n->param_names[i], "status")) {
+                    status_idx = i;
+                } else if (i == 1 && n->param_names[i][0] == '\0') {
+                    value_idx = i;
+                } else if (i == 2 && n->param_names[i][0] == '\0') {
+                    length_idx = i;
+                } else if (i == 3 && n->param_names[i][0] == '\0') {
+                    status_idx = i;
+                }
+            }
+
+            {
+                OfortValue number_val = eval_node(I, n->stmts[0]);
+                number = (int)val_to_int(number_val);
+                free_value(&number_val);
+            }
+
+            if (number == 0) {
+                arg = "ofort";
+            } else if (number > 0 && number <= I->command_argc) {
+                arg = I->command_args[number - 1];
+            } else {
+                status = 1;
+            }
+            arg_len = status == 0 ? (int)strlen(arg) : 0;
+
+            if (value_idx >= 0) {
+                if (n->stmts[value_idx]->type != FND_IDENT)
+                    ofort_error(I, "GET_COMMAND_ARGUMENT VALUE must be a variable");
+                OfortVar *value_var = find_var(I, n->stmts[value_idx]->name);
+                if (!value_var)
+                    ofort_error(I, "Undefined variable '%s' in GET_COMMAND_ARGUMENT", n->stmts[value_idx]->name);
+                if (value_var->val.type != FVAL_CHARACTER)
+                    ofort_error(I, "GET_COMMAND_ARGUMENT VALUE must be CHARACTER");
+                if (status == 0 && value_var->char_len > 0 && arg_len > value_var->char_len) {
+                    status = -1;
+                }
+                set_var(I, n->stmts[value_idx]->name, make_character(status > 0 ? "" : arg));
+            }
+            if (length_idx >= 0) {
+                if (n->stmts[length_idx]->type != FND_IDENT)
+                    ofort_error(I, "GET_COMMAND_ARGUMENT LENGTH must be a variable");
+                set_var(I, n->stmts[length_idx]->name, make_integer(arg_len));
+            }
+            if (status_idx >= 0) {
+                if (n->stmts[status_idx]->type != FND_IDENT)
+                    ofort_error(I, "GET_COMMAND_ARGUMENT STATUS must be a variable");
+                set_var(I, n->stmts[status_idx]->name, make_integer(status));
+            }
+            break;
+        }
 
         /* Evaluate arguments */
         int nargs = n->n_stmts;
@@ -4914,6 +4997,8 @@ static const char *intrinsic_names[] = {
     "COUNT", "ANY", "ALL", "ALLOCATED", "LBOUND", "UBOUND",
     /* Type conversion */
     "FLOAT", "DFLOAT", "SNGL", "LOGICAL",
+    /* Command line */
+    "COMMAND_ARGUMENT_COUNT",
     NULL
 };
 
@@ -5124,6 +5209,9 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             case FVAL_LOGICAL: return make_integer(4);
             default: return make_integer(0);
         }
+    }
+    if (strcmp(upper, "COMMAND_ARGUMENT_COUNT") == 0) {
+        return make_integer(I->command_argc);
     }
 
     /* === Type conversion === */
@@ -5461,6 +5549,11 @@ OfortInterpreter *ofort_create(void) {
     OfortInterpreter *I = (OfortInterpreter *)calloc(1, sizeof(OfortInterpreter));
     if (!I) return NULL;
     I->global_scope = (OfortScope *)calloc(1, sizeof(OfortScope));
+    if (!I->global_scope) {
+        free(I);
+        return NULL;
+    }
+    set_scope_explicit_typing(I->global_scope);
     I->current_scope = I->global_scope;
     I->node_pool = NULL;
     I->node_pool_len = 0;
@@ -5573,6 +5666,581 @@ void ofort_set_suppress_output(OfortInterpreter *interp, int enabled) {
     if (interp) {
         interp->suppress_output = enabled ? 1 : 0;
     }
+}
+
+void ofort_set_implicit_typing(OfortInterpreter *interp, int enabled) {
+    if (!interp || !interp->global_scope) return;
+    if (enabled) {
+        set_scope_legacy_implicit_typing(interp->global_scope);
+    } else {
+        set_scope_explicit_typing(interp->global_scope);
+    }
+}
+
+void ofort_set_command_args(OfortInterpreter *interp, int argc, const char *const *argv) {
+    if (!interp) return;
+    if (argc < 0) argc = 0;
+    if (argc > OFORT_MAX_PARAMS) argc = OFORT_MAX_PARAMS;
+    interp->command_argc = argc;
+    for (int i = 0; i < argc; i++) {
+        copy_cstr(interp->command_args[i], sizeof(interp->command_args[i]), argv ? argv[i] : "");
+    }
+    for (int i = argc; i < OFORT_MAX_PARAMS; i++) {
+        interp->command_args[i][0] = '\0';
+    }
+}
+
+int ofort_dump_variables(OfortInterpreter *interp, const char *const *names,
+                         int n_names, char *buf, size_t buf_size) {
+    size_t used = 0;
+    int count = 0;
+
+    if (!interp || !buf || buf_size == 0) return -1;
+    buf[0] = '\0';
+
+    if (names && n_names > 0) {
+        for (int i = 0; i < n_names; i++) {
+            char value_buf[OFORT_MAX_STRLEN];
+            int written;
+            OfortVar *var;
+
+            if (!names[i] || names[i][0] == '\0') continue;
+            var = find_var(interp, names[i]);
+            if (var) {
+                value_to_string(interp, var->val, value_buf, sizeof(value_buf));
+                written = snprintf(buf + used, buf_size - used, "%s = %s\n", var->name, value_buf);
+            } else {
+                written = snprintf(buf + used, buf_size - used, "%s: undefined\n", names[i]);
+            }
+            if (written < 0) return -1;
+            if ((size_t)written >= buf_size - used) {
+                buf[buf_size - 1] = '\0';
+                return count;
+            }
+            used += (size_t)written;
+            count++;
+        }
+        return count;
+    }
+
+    for (OfortScope *scope = interp->current_scope; scope; scope = scope->parent) {
+        for (int i = 0; i < scope->n_vars; i++) {
+            char value_buf[OFORT_MAX_STRLEN];
+            int duplicate = 0;
+            int written;
+
+            for (OfortScope *inner = interp->current_scope; inner && inner != scope; inner = inner->parent) {
+                for (int j = 0; j < inner->n_vars; j++) {
+                    if (str_eq_nocase(inner->vars[j].name, scope->vars[i].name)) {
+                        duplicate = 1;
+                        break;
+                    }
+                }
+                if (duplicate) break;
+            }
+            if (duplicate) continue;
+
+            value_to_string(interp, scope->vars[i].val, value_buf, sizeof(value_buf));
+            written = snprintf(buf + used, buf_size - used, "%s = %s\n", scope->vars[i].name, value_buf);
+            if (written < 0) return -1;
+            if ((size_t)written >= buf_size - used) {
+                buf[buf_size - 1] = '\0';
+                return count;
+            }
+            used += (size_t)written;
+            count++;
+        }
+    }
+
+    if (count == 0) {
+        snprintf(buf, buf_size, "(no variables)\n");
+    }
+    return count;
+}
+
+static const char *value_type_name_lower(OfortValType type) {
+    switch (type) {
+        case FVAL_INTEGER: return "integer";
+        case FVAL_REAL: return "real";
+        case FVAL_DOUBLE: return "double precision";
+        case FVAL_COMPLEX: return "complex";
+        case FVAL_CHARACTER: return "character";
+        case FVAL_LOGICAL: return "logical";
+        default: return "unknown";
+    }
+}
+
+static OfortValType variable_display_type(const OfortVar *var) {
+    if (!var) return FVAL_VOID;
+    if (var->val.type == FVAL_ARRAY) return var->val.v.arr.elem_type;
+    return var->val.type;
+}
+
+static void variable_shape_string(const OfortVar *var, char *buf, size_t buf_size) {
+    size_t used = 0;
+
+    if (!buf || buf_size == 0) return;
+    buf[0] = '\0';
+    if (!var || var->val.type != FVAL_ARRAY) return;
+
+    used += (size_t)snprintf(buf + used, buf_size - used, "(");
+    if (var->val.v.arr.n_dims > 0) {
+        for (int i = 0; i < var->val.v.arr.n_dims; i++) {
+            int written = snprintf(buf + used, buf_size - used, "%s%d", i > 0 ? "," : "", var->val.v.arr.dims[i]);
+            if (written < 0 || (size_t)written >= buf_size - used) {
+                buf[buf_size - 1] = '\0';
+                return;
+            }
+            used += (size_t)written;
+        }
+    } else {
+        snprintf(buf + used, buf_size - used, "%d", var->val.v.arr.len);
+        used = strlen(buf);
+    }
+    snprintf(buf + used, buf_size - used, ")");
+}
+
+static void variable_shape_extents_string(const OfortVar *var, char *buf, size_t buf_size) {
+    size_t used = 0;
+
+    if (!buf || buf_size == 0) return;
+    buf[0] = '\0';
+    if (!var || var->val.type != FVAL_ARRAY) return;
+
+    if (var->val.v.arr.n_dims > 0) {
+        for (int i = 0; i < var->val.v.arr.n_dims; i++) {
+            int written = snprintf(buf + used, buf_size - used, "%s%d", i > 0 ? " " : "", var->val.v.arr.dims[i]);
+            if (written < 0 || (size_t)written >= buf_size - used) {
+                buf[buf_size - 1] = '\0';
+                return;
+            }
+            used += (size_t)written;
+        }
+    } else {
+        snprintf(buf, buf_size, "%d", var->val.v.arr.len);
+    }
+}
+
+static int append_variable_info_line(OfortInterpreter *interp, const OfortVar *var,
+                                     const char *missing_name, char *buf,
+                                     size_t buf_size, size_t *used) {
+    char value_buf[OFORT_MAX_STRLEN];
+    char shape_buf[128];
+    int written;
+
+    if (!buf || !used || *used >= buf_size) return -1;
+    if (!var) {
+        written = snprintf(buf + *used, buf_size - *used, "%s: undefined\n", missing_name ? missing_name : "");
+    } else {
+        value_to_string(interp, var->val, value_buf, sizeof(value_buf));
+        variable_shape_string(var, shape_buf, sizeof(shape_buf));
+        written = snprintf(buf + *used, buf_size - *used, "%s %s%s: %s\n",
+                           value_type_name_lower(variable_display_type(var)),
+                           var->name, shape_buf, value_buf);
+    }
+    if (written < 0) return -1;
+    if ((size_t)written >= buf_size - *used) {
+        buf[buf_size - 1] = '\0';
+        return 0;
+    }
+    *used += (size_t)written;
+    return 1;
+}
+
+int ofort_dump_variable_info(OfortInterpreter *interp, const char *const *names,
+                             int n_names, char *buf, size_t buf_size) {
+    size_t used = 0;
+    int count = 0;
+
+    if (!interp || !buf || buf_size == 0) return -1;
+    buf[0] = '\0';
+
+    if (names && n_names > 0) {
+        for (int i = 0; i < n_names; i++) {
+            int rc;
+            if (!names[i] || names[i][0] == '\0') continue;
+            rc = append_variable_info_line(interp, find_var(interp, names[i]), names[i], buf, buf_size, &used);
+            if (rc < 0) return -1;
+            count++;
+            if (rc == 0) return count;
+        }
+        return count;
+    }
+
+    for (OfortScope *scope = interp->current_scope; scope; scope = scope->parent) {
+        for (int i = 0; i < scope->n_vars; i++) {
+            int duplicate = 0;
+            int rc;
+
+            for (OfortScope *inner = interp->current_scope; inner && inner != scope; inner = inner->parent) {
+                for (int j = 0; j < inner->n_vars; j++) {
+                    if (str_eq_nocase(inner->vars[j].name, scope->vars[i].name)) {
+                        duplicate = 1;
+                        break;
+                    }
+                }
+                if (duplicate) break;
+            }
+            if (duplicate) continue;
+
+            rc = append_variable_info_line(interp, &scope->vars[i], NULL, buf, buf_size, &used);
+            if (rc < 0) return -1;
+            count++;
+            if (rc == 0) return count;
+        }
+    }
+
+    if (count == 0) {
+        snprintf(buf, buf_size, "(no variables)\n");
+    }
+    return count;
+}
+
+static int append_variable_shape_line(const OfortVar *var, const char *missing_name,
+                                      char *buf, size_t buf_size, size_t *used) {
+    char shape_buf[128];
+    int written;
+
+    if (!buf || !used || *used >= buf_size) return -1;
+    if (!var) {
+        written = snprintf(buf + *used, buf_size - *used, "%s: undefined\n", missing_name ? missing_name : "");
+    } else if (var->val.type != FVAL_ARRAY) {
+        written = snprintf(buf + *used, buf_size - *used, "%s: scalar\n", var->name);
+    } else {
+        variable_shape_extents_string(var, shape_buf, sizeof(shape_buf));
+        written = snprintf(buf + *used, buf_size - *used, "%s: %s\n", var->name, shape_buf);
+    }
+    if (written < 0) return -1;
+    if ((size_t)written >= buf_size - *used) {
+        buf[buf_size - 1] = '\0';
+        return 0;
+    }
+    *used += (size_t)written;
+    return 1;
+}
+
+int ofort_dump_variable_shapes(OfortInterpreter *interp, const char *const *names,
+                               int n_names, char *buf, size_t buf_size) {
+    size_t used = 0;
+    int count = 0;
+
+    if (!interp || !buf || buf_size == 0) return -1;
+    buf[0] = '\0';
+
+    if (names && n_names > 0) {
+        for (int i = 0; i < n_names; i++) {
+            int rc;
+            if (!names[i] || names[i][0] == '\0') continue;
+            rc = append_variable_shape_line(find_var(interp, names[i]), names[i], buf, buf_size, &used);
+            if (rc < 0) return -1;
+            count++;
+            if (rc == 0) return count;
+        }
+        return count;
+    }
+
+    for (OfortScope *scope = interp->current_scope; scope; scope = scope->parent) {
+        for (int i = 0; i < scope->n_vars; i++) {
+            int duplicate = 0;
+            int rc;
+
+            if (scope->vars[i].val.type != FVAL_ARRAY) continue;
+            for (OfortScope *inner = interp->current_scope; inner && inner != scope; inner = inner->parent) {
+                for (int j = 0; j < inner->n_vars; j++) {
+                    if (str_eq_nocase(inner->vars[j].name, scope->vars[i].name)) {
+                        duplicate = 1;
+                        break;
+                    }
+                }
+                if (duplicate) break;
+            }
+            if (duplicate) continue;
+
+            rc = append_variable_shape_line(&scope->vars[i], NULL, buf, buf_size, &used);
+            if (rc < 0) return -1;
+            count++;
+            if (rc == 0) return count;
+        }
+    }
+
+    if (count == 0) {
+        snprintf(buf, buf_size, "(no arrays)\n");
+    }
+    return count;
+}
+
+static int append_variable_size_line(const OfortVar *var, const char *missing_name,
+                                     char *buf, size_t buf_size, size_t *used) {
+    int written;
+
+    if (!buf || !used || *used >= buf_size) return -1;
+    if (!var) {
+        written = snprintf(buf + *used, buf_size - *used, "%s: undefined\n", missing_name ? missing_name : "");
+    } else if (var->val.type != FVAL_ARRAY) {
+        written = snprintf(buf + *used, buf_size - *used, "%s: scalar\n", var->name);
+    } else {
+        written = snprintf(buf + *used, buf_size - *used, "%s: %d\n", var->name, var->val.v.arr.len);
+    }
+    if (written < 0) return -1;
+    if ((size_t)written >= buf_size - *used) {
+        buf[buf_size - 1] = '\0';
+        return 0;
+    }
+    *used += (size_t)written;
+    return 1;
+}
+
+int ofort_dump_variable_sizes(OfortInterpreter *interp, const char *const *names,
+                              int n_names, char *buf, size_t buf_size) {
+    size_t used = 0;
+    int count = 0;
+
+    if (!interp || !buf || buf_size == 0) return -1;
+    buf[0] = '\0';
+
+    if (names && n_names > 0) {
+        for (int i = 0; i < n_names; i++) {
+            int rc;
+            if (!names[i] || names[i][0] == '\0') continue;
+            rc = append_variable_size_line(find_var(interp, names[i]), names[i], buf, buf_size, &used);
+            if (rc < 0) return -1;
+            count++;
+            if (rc == 0) return count;
+        }
+        return count;
+    }
+
+    for (OfortScope *scope = interp->current_scope; scope; scope = scope->parent) {
+        for (int i = 0; i < scope->n_vars; i++) {
+            int duplicate = 0;
+            int rc;
+
+            if (scope->vars[i].val.type != FVAL_ARRAY) continue;
+            for (OfortScope *inner = interp->current_scope; inner && inner != scope; inner = inner->parent) {
+                for (int j = 0; j < inner->n_vars; j++) {
+                    if (str_eq_nocase(inner->vars[j].name, scope->vars[i].name)) {
+                        duplicate = 1;
+                        break;
+                    }
+                }
+                if (duplicate) break;
+            }
+            if (duplicate) continue;
+
+            rc = append_variable_size_line(&scope->vars[i], NULL, buf, buf_size, &used);
+            if (rc < 0) return -1;
+            count++;
+            if (rc == 0) return count;
+        }
+    }
+
+    if (count == 0) {
+        snprintf(buf, buf_size, "(no arrays)\n");
+    }
+    return count;
+}
+
+static int append_text_checked(char *buf, size_t buf_size, size_t *used, const char *text) {
+    int written;
+
+    if (!buf || !used || !text || *used >= buf_size) return -1;
+    written = snprintf(buf + *used, buf_size - *used, "%s", text);
+    if (written < 0) return -1;
+    if ((size_t)written >= buf_size - *used) {
+        buf[buf_size - 1] = '\0';
+        return 0;
+    }
+    *used += (size_t)written;
+    return 1;
+}
+
+static int append_stats_header(char *buf, size_t buf_size, size_t *used, const char *title) {
+    int rc;
+
+    if (*used > 0) {
+        rc = append_text_checked(buf, buf_size, used, "\n");
+        if (rc <= 0) return rc;
+    }
+    rc = append_text_checked(buf, buf_size, used, title);
+    if (rc <= 0) return rc;
+    rc = append_text_checked(buf, buf_size, used, "\n");
+    if (rc <= 0) return rc;
+    return append_text_checked(
+        buf, buf_size, used,
+        "name                 size          min          max         mean           sd        first         last\n");
+}
+
+static int visible_var_seen_in_inner_scope(OfortInterpreter *interp, OfortScope *scope, const char *name) {
+    for (OfortScope *inner = interp->current_scope; inner && inner != scope; inner = inner->parent) {
+        for (int j = 0; j < inner->n_vars; j++) {
+            if (str_eq_nocase(inner->vars[j].name, name)) return 1;
+        }
+    }
+    return 0;
+}
+
+static int array_is_numeric_stats_type(const OfortVar *var, int want_integer) {
+    OfortValType type;
+
+    if (!var || var->val.type != FVAL_ARRAY) return 0;
+    type = var->val.v.arr.elem_type;
+    if (want_integer) return type == FVAL_INTEGER;
+    return type == FVAL_REAL || type == FVAL_DOUBLE;
+}
+
+static void format_stat_value(double value, int integer_style, char *buf, size_t buf_size) {
+    if (integer_style) snprintf(buf, buf_size, "%.0f", value);
+    else snprintf(buf, buf_size, "%.7g", value);
+}
+
+static int append_array_stats_line(const OfortVar *var, int integer_style,
+                                   char *buf, size_t buf_size, size_t *used) {
+    int n;
+    double min_v;
+    double max_v;
+    double first_v;
+    double last_v;
+    double sum = 0.0;
+    double sumsq = 0.0;
+    double mean;
+    double sd;
+    double variance;
+    char min_buf[64], max_buf[64], mean_buf[64], sd_buf[64], first_buf[64], last_buf[64];
+    int written;
+
+    if (!var || var->val.type != FVAL_ARRAY || var->val.v.arr.len <= 0 || !var->val.v.arr.data) return 1;
+    n = var->val.v.arr.len;
+    first_v = val_to_real(var->val.v.arr.data[0]);
+    last_v = val_to_real(var->val.v.arr.data[n - 1]);
+    min_v = first_v;
+    max_v = first_v;
+    for (int i = 0; i < n; i++) {
+        double v = val_to_real(var->val.v.arr.data[i]);
+        if (v < min_v) min_v = v;
+        if (v > max_v) max_v = v;
+        sum += v;
+        sumsq += v * v;
+    }
+    mean = sum / n;
+    if (n > 1) {
+        variance = (sumsq - (sum * sum) / n) / (n - 1);
+        sd = sqrt(variance > 0.0 ? variance : 0.0);
+    } else {
+        sd = 0.0;
+    }
+
+    format_stat_value(min_v, integer_style, min_buf, sizeof(min_buf));
+    format_stat_value(max_v, integer_style, max_buf, sizeof(max_buf));
+    format_stat_value(mean, 0, mean_buf, sizeof(mean_buf));
+    format_stat_value(sd, 0, sd_buf, sizeof(sd_buf));
+    format_stat_value(first_v, integer_style, first_buf, sizeof(first_buf));
+    format_stat_value(last_v, integer_style, last_buf, sizeof(last_buf));
+
+    written = snprintf(buf + *used, buf_size - *used,
+                       "%-16s %8d %12s %12s %12s %12s %12s %12s\n",
+                       var->name, n, min_buf, max_buf, mean_buf, sd_buf, first_buf, last_buf);
+    if (written < 0) return -1;
+    if ((size_t)written >= buf_size - *used) {
+        buf[buf_size - 1] = '\0';
+        return 0;
+    }
+    *used += (size_t)written;
+    return 1;
+}
+
+static int append_stats_group_for_names(OfortInterpreter *interp, const char *const *names, int n_names,
+                                        int want_integer, char *buf, size_t buf_size, size_t *used,
+                                        int *count) {
+    int header_printed = 0;
+
+    for (int i = 0; i < n_names; i++) {
+        OfortVar *var = names[i] ? find_var(interp, names[i]) : NULL;
+        int rc;
+        if (!array_is_numeric_stats_type(var, want_integer)) continue;
+        if (!header_printed) {
+            rc = append_stats_header(buf, buf_size, used, want_integer ? "integer arrays" : "real arrays");
+            if (rc <= 0) return rc;
+            header_printed = 1;
+        }
+        rc = append_array_stats_line(var, want_integer, buf, buf_size, used);
+        if (rc < 0) return -1;
+        (*count)++;
+        if (rc == 0) return 0;
+    }
+    return 1;
+}
+
+static int append_stats_group_for_visible_arrays(OfortInterpreter *interp, int want_integer,
+                                                 char *buf, size_t buf_size, size_t *used, int *count) {
+    int header_printed = 0;
+
+    for (OfortScope *scope = interp->current_scope; scope; scope = scope->parent) {
+        for (int i = 0; i < scope->n_vars; i++) {
+            int rc;
+            if (visible_var_seen_in_inner_scope(interp, scope, scope->vars[i].name)) continue;
+            if (!array_is_numeric_stats_type(&scope->vars[i], want_integer)) continue;
+            if (!header_printed) {
+                rc = append_stats_header(buf, buf_size, used, want_integer ? "integer arrays" : "real arrays");
+                if (rc <= 0) return rc;
+                header_printed = 1;
+            }
+            rc = append_array_stats_line(&scope->vars[i], want_integer, buf, buf_size, used);
+            if (rc < 0) return -1;
+            (*count)++;
+            if (rc == 0) return 0;
+        }
+    }
+    return 1;
+}
+
+int ofort_dump_variable_stats(OfortInterpreter *interp, const char *const *names,
+                              int n_names, char *buf, size_t buf_size) {
+    size_t used = 0;
+    int count = 0;
+    int rc;
+
+    if (!interp || !buf || buf_size == 0) return -1;
+    buf[0] = '\0';
+
+    if (names && n_names > 0) {
+        rc = append_stats_group_for_names(interp, names, n_names, 1, buf, buf_size, &used, &count);
+        if (rc <= 0) return rc < 0 ? -1 : count;
+        rc = append_stats_group_for_names(interp, names, n_names, 0, buf, buf_size, &used, &count);
+        if (rc <= 0) return rc < 0 ? -1 : count;
+
+        for (int i = 0; i < n_names; i++) {
+            OfortVar *var = names[i] ? find_var(interp, names[i]) : NULL;
+            int written;
+            if (!names[i] || names[i][0] == '\0') continue;
+            if (!var) {
+                written = snprintf(buf + used, buf_size - used, "%s: undefined\n", names[i]);
+            } else if (var->val.type != FVAL_ARRAY) {
+                written = snprintf(buf + used, buf_size - used, "%s: scalar\n", var->name);
+            } else if (!array_is_numeric_stats_type(var, 1) && !array_is_numeric_stats_type(var, 0)) {
+                written = snprintf(buf + used, buf_size - used, "%s: nonnumeric\n", var->name);
+            } else {
+                continue;
+            }
+            if (written < 0) return -1;
+            if ((size_t)written >= buf_size - used) {
+                buf[buf_size - 1] = '\0';
+                return count;
+            }
+            used += (size_t)written;
+        }
+        if (count == 0 && used == 0) snprintf(buf, buf_size, "(no numeric arrays)\n");
+        return count;
+    }
+
+    rc = append_stats_group_for_visible_arrays(interp, 1, buf, buf_size, &used, &count);
+    if (rc <= 0) return rc < 0 ? -1 : count;
+    rc = append_stats_group_for_visible_arrays(interp, 0, buf, buf_size, &used, &count);
+    if (rc <= 0) return rc < 0 ? -1 : count;
+
+    if (count == 0) {
+        snprintf(buf, buf_size, "(no numeric arrays)\n");
+    }
+    return count;
 }
 
 const char *ofort_get_output(OfortInterpreter *interp) {
