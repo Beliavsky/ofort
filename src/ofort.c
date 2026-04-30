@@ -5185,7 +5185,7 @@ static const char *intrinsic_names[] = {
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
-    "BIT_SIZE", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE",
+    "BIT_SIZE", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
@@ -5504,6 +5504,12 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         }
         if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(DBL_MAX);
         return make_real(FLT_MAX);
+    }
+    if (strcmp(upper, "TINY") == 0) {
+        if (nargs < 1) ofort_error(I, "TINY requires 1 argument");
+        if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(DBL_MIN);
+        if (args[0].type == FVAL_REAL) return make_real(FLT_MIN);
+        ofort_error(I, "TINY requires a real argument");
     }
     if (strcmp(upper, "COMMAND_ARGUMENT_COUNT") == 0) {
         return make_integer(I->command_argc);
