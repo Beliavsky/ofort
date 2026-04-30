@@ -5195,6 +5195,7 @@ static const char *intrinsic_names[] = {
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
     "BIT_SIZE", "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SCALE",
+    "SELECTED_INT_KIND", "SELECTED_REAL_KIND",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
@@ -5583,6 +5584,44 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         exponent = (int)args[1].v.i;
         if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(ldexp(x, exponent));
         return make_real(ldexp((float)x, exponent));
+    }
+    if (strcmp(upper, "SELECTED_INT_KIND") == 0) {
+        long long r;
+        if (nargs < 1) ofort_error(I, "SELECTED_INT_KIND requires 1 argument");
+        if (args[0].type != FVAL_INTEGER)
+            ofort_error(I, "SELECTED_INT_KIND requires an integer argument");
+        r = args[0].v.i;
+        if (r <= 2) return make_integer(1);
+        if (r <= 4) return make_integer(2);
+        if (r <= 9) return make_integer(4);
+        if (r <= 18) return make_integer(8);
+        return make_integer(-1);
+    }
+    if (strcmp(upper, "SELECTED_REAL_KIND") == 0) {
+        int p_idx = intrinsic_arg_index(arg_names, nargs, "p");
+        int r_idx = intrinsic_arg_index(arg_names, nargs, "r");
+        long long p = 0, r = 0;
+        int p_bad, r_bad;
+        if (p_idx < 0 && nargs >= 1 && (!arg_names || arg_names[0][0] == '\0')) p_idx = 0;
+        if (r_idx < 0 && nargs >= 2 && (!arg_names || arg_names[1][0] == '\0')) r_idx = 1;
+        if (p_idx < 0 && r_idx < 0) ofort_error(I, "SELECTED_REAL_KIND requires P or R");
+        if (p_idx >= 0) {
+            if (args[p_idx].type != FVAL_INTEGER)
+                ofort_error(I, "SELECTED_REAL_KIND P must be integer");
+            p = args[p_idx].v.i;
+        }
+        if (r_idx >= 0) {
+            if (args[r_idx].type != FVAL_INTEGER)
+                ofort_error(I, "SELECTED_REAL_KIND R must be integer");
+            r = args[r_idx].v.i;
+        }
+        p_bad = p > 15;
+        r_bad = r > 307;
+        if (p_bad && r_bad) return make_integer(-3);
+        if (p_bad) return make_integer(-1);
+        if (r_bad) return make_integer(-2);
+        if (p > 6 || r > 37) return make_integer(8);
+        return make_integer(4);
     }
     if (strcmp(upper, "COMMAND_ARGUMENT_COUNT") == 0) {
         return make_integer(I->command_argc);
