@@ -755,6 +755,10 @@ static void tokenize(OfortInterpreter *I, const char *src) {
                 while (isdigit((unsigned char)*p)) p++;
             }
             t->length = (int)(p - start);
+            if (*p == '_') {
+                p++;
+                while (isalnum((unsigned char)*p) || *p == '_') p++;
+            }
             /* parse the number */
             char numbuf[128];
             int nl = t->length < 127 ? t->length : 127;
