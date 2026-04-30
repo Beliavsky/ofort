@@ -5166,7 +5166,7 @@ static const char *intrinsic_names[] = {
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
     /* Array */
     "SIZE", "SHAPE", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC",
-    "DOT_PRODUCT", "MATMUL", "TRANSPOSE", "RESHAPE", "SPREAD", "EOSHIFT",
+    "DOT_PRODUCT", "MATMUL", "TRANSPOSE", "RESHAPE", "SPREAD", "EOSHIFT", "CSHIFT",
     "COUNT", "ANY", "ALL", "ALLOCATED", "LBOUND", "UBOUND",
     /* Type conversion */
     "FLOAT", "DFLOAT", "SNGL", "LOGICAL",
@@ -6059,6 +6059,70 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             }
         }
         ofort_error(I, "EOSHIFT is only implemented for rank 1 or 2 arrays");
+    }
+    if (strcmp(upper, "CSHIFT") == 0) {
+        int array_idx = intrinsic_arg_index(arg_names, nargs, "array");
+        int shift_idx = intrinsic_arg_index(arg_names, nargs, "shift");
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        OfortValue *array;
+        OfortValue *shift;
+        int dim = 1;
+        OfortValue result;
+
+        if (array_idx < 0) array_idx = 0;
+        if (shift_idx < 0) shift_idx = 1;
+        if (dim_idx < 0 && nargs > 2 && (!arg_names || arg_names[2][0] == '\0')) dim_idx = 2;
+        if (nargs <= array_idx || nargs <= shift_idx)
+            ofort_error(I, "CSHIFT requires ARRAY and SHIFT");
+        array = &args[array_idx];
+        shift = &args[shift_idx];
+        if (array->type != FVAL_ARRAY) ofort_error(I, "CSHIFT ARRAY must be an array");
+        if (dim_idx >= 0) dim = (int)val_to_int(args[dim_idx]);
+        if (dim < 1 || dim > array->v.arr.n_dims) ofort_error(I, "CSHIFT DIM is out of range");
+
+        result = make_array(array->v.arr.elem_type, array->v.arr.dims, array->v.arr.n_dims);
+        if (array->v.arr.n_dims == 1) {
+            int n = array->v.arr.dims[0];
+            int sh = (int)val_to_int(*shift);
+            for (int i = 0; i < n; i++) {
+                int src = n ? (i + sh) % n : 0;
+                if (src < 0) src += n;
+                free_value(&result.v.arr.data[i]);
+                result.v.arr.data[i] = copy_value(array->v.arr.data[src]);
+            }
+            return result;
+        }
+        if (array->v.arr.n_dims == 2) {
+            int nrow = array->v.arr.dims[0];
+            int ncol = array->v.arr.dims[1];
+            if (dim == 1) {
+                for (int j = 0; j < ncol; j++) {
+                    int sh = shift->type == FVAL_ARRAY ? (int)val_to_int(shift->v.arr.data[j]) : (int)val_to_int(*shift);
+                    for (int i = 0; i < nrow; i++) {
+                        int src_i = nrow ? (i + sh) % nrow : 0;
+                        int idx = i + j * nrow;
+                        if (src_i < 0) src_i += nrow;
+                        free_value(&result.v.arr.data[idx]);
+                        result.v.arr.data[idx] = copy_value(array->v.arr.data[src_i + j * nrow]);
+                    }
+                }
+                return result;
+            }
+            if (dim == 2) {
+                for (int i = 0; i < nrow; i++) {
+                    int sh = shift->type == FVAL_ARRAY ? (int)val_to_int(shift->v.arr.data[i]) : (int)val_to_int(*shift);
+                    for (int j = 0; j < ncol; j++) {
+                        int src_j = ncol ? (j + sh) % ncol : 0;
+                        int idx = i + j * nrow;
+                        if (src_j < 0) src_j += ncol;
+                        free_value(&result.v.arr.data[idx]);
+                        result.v.arr.data[idx] = copy_value(array->v.arr.data[i + src_j * nrow]);
+                    }
+                }
+                return result;
+            }
+        }
+        ofort_error(I, "CSHIFT is only implemented for rank 1 or 2 arrays");
     }
     if (strcmp(upper, "COUNT") == 0) {
         if (args[0].type != FVAL_ARRAY) return make_integer(val_to_logical(args[0]) ? 1 : 0);
