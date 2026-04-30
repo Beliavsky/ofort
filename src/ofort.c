@@ -5068,7 +5068,7 @@ static const char *intrinsic_names[] = {
     "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
     /* Array */
-    "SIZE", "SHAPE", "SUM", "PRODUCT", "MAXVAL", "MINVAL",
+    "SIZE", "SHAPE", "MERGE", "SUM", "PRODUCT", "MAXVAL", "MINVAL",
     "DOT_PRODUCT", "MATMUL", "TRANSPOSE", "RESHAPE",
     "COUNT", "ANY", "ALL", "ALLOCATED", "LBOUND", "UBOUND",
     /* Type conversion */
@@ -5430,6 +5430,35 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         for (int i = 0; i < nd; i++) {
             free_value(&result.v.arr.data[i]);
             result.v.arr.data[i] = make_integer(args[0].v.arr.dims[i]);
+        }
+        return result;
+    }
+    if (strcmp(upper, "MERGE") == 0) {
+        if (nargs < 3) ofort_error(I, "MERGE requires 3 arguments");
+        if (args[0].type != FVAL_ARRAY && args[1].type != FVAL_ARRAY && args[2].type != FVAL_ARRAY) {
+            return copy_value(val_to_logical(args[2]) ? args[0] : args[1]);
+        }
+
+        OfortValue *shape_arg = NULL;
+        if (args[2].type == FVAL_ARRAY) shape_arg = &args[2];
+        else if (args[0].type == FVAL_ARRAY) shape_arg = &args[0];
+        else if (args[1].type == FVAL_ARRAY) shape_arg = &args[1];
+        if (!shape_arg) ofort_error(I, "MERGE internal shape error");
+
+        int len = shape_arg->v.arr.len;
+        OfortValType result_type = args[0].type == FVAL_ARRAY ? args[0].v.arr.elem_type : args[0].type;
+        OfortValue result = make_array(result_type, shape_arg->v.arr.dims, shape_arg->v.arr.n_dims);
+
+        for (int i = 0; i < len; i++) {
+            OfortValue *mask = args[2].type == FVAL_ARRAY ? &args[2].v.arr.data[i] : &args[2];
+            OfortValue *selected;
+            if (val_to_logical(*mask)) {
+                selected = args[0].type == FVAL_ARRAY ? &args[0].v.arr.data[i] : &args[0];
+            } else {
+                selected = args[1].type == FVAL_ARRAY ? &args[1].v.arr.data[i] : &args[1];
+            }
+            free_value(&result.v.arr.data[i]);
+            result.v.arr.data[i] = copy_value(*selected);
         }
         return result;
     }
