@@ -5,10 +5,12 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
+#include <math.h>
 
 #ifdef _WIN32
 #include <io.h>
 #include <process.h>
+#include <windows.h>
 #define ISATTY(fd) _isatty(fd)
 #define FILENO(fp) _fileno(fp)
 #define GETPID() _getpid()
@@ -26,6 +28,7 @@ static const char *skip_space(const char *line);
 static int starts_with_word_nocase(const char *line, const char *word);
 static int identifier_char(int c);
 static int line_is_terminal_end(const char *start, const char *end);
+static int add_repl_line_to_buffer(char **buf, size_t *len, size_t *cap, const char *line);
 
 static int append_text(char **buf, size_t *len, size_t *cap, const char *text) {
     size_t n = strlen(text);
@@ -49,6 +52,33 @@ static int append_text(char **buf, size_t *len, size_t *cap, const char *text) {
     }
 
     memcpy(*buf + *len, text, n);
+    *len += n;
+    (*buf)[*len] = '\0';
+    return 1;
+}
+
+static int append_text_n(char **buf, size_t *len, size_t *cap, const char *text, size_t n) {
+    if (*len + n + 1 > *cap) {
+        size_t new_cap = *cap ? *cap : 8192;
+        char *new_buf;
+
+        while (*len + n + 1 > new_cap) {
+            new_cap *= 2;
+        }
+
+        new_buf = (char *)realloc(*buf, new_cap);
+        if (!new_buf) {
+            fprintf(stderr, "out of memory\n");
+            return 0;
+        }
+
+        *buf = new_buf;
+        *cap = new_cap;
+    }
+
+    if (n > 0) {
+        memcpy(*buf + *len, text, n);
+    }
     *len += n;
     (*buf)[*len] = '\0';
     return 1;
@@ -116,19 +146,221 @@ static int is_command(const char *line, const char *command) {
            (line[n] == '\0' || line[n] == '\n' || line[n] == '\r');
 }
 
+static int command_starts_with(const char *line, const char *command) {
+    size_t n = strlen(command);
+
+    return strncmp(line, command, n) == 0 &&
+           (line[n] == '\0' || line[n] == '\n' || line[n] == '\r' || isspace((unsigned char)line[n]));
+}
+
+static void free_split_args(char **args, int nargs) {
+    for (int i = 0; i < nargs; i++) {
+        free(args[i]);
+    }
+}
+
+static int split_command_args(const char *text, char **args, int *nargs) {
+    const char *p = text;
+    *nargs = 0;
+
+    while (p && *p) {
+        char quote = '\0';
+        char token[OFORT_MAX_STRLEN];
+        size_t len = 0;
+
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '\0' || *p == '\n' || *p == '\r') break;
+
+        if (*p == '\'' || *p == '"') {
+            quote = *p++;
+        }
+
+        while (*p) {
+            if (quote) {
+                if (*p == quote) {
+                    p++;
+                    break;
+                }
+            } else if (isspace((unsigned char)*p)) {
+                break;
+            }
+            if (len + 1 < sizeof(token)) {
+                token[len++] = *p;
+            }
+            p++;
+        }
+        token[len] = '\0';
+
+        if (*nargs >= OFORT_MAX_PARAMS) {
+            fprintf(stderr, "too many program arguments; maximum is %d\n", OFORT_MAX_PARAMS);
+            free_split_args(args, *nargs);
+            *nargs = 0;
+            return 0;
+        }
+        args[*nargs] = copy_string(token);
+        if (!args[*nargs]) {
+            free_split_args(args, *nargs);
+            *nargs = 0;
+            return 0;
+        }
+        (*nargs)++;
+    }
+
+    return 1;
+}
+
+static int parse_run_command(const char *line, const char *command, int *repeat_count,
+                             char **args, int *nargs) {
+    const char *p;
+    char *endptr;
+    long count;
+
+    if (!command_starts_with(line, command)) {
+        return 0;
+    }
+
+    *repeat_count = 1;
+    *nargs = 0;
+    p = skip_space(line + strlen(command));
+
+    if (*p != '\0' && *p != '\n' && *p != '\r' && strncmp(p, "--", 2) != 0) {
+        count = strtol(p, &endptr, 10);
+        if (endptr == p || count < 1 || count > 1000000) {
+            fprintf(stderr, "%s count must be a positive integer\n", command);
+            return -1;
+        }
+        *repeat_count = (int)count;
+        p = skip_space(endptr);
+    }
+
+    if (strncmp(p, "--", 2) == 0) {
+        p = skip_space(p + 2);
+        if (!split_command_args(p, args, nargs)) {
+            return -1;
+        }
+    } else if (*p != '\0' && *p != '\n' && *p != '\r') {
+        fprintf(stderr, "unexpected text after %s command; use -- before program arguments\n", command);
+        return -1;
+    }
+
+    return 1;
+}
+
+static double monotonic_seconds(void) {
+#ifdef _WIN32
+    LARGE_INTEGER counter;
+    LARGE_INTEGER frequency;
+
+    QueryPerformanceCounter(&counter);
+    QueryPerformanceFrequency(&frequency);
+    return (double)counter.QuadPart / (double)frequency.QuadPart;
+#else
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+#endif
+}
+
+static int word_at_line_start(const char *line, int line_len, const char *word) {
+    char buf[4096];
+    int copy_len = line_len < (int)sizeof(buf) - 1 ? line_len : (int)sizeof(buf) - 1;
+
+    memcpy(buf, line, (size_t)copy_len);
+    buf[copy_len] = '\0';
+    return starts_with_word_nocase(buf, word);
+}
+
+static int word_in_line(const char *line, int line_len, const char *word) {
+    size_t word_len = strlen(word);
+
+    for (int i = 0; i + (int)word_len <= line_len; i++) {
+        int before_ok = i == 0 || !identifier_char((unsigned char)line[i - 1]);
+        int after_ok = i + (int)word_len >= line_len || !identifier_char((unsigned char)line[i + word_len]);
+        int same = 1;
+        for (size_t j = 0; j < word_len; j++) {
+            if (tolower((unsigned char)line[i + j]) != tolower((unsigned char)word[j])) {
+                same = 0;
+                break;
+            }
+        }
+        if (before_ok && after_ok && same) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int line_is_blank_or_comment(const char *line, int line_len) {
+    const char *p = line;
+    const char *end = line + line_len;
+
+    while (p < end && isspace((unsigned char)*p)) p++;
+    return p == end || *p == '!';
+}
+
+static int line_deindents_before_print(const char *line, int line_len) {
+    if (line_is_blank_or_comment(line, line_len)) return 0;
+    return word_at_line_start(line, line_len, "end") ||
+           word_at_line_start(line, line_len, "else") ||
+           word_at_line_start(line, line_len, "case") ||
+           word_at_line_start(line, line_len, "contains");
+}
+
+static int line_indents_after_print(const char *line, int line_len) {
+    if (line_is_blank_or_comment(line, line_len)) return 0;
+    if (word_at_line_start(line, line_len, "end")) return 0;
+    if (word_at_line_start(line, line_len, "do")) return 1;
+    if (word_at_line_start(line, line_len, "if") && word_in_line(line, line_len, "then")) return 1;
+    if (word_at_line_start(line, line_len, "else")) return 1;
+    if (word_at_line_start(line, line_len, "case")) return 1;
+    if (word_at_line_start(line, line_len, "select")) return 1;
+    if (word_at_line_start(line, line_len, "program")) return 1;
+    if (word_at_line_start(line, line_len, "module")) return 1;
+    if (word_at_line_start(line, line_len, "subroutine")) return 1;
+    if (word_at_line_start(line, line_len, "function")) return 1;
+    if (word_at_line_start(line, line_len, "contains")) return 1;
+    return 0;
+}
+
+static void print_indent(int indent) {
+    for (int i = 0; i < indent; i++) {
+        fputs("  ", stdout);
+    }
+}
+
 static void list_source(const char *source) {
     const char *line = source;
     int line_no = 1;
+    int indent = 0;
 
     while (*line) {
         const char *end = strchr(line, '\n');
+        int line_len = end ? (int)(end - line) : (int)strlen(line);
+        const char *p = line;
+        const char *line_end = line + line_len;
+        int indent_after;
+
+        while (p < line_end && isspace((unsigned char)*p)) p++;
+
+        if (line_deindents_before_print(line, line_len) && indent > 0) {
+            indent--;
+        }
+        indent_after = line_indents_after_print(line, line_len);
 
         if (end) {
-            printf("%4d  %.*s\n", line_no, (int)(end - line), line);
+            printf("%4d  ", line_no);
+            print_indent(indent);
+            printf("%.*s\n", (int)(line_end - p), p);
             line = end + 1;
         } else {
-            printf("%4d  %s\n", line_no, line);
+            printf("%4d  ", line_no);
+            print_indent(indent);
+            printf("%.*s\n", (int)(line_end - p), p);
             break;
+        }
+        if (indent_after) {
+            indent++;
         }
         line_no++;
     }
@@ -428,13 +660,198 @@ static int is_repl_declaration_line(const char *line) {
            starts_with_word_nocase(line, "implicit");
 }
 
+static void list_declarations(const char *source) {
+    const char *line = source;
+    int line_no = 1;
+    int indent = 0;
+
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        int line_len = end ? (int)(end - line) : (int)strlen(line);
+        const char *p = line;
+        const char *line_end = line + line_len;
+        int indent_after;
+        char local[4096];
+        int copy_len = line_len < (int)sizeof(local) - 1 ? line_len : (int)sizeof(local) - 1;
+
+        memcpy(local, line, (size_t)copy_len);
+        local[copy_len] = '\0';
+
+        while (p < line_end && isspace((unsigned char)*p)) p++;
+
+        if (line_deindents_before_print(line, line_len) && indent > 0) {
+            indent--;
+        }
+        indent_after = line_indents_after_print(line, line_len);
+
+        if (is_repl_declaration_line(skip_space(local))) {
+            printf("%4d  ", line_no);
+            print_indent(indent);
+            printf("%.*s\n", (int)(line_end - p), p);
+        }
+
+        if (indent_after) {
+            indent++;
+        }
+        if (!end) {
+            break;
+        }
+        line = end + 1;
+        line_no++;
+    }
+}
+
 static int is_blank_or_comment_line(const char *line) {
     const char *p = skip_space(line);
     return *p == '\0' || *p == '\r' || *p == '\n' || *p == '!';
 }
 
+static void copy_logical_line(char *dst, size_t dst_size, const char *line) {
+    size_t len;
+
+    if (dst_size == 0) {
+        return;
+    }
+    len = strcspn(line ? line : "", "\r\n");
+    if (len >= dst_size) {
+        len = dst_size - 1;
+    }
+    memcpy(dst, line ? line : "", len);
+    dst[len] = '\0';
+}
+
+static void lower_logical_line(char *dst, size_t dst_size, const char *line) {
+    size_t i;
+
+    copy_logical_line(dst, dst_size, skip_space(line ? line : ""));
+    for (i = 0; dst[i]; i++) {
+        dst[i] = (char)tolower((unsigned char)dst[i]);
+    }
+}
+
+static int line_starts_word_lower(const char *line, const char *word) {
+    size_t n = strlen(word);
+    return strncmp(line, word, n) == 0 && !identifier_char((unsigned char)line[n]);
+}
+
+static int line_contains_word_lower(const char *line, const char *word) {
+    size_t n = strlen(word);
+    const char *p = line;
+
+    while ((p = strstr(p, word)) != NULL) {
+        int before_ok = p == line || !identifier_char((unsigned char)p[-1]);
+        int after_ok = !identifier_char((unsigned char)p[n]);
+        if (before_ok && after_ok) {
+            return 1;
+        }
+        p += n;
+    }
+    return 0;
+}
+
+static int repl_line_pre_dedent(const char *line) {
+    char lower[4096];
+
+    lower_logical_line(lower, sizeof(lower), line);
+    if (lower[0] == '\0' || lower[0] == '!') {
+        return 0;
+    }
+    return line_starts_word_lower(lower, "end") ||
+           line_starts_word_lower(lower, "else") ||
+           line_starts_word_lower(lower, "case") ||
+           line_starts_word_lower(lower, "contains");
+}
+
+static int repl_line_post_indent(const char *line) {
+    char lower[4096];
+
+    lower_logical_line(lower, sizeof(lower), line);
+    if (lower[0] == '\0' || lower[0] == '!') {
+        return 0;
+    }
+    if (line_starts_word_lower(lower, "end")) {
+        return 0;
+    }
+    if (line_starts_word_lower(lower, "else") ||
+        line_starts_word_lower(lower, "case") ||
+        line_starts_word_lower(lower, "contains")) {
+        return 1;
+    }
+    if (line_starts_word_lower(lower, "do")) {
+        return 1;
+    }
+    if (line_starts_word_lower(lower, "if") && line_contains_word_lower(lower, "then")) {
+        return 1;
+    }
+    if (line_starts_word_lower(lower, "select") ||
+        line_starts_word_lower(lower, "program") ||
+        line_starts_word_lower(lower, "subroutine") ||
+        line_starts_word_lower(lower, "function") ||
+        line_starts_word_lower(lower, "module")) {
+        return 1;
+    }
+    if (line_starts_word_lower(lower, "type") && strstr(lower, "::") == NULL) {
+        return 1;
+    }
+    return 0;
+}
+
+static int append_indented_repl_line(char **buf, size_t *len, size_t *cap,
+                                     const char *line, int indent_level) {
+    char indented[8192];
+    const char *text = skip_space(line);
+    size_t text_len = strlen(text);
+    size_t pos = 0;
+
+    if (indent_level < 0) {
+        indent_level = 0;
+    }
+    for (int i = 0; i < indent_level * 2 && pos + 1 < sizeof(indented); i++) {
+        indented[pos++] = ' ';
+    }
+    if (text_len > sizeof(indented) - pos - 1) {
+        text_len = sizeof(indented) - pos - 1;
+    }
+    memcpy(indented + pos, text, text_len);
+    pos += text_len;
+    indented[pos] = '\0';
+
+    return add_repl_line_to_buffer(buf, len, cap, indented);
+}
+
+static int source_indent_level(const char *source) {
+    const char *line = source;
+    int indent = 0;
+
+    while (line && *line) {
+        const char *end = strchr(line, '\n');
+        char local[4096];
+        size_t len = end ? (size_t)(end - line) : strlen(line);
+        if (len >= sizeof(local)) {
+            len = sizeof(local) - 1;
+        }
+        memcpy(local, line, len);
+        local[len] = '\0';
+        if (repl_line_pre_dedent(local) && indent > 0) {
+            indent--;
+        }
+        if (repl_line_post_indent(local)) {
+            indent++;
+        }
+        line = end ? end + 1 : NULL;
+    }
+
+    return indent;
+}
+
 static int is_buffer_declaration_line(const char *line) {
-    return is_blank_or_comment_line(line) || is_repl_declaration_line(line);
+    const char *p = skip_space(line);
+    return is_blank_or_comment_line(line) ||
+           is_repl_declaration_line(line) ||
+           starts_with_word_nocase(p, "program") ||
+           starts_with_word_nocase(p, "module") ||
+           starts_with_word_nocase(p, "subroutine") ||
+           starts_with_word_nocase(p, "function");
 }
 
 static int insert_text_at(char **buf, size_t *len, size_t *cap, size_t pos, const char *text) {
@@ -757,7 +1174,18 @@ static int is_immediate_expression_line(const char *line) {
     return 1;
 }
 
-static int execute_source_text(const char *text, int print_expr_statements, int suppress_output) {
+static int g_implicit_typing = 0;
+
+static OfortInterpreter *create_ofort_interpreter(void) {
+    OfortInterpreter *interp = ofort_create();
+    if (interp) {
+        ofort_set_implicit_typing(interp, g_implicit_typing);
+    }
+    return interp;
+}
+
+static int execute_source_text(const char *text, int print_expr_statements, int suppress_output,
+                               int command_argc, char **command_args) {
     char *source = copy_string(text);
     OfortInterpreter *interp;
     int rc;
@@ -772,7 +1200,7 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
         return 2;
     }
 
-    interp = ofort_create();
+    interp = create_ofort_interpreter();
     if (!interp) {
         free(source);
         fprintf(stderr, "failed to create Fortran interpreter\n");
@@ -780,6 +1208,7 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
     }
     ofort_set_print_expr_statements(interp, print_expr_statements);
     ofort_set_suppress_output(interp, suppress_output);
+    ofort_set_command_args(interp, command_argc, (const char *const *)command_args);
 
     rc = ofort_execute(interp, source);
     if (rc == 0) {
@@ -799,7 +1228,9 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
 
 static int execute_source_text_on_interpreter(OfortInterpreter *interp, const char *text,
                                               int print_expr_statements,
-                                              int suppress_output) {
+                                              int suppress_output,
+                                              int command_argc,
+                                              char **command_args) {
     char *source = copy_string(text);
     int rc;
 
@@ -816,6 +1247,7 @@ static int execute_source_text_on_interpreter(OfortInterpreter *interp, const ch
     ofort_reset(interp);
     ofort_set_print_expr_statements(interp, print_expr_statements);
     ofort_set_suppress_output(interp, suppress_output);
+    ofort_set_command_args(interp, command_argc, (const char *const *)command_args);
 
     rc = ofort_execute(interp, source);
     if (rc == 0) {
@@ -847,7 +1279,7 @@ static int run_ofort_file_to_path(const char *source_path, const char *out_path)
         return 2;
     }
 
-    interp = ofort_create();
+    interp = create_ofort_interpreter();
     if (!interp) {
         free(source);
         fprintf(stderr, "failed to create Fortran interpreter\n");
@@ -889,7 +1321,7 @@ static int check_ofort_file(const char *source_path) {
         return 2;
     }
 
-    interp = ofort_create();
+    interp = create_ofort_interpreter();
     if (!interp) {
         free(source);
         fprintf(stderr, "failed to create Fortran interpreter\n");
@@ -1046,7 +1478,7 @@ static int execute_repl_pending_source(OfortInterpreter *interp, const char *sou
         return 0;
     }
 
-    rc = execute_source_text_on_interpreter(interp, pending, 0, 1);
+    rc = execute_source_text_on_interpreter(interp, pending, 0, 1, 0, NULL);
     if (rc == 0) {
         *executed_len = strlen(source);
     }
@@ -1060,7 +1492,80 @@ static int execute_repl_expression(OfortInterpreter *interp, const char *source,
     if (rc != 0) {
         return rc;
     }
-    return execute_source_text_on_interpreter(interp, expr_line, 1, 1);
+    return execute_source_text_on_interpreter(interp, expr_line, 1, 1, 0, NULL);
+}
+
+static int execute_repl_run(OfortInterpreter **interp, const char *source, int repeat_count,
+                            int command_argc, char **command_args) {
+    int last_rc = 0;
+
+    if (repeat_count < 1) repeat_count = 1;
+    for (int i = 0; i < repeat_count; i++) {
+        ofort_destroy(*interp);
+        *interp = create_ofort_interpreter();
+        if (!*interp) {
+            fprintf(stderr, "failed to create Fortran interpreter\n");
+            return 2;
+        }
+        last_rc = execute_source_text_on_interpreter(
+            *interp, source ? source : "", 1, 0, command_argc, command_args);
+        if (last_rc != 0) {
+            return last_rc;
+        }
+    }
+
+    return last_rc;
+}
+
+static int execute_repl_timed_run(OfortInterpreter **interp, const char *source, int repeat_count,
+                                  int command_argc, char **command_args) {
+    double total = 0.0;
+    double sumsq = 0.0;
+    double min_time = 0.0;
+    double max_time = 0.0;
+    int last_rc = 0;
+
+    if (repeat_count < 1) repeat_count = 1;
+    for (int i = 0; i < repeat_count; i++) {
+        double start;
+        double elapsed;
+
+        ofort_destroy(*interp);
+        *interp = create_ofort_interpreter();
+        if (!*interp) {
+            fprintf(stderr, "failed to create Fortran interpreter\n");
+            return 2;
+        }
+        start = monotonic_seconds();
+        last_rc = execute_source_text_on_interpreter(
+            *interp, source ? source : "", 1, 0, command_argc, command_args);
+        elapsed = monotonic_seconds() - start;
+        if (last_rc != 0) {
+            return last_rc;
+        }
+        total += elapsed;
+        sumsq += elapsed * elapsed;
+        if (i == 0 || elapsed < min_time) {
+            min_time = elapsed;
+        }
+        if (i == 0 || elapsed > max_time) {
+            max_time = elapsed;
+        }
+    }
+
+    if (repeat_count == 1) {
+        printf("\n%12s\n", "total");
+        printf("%12.6f s\n", total);
+    } else {
+        double avg = total / repeat_count;
+        double variance = (sumsq - (total * total) / repeat_count) / (repeat_count - 1);
+        double sd = sqrt(variance > 0.0 ? variance : 0.0);
+
+        printf("\n%12s %12s %12s %12s %12s\n", "total", "avg", "sd", "min", "max");
+        printf("%12.6f %12.6f %12.6f %12.6f %12.6f s\n",
+               total, avg, sd, min_time, max_time);
+    }
+    return last_rc;
 }
 
 static char *copy_range_with_newline(const char *start, const char *end) {
@@ -1162,6 +1667,335 @@ static const char *load_run_command_path(const char *line) {
     return (*p == '\0' || *p == '\r' || *p == '\n') ? NULL : p;
 }
 
+static int repl_named_command_args(const char *line, const char *command, char **args, int *nargs) {
+    const char *p = skip_space(line);
+
+    if (!command_starts_with(p, command)) {
+        return 0;
+    }
+    p = skip_space(p + strlen(command));
+    if (!split_command_args(p, args, nargs)) {
+        return -1;
+    }
+    return 1;
+}
+
+static int source_line_count(const char *source) {
+    const char *p = source;
+    int count = 0;
+
+    while (p && *p) {
+        count++;
+        p = strchr(p, '\n');
+        if (!p) break;
+        p++;
+    }
+    return count;
+}
+
+static const char *source_line_start(const char *source, int line_no) {
+    const char *p = source;
+
+    if (line_no <= 1) return source;
+    for (int i = 1; p && *p && i < line_no; i++) {
+        p = strchr(p, '\n');
+        if (!p) return NULL;
+        p++;
+    }
+    return p;
+}
+
+static int parse_delete_range(const char *line, int *first_line, int *last_line) {
+    const char *p = skip_space(line);
+    char *endptr;
+    long first = 0;
+    long last = 0;
+    int has_first = 0;
+    int has_last = 0;
+
+    if (!command_starts_with(p, ".del")) return 0;
+    p = skip_space(p + 4);
+    if (*p == '\0' || *p == '\r' || *p == '\n') {
+        fprintf(stderr, ".del requires a line number or range\n");
+        return -1;
+    }
+
+    if (*p != ':') {
+        first = strtol(p, &endptr, 10);
+        if (endptr == p || first < 1) {
+            fprintf(stderr, "invalid .del range\n");
+            return -1;
+        }
+        has_first = 1;
+        p = skip_space(endptr);
+    }
+
+    if (*p == ':') {
+        p = skip_space(p + 1);
+        if (*p != '\0' && *p != '\r' && *p != '\n') {
+            last = strtol(p, &endptr, 10);
+            if (endptr == p || last < 1) {
+                fprintf(stderr, "invalid .del range\n");
+                return -1;
+            }
+            has_last = 1;
+            p = skip_space(endptr);
+        }
+    } else if (has_first) {
+        last = first;
+        has_last = 1;
+    } else {
+        fprintf(stderr, "invalid .del range\n");
+        return -1;
+    }
+
+    if (*p != '\0' && *p != '\r' && *p != '\n') {
+        fprintf(stderr, "unexpected text after .del range\n");
+        return -1;
+    }
+
+    *first_line = has_first ? (int)first : 1;
+    *last_line = has_last ? (int)last : -1;
+    return 1;
+}
+
+static int delete_source_lines(char **buf, size_t *len, int first_line, int last_line) {
+    int n_lines = source_line_count(*buf ? *buf : "");
+    const char *start;
+    const char *end;
+    size_t start_pos;
+    size_t end_pos;
+
+    if (last_line < 0) last_line = n_lines;
+    if (first_line < 1 || last_line < first_line || last_line > n_lines) {
+        fprintf(stderr, ".del range is outside the editable source buffer\n");
+        return 0;
+    }
+
+    start = source_line_start(*buf, first_line);
+    end = source_line_start(*buf, last_line + 1);
+    if (!start) {
+        fprintf(stderr, ".del range is outside the editable source buffer\n");
+        return 0;
+    }
+    if (!end) {
+        end = *buf + *len;
+    }
+
+    start_pos = (size_t)(start - *buf);
+    end_pos = (size_t)(end - *buf);
+    memmove(*buf + start_pos, *buf + end_pos, *len - end_pos + 1);
+    *len -= end_pos - start_pos;
+    return 1;
+}
+
+static int parse_line_edit_command(const char *line, const char *command,
+                                   int *line_no, const char **text_out) {
+    const char *p = skip_space(line);
+    char *endptr;
+    long n;
+
+    if (!command_starts_with(p, command)) return 0;
+    p = skip_space(p + strlen(command));
+    if (*p == '\0' || *p == '\r' || *p == '\n') {
+        fprintf(stderr, "%s requires a line number and text\n", command);
+        return -1;
+    }
+
+    n = strtol(p, &endptr, 10);
+    if (endptr == p || n < 1) {
+        fprintf(stderr, "invalid %s line number\n", command);
+        return -1;
+    }
+    p = skip_space(endptr);
+    if (*p == '\0' || *p == '\r' || *p == '\n') {
+        fprintf(stderr, "%s requires text\n", command);
+        return -1;
+    }
+
+    *line_no = (int)n;
+    *text_out = p;
+    return 1;
+}
+
+static char *copy_edit_text_with_newline(const char *text) {
+    size_t len = strcspn(text ? text : "", "\r\n");
+    char *copy = (char *)malloc(len + 2);
+
+    if (!copy) {
+        fprintf(stderr, "out of memory\n");
+        return NULL;
+    }
+    if (len > 0) memcpy(copy, text, len);
+    copy[len++] = '\n';
+    copy[len] = '\0';
+    return copy;
+}
+
+static int insert_source_line(char **buf, size_t *len, size_t *cap, int line_no, const char *text) {
+    int n_lines = source_line_count(*buf ? *buf : "");
+    const char *pos_ptr;
+    size_t pos;
+    char *line_text;
+    int ok;
+
+    if (line_no < 1 || line_no > n_lines + 1) {
+        fprintf(stderr, ".ins line is outside the editable source buffer\n");
+        return 0;
+    }
+    pos_ptr = (line_no == n_lines + 1) ? (*buf ? *buf + *len : NULL) : source_line_start(*buf ? *buf : "", line_no);
+    if (!pos_ptr) {
+        fprintf(stderr, ".ins line is outside the editable source buffer\n");
+        return 0;
+    }
+    pos = *buf ? (size_t)(pos_ptr - *buf) : 0;
+    line_text = copy_edit_text_with_newline(text);
+    if (!line_text) return 0;
+    ok = insert_text_at(buf, len, cap, pos, line_text);
+    free(line_text);
+    return ok;
+}
+
+static int replace_source_line(char **buf, size_t *len, size_t *cap, int line_no, const char *text) {
+    int n_lines = source_line_count(*buf ? *buf : "");
+
+    if (line_no < 1 || line_no > n_lines) {
+        fprintf(stderr, ".rep line is outside the editable source buffer\n");
+        return 0;
+    }
+    if (!delete_source_lines(buf, len, line_no, line_no)) {
+        return 0;
+    }
+    return insert_source_line(buf, len, cap, line_no, text);
+}
+
+static int valid_identifier_name(const char *name) {
+    const char *p = name;
+
+    if (!name || !(isalpha((unsigned char)*p) || *p == '_')) {
+        return 0;
+    }
+    p++;
+    while (*p) {
+        if (!identifier_char((unsigned char)*p)) {
+            return 0;
+        }
+        p++;
+    }
+    return 1;
+}
+
+static const char *skip_string_literal(const char *p) {
+    char quote = *p++;
+
+    while (*p) {
+        if (*p == quote) {
+            if (p[1] == quote) {
+                p += 2;
+                continue;
+            }
+            p++;
+            break;
+        }
+        p++;
+    }
+    return p;
+}
+
+static int source_identifier_exists(const char *source, const char *name) {
+    const char *p = source ? source : "";
+
+    while (*p) {
+        if (*p == '\'' || *p == '"') {
+            p = skip_string_literal(p);
+        } else if (*p == '!') {
+            while (*p && *p != '\n') p++;
+        } else if (isalpha((unsigned char)*p) || *p == '_') {
+            const char *start = p;
+            while (identifier_char((unsigned char)*p)) p++;
+            if (names_match(start, (size_t)(p - start), name)) {
+                return 1;
+            }
+        } else {
+            p++;
+        }
+    }
+    return 0;
+}
+
+static int rename_source_identifier(char **buf, size_t *len, size_t *cap,
+                                    const char *old_name, const char *new_name) {
+    const char *src = *buf ? *buf : "";
+    const char *p = src;
+    char *new_buf = NULL;
+    size_t new_len = 0;
+    size_t new_cap = 0;
+    int renamed = 0;
+
+    if (!valid_identifier_name(old_name) || !valid_identifier_name(new_name)) {
+        fprintf(stderr, ".rename requires valid identifier names\n");
+        return 0;
+    }
+    if (names_match(old_name, strlen(old_name), new_name)) {
+        fprintf(stderr, ".rename old and new names are the same\n");
+        return 0;
+    }
+    if (source_identifier_exists(src, new_name)) {
+        fprintf(stderr, ".rename: %s already exists\n", new_name);
+        return 0;
+    }
+
+    while (*p) {
+        if (*p == '\'' || *p == '"') {
+            const char *end = skip_string_literal(p);
+            if (!append_text_n(&new_buf, &new_len, &new_cap, p, (size_t)(end - p))) {
+                free(new_buf);
+                return 0;
+            }
+            p = end;
+        } else if (*p == '!') {
+            const char *end = p;
+            while (*end && *end != '\n') end++;
+            if (!append_text_n(&new_buf, &new_len, &new_cap, p, (size_t)(end - p))) {
+                free(new_buf);
+                return 0;
+            }
+            p = end;
+        } else if (isalpha((unsigned char)*p) || *p == '_') {
+            const char *start = p;
+            while (identifier_char((unsigned char)*p)) p++;
+            if (names_match(start, (size_t)(p - start), old_name)) {
+                if (!append_text(&new_buf, &new_len, &new_cap, new_name)) {
+                    free(new_buf);
+                    return 0;
+                }
+                renamed = 1;
+            } else if (!append_text_n(&new_buf, &new_len, &new_cap, start, (size_t)(p - start))) {
+                free(new_buf);
+                return 0;
+            }
+        } else {
+            if (!append_text_n(&new_buf, &new_len, &new_cap, p, 1)) {
+                free(new_buf);
+                return 0;
+            }
+            p++;
+        }
+    }
+
+    if (!renamed) {
+        fprintf(stderr, ".rename: %s not found\n", old_name);
+        free(new_buf);
+        return 0;
+    }
+
+    free(*buf);
+    *buf = new_buf;
+    *len = new_len;
+    *cap = new_cap;
+    return 1;
+}
+
 static void trim_line_end(char *text) {
     size_t len = strlen(text);
     while (len > 0 && (text[len - 1] == '\n' || text[len - 1] == '\r')) {
@@ -1180,9 +2014,9 @@ static int run_interactive(const char *load_path, int run_after_load) {
     int last_rc = 0;
 
     printf("Enter Fortran source.\n");
-    printf("Commands: . runs, .runq runs and quits, .quit quits, .clear clears, .list lists, .load file loads, .load-run file loads/runs.\n");
+    printf("Commands: . runs, .run [n] [-- args] repeats, .time [n] [-- args] times, .runq [n] [-- args] runs and quits, .quit quits, .clear clears, .del n[:m] deletes lines, .ins n text inserts, .rep n text replaces, .rename old new renames, .list lists, .decl lists declarations, .vars [names] lists values, .info [names] lists details, .shapes [names] lists array shapes, .sizes [names] lists array sizes, .stats [names] lists array stats, .load file loads, .load-run file loads/runs.\n");
 
-    repl_interp = ofort_create();
+    repl_interp = create_ofort_interpreter();
     if (!repl_interp) {
         fprintf(stderr, "failed to create Fortran interpreter\n");
         return 2;
@@ -1195,14 +2029,27 @@ static int run_interactive(const char *load_path, int run_after_load) {
         return 2;
     }
     if (load_path && run_after_load) {
-        last_rc = execute_source_text_on_interpreter(repl_interp, buf ? buf : "", 1, 0);
+        char *effective = make_effective_source(buf ? buf : "", footer);
+        if (!effective) {
+            free(buf);
+            free(footer);
+            ofort_destroy(repl_interp);
+            return 2;
+        }
+        last_rc = execute_source_text_on_interpreter(repl_interp, effective, 1, 0, 0, NULL);
+        free(effective);
         if (last_rc == 0) {
             executed_len = strlen(buf ? buf : "");
         }
     }
 
     for (;;) {
+        int prompt_indent = source_indent_level(buf ? buf : "");
+
         fputs("ofort> ", stdout);
+        for (int i = 0; i < prompt_indent * 2; i++) {
+            fputc(' ', stdout);
+        }
         fflush(stdout);
 
         if (!fgets(line, sizeof(line), stdin)) {
@@ -1217,25 +2064,112 @@ static int run_interactive(const char *load_path, int run_after_load) {
         }
 
         if (is_command(line, ".")) {
-            last_rc = execute_source_text_on_interpreter(repl_interp, buf ? buf : "", 1, 0);
+            char *effective = make_effective_source(buf ? buf : "", footer);
+            if (!effective) {
+                free(buf);
+                free(footer);
+                ofort_destroy(repl_interp);
+                return 2;
+            }
+            last_rc = execute_source_text_on_interpreter(repl_interp, effective, 1, 0, 0, NULL);
+            free(effective);
             if (last_rc == 0) {
                 executed_len = strlen(buf ? buf : "");
             }
             continue;
         }
 
-        if (is_command(line, ".runq")) {
-            last_rc = execute_source_text_on_interpreter(repl_interp, buf ? buf : "", 1, 0);
-            if (last_rc == 0) {
-                executed_len = strlen(buf ? buf : "");
+        {
+            char *run_args[OFORT_MAX_PARAMS];
+            int run_nargs = 0;
+            int repeat_count = 1;
+            int parsed = parse_run_command(line, ".run", &repeat_count, run_args, &run_nargs);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    char *effective = make_effective_source(buf ? buf : "", footer);
+                    if (!effective) {
+                        free_split_args(run_args, run_nargs);
+                        free(buf);
+                        free(footer);
+                        ofort_destroy(repl_interp);
+                        return 2;
+                    }
+                    last_rc = execute_repl_run(&repl_interp, effective, repeat_count, run_nargs, run_args);
+                    free(effective);
+                    if (last_rc == 0) {
+                        executed_len = strlen(buf ? buf : "");
+                    }
+                    free_split_args(run_args, run_nargs);
+                } else {
+                    last_rc = 1;
+                }
+                continue;
             }
-            if (save_interactive_source(buf ? buf : "", footer) != 0 && last_rc == 0) {
-                last_rc = 1;
+        }
+
+        {
+            char *run_args[OFORT_MAX_PARAMS];
+            int run_nargs = 0;
+            int repeat_count = 1;
+            int parsed = parse_run_command(line, ".time", &repeat_count, run_args, &run_nargs);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    char *effective = make_effective_source(buf ? buf : "", footer);
+                    if (!effective) {
+                        free_split_args(run_args, run_nargs);
+                        free(buf);
+                        free(footer);
+                        ofort_destroy(repl_interp);
+                        return 2;
+                    }
+                    last_rc = execute_repl_timed_run(&repl_interp, effective, repeat_count, run_nargs, run_args);
+                    free(effective);
+                    if (last_rc == 0) {
+                        executed_len = strlen(buf ? buf : "");
+                    }
+                    free_split_args(run_args, run_nargs);
+                } else {
+                    last_rc = 1;
+                }
+                continue;
             }
-            free(buf);
-            free(footer);
-            ofort_destroy(repl_interp);
-            return last_rc;
+        }
+
+        {
+            char *run_args[OFORT_MAX_PARAMS];
+            int run_nargs = 0;
+            int repeat_count = 1;
+            int parsed = parse_run_command(line, ".runq", &repeat_count, run_args, &run_nargs);
+            if (parsed == 0) {
+                parsed = is_command(line, ".runq") ? 1 : 0;
+            }
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    char *effective = make_effective_source(buf ? buf : "", footer);
+                    if (!effective) {
+                        free_split_args(run_args, run_nargs);
+                        free(buf);
+                        free(footer);
+                        ofort_destroy(repl_interp);
+                        return 2;
+                    }
+                    last_rc = execute_repl_run(&repl_interp, effective, repeat_count, run_nargs, run_args);
+                    free(effective);
+                    free_split_args(run_args, run_nargs);
+                } else {
+                    last_rc = 1;
+                }
+                if (last_rc == 0) {
+                    executed_len = strlen(buf ? buf : "");
+                }
+                if (save_interactive_source(buf ? buf : "", footer) != 0 && last_rc == 0) {
+                    last_rc = 1;
+                }
+                free(buf);
+                free(footer);
+                ofort_destroy(repl_interp);
+                return last_rc;
+            }
         }
 
         if (is_command(line, ".quit")) {
@@ -1271,7 +2205,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
             cap = 0;
             executed_len = 0;
             ofort_destroy(repl_interp);
-            repl_interp = ofort_create();
+            repl_interp = create_ofort_interpreter();
             if (!repl_interp) {
                 fprintf(stderr, "failed to create Fortran interpreter\n");
                 return 2;
@@ -1279,13 +2213,268 @@ static int run_interactive(const char *load_path, int run_after_load) {
             continue;
         }
 
-        if (is_command(line, ".list")) {
-            list_source(buf ? buf : "");
-            if (footer && footer[0] != '\0') {
-                fputs("   .  ", stdout);
-                fputs(footer, stdout);
+        {
+            int first_line = 0;
+            int last_line = 0;
+            int parsed = parse_delete_range(line, &first_line, &last_line);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    if (delete_source_lines(&buf, &len, first_line, last_line)) {
+                        executed_len = 0;
+                        ofort_destroy(repl_interp);
+                        repl_interp = create_ofort_interpreter();
+                        if (!repl_interp) {
+                            fprintf(stderr, "failed to create Fortran interpreter\n");
+                            free(buf);
+                            free(footer);
+                            return 2;
+                        }
+                        last_rc = 0;
+                    } else {
+                        last_rc = 1;
+                    }
+                } else {
+                    last_rc = 1;
+                }
+                continue;
             }
+        }
+
+        {
+            int edit_line = 0;
+            const char *edit_text = NULL;
+            int parsed = parse_line_edit_command(line, ".ins", &edit_line, &edit_text);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    if (insert_source_line(&buf, &len, &cap, edit_line, edit_text)) {
+                        executed_len = 0;
+                        ofort_destroy(repl_interp);
+                        repl_interp = create_ofort_interpreter();
+                        if (!repl_interp) {
+                            fprintf(stderr, "failed to create Fortran interpreter\n");
+                            free(buf);
+                            free(footer);
+                            return 2;
+                        }
+                        last_rc = 0;
+                    } else {
+                        last_rc = 1;
+                    }
+                } else {
+                    last_rc = 1;
+                }
+                continue;
+            }
+        }
+
+        {
+            int edit_line = 0;
+            const char *edit_text = NULL;
+            int parsed = parse_line_edit_command(line, ".rep", &edit_line, &edit_text);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    if (replace_source_line(&buf, &len, &cap, edit_line, edit_text)) {
+                        executed_len = 0;
+                        ofort_destroy(repl_interp);
+                        repl_interp = create_ofort_interpreter();
+                        if (!repl_interp) {
+                            fprintf(stderr, "failed to create Fortran interpreter\n");
+                            free(buf);
+                            free(footer);
+                            return 2;
+                        }
+                        last_rc = 0;
+                    } else {
+                        last_rc = 1;
+                    }
+                } else {
+                    last_rc = 1;
+                }
+                continue;
+            }
+        }
+
+        {
+            char *rename_args[OFORT_MAX_PARAMS];
+            int n_rename_args = 0;
+            int parsed = repl_named_command_args(line, ".rename", rename_args, &n_rename_args);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    if (n_rename_args != 2) {
+                        fprintf(stderr, ".rename requires old and new names\n");
+                        last_rc = 1;
+                    } else if (rename_source_identifier(&buf, &len, &cap, rename_args[0], rename_args[1])) {
+                        executed_len = 0;
+                        ofort_destroy(repl_interp);
+                        repl_interp = create_ofort_interpreter();
+                        if (!repl_interp) {
+                            fprintf(stderr, "failed to create Fortran interpreter\n");
+                            free_split_args(rename_args, n_rename_args);
+                            free(buf);
+                            free(footer);
+                            return 2;
+                        }
+                        last_rc = 0;
+                    } else {
+                        last_rc = 1;
+                    }
+                    free_split_args(rename_args, n_rename_args);
+                } else {
+                    last_rc = 1;
+                }
+                continue;
+            }
+        }
+
+        if (is_command(line, ".list")) {
+            char *effective = make_effective_source(buf ? buf : "", footer);
+            if (!effective) {
+                free(buf);
+                free(footer);
+                ofort_destroy(repl_interp);
+                return 2;
+            }
+            list_source(effective);
+            free(effective);
             continue;
+        }
+
+        if (is_command(line, ".decl")) {
+            char *effective = make_effective_source(buf ? buf : "", footer);
+            if (!effective) {
+                free(buf);
+                free(footer);
+                ofort_destroy(repl_interp);
+                return 2;
+            }
+            list_declarations(effective);
+            free(effective);
+            continue;
+        }
+
+        {
+            char *var_names[OFORT_MAX_PARAMS];
+            int n_var_names = 0;
+            int parsed = repl_named_command_args(line, ".vars", var_names, &n_var_names);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    char vars_buf[OFORT_MAX_OUTPUT];
+                    last_rc = execute_repl_pending_source(repl_interp, buf ? buf : "", &executed_len);
+                    if (last_rc == 0) {
+                        if (ofort_dump_variables(repl_interp, (const char *const *)var_names,
+                                                 n_var_names, vars_buf, sizeof(vars_buf)) == 0 &&
+                            n_var_names == 0) {
+                            fputs("(no variables)\n", stdout);
+                        } else {
+                            fputs(vars_buf, stdout);
+                        }
+                    }
+                    free_split_args(var_names, n_var_names);
+                } else {
+                    last_rc = 1;
+                }
+                continue;
+            }
+        }
+
+        {
+            char *var_names[OFORT_MAX_PARAMS];
+            int n_var_names = 0;
+            int parsed = repl_named_command_args(line, ".info", var_names, &n_var_names);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    char vars_buf[OFORT_MAX_OUTPUT];
+                    last_rc = execute_repl_pending_source(repl_interp, buf ? buf : "", &executed_len);
+                    if (last_rc == 0) {
+                        if (ofort_dump_variable_info(repl_interp, (const char *const *)var_names,
+                                                     n_var_names, vars_buf, sizeof(vars_buf)) == 0 &&
+                            n_var_names == 0) {
+                            fputs("(no variables)\n", stdout);
+                        } else {
+                            fputs(vars_buf, stdout);
+                        }
+                    }
+                    free_split_args(var_names, n_var_names);
+                } else {
+                    last_rc = 1;
+                }
+                continue;
+            }
+        }
+
+        {
+            char *var_names[OFORT_MAX_PARAMS];
+            int n_var_names = 0;
+            int parsed = repl_named_command_args(line, ".shapes", var_names, &n_var_names);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    char shapes_buf[OFORT_MAX_OUTPUT];
+                    last_rc = execute_repl_pending_source(repl_interp, buf ? buf : "", &executed_len);
+                    if (last_rc == 0) {
+                        if (ofort_dump_variable_shapes(repl_interp, (const char *const *)var_names,
+                                                       n_var_names, shapes_buf, sizeof(shapes_buf)) == 0 &&
+                            n_var_names == 0) {
+                            fputs("(no arrays)\n", stdout);
+                        } else {
+                            fputs(shapes_buf, stdout);
+                        }
+                    }
+                    free_split_args(var_names, n_var_names);
+                } else {
+                    last_rc = 1;
+                }
+                continue;
+            }
+        }
+
+        {
+            char *var_names[OFORT_MAX_PARAMS];
+            int n_var_names = 0;
+            int parsed = repl_named_command_args(line, ".sizes", var_names, &n_var_names);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    char sizes_buf[OFORT_MAX_OUTPUT];
+                    last_rc = execute_repl_pending_source(repl_interp, buf ? buf : "", &executed_len);
+                    if (last_rc == 0) {
+                        if (ofort_dump_variable_sizes(repl_interp, (const char *const *)var_names,
+                                                      n_var_names, sizes_buf, sizeof(sizes_buf)) == 0 &&
+                            n_var_names == 0) {
+                            fputs("(no arrays)\n", stdout);
+                        } else {
+                            fputs(sizes_buf, stdout);
+                        }
+                    }
+                    free_split_args(var_names, n_var_names);
+                } else {
+                    last_rc = 1;
+                }
+                continue;
+            }
+        }
+
+        {
+            char *var_names[OFORT_MAX_PARAMS];
+            int n_var_names = 0;
+            int parsed = repl_named_command_args(line, ".stats", var_names, &n_var_names);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    char stats_buf[OFORT_MAX_OUTPUT];
+                    last_rc = execute_repl_pending_source(repl_interp, buf ? buf : "", &executed_len);
+                    if (last_rc == 0) {
+                        if (ofort_dump_variable_stats(repl_interp, (const char *const *)var_names,
+                                                      n_var_names, stats_buf, sizeof(stats_buf)) == 0 &&
+                            n_var_names == 0) {
+                            fputs("(no numeric arrays)\n", stdout);
+                        } else {
+                            fputs(stats_buf, stdout);
+                        }
+                    }
+                    free_split_args(var_names, n_var_names);
+                } else {
+                    last_rc = 1;
+                }
+                continue;
+            }
         }
 
         {
@@ -1296,14 +2485,22 @@ static int run_interactive(const char *load_path, int run_after_load) {
                 trim_line_end(local_path);
                 if (load_interactive_file(local_path, &buf, &len, &cap, &footer)) {
                     ofort_destroy(repl_interp);
-                    repl_interp = ofort_create();
+                    repl_interp = create_ofort_interpreter();
                     if (!repl_interp) {
                         fprintf(stderr, "failed to create Fortran interpreter\n");
                         free(buf);
                         free(footer);
                         return 2;
                     }
-                    last_rc = execute_source_text_on_interpreter(repl_interp, buf ? buf : "", 1, 0);
+                    char *effective = make_effective_source(buf ? buf : "", footer);
+                    if (!effective) {
+                        free(buf);
+                        free(footer);
+                        ofort_destroy(repl_interp);
+                        return 2;
+                    }
+                    last_rc = execute_source_text_on_interpreter(repl_interp, effective, 1, 0, 0, NULL);
+                    free(effective);
                     executed_len = last_rc == 0 ? strlen(buf ? buf : "") : 0;
                 } else {
                     last_rc = 1;
@@ -1323,7 +2520,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
                 } else {
                     executed_len = 0;
                     ofort_destroy(repl_interp);
-                    repl_interp = ofort_create();
+                    repl_interp = create_ofort_interpreter();
                     if (!repl_interp) {
                         fprintf(stderr, "failed to create Fortran interpreter\n");
                         free(buf);
@@ -1345,16 +2542,30 @@ static int run_interactive(const char *load_path, int run_after_load) {
             continue;
         }
 
-        if (!add_repl_line_to_buffer(&buf, &len, &cap, line)) {
+        {
+            int line_indent = source_indent_level(buf ? buf : "");
+            if (repl_line_pre_dedent(line) && line_indent > 0) {
+                line_indent--;
+            }
+            if (!append_indented_repl_line(&buf, &len, &cap, line, line_indent)) {
+                free(buf);
+                free(footer);
+                ofort_destroy(repl_interp);
+                return 2;
+            }
+        }
+    }
+
+    if (buf && buf[0] != '\0') {
+        char *effective = make_effective_source(buf, footer);
+        if (!effective) {
             free(buf);
             free(footer);
             ofort_destroy(repl_interp);
             return 2;
         }
-    }
-
-    if (buf && buf[0] != '\0') {
-        last_rc = execute_source_text_on_interpreter(repl_interp, buf, 1, 0);
+        last_rc = execute_source_text_on_interpreter(repl_interp, effective, 1, 0, 0, NULL);
+        free(effective);
         if (save_interactive_source(buf, footer) != 0 && last_rc == 0) {
             last_rc = 1;
         }
@@ -1377,6 +2588,35 @@ static char *read_file(const char *path) {
 
     source = read_stream(fp, path);
     fclose(fp);
+    return source;
+}
+
+static char *read_files_concatenated(const char *const *paths, int npaths) {
+    char *source = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+
+    for (int i = 0; i < npaths; i++) {
+        char *part = read_file(paths[i]);
+        if (!part) {
+            free(source);
+            return NULL;
+        }
+        if (!append_text(&source, &len, &cap, part)) {
+            free(part);
+            free(source);
+            return NULL;
+        }
+        free(part);
+        if (len > 0 && source[len - 1] != '\n' && !append_text(&source, &len, &cap, "\n")) {
+            free(source);
+            return NULL;
+        }
+    }
+
+    if (!source && !append_text(&source, &len, &cap, "")) {
+        return NULL;
+    }
     return source;
 }
 
@@ -1485,61 +2725,114 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [file.f90]\n", program);
-    fprintf(stderr, "       %s --load file.f90\n", program);
-    fprintf(stderr, "       %s --load-run file.f90\n", program);
-    fprintf(stderr, "       %s --check file.f90\n", program);
+    fprintf(stderr, "usage: %s [--implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "       %s [--implicit-typing] --load file.f90\n", program);
+    fprintf(stderr, "       %s [--implicit-typing] --load-run file.f90\n", program);
+    fprintf(stderr, "       %s [--implicit-typing] --check file.f90\n", program);
     fprintf(stderr, "       %s --check-gfortran file.f90\n", program);
     fprintf(stderr, "       %s < file.f90\n", program);
+    fprintf(stderr, "       --implicit-typing, --legacy-implicit enables historical I-N integer/rest real implicit typing\n");
     fprintf(stderr, "       with no file in a console, start an interactive session\n");
 }
 
 int main(int argc, char **argv) {
     char *source;
+    const char **source_paths = NULL;
     const char *load_path = NULL;
     const char *syntax_check_path = NULL;
     const char *check_path = NULL;
+    char **program_args = NULL;
+    int program_argc = 0;
     int run_after_load = 0;
+    int nsource_paths = 0;
+    int i;
 
-    if (argc == 3 && strcmp(argv[1], "--load") == 0) {
-        load_path = argv[2];
-    } else if (argc == 3 && strcmp(argv[1], "--load-run") == 0) {
-        load_path = argv[2];
-        run_after_load = 1;
-    } else if (argc == 3 && strcmp(argv[1], "--check") == 0) {
-        syntax_check_path = argv[2];
-    } else if (argc == 3 && strcmp(argv[1], "--check-gfortran") == 0) {
-        check_path = argv[2];
-    } else if (argc > 2) {
-        print_usage(argv[0]);
+    source_paths = (const char **)calloc((size_t)argc, sizeof(*source_paths));
+    if (!source_paths) {
+        fprintf(stderr, "out of memory\n");
         return 2;
     }
 
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--implicit-typing") == 0 || strcmp(argv[i], "--legacy-implicit") == 0) {
+            g_implicit_typing = 1;
+        } else if (strcmp(argv[i], "--") == 0) {
+            program_args = &argv[i + 1];
+            program_argc = argc - i - 1;
+            break;
+        } else if (strcmp(argv[i], "--load") == 0 ||
+                   strcmp(argv[i], "--load-run") == 0 ||
+                   strcmp(argv[i], "--check") == 0 ||
+                   strcmp(argv[i], "--check-gfortran") == 0) {
+            const char *opt = argv[i];
+            if (++i >= argc) {
+                print_usage(argv[0]);
+                free(source_paths);
+                return 2;
+            }
+            if (load_path || syntax_check_path || check_path || nsource_paths > 0) {
+                print_usage(argv[0]);
+                free(source_paths);
+                return 2;
+            }
+            if (strcmp(opt, "--load") == 0) {
+                load_path = argv[i];
+            } else if (strcmp(opt, "--load-run") == 0) {
+                load_path = argv[i];
+                run_after_load = 1;
+            } else if (strcmp(opt, "--check") == 0) {
+                syntax_check_path = argv[i];
+            } else {
+                check_path = argv[i];
+            }
+        } else if (argv[i][0] == '-') {
+            print_usage(argv[0]);
+            free(source_paths);
+            return 2;
+        } else {
+            if (load_path || syntax_check_path || check_path) {
+                print_usage(argv[0]);
+                free(source_paths);
+                return 2;
+            }
+            source_paths[nsource_paths++] = argv[i];
+        }
+    }
+
     if (check_path) {
-        return check_with_gfortran(check_path);
+        int rc = check_with_gfortran(check_path);
+        free(source_paths);
+        return rc;
     }
 
     if (syntax_check_path) {
-        return check_ofort_file(syntax_check_path);
+        int rc = check_ofort_file(syntax_check_path);
+        free(source_paths);
+        return rc;
     }
 
     if (load_path) {
-        return run_interactive(load_path, run_after_load);
+        int rc = run_interactive(load_path, run_after_load);
+        free(source_paths);
+        return rc;
     }
 
-    if (argc == 2) {
-        source = read_file(argv[1]);
+    if (nsource_paths > 0) {
+        source = read_files_concatenated(source_paths, nsource_paths);
     } else if (ISATTY(FILENO(stdin))) {
+        free(source_paths);
         return run_interactive(NULL, 0);
     } else {
         source = read_stream(stdin, "stdin");
     }
     if (!source) {
+        free(source_paths);
         return 2;
     }
     {
-        int rc = execute_source_text(source, 0, 0);
+        int rc = execute_source_text(source, 0, 0, program_argc, program_args);
         free(source);
+        free(source_paths);
         return rc;
     }
 }
