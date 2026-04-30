@@ -31,6 +31,7 @@ typedef struct {
     int is_parameter; /* PARAMETER = const */
     int intent;       /* 0=none,1=IN,2=OUT,3=INOUT */
     int char_len;     /* declared CHARACTER length, 0 if not CHARACTER */
+    int present;      /* 0 for absent OPTIONAL dummy arguments */
 } OfortVar;
 
 typedef struct OfortScope {
@@ -550,6 +551,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->is_parameter = 0;
     v->intent = 0;
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
+    v->present = 1;
     return v;
 }
 
@@ -567,6 +569,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
             free_value(&s->vars[i].val);
             s->vars[i].val = val;
             s->vars[i].char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
+            s->vars[i].present = val.type != FVAL_VOID;
             return &s->vars[i];
         }
     }
@@ -576,10 +579,17 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->is_parameter = 0;
     v->intent = 0;
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
+    v->present = val.type != FVAL_VOID;
     return v;
 }
 
 /* ── Function lookup ─────────────────────────── */
+static OfortVar *declare_absent_optional_var(OfortInterpreter *I, const char *name) {
+    OfortVar *v = declare_var(I, name, make_void_val());
+    v->present = 0;
+    return v;
+}
+
 static OfortFunc *find_func(OfortInterpreter *I, const char *name) {
     char upper[256];
     str_upper(upper, name, 256);
@@ -1541,6 +1551,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     OfortNode *char_len_expr = NULL;
     int is_allocatable = 0;
     int is_parameter = 0;
+    int is_optional = 0;
     int intent = 0;
     int decl_dims[7] = {0};
     int n_decl_dims = 0;
@@ -1620,6 +1631,9 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         } else if (check(I, FTOK_PARAMETER)) {
             advance(I);
             is_parameter = 1;
+        } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "optional")) {
+            advance(I);
+            is_optional = 1;
         } else if (check(I, FTOK_INTENT)) {
             advance(I);
             expect(I, FTOK_LPAREN);
@@ -1655,6 +1669,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         decl->char_len_expr = char_len_expr;
         decl->is_allocatable = is_allocatable;
         decl->is_parameter = is_parameter;
+        decl->is_optional = is_optional;
         decl->intent = intent;
         decl->line = name_tok->line;
 
@@ -2323,6 +2338,7 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
             copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), param->str_val);
             n->param_types[n->n_params] = FVAL_VOID; /* resolved later */
             n->param_intents[n->n_params] = 0;
+            n->param_optional[n->n_params] = 0;
             n->n_params++;
             if (check(I, FTOK_COMMA)) advance(I);
         }
@@ -2356,6 +2372,7 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
             copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), param->str_val);
             n->param_types[n->n_params] = FVAL_VOID;
             n->param_intents[n->n_params] = 0;
+            n->param_optional[n->n_params] = 0;
             n->n_params++;
             if (check(I, FTOK_COMMA)) advance(I);
         }
@@ -4067,6 +4084,16 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             return eval_array_section(I, var, n);
         }
 
+        if (str_eq_nocase(n->name, "present")) {
+            int present = 0;
+            if (nargs != 1 || n->stmts[0]->type != FND_IDENT) {
+                ofort_error(I, "PRESENT requires one dummy argument name");
+            }
+            var = find_var(I, n->stmts[0]->name);
+            present = var && var->present;
+            return make_logical(present);
+        }
+
         /* Evaluate all args */
         for (int i = 0; i < nargs; i++) args[i] = eval_node(I, n->stmts[i]);
 
@@ -4083,8 +4110,15 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             OfortNode *fn = func->node;
             push_scope(I);
             /* Bind parameters */
-            for (int i = 0; i < fn->n_params && i < nargs; i++) {
-                declare_var(I, fn->param_names[i], copy_value(args[i]));
+            for (int i = 0; i < fn->n_params; i++) {
+                if (i < nargs && args[i].type != FVAL_VOID) {
+                    declare_var(I, fn->param_names[i], copy_value(args[i]));
+                } else if (fn->param_optional[i]) {
+                    declare_absent_optional_var(I, fn->param_names[i]);
+                } else {
+                    ofort_error(I, "Missing required argument '%s' in call to '%s'",
+                                fn->param_names[i], fn->name);
+                }
             }
             /* Set up result variable */
             const char *res_name = fn->result_name[0] ? fn->result_name : fn->name;
@@ -4102,7 +4136,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             for (int i = 0; i < fn->n_params && i < nargs; i++) {
                 if (fn->param_intents[i] == 2 || fn->param_intents[i] == 3) {
                     OfortVar *pv = find_var(I, fn->param_names[i]);
-                    if (pv && n->stmts[i]->type == FND_IDENT) {
+                    if (pv && pv->present && n->stmts[i]->type == FND_IDENT) {
                         free_value(&args[i]);
                         args[i] = copy_value(pv->val);
                     }
@@ -4114,7 +4148,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             /* Write back OUT/INOUT args */
             for (int i = 0; i < fn->n_params && i < nargs; i++) {
                 if (fn->param_intents[i] == 2 || fn->param_intents[i] == 3) {
-                    if (n->stmts[i]->type == FND_IDENT) {
+                    if (n->stmts[i]->type == FND_IDENT && args[i].type != FVAL_VOID) {
                         set_var(I, n->stmts[i]->name, copy_value(args[i]));
                     }
                 }
@@ -4197,6 +4231,35 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
     }
 }
 
+static void annotate_procedure_params(OfortNode *n) {
+    OfortNode *body = n ? n->children[0] : NULL;
+    if (!body) return;
+
+    for (int i = 0; i < body->n_stmts; i++) {
+        OfortNode *s = body->stmts[i];
+        OfortNode **decls = &s;
+        int n_decls = 1;
+        if (s->type == FND_BLOCK) {
+            decls = s->stmts;
+            n_decls = s->n_stmts;
+        }
+        for (int j = 0; j < n_decls; j++) {
+            OfortNode *d = decls[j];
+            if (d->type != FND_VARDECL || (d->intent == 0 && !d->is_optional)) {
+                continue;
+            }
+            for (int k = 0; k < n->n_params; k++) {
+                if (str_eq_nocase(d->name, n->param_names[k])) {
+                    n->param_intents[k] = d->intent;
+                    n->param_types[k] = d->val_type;
+                    n->param_optional[k] = d->is_optional;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /* Execute statement node */
 static void exec_node(OfortInterpreter *I, OfortNode *n) {
     if (!n) return;
@@ -4236,6 +4299,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             for (int i = 0; i < body->n_stmts; i++) {
                 OfortNode *s = body->stmts[i];
                 if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION) {
+                    annotate_procedure_params(s);
                     register_func(I, s->name, s, s->type == FND_FUNCTION);
                 } else if (s->type == FND_TYPE_DEF) {
                     exec_node(I, s);
@@ -4344,8 +4408,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 break;
             }
         }
-        if (existing && n->intent != 0) {
+        if (existing && (n->intent != 0 || n->is_optional)) {
             existing->intent = n->intent;
+            if (n->val_type == FVAL_CHARACTER) existing->char_len = decl_char_len;
             break;
         }
         if (existing && n->type == FND_PARAMDECL && n->n_children > 0 && n->children[0]) {
@@ -4800,8 +4865,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortNode *fn = func->node;
         push_scope(I);
         /* Bind parameters */
-        for (int i = 0; i < fn->n_params && i < nargs; i++) {
-            OfortVar *pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
+        for (int i = 0; i < fn->n_params; i++) {
+            OfortVar *pv;
+            if (i < nargs && args[i].type != FVAL_VOID) {
+                pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
+            } else if (fn->param_optional[i]) {
+                pv = declare_absent_optional_var(I, fn->param_names[i]);
+            } else {
+                ofort_error(I, "Missing required argument '%s' in call to '%s'",
+                            fn->param_names[i], fn->name);
+            }
             pv->intent = fn->param_intents[i];
         }
 
@@ -4812,7 +4885,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             if (fn->param_intents[i] != 1) {
                 OfortVar *pv = find_var(I, fn->param_names[i]);
-                if (pv && n->stmts[i]->type == FND_IDENT) {
+                if (pv && pv->present && n->stmts[i]->type == FND_IDENT) {
                     free_value(&args[i]);
                     args[i] = copy_value(pv->val);
                 }
@@ -4821,7 +4894,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
         pop_scope(I);
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
-            if (n->stmts[i]->type == FND_IDENT && fn->param_intents[i] != 1) {
+            if (n->stmts[i]->type == FND_IDENT && fn->param_intents[i] != 1 &&
+                args[i].type != FVAL_VOID) {
                 set_var(I, n->stmts[i]->name, copy_value(args[i]));
             }
         }
@@ -4841,7 +4915,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     /* declaration block */
                     for (int j = 0; j < s->n_stmts; j++) {
                         OfortNode *d = s->stmts[j];
-                        if (d->type == FND_VARDECL && d->intent != 0) {
+                        if (d->type == FND_VARDECL && (d->intent != 0 || d->is_optional)) {
                             /* Match parameter name */
                             char du[256];
                             str_upper(du, d->name, 256);
@@ -4851,12 +4925,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                                 if (strcmp(du, pu) == 0) {
                                     n->param_intents[k] = d->intent;
                                     n->param_types[k] = d->val_type;
+                                    n->param_optional[k] = d->is_optional;
                                     break;
                                 }
                             }
                         }
                     }
-                } else if (s->type == FND_VARDECL && s->intent != 0) {
+                } else if (s->type == FND_VARDECL && (s->intent != 0 || s->is_optional)) {
                     char du[256];
                     str_upper(du, s->name, 256);
                     for (int k = 0; k < n->n_params; k++) {
@@ -4865,6 +4940,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         if (strcmp(du, pu) == 0) {
                             n->param_intents[k] = s->intent;
                             n->param_types[k] = s->val_type;
+                            n->param_optional[k] = s->is_optional;
                             break;
                         }
                     }
