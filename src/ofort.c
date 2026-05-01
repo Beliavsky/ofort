@@ -42,6 +42,7 @@ typedef struct {
     int is_protected;
     int is_save;
     int is_implicit_save;
+    int is_alias;
     int pointer_associated;
     char pointer_target[256];
     int pointer_has_slice;
@@ -592,7 +593,9 @@ static void pop_scope(OfortInterpreter *I) {
     I->current_scope = s->parent;
     /* free vars */
     int i;
-    for (i = 0; i < s->n_vars; i++) free_value(&s->vars[i].val);
+    for (i = 0; i < s->n_vars; i++) {
+        if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
+    }
     free(s);
 }
 
@@ -711,8 +714,9 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
             if (s->vars[i].is_protected)
                 ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
             val = resize_character_value(val, s->vars[i].char_len);
-            free_value(&s->vars[i].val);
+            if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
             s->vars[i].val = val;
+            s->vars[i].is_alias = 0;
             return &s->vars[i];
         }
     }
@@ -729,8 +733,9 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                     ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
                 val = coerce_assignment_value(I, name, ps->vars[i].val.type, val);
                 val = resize_character_value(val, ps->vars[i].char_len);
-                free_value(&ps->vars[i].val);
+                if (!ps->vars[i].is_alias) free_value(&ps->vars[i].val);
                 ps->vars[i].val = val;
+                ps->vars[i].is_alias = 0;
                 return &ps->vars[i];
             }
         }
@@ -761,6 +766,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->is_protected = 0;
     v->is_save = 0;
     v->is_implicit_save = 0;
+    v->is_alias = 0;
     v->pointer_associated = 0;
     v->pointer_target[0] = '\0';
     v->pointer_has_slice = 0;
@@ -780,8 +786,9 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
         char vu[256];
         str_upper(vu, s->vars[i].name, 256);
         if (strcmp(upper, vu) == 0) {
-            free_value(&s->vars[i].val);
+            if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
             s->vars[i].val = val;
+            s->vars[i].is_alias = 0;
             s->vars[i].char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
             s->vars[i].present = val.type != FVAL_VOID;
             return &s->vars[i];
@@ -800,11 +807,40 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->is_protected = 0;
     v->is_save = 0;
     v->is_implicit_save = 0;
+    v->is_alias = 0;
     v->pointer_associated = 0;
     v->pointer_target[0] = '\0';
     v->pointer_has_slice = 0;
     v->pointer_slice_start = 0;
     v->pointer_slice_end = 0;
+    return v;
+}
+
+static OfortVar *declare_alias_var(OfortInterpreter *I, const char *name, OfortVar *target) {
+    OfortScope *s = I->current_scope;
+    OfortVar *v;
+    if (!target) return NULL;
+    if (s->n_vars >= OFORT_MAX_VARS) ofort_error(I, "Too many variables");
+    v = &s->vars[s->n_vars++];
+    memset(v, 0, sizeof(*v));
+    copy_cstr(v->name, sizeof(v->name), name);
+    v->val = target->val;
+    v->is_parameter = target->is_parameter;
+    v->intent = target->intent;
+    v->char_len = target->char_len;
+    v->present = target->present;
+    v->is_allocatable = target->is_allocatable;
+    v->is_pointer = target->is_pointer;
+    v->is_target = target->is_target;
+    v->is_protected = target->is_protected;
+    v->is_save = target->is_save;
+    v->is_implicit_save = target->is_implicit_save;
+    v->is_alias = 1;
+    v->pointer_associated = target->pointer_associated;
+    copy_cstr(v->pointer_target, sizeof(v->pointer_target), target->pointer_target);
+    v->pointer_has_slice = target->pointer_has_slice;
+    v->pointer_slice_start = target->pointer_slice_start;
+    v->pointer_slice_end = target->pointer_slice_end;
     return v;
 }
 
@@ -7139,24 +7175,38 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
         /* Evaluate arguments */
         int nargs = n->n_stmts;
-        OfortValue args[OFORT_MAX_PARAMS];
-        for (int i = 0; i < nargs; i++) args[i] = eval_node(I, n->stmts[i]);
 
         /* Check for intrinsic subroutines */
         /* (none currently — user subroutines only) */
 
         OfortFunc *func = find_func(I, n->name);
         if (!func) {
-            for (int i = 0; i < nargs; i++) free_value(&args[i]);
             ofort_error(I, "Unknown subroutine '%s' at line %d", n->name, n->line);
         }
 
         OfortNode *fn = func->node;
+        OfortValue args[OFORT_MAX_PARAMS];
+        int arg_alias[OFORT_MAX_PARAMS] = {0};
+        OfortVar *arg_alias_var[OFORT_MAX_PARAMS] = {0};
+        for (int i = 0; i < nargs; i++) {
+            args[i] = make_void_val();
+            if (I->fast_mode && i < fn->n_params && n->stmts[i]->type == FND_IDENT) {
+                OfortVar *actual = find_var(I, n->stmts[i]->name);
+                if (actual && actual->val.type == FVAL_ARRAY && array_has_packed_numeric(&actual->val)) {
+                    arg_alias[i] = 1;
+                    arg_alias_var[i] = actual;
+                    continue;
+                }
+            }
+            args[i] = eval_node(I, n->stmts[i]);
+        }
         push_scope(I);
         /* Bind parameters */
         for (int i = 0; i < fn->n_params; i++) {
             OfortVar *pv;
-            if (i < nargs && args[i].type != FVAL_VOID) {
+            if (i < nargs && arg_alias[i]) {
+                pv = declare_alias_var(I, fn->param_names[i], arg_alias_var[i]);
+            } else if (i < nargs && args[i].type != FVAL_VOID) {
                 pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
             } else if (fn->param_optional[i]) {
                 pv = declare_absent_optional_var(I, fn->param_names[i]);
@@ -7175,7 +7225,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
         /* Handle INTENT(OUT/INOUT) — copy back */
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
-            if (fn->param_intents[i] != 1) {
+            if (!arg_alias[i] && fn->param_intents[i] != 1) {
                 OfortVar *pv = find_var(I, fn->param_names[i]);
                 if (pv && pv->present && n->stmts[i]->type == FND_IDENT) {
                     free_value(&args[i]);
@@ -7187,7 +7237,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         store_saved_vars(func, I->current_scope);
         pop_scope(I);
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
-            if (n->stmts[i]->type == FND_IDENT && fn->param_intents[i] != 1 &&
+            if (!arg_alias[i] && n->stmts[i]->type == FND_IDENT && fn->param_intents[i] != 1 &&
                 args[i].type != FVAL_VOID) {
                 set_var(I, n->stmts[i]->name, copy_value(args[i]));
             }
@@ -9092,7 +9142,9 @@ void ofort_destroy(OfortInterpreter *interp) {
     OfortScope *s = interp->current_scope;
     while (s) {
         OfortScope *parent = s->parent;
-        for (int i = 0; i < s->n_vars; i++) free_value(&s->vars[i].val);
+        for (int i = 0; i < s->n_vars; i++) {
+            if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
+        }
         free(s);
         s = parent;
     }
