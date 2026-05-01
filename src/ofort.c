@@ -154,6 +154,17 @@ struct OfortInterpreter {
 
 /* ── Forward declarations ────────────────────── */
 static char fast_local_array_cache_tag;
+static char fast_numeric_loop_plan_tag;
+
+typedef struct {
+    int kind; /* 1=assignment, 2=counted DO */
+    OfortNode *node;
+} FastNumericLoopItem;
+
+typedef struct {
+    int n_items;
+    FastNumericLoopItem *items;
+} FastNumericLoopPlan;
 
 static void ofort_error(OfortInterpreter *I, const char *fmt, ...);
 static OfortValue eval_node(OfortInterpreter *I, OfortNode *n);
@@ -5712,19 +5723,64 @@ static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n
     return 1;
 }
 
-static int fast_numeric_loop_body_supported(OfortNode *body) {
-    if (!body || body->type != FND_BLOCK || body->n_stmts <= 0) return 0;
+static void free_fast_numeric_loop_plan(FastNumericLoopPlan *plan) {
+    if (!plan) return;
+    free(plan->items);
+    free(plan);
+}
+
+static FastNumericLoopPlan *compile_fast_numeric_loop_plan(OfortNode *body) {
+    FastNumericLoopPlan *plan;
+    if (!body || body->type != FND_BLOCK || body->n_stmts <= 0) return NULL;
+    plan = (FastNumericLoopPlan *)calloc(1, sizeof(*plan));
+    if (!plan) return NULL;
+    plan->items = (FastNumericLoopItem *)calloc((size_t)body->n_stmts, sizeof(*plan->items));
+    if (!plan->items) {
+        free(plan);
+        return NULL;
+    }
     for (int i = 0; i < body->n_stmts; i++) {
         OfortNode *s = body->stmts[i];
         if (!s) continue;
-        if (s->type == FND_ASSIGN) continue;
-        if (s->type == FND_DO_LOOP && fast_numeric_loop_body_supported(s->children[3])) continue;
-        return 0;
+        if (s->type == FND_ASSIGN) {
+            plan->items[plan->n_items].kind = 1;
+            plan->items[plan->n_items].node = s;
+            plan->n_items++;
+        } else if (s->type == FND_DO_LOOP) {
+            FastNumericLoopPlan *child_plan = compile_fast_numeric_loop_plan(s->children[3]);
+            if (!child_plan) {
+                free_fast_numeric_loop_plan(plan);
+                return NULL;
+            }
+            free_fast_numeric_loop_plan(child_plan);
+            plan->items[plan->n_items].kind = 2;
+            plan->items[plan->n_items].node = s;
+            plan->n_items++;
+        } else {
+            free_fast_numeric_loop_plan(plan);
+            return NULL;
+        }
     }
-    return 1;
+    if (plan->n_items == 0) {
+        free_fast_numeric_loop_plan(plan);
+        return NULL;
+    }
+    return plan;
 }
 
-static int exec_fast_numeric_loop_body(OfortInterpreter *I, OfortNode *body);
+static FastNumericLoopPlan *get_fast_numeric_loop_plan(OfortNode *n) {
+    FastNumericLoopPlan *plan;
+    if (!n || n->type != FND_DO_LOOP) return NULL;
+    if (n->fast_cache[4] == &fast_numeric_loop_plan_tag) {
+        return (FastNumericLoopPlan *)n->fast_cache[5];
+    }
+    plan = compile_fast_numeric_loop_plan(n->children[3]);
+    n->fast_cache[4] = &fast_numeric_loop_plan_tag;
+    n->fast_cache[5] = plan;
+    return plan;
+}
+
+static int exec_fast_numeric_loop_plan(OfortInterpreter *I, FastNumericLoopPlan *plan);
 
 static int exec_fast_numeric_do_loop(OfortInterpreter *I, OfortNode *n) {
     OfortValue start;
@@ -5732,9 +5788,11 @@ static int exec_fast_numeric_do_loop(OfortInterpreter *I, OfortNode *n) {
     OfortValue step;
     long long s, e, st, iter;
     OfortVar *loop_var;
+    FastNumericLoopPlan *plan;
 
     if (!I || !I->fast_mode || I->line_profile_enabled || !n || n->type != FND_DO_LOOP) return 0;
-    if (!fast_numeric_loop_body_supported(n->children[3])) return 0;
+    plan = get_fast_numeric_loop_plan(n);
+    if (!plan) return 0;
 
     start = eval_node(I, n->children[0]);
     end = eval_node(I, n->children[1]);
@@ -5759,7 +5817,7 @@ static int exec_fast_numeric_do_loop(OfortInterpreter *I, OfortNode *n) {
             set_var(I, n->name, make_integer(iter));
             loop_var = find_var(I, n->name);
         }
-        if (!exec_fast_numeric_loop_body(I, n->children[3])) return 0;
+        if (!exec_fast_numeric_loop_plan(I, plan)) return 0;
         if (I->returning || I->exiting || I->cycling || I->stopping) return 0;
         iter += st;
     }
@@ -5771,15 +5829,14 @@ static int exec_fast_numeric_do_loop(OfortInterpreter *I, OfortNode *n) {
     return 1;
 }
 
-static int exec_fast_numeric_loop_body(OfortInterpreter *I, OfortNode *body) {
-    if (!body || body->type != FND_BLOCK) return 0;
-    for (int i = 0; i < body->n_stmts; i++) {
-        OfortNode *s = body->stmts[i];
-        if (!s) continue;
-        if (s->type == FND_ASSIGN) {
-            if (!exec_fast_scalar_numeric_assignment(I, s)) return 0;
-        } else if (s->type == FND_DO_LOOP) {
-            if (!exec_fast_numeric_do_loop(I, s)) return 0;
+static int exec_fast_numeric_loop_plan(OfortInterpreter *I, FastNumericLoopPlan *plan) {
+    if (!plan) return 0;
+    for (int i = 0; i < plan->n_items; i++) {
+        FastNumericLoopItem *item = &plan->items[i];
+        if (item->kind == 1) {
+            if (!exec_fast_scalar_numeric_assignment(I, item->node)) return 0;
+        } else if (item->kind == 2) {
+            if (!exec_fast_numeric_do_loop(I, item->node)) return 0;
         } else {
             return 0;
         }
@@ -9281,6 +9338,9 @@ void ofort_destroy(OfortInterpreter *interp) {
                 OfortValue *cached = (OfortValue *)n->fast_cache[2];
                 free_value(cached);
                 free(cached);
+            }
+            if (n->fast_cache[4] == &fast_numeric_loop_plan_tag && n->fast_cache[5]) {
+                free_fast_numeric_loop_plan((FastNumericLoopPlan *)n->fast_cache[5]);
             }
             free(n);
         }
