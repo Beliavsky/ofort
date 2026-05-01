@@ -3407,6 +3407,18 @@ static OfortValue packed_array_element_value(const OfortValue *arr, int index) {
     return make_void_val();
 }
 
+static OfortValue array_element_value(const OfortValue *arr, int index) {
+    if (!arr || arr->type != FVAL_ARRAY || index < 0 || index >= arr->v.arr.len) return make_void_val();
+    if (array_has_packed_numeric(arr)) {
+        return packed_array_element_value(arr, index);
+    }
+    if (!arr->v.arr.data) return default_value(arr->v.arr.elem_type, 1);
+    if (arr->v.arr.data[index].kind == 0 && can_defer_numeric_array_tags(arr->v.arr.elem_type)) {
+        return default_value(arr->v.arr.elem_type, 1);
+    }
+    return copy_value(arr->v.arr.data[index]);
+}
+
 static int assign_packed_array_element(OfortValue *arr, int index, OfortValue rhs) {
     if (!arr || arr->type != FVAL_ARRAY || index < 0 || index >= arr->v.arr.len) return 0;
     if (arr->v.arr.real_data &&
@@ -3693,7 +3705,7 @@ static void assign_section_recursive(OfortInterpreter *I, OfortValue *dst, Ofort
         if (rhs->type == FVAL_ARRAY) {
             if (*rhs_index >= rhs->v.arr.len)
                 ofort_error(I, "Array assignment shape mismatch");
-            value = copy_value(rhs->v.arr.data[*rhs_index]);
+            value = array_element_value(rhs, *rhs_index);
             (*rhs_index)++;
         } else {
             value = copy_value(*rhs);
@@ -5557,19 +5569,27 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     if (rhs.v.arr.len != v->val.v.arr.len)
                         ofort_error(I, "Array assignment shape mismatch");
                     for (int i = 0; i < v->val.v.arr.len; i++) {
-                        OfortValue elem = copy_value(rhs.v.arr.data[i]);
+                        OfortValue elem = array_element_value(&rhs, i);
                         if (v->val.v.arr.elem_type == FVAL_CHARACTER)
                             elem = resize_character_value(elem, v->char_len);
-                        free_value(&v->val.v.arr.data[i]);
-                        v->val.v.arr.data[i] = elem;
+                        if (assign_packed_array_element(&v->val, i, elem)) {
+                            free_value(&elem);
+                        } else {
+                            free_value(&v->val.v.arr.data[i]);
+                            v->val.v.arr.data[i] = elem;
+                        }
                     }
                 } else {
                     for (int i = 0; i < v->val.v.arr.len; i++) {
                         OfortValue elem = copy_value(rhs);
                         if (v->val.v.arr.elem_type == FVAL_CHARACTER)
                             elem = resize_character_value(elem, v->char_len);
-                        free_value(&v->val.v.arr.data[i]);
-                        v->val.v.arr.data[i] = elem;
+                        if (assign_packed_array_element(&v->val, i, elem)) {
+                            free_value(&elem);
+                        } else {
+                            free_value(&v->val.v.arr.data[i]);
+                            v->val.v.arr.data[i] = elem;
+                        }
                     }
                 }
                 free_value(&rhs);
@@ -7501,6 +7521,16 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "PRODUCT") == 0) {
         if (args[0].type != FVAL_ARRAY) return copy_value(args[0]);
         double prod = 1;
+        if (args[0].v.arr.int_data && args[0].v.arr.elem_type == FVAL_INTEGER) {
+            long long iprod = 1;
+            for (int i = 0; i < args[0].v.arr.len; i++) iprod *= args[0].v.arr.int_data[i];
+            return make_integer(iprod);
+        }
+        if (args[0].v.arr.real_data &&
+            (args[0].v.arr.elem_type == FVAL_REAL || args[0].v.arr.elem_type == FVAL_DOUBLE)) {
+            for (int i = 0; i < args[0].v.arr.len; i++) prod *= args[0].v.arr.real_data[i];
+            return make_real(prod);
+        }
         for (int i = 0; i < args[0].v.arr.len; i++)
             prod *= val_to_real(args[0].v.arr.data[i]);
         if (args[0].v.arr.elem_type == FVAL_INTEGER) return make_integer((long long)prod);
@@ -7509,6 +7539,19 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "MAXVAL") == 0) {
         if (args[0].type != FVAL_ARRAY || args[0].v.arr.len == 0)
             ofort_error(I, "MAXVAL requires a non-empty array");
+        if (args[0].v.arr.int_data && args[0].v.arr.elem_type == FVAL_INTEGER) {
+            long long mx = args[0].v.arr.int_data[0];
+            for (int i = 1; i < args[0].v.arr.len; i++)
+                if (args[0].v.arr.int_data[i] > mx) mx = args[0].v.arr.int_data[i];
+            return make_integer(mx);
+        }
+        if (args[0].v.arr.real_data &&
+            (args[0].v.arr.elem_type == FVAL_REAL || args[0].v.arr.elem_type == FVAL_DOUBLE)) {
+            double mx = args[0].v.arr.real_data[0];
+            for (int i = 1; i < args[0].v.arr.len; i++)
+                if (args[0].v.arr.real_data[i] > mx) mx = args[0].v.arr.real_data[i];
+            return make_real(mx);
+        }
         double mx = val_to_real(args[0].v.arr.data[0]);
         for (int i = 1; i < args[0].v.arr.len; i++) {
             double v = val_to_real(args[0].v.arr.data[i]);
@@ -7520,6 +7563,19 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "MINVAL") == 0) {
         if (args[0].type != FVAL_ARRAY || args[0].v.arr.len == 0)
             ofort_error(I, "MINVAL requires a non-empty array");
+        if (args[0].v.arr.int_data && args[0].v.arr.elem_type == FVAL_INTEGER) {
+            long long mn = args[0].v.arr.int_data[0];
+            for (int i = 1; i < args[0].v.arr.len; i++)
+                if (args[0].v.arr.int_data[i] < mn) mn = args[0].v.arr.int_data[i];
+            return make_integer(mn);
+        }
+        if (args[0].v.arr.real_data &&
+            (args[0].v.arr.elem_type == FVAL_REAL || args[0].v.arr.elem_type == FVAL_DOUBLE)) {
+            double mn = args[0].v.arr.real_data[0];
+            for (int i = 1; i < args[0].v.arr.len; i++)
+                if (args[0].v.arr.real_data[i] < mn) mn = args[0].v.arr.real_data[i];
+            return make_real(mn);
+        }
         double mn = val_to_real(args[0].v.arr.data[0]);
         for (int i = 1; i < args[0].v.arr.len; i++) {
             double v = val_to_real(args[0].v.arr.data[i]);
