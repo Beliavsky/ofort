@@ -38,6 +38,7 @@ typedef struct {
     int is_target;
     int is_protected;
     int is_save;
+    int is_implicit_save;
     int pointer_associated;
     char pointer_target[256];
     int pointer_has_slice;
@@ -93,6 +94,9 @@ struct OfortInterpreter {
     char output[OFORT_MAX_OUTPUT];
     int out_len;
     char error[4096];
+    char warnings[4096];
+    int warn_len;
+    int warnings_enabled;
     /* tokens */
     OfortToken tokens[OFORT_MAX_TOKENS];
     int n_tokens;
@@ -129,6 +133,7 @@ struct OfortInterpreter {
     int suppress_output;
     int command_argc;
     char command_args[OFORT_MAX_PARAMS][OFORT_MAX_STRLEN];
+    int procedure_depth;
     /* node pool for memory management */
     OfortNode **node_pool;
     int node_pool_len;
@@ -238,6 +243,59 @@ static void ofort_error(OfortInterpreter *I, const char *fmt, ...) {
     append_source_line_to_error(I, line);
     I->has_error = 1;
     longjmp(I->err_jmp, 1);
+}
+
+static void append_source_line_to_warning(OfortInterpreter *I, int line) {
+    const char *p;
+    const char *start;
+    const char *end;
+    int current = 1;
+
+    if (!I->source || line <= 0 || I->warn_len >= (int)sizeof(I->warnings) - 1) {
+        return;
+    }
+
+    p = I->source;
+    while (*p && current < line) {
+        if (*p == '\n') current++;
+        p++;
+    }
+    if (current != line || !*p) return;
+
+    start = p;
+    end = start;
+    while (*end && *end != '\n' && *end != '\r') end++;
+
+    I->warn_len += snprintf(I->warnings + I->warn_len,
+                            sizeof(I->warnings) - (size_t)I->warn_len,
+                            "line %d: %.*s\n", line, (int)(end - start), start);
+    if (I->warn_len >= (int)sizeof(I->warnings)) {
+        I->warn_len = (int)sizeof(I->warnings) - 1;
+        I->warnings[I->warn_len] = '\0';
+    }
+}
+
+static void ofort_warning(OfortInterpreter *I, int line, const char *fmt, ...) {
+    va_list ap;
+    int written;
+
+    if (!I || !I->warnings_enabled || I->warn_len >= (int)sizeof(I->warnings) - 1) return;
+    va_start(ap, fmt);
+    written = vsnprintf(I->warnings + I->warn_len,
+                        sizeof(I->warnings) - (size_t)I->warn_len, fmt, ap);
+    va_end(ap);
+    if (written < 0) return;
+    if (written >= (int)sizeof(I->warnings) - I->warn_len) {
+        I->warn_len = (int)sizeof(I->warnings) - 1;
+        I->warnings[I->warn_len] = '\0';
+        return;
+    }
+    I->warn_len += written;
+    if (I->warn_len < (int)sizeof(I->warnings) - 1) {
+        I->warnings[I->warn_len++] = '\n';
+        I->warnings[I->warn_len] = '\0';
+    }
+    append_source_line_to_warning(I, line);
 }
 
 /* ── String upper-case helper (for case-insensitive matching) ── */
@@ -595,6 +653,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->is_target = 0;
     v->is_protected = 0;
     v->is_save = 0;
+    v->is_implicit_save = 0;
     v->pointer_associated = 0;
     v->pointer_target[0] = '\0';
     v->pointer_has_slice = 0;
@@ -633,6 +692,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->is_target = 0;
     v->is_protected = 0;
     v->is_save = 0;
+    v->is_implicit_save = 0;
     v->pointer_associated = 0;
     v->pointer_target[0] = '\0';
     v->pointer_has_slice = 0;
@@ -693,6 +753,7 @@ static void restore_saved_vars(OfortInterpreter *I, OfortFunc *func) {
         v->is_target = func->saved_vars[i].is_target;
         v->is_protected = func->saved_vars[i].is_protected;
         v->is_save = 1;
+        v->is_implicit_save = func->saved_vars[i].is_implicit_save;
         v->pointer_associated = func->saved_vars[i].pointer_associated;
         copy_cstr(v->pointer_target, sizeof(v->pointer_target), func->saved_vars[i].pointer_target);
         v->pointer_has_slice = func->saved_vars[i].pointer_has_slice;
@@ -725,6 +786,7 @@ static void store_saved_vars(OfortFunc *func, OfortScope *scope) {
         dst->is_target = src->is_target;
         dst->is_protected = src->is_protected;
         dst->is_save = 1;
+        dst->is_implicit_save = src->is_implicit_save;
         dst->pointer_associated = src->pointer_associated;
         copy_cstr(dst->pointer_target, sizeof(dst->pointer_target), src->pointer_target);
         dst->pointer_has_slice = src->pointer_has_slice;
@@ -1707,6 +1769,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     int is_target = 0;
     int is_protected = 0;
     int is_save = 0;
+    int is_implicit_save = 0;
     int is_parameter = 0;
     int is_optional = 0;
     int intent = 0;
@@ -1839,6 +1902,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         decl->is_target = is_target;
         decl->is_protected = is_protected;
         decl->is_save = is_save;
+        decl->is_implicit_save = is_implicit_save;
         decl->is_parameter = is_parameter;
         decl->is_optional = is_optional;
         decl->intent = intent;
@@ -1905,7 +1969,9 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             advance(I);
             decl->children[0] = parse_expr(I);
             decl->n_children = 1;
-            decl->is_save = 1;
+            if (!decl->is_save && decl->type == FND_VARDECL) {
+                decl->is_implicit_save = 1;
+            }
         }
 
         if (block->n_stmts >= cap) {
@@ -4470,7 +4536,9 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             declare_var(I, res_name, default_value(fn->val_type, 1));
 
             /* Execute body */
+            I->procedure_depth++;
             exec_node(I, fn->children[0]);
+            I->procedure_depth--;
             I->returning = 0;
 
             /* Get result */
@@ -4794,8 +4862,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortValue val;
         int decl_char_len = n->val_type == FVAL_CHARACTER ? eval_character_length(I, n) : 0;
         OfortVar *existing = find_var(I, n->name);
-        if (existing && (n->is_save || (n->type == FND_VARDECL && n->n_children > 0 && n->children[0]))) {
+        if (existing && (n->is_save || (I->procedure_depth > 0 && n->is_implicit_save))) {
             existing->is_save = 1;
+            existing->is_implicit_save = n->is_implicit_save;
             existing->is_protected = n->is_protected;
             if (n->val_type == FVAL_CHARACTER) existing->char_len = decl_char_len;
             break;
@@ -4872,7 +4941,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         v->is_pointer = n->is_pointer;
         v->is_target = n->is_target;
         v->is_protected = n->is_protected;
-        v->is_save = n->is_save || (n->type == FND_VARDECL && n->n_children > 0 && n->children[0]);
+        v->is_save = n->is_save || (I->procedure_depth > 0 && n->is_implicit_save);
+        v->is_implicit_save = I->procedure_depth > 0 && n->is_implicit_save;
+        if (v->is_implicit_save) {
+            ofort_warning(I, n->line,
+                          "warning: local variable '%s' has implicit SAVE due to initialization",
+                          n->name);
+        }
         v->pointer_associated = 0;
         v->pointer_target[0] = '\0';
         v->pointer_has_slice = 0;
@@ -5490,7 +5565,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         restore_saved_vars(I, func);
 
+        I->procedure_depth++;
         exec_node(I, fn->children[0]);
+        I->procedure_depth--;
         I->returning = 0;
 
         /* Handle INTENT(OUT/INOUT) — copy back */
@@ -7331,6 +7408,7 @@ OfortInterpreter *ofort_create(void) {
     I->node_pool = NULL;
     I->node_pool_len = 0;
     I->node_pool_cap = 0;
+    I->warnings_enabled = 1;
     return I;
 }
 
@@ -7376,6 +7454,9 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     interp->cycling = 0;
     interp->stopping = 0;
     interp->current_line = 0;
+    interp->warnings[0] = '\0';
+    interp->warn_len = 0;
+    interp->procedure_depth = 0;
 
     if (setjmp(interp->err_jmp) != 0) {
         return -1;
@@ -7423,6 +7504,9 @@ int ofort_check(OfortInterpreter *interp, const char *source) {
     interp->cycling = 0;
     interp->stopping = 0;
     interp->current_line = 0;
+    interp->warnings[0] = '\0';
+    interp->warn_len = 0;
+    interp->procedure_depth = 0;
 
     if (setjmp(interp->err_jmp) != 0) {
         return -1;
@@ -7452,6 +7536,12 @@ void ofort_set_implicit_typing(OfortInterpreter *interp, int enabled) {
         set_scope_legacy_implicit_typing(interp->global_scope);
     } else {
         set_scope_explicit_typing(interp->global_scope);
+    }
+}
+
+void ofort_set_warnings_enabled(OfortInterpreter *interp, int enabled) {
+    if (interp) {
+        interp->warnings_enabled = enabled ? 1 : 0;
     }
 }
 
@@ -8029,15 +8119,22 @@ const char *ofort_get_error(OfortInterpreter *interp) {
     return interp ? interp->error : "";
 }
 
+const char *ofort_get_warnings(OfortInterpreter *interp) {
+    return interp ? interp->warnings : "";
+}
+
 void ofort_reset(OfortInterpreter *interp) {
     if (!interp) return;
     interp->output[0] = '\0';
     interp->out_len = 0;
     interp->error[0] = '\0';
+    interp->warnings[0] = '\0';
+    interp->warn_len = 0;
     interp->has_error = 0;
     interp->returning = 0;
     interp->exiting = 0;
     interp->cycling = 0;
     interp->stopping = 0;
     interp->current_line = 0;
+    interp->procedure_depth = 0;
 }
