@@ -1998,6 +1998,25 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         }
     }
 
+    if (vtype == FVAL_CHARACTER && check(I, FTOK_STAR)) {
+        advance(I);
+        if (check(I, FTOK_LPAREN)) {
+            advance(I);
+            if (check(I, FTOK_STAR)) {
+                advance(I);
+                char_len = OFORT_MAX_STRLEN - 1;
+            } else {
+                char_len_expr = parse_expr(I);
+                if (char_len_expr->type == FND_INT_LIT)
+                    char_len = (int)char_len_expr->int_val;
+            }
+            expect(I, FTOK_RPAREN);
+        } else {
+            OfortToken *len_tok = expect(I, FTOK_INT_LIT);
+            char_len = (int)len_tok->int_val;
+        }
+    }
+
     /* optional (LEN=n) or (KIND=n) for CHARACTER */
     if (vtype == FVAL_CHARACTER && check(I, FTOK_LPAREN)) {
         advance(I);
