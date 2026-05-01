@@ -37,6 +37,7 @@ typedef struct {
     int is_pointer;
     int is_target;
     int is_protected;
+    int is_save;
     int pointer_associated;
     char pointer_target[256];
     int pointer_has_slice;
@@ -57,6 +58,8 @@ typedef struct {
     OfortNode *node;
     int is_function; /* 1=function, 0=subroutine */
     char module_name[256]; /* "" if not in a module */
+    OfortVar saved_vars[OFORT_MAX_VARS];
+    int n_saved_vars;
 } OfortFunc;
 
 typedef struct {
@@ -591,6 +594,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->is_pointer = 0;
     v->is_target = 0;
     v->is_protected = 0;
+    v->is_save = 0;
     v->pointer_associated = 0;
     v->pointer_target[0] = '\0';
     v->pointer_has_slice = 0;
@@ -628,6 +632,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->is_pointer = 0;
     v->is_target = 0;
     v->is_protected = 0;
+    v->is_save = 0;
     v->pointer_associated = 0;
     v->pointer_target[0] = '\0';
     v->pointer_has_slice = 0;
@@ -662,6 +667,70 @@ static void register_func(OfortInterpreter *I, const char *name, OfortNode *node
     f->node = node;
     f->is_function = is_function;
     f->module_name[0] = '\0';
+    f->n_saved_vars = 0;
+}
+
+static OfortVar *find_saved_var(OfortFunc *func, const char *name) {
+    char upper[256];
+    str_upper(upper, name, 256);
+    for (int i = 0; i < func->n_saved_vars; i++) {
+        char vu[256];
+        str_upper(vu, func->saved_vars[i].name, 256);
+        if (strcmp(upper, vu) == 0) return &func->saved_vars[i];
+    }
+    return NULL;
+}
+
+static void restore_saved_vars(OfortInterpreter *I, OfortFunc *func) {
+    for (int i = 0; i < func->n_saved_vars; i++) {
+        OfortVar *v = declare_var(I, func->saved_vars[i].name, copy_value(func->saved_vars[i].val));
+        v->is_parameter = func->saved_vars[i].is_parameter;
+        v->intent = func->saved_vars[i].intent;
+        v->char_len = func->saved_vars[i].char_len;
+        v->present = func->saved_vars[i].present;
+        v->is_allocatable = func->saved_vars[i].is_allocatable;
+        v->is_pointer = func->saved_vars[i].is_pointer;
+        v->is_target = func->saved_vars[i].is_target;
+        v->is_protected = func->saved_vars[i].is_protected;
+        v->is_save = 1;
+        v->pointer_associated = func->saved_vars[i].pointer_associated;
+        copy_cstr(v->pointer_target, sizeof(v->pointer_target), func->saved_vars[i].pointer_target);
+        v->pointer_has_slice = func->saved_vars[i].pointer_has_slice;
+        v->pointer_slice_start = func->saved_vars[i].pointer_slice_start;
+        v->pointer_slice_end = func->saved_vars[i].pointer_slice_end;
+    }
+}
+
+static void store_saved_vars(OfortFunc *func, OfortScope *scope) {
+    for (int i = 0; i < scope->n_vars; i++) {
+        OfortVar *src = &scope->vars[i];
+        OfortVar *dst;
+        if (!src->is_save) continue;
+        dst = find_saved_var(func, src->name);
+        if (!dst) {
+            if (func->n_saved_vars >= OFORT_MAX_VARS) continue;
+            dst = &func->saved_vars[func->n_saved_vars++];
+            memset(dst, 0, sizeof(*dst));
+            copy_cstr(dst->name, sizeof(dst->name), src->name);
+        } else {
+            free_value(&dst->val);
+        }
+        dst->val = copy_value(src->val);
+        dst->is_parameter = src->is_parameter;
+        dst->intent = src->intent;
+        dst->char_len = src->char_len;
+        dst->present = src->present;
+        dst->is_allocatable = src->is_allocatable;
+        dst->is_pointer = src->is_pointer;
+        dst->is_target = src->is_target;
+        dst->is_protected = src->is_protected;
+        dst->is_save = 1;
+        dst->pointer_associated = src->pointer_associated;
+        copy_cstr(dst->pointer_target, sizeof(dst->pointer_target), src->pointer_target);
+        dst->pointer_has_slice = src->pointer_has_slice;
+        dst->pointer_slice_start = src->pointer_slice_start;
+        dst->pointer_slice_end = src->pointer_slice_end;
+    }
 }
 
 /* ── Type definition lookup ──────────────────── */
@@ -1637,6 +1706,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     int is_pointer = 0;
     int is_target = 0;
     int is_protected = 0;
+    int is_save = 0;
     int is_parameter = 0;
     int is_optional = 0;
     int intent = 0;
@@ -1739,7 +1809,8 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             if (intent == 1 && check(I, FTOK_OUT)) { advance(I); intent = 3; }
             expect(I, FTOK_RPAREN);
         } else if (check(I, FTOK_SAVE)) {
-            advance(I); /* just note it */
+            advance(I);
+            is_save = 1;
         } else {
             /* unknown attribute, skip */
             advance(I);
@@ -1767,6 +1838,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         decl->is_pointer = is_pointer;
         decl->is_target = is_target;
         decl->is_protected = is_protected;
+        decl->is_save = is_save;
         decl->is_parameter = is_parameter;
         decl->is_optional = is_optional;
         decl->intent = intent;
@@ -1833,6 +1905,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             advance(I);
             decl->children[0] = parse_expr(I);
             decl->n_children = 1;
+            decl->is_save = 1;
         }
 
         if (block->n_stmts >= cap) {
@@ -4391,6 +4464,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                                 fn->param_names[i], fn->name);
                 }
             }
+            restore_saved_vars(I, func);
             /* Set up result variable */
             const char *res_name = fn->result_name[0] ? fn->result_name : fn->name;
             declare_var(I, res_name, default_value(fn->val_type, 1));
@@ -4414,6 +4488,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 }
             }
 
+            store_saved_vars(func, I->current_scope);
             pop_scope(I);
 
             /* Write back OUT/INOUT args */
@@ -4719,6 +4794,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortValue val;
         int decl_char_len = n->val_type == FVAL_CHARACTER ? eval_character_length(I, n) : 0;
         OfortVar *existing = find_var(I, n->name);
+        if (existing && (n->is_save || (n->type == FND_VARDECL && n->n_children > 0 && n->children[0]))) {
+            existing->is_save = 1;
+            existing->is_protected = n->is_protected;
+            if (n->val_type == FVAL_CHARACTER) existing->char_len = decl_char_len;
+            break;
+        }
         if (existing && n->n_dims > 0) {
             int has_assumed_shape = 0;
             for (int i = 0; i < n->n_dims; i++) {
@@ -4791,6 +4872,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         v->is_pointer = n->is_pointer;
         v->is_target = n->is_target;
         v->is_protected = n->is_protected;
+        v->is_save = n->is_save || (n->type == FND_VARDECL && n->n_children > 0 && n->children[0]);
         v->pointer_associated = 0;
         v->pointer_target[0] = '\0';
         v->pointer_has_slice = 0;
@@ -5406,6 +5488,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             pv->intent = fn->param_intents[i];
         }
+        restore_saved_vars(I, func);
 
         exec_node(I, fn->children[0]);
         I->returning = 0;
@@ -5421,6 +5504,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
         }
 
+        store_saved_vars(func, I->current_scope);
         pop_scope(I);
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             if (n->stmts[i]->type == FND_IDENT && fn->param_intents[i] != 1 &&
@@ -7273,6 +7357,11 @@ void ofort_destroy(OfortInterpreter *interp) {
     for (int m = 0; m < interp->n_modules; m++) {
         for (int i = 0; i < interp->modules[m].n_vars; i++) {
             free_value(&interp->modules[m].vars[i].val);
+        }
+    }
+    for (int f = 0; f < interp->n_funcs; f++) {
+        for (int i = 0; i < interp->funcs[f].n_saved_vars; i++) {
+            free_value(&interp->funcs[f].saved_vars[i].val);
         }
     }
     free(interp);
