@@ -100,6 +100,7 @@ struct OfortInterpreter {
     char warnings[4096];
     int warn_len;
     int warnings_enabled;
+    int fast_mode;
     OfortTiming timing;
     /* tokens */
     OfortToken tokens[OFORT_MAX_TOKENS];
@@ -5136,11 +5137,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (st == 0) ofort_error(I, "DO loop step cannot be zero");
 
         set_var(I, n->name, make_integer(s));
+        OfortVar *loop_var = I->fast_mode ? find_var(I, n->name) : NULL;
         long long iter = s;
         for (;;) {
             if (st > 0 && iter > e) break;
             if (st < 0 && iter < e) break;
-            set_var(I, n->name, make_integer(iter));
+            if (loop_var && loop_var->val.type == FVAL_INTEGER && !loop_var->is_parameter && !loop_var->is_protected) {
+                loop_var->val.v.i = iter;
+            } else {
+                set_var(I, n->name, make_integer(iter));
+            }
             exec_node(I, n->children[3]);
             if (I->returning || I->stopping) break;
             if (I->exiting) { I->exiting = 0; break; }
@@ -5148,7 +5154,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             iter += st;
         }
         if (!I->returning && !I->stopping) {
-            set_var(I, n->name, make_integer(iter));
+            if (loop_var && loop_var->val.type == FVAL_INTEGER && !loop_var->is_parameter && !loop_var->is_protected) {
+                loop_var->val.v.i = iter;
+            } else {
+                set_var(I, n->name, make_integer(iter));
+            }
         }
         break;
     }
@@ -5425,16 +5435,24 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (arr->v.arr.elem_type != FVAL_REAL && arr->v.arr.elem_type != FVAL_DOUBLE)
                     ofort_error(I, "RANDOM_NUMBER harvest array must be REAL");
                 for (int i = 0; i < arr->v.arr.len; i++) {
-                    free_value(&arr->v.arr.data[i]);
-                    if (arr->v.arr.elem_type == FVAL_DOUBLE)
-                        arr->v.arr.data[i] = make_double(random_unit());
-                    else
-                        arr->v.arr.data[i] = make_real(random_unit());
+                    if (I->fast_mode && (arr->v.arr.data[i].type == FVAL_REAL || arr->v.arr.data[i].type == FVAL_DOUBLE)) {
+                        arr->v.arr.data[i].v.r = random_unit();
+                    } else {
+                        free_value(&arr->v.arr.data[i]);
+                        if (arr->v.arr.elem_type == FVAL_DOUBLE)
+                            arr->v.arr.data[i] = make_double(random_unit());
+                        else
+                            arr->v.arr.data[i] = make_real(random_unit());
+                    }
                 }
             } else if (harvest->val.type == FVAL_REAL || harvest->val.type == FVAL_DOUBLE) {
                 OfortValType t = harvest->val.type;
-                free_value(&harvest->val);
-                harvest->val = (t == FVAL_DOUBLE) ? make_double(random_unit()) : make_real(random_unit());
+                if (I->fast_mode) {
+                    harvest->val.v.r = random_unit();
+                } else {
+                    free_value(&harvest->val);
+                    harvest->val = (t == FVAL_DOUBLE) ? make_double(random_unit()) : make_real(random_unit());
+                }
             } else {
                 ofort_error(I, "RANDOM_NUMBER harvest must be REAL");
             }
@@ -7589,6 +7607,12 @@ void ofort_set_implicit_typing(OfortInterpreter *interp, int enabled) {
 void ofort_set_warnings_enabled(OfortInterpreter *interp, int enabled) {
     if (interp) {
         interp->warnings_enabled = enabled ? 1 : 0;
+    }
+}
+
+void ofort_set_fast_mode(OfortInterpreter *interp, int enabled) {
+    if (interp) {
+        interp->fast_mode = enabled ? 1 : 0;
     }
 }
 
