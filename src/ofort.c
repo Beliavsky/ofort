@@ -21,6 +21,9 @@
 #include <limits.h>
 #include <stdint.h>
 #include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 /* ══════════════════════════════════════════════
  *  Interpreter state
@@ -97,6 +100,7 @@ struct OfortInterpreter {
     char warnings[4096];
     int warn_len;
     int warnings_enabled;
+    OfortTiming timing;
     /* tokens */
     OfortToken tokens[OFORT_MAX_TOKENS];
     int n_tokens;
@@ -148,6 +152,24 @@ static void exec_node(OfortInterpreter *I, OfortNode *n);
 static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs,
                                 char arg_names[OFORT_MAX_PARAMS][256]);
 static int is_intrinsic(const char *name);
+
+static double ofort_monotonic_seconds(void) {
+#ifdef _WIN32
+    LARGE_INTEGER counter;
+    LARGE_INTEGER frequency;
+    QueryPerformanceCounter(&counter);
+    QueryPerformanceFrequency(&frequency);
+    return (double)counter.QuadPart / (double)frequency.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+#endif
+}
+
+static void clear_timing(OfortInterpreter *I) {
+    if (I) memset(&I->timing, 0, sizeof(I->timing));
+}
 
 /* ── Helpers ─────────────────────────────────── */
 
@@ -7446,7 +7468,11 @@ void ofort_destroy(OfortInterpreter *interp) {
 }
 
 int ofort_execute(OfortInterpreter *interp, const char *source) {
+    double total_start;
+    double stage_start;
     if (!interp || !source) return -1;
+    total_start = ofort_monotonic_seconds();
+    clear_timing(interp);
     interp->source = source;
     interp->has_error = 0;
     interp->returning = 0;
@@ -7463,13 +7489,18 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     }
 
     /* Tokenize */
+    stage_start = ofort_monotonic_seconds();
     tokenize(interp, source);
+    interp->timing.lex = ofort_monotonic_seconds() - stage_start;
     interp->tok_pos = 0;
 
     /* Parse */
+    stage_start = ofort_monotonic_seconds();
     interp->ast = parse_program(interp);
+    interp->timing.parse = ofort_monotonic_seconds() - stage_start;
 
     /* First pass: register all top-level functions/subroutines/modules */
+    stage_start = ofort_monotonic_seconds();
     if (interp->ast && interp->ast->type == FND_BLOCK) {
         for (int i = 0; i < interp->ast->n_stmts; i++) {
             OfortNode *s = interp->ast->stmts[i];
@@ -7479,8 +7510,10 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
             }
         }
     }
+    interp->timing.register_time = ofort_monotonic_seconds() - stage_start;
 
     /* Second pass: execute everything else */
+    stage_start = ofort_monotonic_seconds();
     if (interp->ast && interp->ast->type == FND_BLOCK) {
         for (int i = 0; i < interp->ast->n_stmts; i++) {
             OfortNode *s = interp->ast->stmts[i];
@@ -7491,12 +7524,18 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
             if (interp->stopping) break;
         }
     }
+    interp->timing.execute = ofort_monotonic_seconds() - stage_start;
+    interp->timing.total = ofort_monotonic_seconds() - total_start;
 
     return interp->has_error ? -1 : 0;
 }
 
 int ofort_check(OfortInterpreter *interp, const char *source) {
+    double total_start;
+    double stage_start;
     if (!interp || !source) return -1;
+    total_start = ofort_monotonic_seconds();
+    clear_timing(interp);
     interp->source = source;
     interp->has_error = 0;
     interp->returning = 0;
@@ -7512,9 +7551,14 @@ int ofort_check(OfortInterpreter *interp, const char *source) {
         return -1;
     }
 
+    stage_start = ofort_monotonic_seconds();
     tokenize(interp, source);
+    interp->timing.lex = ofort_monotonic_seconds() - stage_start;
     interp->tok_pos = 0;
+    stage_start = ofort_monotonic_seconds();
     interp->ast = parse_program(interp);
+    interp->timing.parse = ofort_monotonic_seconds() - stage_start;
+    interp->timing.total = ofort_monotonic_seconds() - total_start;
     return interp->has_error ? -1 : 0;
 }
 
@@ -8123,6 +8167,12 @@ const char *ofort_get_warnings(OfortInterpreter *interp) {
     return interp ? interp->warnings : "";
 }
 
+int ofort_get_timing(OfortInterpreter *interp, OfortTiming *timing) {
+    if (!interp || !timing) return -1;
+    *timing = interp->timing;
+    return 0;
+}
+
 void ofort_reset(OfortInterpreter *interp) {
     if (!interp) return;
     interp->output[0] = '\0';
@@ -8137,4 +8187,5 @@ void ofort_reset(OfortInterpreter *interp) {
     interp->stopping = 0;
     interp->current_line = 0;
     interp->procedure_depth = 0;
+    clear_timing(interp);
 }
