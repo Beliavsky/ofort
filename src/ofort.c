@@ -721,12 +721,14 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
         char vu[256];
         str_upper(vu, s->vars[i].name, 256);
         if (strcmp(upper, vu) == 0) {
+            int target_kind = s->vars[i].val.kind;
             val = coerce_assignment_value(I, name, s->vars[i].val.type, val);
             if (s->vars[i].is_parameter)
                 ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
             if (s->vars[i].is_protected)
                 ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
             val = resize_character_value(val, s->vars[i].char_len);
+            if (target_kind > 0 && is_numeric_type(val.type)) val.kind = target_kind;
             if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
             s->vars[i].val = val;
             s->vars[i].is_alias = 0;
@@ -740,12 +742,14 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
             char vu[256];
             str_upper(vu, ps->vars[i].name, 256);
             if (strcmp(upper, vu) == 0) {
+                int target_kind = ps->vars[i].val.kind;
                 if (ps->vars[i].is_parameter)
                     ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
                 if (ps->vars[i].is_protected)
                     ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
                 val = coerce_assignment_value(I, name, ps->vars[i].val.type, val);
                 val = resize_character_value(val, ps->vars[i].char_len);
+                if (target_kind > 0 && is_numeric_type(val.type)) val.kind = target_kind;
                 if (!ps->vars[i].is_alias) free_value(&ps->vars[i].val);
                 ps->vars[i].val = val;
                 ps->vars[i].is_alias = 0;
@@ -1938,10 +1942,27 @@ static OfortValType token_to_valtype(OfortTokenType t) {
     }
 }
 
+static int parse_kind_selector(OfortInterpreter *I) {
+    int kind = 0;
+    expect(I, FTOK_LPAREN);
+    if (check_ident_upper(I, "KIND")) {
+        advance(I);
+        expect(I, FTOK_ASSIGN);
+    }
+    if (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+        OfortNode *expr = parse_expr(I);
+        if (expr && expr->type == FND_INT_LIT) kind = (int)expr->int_val;
+    }
+    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) advance(I);
+    expect(I, FTOK_RPAREN);
+    return kind;
+}
+
 /* ── Declaration parsing ────────────────────── */
 static OfortNode *parse_declaration(OfortInterpreter *I) {
     OfortToken *type_tok = advance(I); /* consume type keyword */
     OfortValType vtype = token_to_valtype(type_tok->type);
+    int decl_kind = 0;
     int char_len = 1;
     OfortNode *char_len_expr = NULL;
     int is_allocatable = 0;
@@ -2002,17 +2023,15 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         expect(I, FTOK_RPAREN);
     }
 
-    /* optional KIND for integer/real: INTEGER(KIND=4) or INTEGER(4) */
-    if ((vtype == FVAL_INTEGER || vtype == FVAL_REAL || vtype == FVAL_DOUBLE) && check(I, FTOK_LPAREN)) {
-        advance(I);
-        /* skip kind specification */
-        int depth = 1;
-        while (depth > 0 && !check(I, FTOK_EOF)) {
-            if (check(I, FTOK_LPAREN)) depth++;
-            if (check(I, FTOK_RPAREN)) depth--;
-            if (depth > 0) advance(I);
+    /* optional KIND for numeric types: INTEGER(KIND=4), REAL(8), COMPLEX(8) */
+    if ((vtype == FVAL_INTEGER || vtype == FVAL_REAL || vtype == FVAL_DOUBLE ||
+         vtype == FVAL_COMPLEX) && check(I, FTOK_LPAREN)) {
+        decl_kind = parse_kind_selector(I);
+        if (vtype == FVAL_REAL && decl_kind == 8) {
+            vtype = FVAL_DOUBLE;
+        } else if (vtype == FVAL_DOUBLE && decl_kind == 0) {
+            decl_kind = 8;
         }
-        if (check(I, FTOK_RPAREN)) advance(I);
     }
 
     /* optional attributes before :: */
@@ -2100,6 +2119,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         OfortNode *decl = alloc_node(I, is_parameter ? FND_PARAMDECL : FND_VARDECL);
         copy_cstr(decl->name, sizeof(decl->name), token_name_text(name_tok));
         decl->val_type = vtype;
+        decl->kind = decl_kind;
         decl->char_len = char_len;
         decl->char_len_expr = char_len_expr;
         decl->is_allocatable = is_allocatable;
@@ -6634,6 +6654,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (n->val_type == FVAL_CHARACTER)
             val = resize_character_value(val, decl_char_len);
 
+        if (n->kind > 0) {
+            val.kind = n->kind;
+            if (val.type == FVAL_ARRAY && val.v.arr.data) {
+                for (int i = 0; i < val.v.arr.len; i++) {
+                    val.v.arr.data[i].kind = n->kind;
+                }
+            }
+        }
+
         /* If there's an initializer and it's an array, set elements */
         if (n->n_dims > 0 && !n->is_allocatable && n->n_children > 0 && n->children[0]) {
             OfortValue init = eval_node(I, n->children[0]);
@@ -6734,6 +6763,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         OfortValue elem = array_element_value(&rhs, i);
                         if (v->val.v.arr.elem_type == FVAL_CHARACTER)
                             elem = resize_character_value(elem, v->char_len);
+                        if (v->val.v.arr.data && v->val.v.arr.data[i].kind > 0 && is_numeric_type(elem.type))
+                            elem.kind = v->val.v.arr.data[i].kind;
                         if (assign_packed_array_element(&v->val, i, elem)) {
                             free_value(&elem);
                         } else {
@@ -6746,6 +6777,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         OfortValue elem = copy_value(rhs);
                         if (v->val.v.arr.elem_type == FVAL_CHARACTER)
                             elem = resize_character_value(elem, v->char_len);
+                        if (v->val.v.arr.data && v->val.v.arr.data[i].kind > 0 && is_numeric_type(elem.type))
+                            elem.kind = v->val.v.arr.data[i].kind;
                         if (assign_packed_array_element(&v->val, i, elem)) {
                             free_value(&elem);
                         } else {
@@ -8057,9 +8090,9 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         switch (args[0].type) {
             case FVAL_CHARACTER: return make_integer(1);
             case FVAL_INTEGER: return make_integer(args[0].kind ? args[0].kind : 4);
-            case FVAL_REAL: return make_integer(4);
+            case FVAL_REAL: return make_integer(args[0].kind ? args[0].kind : 4);
             case FVAL_DOUBLE: return make_integer(8);
-            case FVAL_COMPLEX: return make_integer(8);
+            case FVAL_COMPLEX: return make_integer(args[0].kind ? args[0].kind : 4);
             case FVAL_LOGICAL: return make_integer(4);
             default: return make_integer(0);
         }
