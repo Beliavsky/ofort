@@ -3065,6 +3065,12 @@ static int token_letter_index(OfortToken *t) {
     return c - 'A';
 }
 
+static int is_procedure_prefix_token(OfortToken *t) {
+    return token_ident_upper(t, "PURE") ||
+           token_ident_upper(t, "ELEMENTAL") ||
+           token_ident_upper(t, "RECURSIVE");
+}
+
 static void skip_balanced_parens(OfortInterpreter *I) {
     if (!check(I, FTOK_LPAREN)) return;
     advance(I);
@@ -3167,6 +3173,20 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         skip_newlines(I);
         t = peek(I);
         if (t->type == FTOK_EOF) return NULL;
+    }
+
+    if (is_procedure_prefix_token(t)) {
+        while (is_procedure_prefix_token(peek(I))) {
+            advance(I);
+        }
+        t = peek(I);
+        if (t->type == FTOK_SUBROUTINE) return parse_subroutine(I);
+        if (t->type == FTOK_FUNCTION) return parse_function(I);
+        if (is_type_keyword(t->type) &&
+            (peek_ahead(I, 1)->type == FTOK_FUNCTION ||
+             (peek_ahead(I, 1)->type == FTOK_LPAREN && peek_ahead(I, 3)->type == FTOK_FUNCTION))) {
+            return parse_typed_function(I);
+        }
     }
 
     /* IMPLICIT NONE */
@@ -5371,6 +5391,20 @@ static OfortVar *cached_ident_var(OfortInterpreter *I, OfortNode *owner, int slo
     return (OfortVar *)owner->fast_cache[slot];
 }
 
+static OfortVar *cached_node_var(OfortInterpreter *I, OfortNode *node, const char *name) {
+    if (!I || !node || !name || !name[0]) return NULL;
+    if (node->fast_cache[0] != I->current_scope) {
+        node->fast_cache[0] = I->current_scope;
+        node->fast_cache[1] = NULL;
+    }
+    if (!node->fast_cache[1]) {
+        node->fast_cache[1] = find_var(I, name);
+    }
+    return (OfortVar *)node->fast_cache[1];
+}
+
+static int fast_array_ref_index(OfortInterpreter *I, OfortNode *n, OfortVar **var_out, int *index_out);
+
 static int simple_numeric_node_value(OfortInterpreter *I, OfortNode *owner, int slot,
                                      OfortNode *n, double *value) {
     if (!n || !value) return 0;
@@ -5382,7 +5416,7 @@ static int simple_numeric_node_value(OfortInterpreter *I, OfortNode *owner, int 
         *value = n->num_val;
         return 1;
     case FND_IDENT: {
-        OfortVar *v = owner ? cached_ident_var(I, owner, slot, n) : find_var(I, n->name);
+        OfortVar *v = owner ? cached_ident_var(I, owner, slot, n) : cached_node_var(I, n, n->name);
         if (!v) return 0;
         if (v->val.type == FVAL_INTEGER) {
             *value = (double)v->val.v.i;
@@ -5399,6 +5433,87 @@ static int simple_numeric_node_value(OfortInterpreter *I, OfortNode *owner, int 
     }
 }
 
+static int fast_numeric_expr_value_node(OfortInterpreter *I, OfortNode *n, double *value) {
+    double left;
+    double right;
+    OfortVar *var;
+    int index;
+
+    if (!I || !n || !value) return 0;
+    switch (n->type) {
+    case FND_INT_LIT:
+        *value = (double)n->int_val;
+        return 1;
+    case FND_REAL_LIT:
+        *value = n->num_val;
+        return 1;
+    case FND_IDENT: {
+        OfortVar *v = cached_node_var(I, n, n->name);
+        if (!v) return 0;
+        if (v->val.type == FVAL_INTEGER) {
+            *value = (double)v->val.v.i;
+            return 1;
+        }
+        if (v->val.type == FVAL_REAL || v->val.type == FVAL_DOUBLE) {
+            *value = v->val.v.r;
+            return 1;
+        }
+        return 0;
+    }
+    case FND_NEGATE:
+        if (!fast_numeric_expr_value_node(I, n->children[0], value)) return 0;
+        *value = -*value;
+        return 1;
+    case FND_ADD:
+    case FND_SUB:
+    case FND_MUL:
+    case FND_DIV:
+    case FND_POWER:
+        if (!fast_numeric_expr_value_node(I, n->children[0], &left) ||
+            !fast_numeric_expr_value_node(I, n->children[1], &right)) {
+            return 0;
+        }
+        switch (n->type) {
+        case FND_ADD: *value = left + right; break;
+        case FND_SUB: *value = left - right; break;
+        case FND_MUL: *value = left * right; break;
+        case FND_DIV:
+            if (right == 0.0) return 0;
+            *value = left / right;
+            break;
+        case FND_POWER: *value = pow(left, right); break;
+        default: return 0;
+        }
+        return 1;
+    case FND_FUNC_CALL:
+        if (str_eq_nocase(n->name, "REAL") && n->n_stmts >= 1) {
+            return fast_numeric_expr_value_node(I, n->stmts[0], value);
+        }
+        if (str_eq_nocase(n->name, "SQRT") && n->n_stmts == 1) {
+            if (!fast_numeric_expr_value_node(I, n->stmts[0], value) || *value < 0.0) return 0;
+            *value = sqrt(*value);
+            return 1;
+        }
+        if (!fast_array_ref_index(I, n, &var, &index)) return 0;
+        if (var->val.v.arr.real_data &&
+            (var->val.v.arr.elem_type == FVAL_REAL || var->val.v.arr.elem_type == FVAL_DOUBLE)) {
+            *value = var->val.v.arr.real_data[index];
+            return 1;
+        }
+        if (var->val.v.arr.int_data && var->val.v.arr.elem_type == FVAL_INTEGER) {
+            *value = (double)var->val.v.arr.int_data[index];
+            return 1;
+        }
+        if (var->val.v.arr.data) {
+            *value = val_to_real(var->val.v.arr.data[index]);
+            return 1;
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
 static int fast_numeric_expr_value(OfortInterpreter *I, OfortNode *owner, int *slot,
                                    OfortNode *n, double *value) {
     double left;
@@ -5406,6 +5521,7 @@ static int fast_numeric_expr_value(OfortInterpreter *I, OfortNode *owner, int *s
     int right_slot;
 
     if (!n || !value || !slot || *slot > 6) return 0;
+    if (fast_numeric_expr_value_node(I, n, value)) return 1;
     if (n->type == FND_ADD || n->type == FND_SUB ||
         n->type == FND_MUL || n->type == FND_DIV) {
         if (!fast_numeric_expr_value(I, owner, slot, n->children[0], &left)) return 0;
@@ -5428,6 +5544,35 @@ static int fast_numeric_expr_value(OfortInterpreter *I, OfortNode *owner, int *s
     return 1;
 }
 
+static int fast_array_ref_index(OfortInterpreter *I, OfortNode *n, OfortVar **var_out, int *index_out) {
+    OfortVar *var;
+    int stride = 1;
+    int index = 0;
+
+    if (!I || !n || n->type != FND_FUNC_CALL || !var_out || !index_out) return 0;
+    var = cached_node_var(I, n, n->name);
+    if (!var || var->val.type != FVAL_ARRAY) return 0;
+    if (n->n_stmts <= 0 || n->n_stmts > var->val.v.arr.n_dims) return 0;
+    for (int i = 0; i < n->n_stmts; i++) {
+        double sub_value;
+        int sub;
+        int lower;
+        int extent;
+        if (!n->stmts[i] || n->stmts[i]->type == FND_SLICE) return 0;
+        if (!fast_numeric_expr_value_node(I, n->stmts[i], &sub_value)) return 0;
+        sub = (int)sub_value;
+        lower = var->val.v.arr.lower_bounds[i];
+        extent = var->val.v.arr.dims[i];
+        if (sub < lower || sub >= lower + extent) return 0;
+        index += (sub - lower) * stride;
+        stride *= extent;
+    }
+    if (index < 0 || index >= var->val.v.arr.len) return 0;
+    *var_out = var;
+    *index_out = index;
+    return 1;
+}
+
 static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n) {
     OfortNode *lhs;
     OfortNode *rhs;
@@ -5438,7 +5583,22 @@ static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n
     if (!I || !I->fast_mode || !n || n->type != FND_ASSIGN) return 0;
     lhs = n->children[0];
     rhs = n->children[1];
-    if (!lhs || lhs->type != FND_IDENT || !rhs) return 0;
+    if (!lhs || !rhs) return 0;
+    if (lhs->type == FND_FUNC_CALL) {
+        OfortVar *array_var;
+        int index;
+        if (!fast_array_ref_index(I, lhs, &array_var, &index)) return 0;
+        if (array_var->is_parameter || array_var->is_protected) return 0;
+        if (!array_has_packed_numeric(&array_var->val)) return 0;
+        if (!fast_numeric_expr_value_node(I, rhs, &result)) return 0;
+        if (array_var->val.v.arr.real_data) {
+            array_var->val.v.arr.real_data[index] = result;
+        } else {
+            array_var->val.v.arr.int_data[index] = (long long)result;
+        }
+        return 1;
+    }
+    if (lhs->type != FND_IDENT) return 0;
     target = cached_ident_var(I, n, 0, lhs);
     if (!target || target->is_parameter || target->is_protected) return 0;
     if (target->val.type != FVAL_INTEGER &&
