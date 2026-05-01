@@ -1406,7 +1406,8 @@ static int token_ident_upper(OfortToken *t, const char *name) {
 
 static int token_can_be_name(OfortToken *t) {
     return t && (t->type == FTOK_IDENT || t->type == FTOK_IN ||
-                 t->type == FTOK_OUT || t->type == FTOK_INOUT);
+                 t->type == FTOK_OUT || t->type == FTOK_INOUT ||
+                 t->type == FTOK_CALL);
 }
 
 static const char *token_name_text(OfortToken *t) {
@@ -1414,6 +1415,7 @@ static const char *token_name_text(OfortToken *t) {
     if (t->type == FTOK_IN) return "in";
     if (t->type == FTOK_OUT) return "out";
     if (t->type == FTOK_INOUT) return "inout";
+    if (t->type == FTOK_CALL) return "call";
     return t->str_val;
 }
 
@@ -1673,11 +1675,13 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
 
         return n;
     }
-    if (t->type == FTOK_IDENT || t->type == FTOK_IN || t->type == FTOK_OUT) {
+    if (t->type == FTOK_IDENT || t->type == FTOK_IN || t->type == FTOK_OUT ||
+        t->type == FTOK_CALL) {
         advance(I);
         OfortNode *n = alloc_node(I, FND_IDENT);
         if (t->type == FTOK_IN) copy_cstr(n->name, sizeof(n->name), "in");
         else if (t->type == FTOK_OUT) copy_cstr(n->name, sizeof(n->name), "out");
+        else if (t->type == FTOK_CALL) copy_cstr(n->name, sizeof(n->name), "call");
         else copy_cstr(n->name, sizeof(n->name), t->str_val);
         n->line = t->line;
 
@@ -3472,7 +3476,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     if (t->type == FTOK_CLOSE) return parse_close_stmt(I);
 
     /* CALL */
-    if (t->type == FTOK_CALL) {
+    if (t->type == FTOK_CALL && peek_ahead(I, 1)->type == FTOK_IDENT) {
         OfortToken *ct = advance(I);
         OfortToken *name = expect(I, FTOK_IDENT);
         OfortNode *n = alloc_node(I, FND_CALL);
@@ -3565,13 +3569,14 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     }
 
     /* Expression statement or assignment: ident = expr, ident(args) = expr, or bare expr */
-    if (t->type == FTOK_IDENT || t->type == FTOK_INT_LIT || t->type == FTOK_REAL_LIT ||
+    if (t->type == FTOK_IDENT || t->type == FTOK_CALL ||
+        t->type == FTOK_INT_LIT || t->type == FTOK_REAL_LIT ||
         t->type == FTOK_STRING_LIT || t->type == FTOK_TRUE || t->type == FTOK_FALSE ||
         t->type == FTOK_LPAREN || t->type == FTOK_MINUS || t->type == FTOK_PLUS ||
         t->type == FTOK_NOT) {
         OfortNode *expr = parse_expr(I);
         if (check(I, FTOK_POINTER_ASSIGN)) {
-            if (expr->type != FND_IDENT && expr->type != FND_FUNC_CALL) {
+            if (expr->type != FND_IDENT && expr->type != FND_FUNC_CALL && expr->type != FND_MEMBER) {
                 ofort_error(I, "Invalid pointer assignment target at line %d", t->line);
             }
             advance(I);
@@ -6800,6 +6805,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         char target_name[256];
         int has_slice, slice_start, slice_end;
         OfortValue rhs;
+        if (lhs->type == FND_MEMBER) {
+            OfortValue *target = member_lvalue(I, lhs);
+            if (!target) ofort_error(I, "Pointer assignment target not found");
+            rhs = eval_node(I, rhs_node);
+            free_value(target);
+            *target = rhs;
+            break;
+        }
         if (lhs->type != FND_IDENT)
             ofort_error(I, "Pointer assignment target must be a pointer variable");
         ptr = find_var(I, lhs->name);
