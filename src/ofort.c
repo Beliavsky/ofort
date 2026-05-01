@@ -5712,6 +5712,82 @@ static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n
     return 1;
 }
 
+static int fast_numeric_loop_body_supported(OfortNode *body) {
+    if (!body || body->type != FND_BLOCK || body->n_stmts <= 0) return 0;
+    for (int i = 0; i < body->n_stmts; i++) {
+        OfortNode *s = body->stmts[i];
+        if (!s) continue;
+        if (s->type == FND_ASSIGN) continue;
+        if (s->type == FND_DO_LOOP && fast_numeric_loop_body_supported(s->children[3])) continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int exec_fast_numeric_loop_body(OfortInterpreter *I, OfortNode *body);
+
+static int exec_fast_numeric_do_loop(OfortInterpreter *I, OfortNode *n) {
+    OfortValue start;
+    OfortValue end;
+    OfortValue step;
+    long long s, e, st, iter;
+    OfortVar *loop_var;
+
+    if (!I || !I->fast_mode || I->line_profile_enabled || !n || n->type != FND_DO_LOOP) return 0;
+    if (!fast_numeric_loop_body_supported(n->children[3])) return 0;
+
+    start = eval_node(I, n->children[0]);
+    end = eval_node(I, n->children[1]);
+    step = eval_node(I, n->children[2]);
+    s = val_to_int(start);
+    e = val_to_int(end);
+    st = val_to_int(step);
+    free_value(&start);
+    free_value(&end);
+    free_value(&step);
+    if (st == 0) ofort_error(I, "DO loop step cannot be zero");
+
+    set_var(I, n->name, make_integer(s));
+    loop_var = find_var(I, n->name);
+    iter = s;
+    for (;;) {
+        if (st > 0 && iter > e) break;
+        if (st < 0 && iter < e) break;
+        if (loop_var && loop_var->val.type == FVAL_INTEGER && !loop_var->is_parameter && !loop_var->is_protected) {
+            loop_var->val.v.i = iter;
+        } else {
+            set_var(I, n->name, make_integer(iter));
+            loop_var = find_var(I, n->name);
+        }
+        if (!exec_fast_numeric_loop_body(I, n->children[3])) return 0;
+        if (I->returning || I->exiting || I->cycling || I->stopping) return 0;
+        iter += st;
+    }
+    if (loop_var && loop_var->val.type == FVAL_INTEGER && !loop_var->is_parameter && !loop_var->is_protected) {
+        loop_var->val.v.i = iter;
+    } else {
+        set_var(I, n->name, make_integer(iter));
+    }
+    return 1;
+}
+
+static int exec_fast_numeric_loop_body(OfortInterpreter *I, OfortNode *body) {
+    if (!body || body->type != FND_BLOCK) return 0;
+    for (int i = 0; i < body->n_stmts; i++) {
+        OfortNode *s = body->stmts[i];
+        if (!s) continue;
+        if (s->type == FND_ASSIGN) {
+            if (!exec_fast_scalar_numeric_assignment(I, s)) return 0;
+        } else if (s->type == FND_DO_LOOP) {
+            if (!exec_fast_numeric_do_loop(I, s)) return 0;
+        } else {
+            return 0;
+        }
+        if (I->returning || I->exiting || I->cycling || I->stopping) return 0;
+    }
+    return 1;
+}
+
 static int fast_linear_expr_coeff(OfortNode *n, const char *name, double *coef, double *constant) {
     double lc, lb, rc, rb;
     if (!n || !coef || !constant) return 0;
@@ -6719,6 +6795,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
              exec_fast_array_affine_loop(I, n, s, e, st) ||
              exec_fast_random_dot_loop(I, n, s, e, st) ||
              exec_fast_random_sum_loop(I, n, s, e, st))) {
+            break;
+        }
+
+        if (exec_fast_numeric_do_loop(I, n)) {
             break;
         }
 
