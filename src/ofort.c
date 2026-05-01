@@ -101,6 +101,7 @@ struct OfortInterpreter {
     int warn_len;
     int warnings_enabled;
     int fast_mode;
+    uint64_t fast_rng_state;
     int line_profile_enabled;
     double *line_profile_seconds;
     int *line_profile_counts;
@@ -3368,7 +3369,13 @@ static int eval_character_length(OfortInterpreter *I, OfortNode *n) {
     return char_len;
 }
 
-static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, int n_dims, int char_len) {
+static int can_defer_numeric_array_tags(OfortValType elem_type) {
+    return elem_type == FVAL_INTEGER || elem_type == FVAL_REAL ||
+           elem_type == FVAL_DOUBLE || elem_type == FVAL_COMPLEX;
+}
+
+static OfortValue make_array_with_char_len_options(OfortValType elem_type, int *dims, int n_dims,
+                                                   int char_len, int defer_numeric_tags) {
     OfortValue v; memset(&v, 0, sizeof(v));
     v.type = FVAL_ARRAY;
     int total = 1;
@@ -3383,9 +3390,38 @@ static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, in
     v.v.arr.elem_type = elem_type;
     v.v.arr.allocated = 1;
     v.v.arr.data = (OfortValue *)calloc(total, sizeof(OfortValue));
-    for (i = 0; i < total; i++)
-        v.v.arr.data[i] = default_value(elem_type, char_len);
+    if (!v.v.arr.data) return v;
+    if (defer_numeric_tags && can_defer_numeric_array_tags(elem_type)) {
+        return v;
+    }
+    if (elem_type == FVAL_INTEGER) {
+        for (i = 0; i < total; i++) v.v.arr.data[i].kind = 4;
+    } else if (elem_type == FVAL_REAL) {
+        for (i = 0; i < total; i++) {
+            v.v.arr.data[i].type = FVAL_REAL;
+            v.v.arr.data[i].kind = 4;
+        }
+    } else if (elem_type == FVAL_DOUBLE) {
+        for (i = 0; i < total; i++) {
+            v.v.arr.data[i].type = FVAL_DOUBLE;
+            v.v.arr.data[i].kind = 8;
+        }
+    } else if (elem_type == FVAL_COMPLEX) {
+        for (i = 0; i < total; i++) {
+            v.v.arr.data[i].type = FVAL_COMPLEX;
+            v.v.arr.data[i].kind = 4;
+        }
+    } else if (elem_type == FVAL_LOGICAL) {
+        for (i = 0; i < total; i++) v.v.arr.data[i].type = FVAL_LOGICAL;
+    } else {
+        for (i = 0; i < total; i++)
+            v.v.arr.data[i] = default_value(elem_type, char_len);
+    }
     return v;
+}
+
+static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, int n_dims, int char_len) {
+    return make_array_with_char_len_options(elem_type, dims, n_dims, char_len, 0);
 }
 
 static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims) {
@@ -3406,7 +3442,8 @@ static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
         if (dims[i] < 0) dims[i] = 0;
     }
 
-    return make_array_with_char_len(n->val_type, dims, ndims, eval_character_length(I, n));
+    return make_array_with_char_len_options(n->val_type, dims, ndims, eval_character_length(I, n),
+                                            I->fast_mode);
 }
 
 typedef struct {
@@ -3477,7 +3514,12 @@ static void copy_section_recursive(OfortInterpreter *I, OfortValue *src, OfortVa
         if (src_index < 0 || src_index >= src->v.arr.len)
             ofort_error(I, "Array section index out of bounds");
         free_value(&dst->v.arr.data[*out_index]);
-        dst->v.arr.data[*out_index] = copy_value(src->v.arr.data[src_index]);
+        if (src->v.arr.data[src_index].kind == 0 &&
+            can_defer_numeric_array_tags(src->v.arr.elem_type)) {
+            dst->v.arr.data[*out_index] = default_value(src->v.arr.elem_type, 1);
+        } else {
+            dst->v.arr.data[*out_index] = copy_value(src->v.arr.data[src_index]);
+        }
         (*out_index)++;
         return;
     }
@@ -3512,6 +3554,10 @@ static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNo
         int index = section_linear_index(&var->val, subscripts, nargs);
         if (index < 0 || index >= var->val.v.arr.len)
             ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, var->val.v.arr.len);
+        if (var->val.v.arr.data[index].kind == 0 &&
+            can_defer_numeric_array_tags(var->val.v.arr.elem_type)) {
+            return default_value(var->val.v.arr.elem_type, 1);
+        }
         return copy_value(var->val.v.arr.data[index]);
     }
 
@@ -3648,6 +3694,28 @@ static double random_unit(void) {
         seeded = 1;
     }
     return (double)rand() / ((double)RAND_MAX + 1.0);
+}
+
+static inline uint32_t fast_rng_next32(uint64_t *state) {
+    uint32_t x = (uint32_t)*state;
+    if (x == 0) x = 2463534242u;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = (uint64_t)x;
+    return x;
+}
+
+static inline double fast_rng_unit_from_u32(uint32_t x) {
+    return (double)x / 4294967296.0;
+}
+
+static void seed_fast_rng_if_needed(OfortInterpreter *I) {
+    if (!I || I->fast_rng_state != 0) return;
+    I->fast_rng_state = ((uint64_t)time(NULL) << 32) ^
+                        (uint64_t)(uintptr_t)I ^
+                        UINT64_C(0x9e3779b97f4a7c15);
+    if (I->fast_rng_state == 0) I->fast_rng_state = UINT64_C(0x9e3779b97f4a7c15);
 }
 
 static void append_to_buffer(char *buf, int bufsize, const char *text) {
@@ -5550,9 +5618,18 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (arr->v.arr.elem_type != FVAL_REAL && arr->v.arr.elem_type != FVAL_DOUBLE)
                     ofort_error(I, "RANDOM_NUMBER harvest array must be REAL");
                 if (I->fast_mode) {
+                    OfortValue *data = arr->v.arr.data;
+                    OfortValType elem_type = arr->v.arr.elem_type;
+                    int elem_kind = elem_type == FVAL_DOUBLE ? 8 : 4;
+                    uint64_t rng_state;
+                    seed_fast_rng_if_needed(I);
+                    rng_state = I->fast_rng_state;
                     for (int i = 0; i < arr->v.arr.len; i++) {
-                        arr->v.arr.data[i].v.r = random_unit();
+                        data[i].type = elem_type;
+                        data[i].kind = elem_kind;
+                        data[i].v.r = fast_rng_unit_from_u32(fast_rng_next32(&rng_state));
                     }
+                    I->fast_rng_state = rng_state;
                 } else {
                     for (int i = 0; i < arr->v.arr.len; i++) {
                         free_value(&arr->v.arr.data[i]);
@@ -5565,7 +5642,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             } else if (harvest->val.type == FVAL_REAL || harvest->val.type == FVAL_DOUBLE) {
                 OfortValType t = harvest->val.type;
                 if (I->fast_mode) {
-                    harvest->val.v.r = random_unit();
+                    seed_fast_rng_if_needed(I);
+                    harvest->val.v.r = fast_rng_unit_from_u32(fast_rng_next32(&I->fast_rng_state));
                 } else {
                     free_value(&harvest->val);
                     harvest->val = (t == FVAL_DOUBLE) ? make_double(random_unit()) : make_real(random_unit());
