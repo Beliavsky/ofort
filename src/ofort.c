@@ -4583,6 +4583,43 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             return make_logical(pointer_matches_target(I, ptr, n->stmts[1]));
         }
 
+        if (str_eq_nocase(n->name, "sum") && nargs == 1 &&
+            n->stmts[0]->type == FND_IDENT) {
+            OfortVar *array_var = find_var(I, n->stmts[0]->name);
+            if (array_var && array_var->val.type == FVAL_ARRAY) {
+                OfortValue *array = &array_var->val;
+                if (array->v.arr.elem_type == FVAL_INTEGER) {
+                    long long isum = 0;
+                    for (int i = 0; i < array->v.arr.len; i++) isum += array->v.arr.data[i].v.i;
+                    return make_integer(isum);
+                }
+                if (array->v.arr.elem_type == FVAL_REAL || array->v.arr.elem_type == FVAL_DOUBLE) {
+                    double sum = 0.0;
+                    for (int i = 0; i < array->v.arr.len; i++) sum += array->v.arr.data[i].v.r;
+                    return make_real(sum);
+                }
+            }
+        }
+
+        if (str_eq_nocase(n->name, "size") && nargs >= 1 &&
+            n->stmts[0]->type == FND_IDENT) {
+            OfortVar *array_var = find_var(I, n->stmts[0]->name);
+            if (array_var && array_var->val.type == FVAL_ARRAY) {
+                OfortValue *array = &array_var->val;
+                if (nargs == 1) {
+                    return make_integer(array->v.arr.len);
+                }
+                if (nargs == 2) {
+                    OfortValue dim_v = eval_node(I, n->stmts[1]);
+                    int dim = (int)val_to_int(dim_v);
+                    free_value(&dim_v);
+                    if (dim >= 1 && dim <= array->v.arr.n_dims)
+                        return make_integer(array->v.arr.dims[dim - 1]);
+                    return make_integer(0);
+                }
+            }
+        }
+
         /* Check if this is an array variable reference */
         OfortVar *var = find_var(I, n->name);
         if (var && var->val.type == FVAL_ARRAY) {
