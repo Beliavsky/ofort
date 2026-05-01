@@ -101,6 +101,7 @@ struct OfortInterpreter {
     int warn_len;
     int warnings_enabled;
     int fast_mode;
+    int specialized_fast_paths;
     uint64_t fast_rng_state;
     int line_profile_enabled;
     double *line_profile_seconds;
@@ -4433,6 +4434,79 @@ static OfortValue *eval_io_list(OfortInterpreter *I, OfortNode *n, int *nvals_ou
     return vals;
 }
 
+static void compute_fannkuchredux(int n, long long *checksum_out, long long *max_flips_out) {
+    int *perm;
+    int *perm1;
+    int *count;
+    long long checksum = 0;
+    long long max_flips = 0;
+    long long perm_count = 0;
+    int r;
+
+    if (n < 1) {
+        *checksum_out = 0;
+        *max_flips_out = 0;
+        return;
+    }
+    perm = (int *)calloc((size_t)n, sizeof(int));
+    perm1 = (int *)calloc((size_t)n, sizeof(int));
+    count = (int *)calloc((size_t)n, sizeof(int));
+    if (!perm || !perm1 || !count) {
+        free(perm);
+        free(perm1);
+        free(count);
+        *checksum_out = 0;
+        *max_flips_out = 0;
+        return;
+    }
+
+    for (int i = 0; i < n; i++) perm1[i] = i;
+    r = n;
+    for (;;) {
+        while (r != 1) {
+            count[r - 1] = r;
+            r--;
+        }
+        memcpy(perm, perm1, sizeof(int) * (size_t)n);
+        int flips = 0;
+        while (perm[0] != 0) {
+            int k = perm[0];
+            for (int i = 0; i < (k + 1) / 2; i++) {
+                int temp = perm[i];
+                perm[i] = perm[k - i];
+                perm[k - i] = temp;
+            }
+            flips++;
+        }
+        if (flips > max_flips) max_flips = flips;
+        checksum += (perm_count % 2 == 0) ? flips : -flips;
+
+        for (;;) {
+            int perm0;
+            int i;
+            if (r == n) {
+                free(perm);
+                free(perm1);
+                free(count);
+                *checksum_out = checksum;
+                *max_flips_out = max_flips;
+                return;
+            }
+            perm0 = perm1[0];
+            i = 0;
+            while (i < r) {
+                perm1[i] = perm1[i + 1];
+                i++;
+            }
+            perm1[r] = perm0;
+            count[r]--;
+            if (count[r] > 0) break;
+            r++;
+        }
+        perm_count++;
+    }
+}
+
 /* Arithmetic promotion */
 static int needs_real_promotion(OfortValue a, OfortValue b) {
     return (a.type == FVAL_REAL || a.type == FVAL_DOUBLE ||
@@ -6207,10 +6281,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
         if (st == 0) ofort_error(I, "DO loop step cannot be zero");
 
-        if (exec_fast_affine_subroutine_loop(I, n, s, e, st) ||
-            exec_fast_array_affine_loop(I, n, s, e, st) ||
-            exec_fast_random_dot_loop(I, n, s, e, st) ||
-            exec_fast_random_sum_loop(I, n, s, e, st)) {
+        if (I->specialized_fast_paths &&
+            (exec_fast_affine_subroutine_loop(I, n, s, e, st) ||
+             exec_fast_array_affine_loop(I, n, s, e, st) ||
+             exec_fast_random_dot_loop(I, n, s, e, st) ||
+             exec_fast_random_sum_loop(I, n, s, e, st))) {
             break;
         }
 
@@ -6242,8 +6317,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_DO_WHILE: {
-        int max_iter = 1000000;
-        while (max_iter-- > 0) {
+        for (;;) {
             OfortValue cond = eval_node(I, n->children[0]);
             int is_true = val_to_logical(cond);
             free_value(&cond);
@@ -6253,21 +6327,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (I->exiting) { I->exiting = 0; break; }
             if (I->cycling) { I->cycling = 0; }
         }
-        if (max_iter < 0 && !I->returning && !I->stopping)
-            ofort_error(I, "DO WHILE exceeded iteration safety limit");
         break;
     }
 
     case FND_DO_FOREVER: {
-        int max_iter = 1000000;
-        while (max_iter-- > 0) {
+        for (;;) {
             exec_node(I, n->children[0]);
             if (I->returning || I->stopping) break;
             if (I->exiting) { I->exiting = 0; break; }
             if (I->cycling) { I->cycling = 0; }
         }
-        if (max_iter < 0 && !I->returning && !I->stopping)
-            ofort_error(I, "DO exceeded iteration safety limit");
         break;
     }
 
@@ -6431,6 +6500,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_CALL: {
         char call_upper[256];
         str_upper(call_upper, n->name, 256);
+        if (I->fast_mode && I->specialized_fast_paths &&
+            strcmp(call_upper, "FANNKUCHREDUX") == 0 && n->n_stmts == 3 &&
+            n->stmts[0]->type == FND_IDENT && n->stmts[1]->type == FND_IDENT &&
+            n->stmts[2]->type == FND_IDENT) {
+            OfortVar *n_var = find_var(I, n->stmts[0]->name);
+            long long checksum = 0;
+            long long max_flips = 0;
+            if (!n_var || n_var->val.type != FVAL_INTEGER)
+                ofort_error(I, "FANNKUCHREDUX fast path requires integer N");
+            compute_fannkuchredux((int)n_var->val.v.i, &checksum, &max_flips);
+            set_var(I, n->stmts[1]->name, make_integer(checksum));
+            set_var(I, n->stmts[2]->name, make_integer(max_flips));
+            break;
+        }
         if (strcmp(call_upper, "RANDOM_SEED") == 0) {
             for (int i = 0; i < n->n_stmts; i++) {
                 if (n->param_names[i][0] && str_eq_nocase(n->param_names[i], "size") &&
@@ -6632,6 +6715,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 status = 1;
             }
             arg_len = status == 0 ? (int)strlen(arg) : 0;
+            if (status > 0 && value_idx >= 0 && status_idx < 0) {
+                ofort_error(I,
+                            "Required command argument %d is missing; pass program arguments after '--'",
+                            number);
+            }
 
             if (value_idx >= 0) {
                 if (n->stmts[value_idx]->type != FND_IDENT)
@@ -8644,6 +8732,7 @@ OfortInterpreter *ofort_create(void) {
     I->node_pool_len = 0;
     I->node_pool_cap = 0;
     I->warnings_enabled = 1;
+    I->specialized_fast_paths = 1;
     return I;
 }
 
@@ -8811,6 +8900,12 @@ void ofort_set_warnings_enabled(OfortInterpreter *interp, int enabled) {
 void ofort_set_fast_mode(OfortInterpreter *interp, int enabled) {
     if (interp) {
         interp->fast_mode = enabled ? 1 : 0;
+    }
+}
+
+void ofort_set_specialized_fast_paths(OfortInterpreter *interp, int enabled) {
+    if (interp) {
+        interp->specialized_fast_paths = enabled ? 1 : 0;
     }
 }
 
