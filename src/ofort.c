@@ -5159,6 +5159,8 @@ static int exec_fast_random_sum_loop(OfortInterpreter *I, OfortNode *n,
     OfortVar *loop_var;
     long long iter;
     uint64_t rng_state;
+    double last_random = 0.0;
+    double sum;
     double profile_start = 0.0;
 
     if (!I || !I->fast_mode || !n || n->type != FND_DO_LOOP || st == 0) return 0;
@@ -5203,18 +5205,31 @@ static int exec_fast_random_sum_loop(OfortInterpreter *I, OfortNode *n,
     if (I->line_profile_enabled && n->line > 0) profile_start = ofort_monotonic_seconds();
     seed_fast_rng_if_needed(I);
     rng_state = I->fast_rng_state;
-    iter = s;
-    for (;;) {
-        double x;
-        if (st > 0 && iter > e) break;
-        if (st < 0 && iter < e) break;
-        loop_var->val.v.i = iter;
-        x = fast_rng_unit_from_u32(fast_rng_next32(&rng_state));
-        random_var->val.v.r = x;
-        sum_var->val.v.r += x;
-        iter += st;
+    sum = sum_var->val.v.r;
+    if (st > 0 ? s <= e : s >= e) {
+        if (st == 1) {
+            long long count = e - s + 1;
+            for (long long k = 0; k < count; k++) {
+                last_random = fast_rng_unit_from_u32(fast_rng_next32(&rng_state));
+                sum += last_random;
+            }
+            iter = e + 1;
+        } else {
+            iter = s;
+            for (;;) {
+                if (st > 0 && iter > e) break;
+                if (st < 0 && iter < e) break;
+                last_random = fast_rng_unit_from_u32(fast_rng_next32(&rng_state));
+                sum += last_random;
+                iter += st;
+            }
+        }
+    } else {
+        iter = s;
     }
     I->fast_rng_state = rng_state;
+    random_var->val.v.r = last_random;
+    sum_var->val.v.r = sum;
     loop_var->val.v.i = iter;
     if (I->line_profile_enabled && n->line > 0) {
         add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
