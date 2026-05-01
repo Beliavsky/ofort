@@ -3087,6 +3087,17 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
         advance(I);
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
             OfortNode *dim = parse_expr(I);
+            int dim_index = n->n_stmts;
+            if (check(I, FTOK_COLON)) {
+                advance(I);
+                n->has_lower_bound[dim_index] = 1;
+                if (dim->type == FND_INT_LIT) {
+                    n->lower_bounds[dim_index] = (int)dim->int_val;
+                } else {
+                    n->children[2 + dim_index] = dim;
+                }
+                dim = parse_expr(I);
+            }
             if (n->n_stmts >= cap) {
                 cap = cap ? cap * 2 : 4;
                 n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
@@ -7551,14 +7562,31 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (!var) ofort_error(I, "Variable '%s' not found for ALLOCATE", n->name);
         /* Get dimensions */
         int dims[7];
+        int lower_bounds[7];
         int ndims = n->n_stmts;
         OfortValType elem_type = var->val.v.arr.elem_type ? var->val.v.arr.elem_type : FVAL_REAL;
 
+        for (int i = 0; i < 7; i++) lower_bounds[i] = 1;
         if (ndims > 0) {
             for (int i = 0; i < ndims; i++) {
+                int lower = 1;
                 OfortValue dv = eval_node(I, n->stmts[i]);
-                dims[i] = (int)val_to_int(dv);
+                int upper = (int)val_to_int(dv);
                 free_value(&dv);
+                if (n->has_lower_bound[i]) {
+                    if (n->children[2 + i]) {
+                        OfortValue lv = eval_node(I, n->children[2 + i]);
+                        lower = (int)val_to_int(lv);
+                        free_value(&lv);
+                    } else {
+                        lower = n->lower_bounds[i];
+                    }
+                    dims[i] = upper - lower + 1;
+                    lower_bounds[i] = lower;
+                } else {
+                    dims[i] = upper;
+                }
+                if (dims[i] < 0) dims[i] = 0;
             }
         } else if (n->children[1]) {
             OfortValue mold = eval_node(I, n->children[1]);
@@ -7566,14 +7594,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 ofort_error(I, "ALLOCATE MOLD must be an array");
             ndims = mold.v.arr.n_dims;
             elem_type = mold.v.arr.elem_type;
-            for (int i = 0; i < ndims; i++) dims[i] = mold.v.arr.dims[i];
+            for (int i = 0; i < ndims; i++) {
+                dims[i] = mold.v.arr.dims[i];
+                lower_bounds[i] = mold.v.arr.lower_bounds[i];
+            }
             free_value(&mold);
         } else if (n->children[0]) {
             OfortValue source = eval_node(I, n->children[0]);
             if (source.type == FVAL_ARRAY) {
                 ndims = source.v.arr.n_dims;
                 elem_type = source.v.arr.elem_type;
-                for (int i = 0; i < ndims; i++) dims[i] = source.v.arr.dims[i];
+                for (int i = 0; i < ndims; i++) {
+                    dims[i] = source.v.arr.dims[i];
+                    lower_bounds[i] = source.v.arr.lower_bounds[i];
+                }
             } else {
                 ndims = 1;
                 dims[0] = 1;
@@ -7585,6 +7619,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         free_value(&var->val);
         var->val = make_array(elem_type, dims, ndims);
+        set_array_lower_bounds(&var->val, lower_bounds, ndims);
         if (n->children[0]) {
             OfortValue source = eval_node(I, n->children[0]);
             if (source.type == FVAL_ARRAY) {
@@ -9318,15 +9353,22 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         return make_logical(0);
     }
     if (strcmp(upper, "LBOUND") == 0) {
-        /* Fortran arrays always start at 1 in our implementation */
-        if (intrinsic_arg_index(arg_names, nargs, "dim") >= 0 || nargs >= 2) return make_integer(1);
+        if (args[0].type != FVAL_ARRAY) return make_integer(1);
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        if (dim_idx < 0 && nargs >= 2) dim_idx = 1;
+        if (dim_idx >= 0) {
+            int dim = (int)val_to_int(args[dim_idx]);
+            if (dim >= 1 && dim <= args[0].v.arr.n_dims)
+                return make_integer(args[0].v.arr.lower_bounds[dim - 1]);
+            return make_integer(0);
+        }
         if (args[0].type == FVAL_ARRAY) {
             int nd = args[0].v.arr.n_dims;
             int dims[1] = {nd};
             OfortValue result = make_array(FVAL_INTEGER, dims, 1);
             for (int i = 0; i < nd; i++) {
                 free_value(&result.v.arr.data[i]);
-                result.v.arr.data[i] = make_integer(1);
+                result.v.arr.data[i] = make_integer(args[0].v.arr.lower_bounds[i]);
             }
             return result;
         }
@@ -9339,7 +9381,8 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (dim_idx >= 0) {
             int dim = (int)val_to_int(args[dim_idx]);
             if (dim >= 1 && dim <= args[0].v.arr.n_dims)
-                return make_integer(args[0].v.arr.dims[dim - 1]);
+                return make_integer(args[0].v.arr.lower_bounds[dim - 1] +
+                                    args[0].v.arr.dims[dim - 1] - 1);
             return make_integer(0);
         }
         int nd = args[0].v.arr.n_dims;
@@ -9347,7 +9390,8 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         OfortValue result = make_array(FVAL_INTEGER, dims, 1);
         for (int i = 0; i < nd; i++) {
             free_value(&result.v.arr.data[i]);
-            result.v.arr.data[i] = make_integer(args[0].v.arr.dims[i]);
+            result.v.arr.data[i] = make_integer(args[0].v.arr.lower_bounds[i] +
+                                                args[0].v.arr.dims[i] - 1);
         }
         return result;
     }
