@@ -1348,6 +1348,19 @@ static int token_ident_upper(OfortToken *t, const char *name) {
     return strcmp(upper, name) == 0;
 }
 
+static int token_can_be_name(OfortToken *t) {
+    return t && (t->type == FTOK_IDENT || t->type == FTOK_IN ||
+                 t->type == FTOK_OUT || t->type == FTOK_INOUT);
+}
+
+static const char *token_name_text(OfortToken *t) {
+    if (!t) return "";
+    if (t->type == FTOK_IN) return "in";
+    if (t->type == FTOK_OUT) return "out";
+    if (t->type == FTOK_INOUT) return "inout";
+    return t->str_val;
+}
+
 static void skip_to_next_line(OfortInterpreter *I) {
     while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
         advance(I);
@@ -1391,6 +1404,13 @@ static void skip_interface_block(OfortInterpreter *I) {
 
 /* Check if current token is END followed by a keyword (END PROGRAM, END DO, etc.) */
 static int check_end(OfortInterpreter *I, const char *what) {
+    if (what && peek(I)->type == FTOK_IDENT) {
+        char compact[256];
+        char wup[256];
+        str_upper(compact, peek(I)->str_val, 256);
+        str_upper(wup, what, 256);
+        if (strncmp(compact, "END", 3) == 0 && strcmp(compact + 3, wup) == 0) return 1;
+    }
     if (peek(I)->type != FTOK_END) return 0;
     if (!what) return 1;
     OfortToken *next = peek_ahead(I, 1);
@@ -1418,6 +1438,10 @@ static int check_end(OfortInterpreter *I, const char *what) {
 }
 
 static void consume_end(OfortInterpreter *I, const char *what) {
+    if (what && check_end(I, what) && peek(I)->type == FTOK_IDENT) {
+        advance(I);
+        return;
+    }
     expect(I, FTOK_END);
     if (what) {
         OfortToken *t = peek(I);
@@ -1997,9 +2021,13 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     int cap = 0;
 
     do {
-        OfortToken *name_tok = expect(I, FTOK_IDENT);
+        OfortToken *name_tok = peek(I);
+        if (!token_can_be_name(name_tok))
+            expect(I, FTOK_IDENT);
+        else
+            advance(I);
         OfortNode *decl = alloc_node(I, is_parameter ? FND_PARAMDECL : FND_VARDECL);
-        copy_cstr(decl->name, sizeof(decl->name), name_tok->str_val);
+        copy_cstr(decl->name, sizeof(decl->name), token_name_text(name_tok));
         decl->val_type = vtype;
         decl->char_len = char_len;
         decl->char_len_expr = char_len_expr;
@@ -2057,6 +2085,10 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                     if (check(I, FTOK_COLON)) {
                         advance(I);
                         OfortNode *dh = parse_expr(I);
+                        if (de->type == FND_INT_LIT) {
+                            decl->lower_bounds[dim_index] = (int)de->int_val;
+                            decl->has_lower_bound[dim_index] = 1;
+                        }
                         if (dh->type == FND_INT_LIT) {
                             decl->dims[dim_index] = (int)dh->int_val;
                         } else if (dim_index < decl->n_stmts) {
@@ -3441,6 +3473,7 @@ static OfortValue make_array_with_char_len_options(OfortValType elem_type, int *
     int i;
     for (i = 0; i < n_dims; i++) {
         v.v.arr.dims[i] = dims[i];
+        v.v.arr.lower_bounds[i] = 1;
         total *= dims[i];
     }
     v.v.arr.n_dims = n_dims;
@@ -3491,26 +3524,41 @@ static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, in
     return make_array_with_char_len_options(elem_type, dims, n_dims, char_len, 0);
 }
 
+static void set_array_lower_bounds(OfortValue *arr, int *lower_bounds, int n_dims) {
+    if (!arr || arr->type != FVAL_ARRAY) return;
+    for (int i = 0; i < n_dims && i < arr->v.arr.n_dims; i++) {
+        arr->v.arr.lower_bounds[i] = lower_bounds ? lower_bounds[i] : 1;
+    }
+}
+
 static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims) {
     return make_array_with_char_len(elem_type, dims, n_dims, 1);
 }
 
 static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
     int dims[7];
+    int lower_bounds[7];
     int ndims = n->n_dims;
 
     for (int i = 0; i < ndims; i++) {
+        lower_bounds[i] = n->has_lower_bound[i] ? n->lower_bounds[i] : 1;
         dims[i] = n->dims[i];
         if (dims[i] <= 0 && n->stmts && i < n->n_stmts && n->stmts[i]) {
             OfortValue dv = eval_node(I, n->stmts[i]);
             dims[i] = (int)val_to_int(dv);
             free_value(&dv);
         }
+        if (n->has_lower_bound[i]) {
+            dims[i] = dims[i] - lower_bounds[i] + 1;
+        }
         if (dims[i] < 0) dims[i] = 0;
     }
 
-    return make_array_with_char_len_options(n->val_type, dims, ndims, eval_character_length(I, n),
-                                            I->fast_mode);
+    OfortValue arr = make_array_with_char_len_options(n->val_type, dims, ndims,
+                                                      eval_character_length(I, n),
+                                                      I->fast_mode);
+    set_array_lower_bounds(&arr, lower_bounds, ndims);
+    return arr;
 }
 
 typedef struct {
@@ -3565,7 +3613,8 @@ static int section_linear_index(OfortValue *arr, int *subscripts, int nsubs) {
     int index = 0;
     int stride = 1;
     for (int i = 0; i < nsubs; i++) {
-        index += (subscripts[i] - 1) * stride;
+        int lower = i < arr->v.arr.n_dims ? arr->v.arr.lower_bounds[i] : 1;
+        index += (subscripts[i] - lower) * stride;
         if (i < arr->v.arr.n_dims) {
             stride *= arr->v.arr.dims[i];
         }
@@ -5317,6 +5366,195 @@ static int exec_fast_affine_subroutine_loop(OfortInterpreter *I, OfortNode *n,
     return 1;
 }
 
+static int is_loop_index_ref(OfortNode *n, const char *loop_name) {
+    return n && n->type == FND_IDENT && str_eq_nocase(n->name, loop_name);
+}
+
+static int is_loop_array_ref(OfortNode *n, const char *array_name, const char *loop_name) {
+    return n && n->type == FND_FUNC_CALL &&
+           str_eq_nocase(n->name, array_name) &&
+           n->n_stmts == 1 &&
+           is_loop_index_ref(n->stmts[0], loop_name);
+}
+
+static int expr_has_loop_array_ref(OfortNode *n, const char *loop_name) {
+    if (!n) return 0;
+    if (n->type == FND_FUNC_CALL && n->n_stmts == 1 && is_loop_index_ref(n->stmts[0], loop_name)) {
+        return 1;
+    }
+    for (int i = 0; i < n->n_children; i++) {
+        if (expr_has_loop_array_ref(n->children[i], loop_name)) return 1;
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        if (expr_has_loop_array_ref(n->stmts[i], loop_name)) return 1;
+    }
+    return 0;
+}
+
+static int fast_scalar_expr_once(OfortInterpreter *I, OfortNode *n, double *value) {
+    OfortValue v;
+    if (!n || !value) return 0;
+    v = eval_node(I, n);
+    if (v.type != FVAL_INTEGER && v.type != FVAL_REAL && v.type != FVAL_DOUBLE) {
+        free_value(&v);
+        return 0;
+    }
+    *value = val_to_real(v);
+    free_value(&v);
+    return 1;
+}
+
+static int fast_loop_array_affine_coeff(OfortInterpreter *I, OfortNode *n,
+                                        const char *loop_name, const char *src_name,
+                                        double *coef, double *constant) {
+    double lc, lb, rc, rb;
+    if (!n || !coef || !constant) return 0;
+    if (is_loop_array_ref(n, src_name, loop_name)) {
+        *coef = 1.0;
+        *constant = 0.0;
+        return 1;
+    }
+    switch (n->type) {
+    case FND_NEGATE:
+        if (!fast_loop_array_affine_coeff(I, n->children[0], loop_name, src_name, coef, constant)) return 0;
+        *coef = -*coef;
+        *constant = -*constant;
+        return 1;
+    case FND_ADD:
+    case FND_SUB:
+        if (!fast_loop_array_affine_coeff(I, n->children[0], loop_name, src_name, &lc, &lb) ||
+            !fast_loop_array_affine_coeff(I, n->children[1], loop_name, src_name, &rc, &rb)) {
+            return 0;
+        }
+        *coef = n->type == FND_ADD ? lc + rc : lc - rc;
+        *constant = n->type == FND_ADD ? lb + rb : lb - rb;
+        return 1;
+    case FND_MUL:
+        if (!fast_loop_array_affine_coeff(I, n->children[0], loop_name, src_name, &lc, &lb) ||
+            !fast_loop_array_affine_coeff(I, n->children[1], loop_name, src_name, &rc, &rb)) {
+            return 0;
+        }
+        if (lc != 0.0 && rc != 0.0) return 0;
+        *coef = lc * rb + rc * lb;
+        *constant = lb * rb;
+        return 1;
+    case FND_DIV:
+        if (!fast_loop_array_affine_coeff(I, n->children[0], loop_name, src_name, &lc, &lb) ||
+            !fast_loop_array_affine_coeff(I, n->children[1], loop_name, src_name, &rc, &rb) ||
+            rc != 0.0 || rb == 0.0) {
+            return 0;
+        }
+        *coef = lc / rb;
+        *constant = lb / rb;
+        return 1;
+    default:
+        if (expr_has_loop_array_ref(n, loop_name)) return 0;
+        if (!fast_scalar_expr_once(I, n, constant)) return 0;
+        *coef = 0.0;
+        return 1;
+    }
+}
+
+static int exec_fast_array_affine_loop(OfortInterpreter *I, OfortNode *n,
+                                       long long s, long long e, long long st) {
+    OfortNode *body;
+    OfortNode *assign;
+    OfortNode *lhs;
+    OfortNode *rhs;
+    OfortNode *src_ref = NULL;
+    OfortVar *dst_var;
+    OfortVar *src_var;
+    OfortVar *loop_var;
+    double coef;
+    double constant;
+    long long iter;
+    double profile_start = 0.0;
+
+    if (!I || !I->fast_mode || !n || n->type != FND_DO_LOOP || st == 0) return 0;
+    body = n->children[3];
+    if (!body || body->type != FND_BLOCK || body->n_stmts != 1) return 0;
+    assign = body->stmts[0];
+    if (!assign || assign->type != FND_ASSIGN) return 0;
+    lhs = assign->children[0];
+    rhs = assign->children[1];
+    if (!lhs || lhs->type != FND_FUNC_CALL || lhs->n_stmts != 1 ||
+        !is_loop_index_ref(lhs->stmts[0], n->name) || !rhs) {
+        return 0;
+    }
+
+    /* This fast path currently handles exactly one source array indexed by the loop variable. */
+    if (rhs->type == FND_ADD || rhs->type == FND_SUB || rhs->type == FND_MUL || rhs->type == FND_DIV) {
+        OfortNode *stack[64];
+        int top = 0;
+        stack[top++] = rhs;
+        while (top > 0) {
+            OfortNode *cur = stack[--top];
+            if (!cur) continue;
+            if (cur->type == FND_FUNC_CALL && cur->n_stmts == 1 && is_loop_index_ref(cur->stmts[0], n->name)) {
+                if (src_ref && !str_eq_nocase(src_ref->name, cur->name)) return 0;
+                src_ref = cur;
+            }
+            for (int i = 0; i < cur->n_children && top < 64; i++) stack[top++] = cur->children[i];
+            for (int i = 0; i < cur->n_stmts && top < 64; i++) stack[top++] = cur->stmts[i];
+        }
+    } else if (rhs->type == FND_FUNC_CALL && rhs->n_stmts == 1 && is_loop_index_ref(rhs->stmts[0], n->name)) {
+        src_ref = rhs;
+    }
+    if (!src_ref) return 0;
+    if (!fast_loop_array_affine_coeff(I, rhs, n->name, src_ref->name, &coef, &constant)) return 0;
+
+    dst_var = find_var(I, lhs->name);
+    src_var = find_var(I, src_ref->name);
+    loop_var = find_var(I, n->name);
+    if (!dst_var || !src_var || !loop_var) return 0;
+    if (dst_var->is_parameter || dst_var->is_protected ||
+        src_var->is_parameter || src_var->is_protected ||
+        loop_var->is_parameter || loop_var->is_protected) {
+        return 0;
+    }
+    if (dst_var->val.type != FVAL_ARRAY || src_var->val.type != FVAL_ARRAY ||
+        !array_has_packed_numeric(&dst_var->val) || !array_has_packed_numeric(&src_var->val) ||
+        dst_var->val.v.arr.len != src_var->val.v.arr.len ||
+        loop_var->val.type != FVAL_INTEGER) {
+        return 0;
+    }
+
+    if (I->line_profile_enabled && n->line > 0) profile_start = ofort_monotonic_seconds();
+    if (st > 0 ? s <= e : s >= e) {
+        long long first = s - 1;
+        long long last = e - 1;
+        if (first < 0 || first >= src_var->val.v.arr.len ||
+            last < 0 || last >= src_var->val.v.arr.len) {
+            return 0;
+        }
+    }
+    if (st > 0 ? s <= e : s >= e) {
+        iter = s;
+        for (;;) {
+            int idx;
+            double x;
+            double y;
+            if (st > 0 && iter > e) break;
+            if (st < 0 && iter < e) break;
+            idx = (int)(iter - 1);
+            x = src_var->val.v.arr.real_data ?
+                src_var->val.v.arr.real_data[idx] :
+                (double)src_var->val.v.arr.int_data[idx];
+            y = coef * x + constant;
+            if (dst_var->val.v.arr.real_data) dst_var->val.v.arr.real_data[idx] = y;
+            else dst_var->val.v.arr.int_data[idx] = (long long)y;
+            iter += st;
+        }
+    } else {
+        iter = s;
+    }
+    loop_var->val.v.i = iter;
+    if (I->line_profile_enabled && n->line > 0) {
+        add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
+    }
+    return 1;
+}
+
 static int exec_fast_random_sum_loop(OfortInterpreter *I, OfortNode *n,
                                      long long s, long long e, long long st) {
     OfortNode *body;
@@ -5539,8 +5777,25 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_PROGRAM: {
+        OfortNode *body = n->children[0];
         push_scope(I);
-        exec_node(I, n->children[0]);
+        if (body && body->type == FND_BLOCK) {
+            for (int i = 0; i < body->n_stmts; i++) {
+                OfortNode *s = body->stmts[i];
+                if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION)) {
+                    annotate_procedure_params(s);
+                    register_func(I, s->name, s, s->type == FND_FUNCTION);
+                }
+            }
+            for (int i = 0; i < body->n_stmts; i++) {
+                OfortNode *s = body->stmts[i];
+                if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION)) continue;
+                exec_node(I, s);
+                if (I->returning || I->exiting || I->cycling || I->stopping) break;
+            }
+        } else {
+            exec_node(I, body);
+        }
         pop_scope(I);
         break;
     }
@@ -5953,6 +6208,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (st == 0) ofort_error(I, "DO loop step cannot be zero");
 
         if (exec_fast_affine_subroutine_loop(I, n, s, e, st) ||
+            exec_fast_array_affine_loop(I, n, s, e, st) ||
             exec_fast_random_dot_loop(I, n, s, e, st) ||
             exec_fast_random_sum_loop(I, n, s, e, st)) {
             break;
@@ -6069,7 +6325,40 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_WRITE: {
         int nvals = 0;
         OfortValue *vals = eval_io_list(I, n, &nvals);
-        if (n->children[0]) {
+        if (n->children[0] && n->children[0]->type == FND_IDENT) {
+            OfortVar *target = find_var(I, n->children[0]->name);
+            if (target && target->val.type == FVAL_CHARACTER) {
+                int saved_len = I->out_len;
+                char saved_output[OFORT_MAX_OUTPUT];
+                OfortValue text;
+                copy_cstr(saved_output, sizeof(saved_output), I->output);
+                I->out_len = 0;
+                I->output[0] = '\0';
+                format_output(I, n->format_str, vals, nvals);
+                while (I->out_len > 0 &&
+                       (I->output[I->out_len - 1] == '\n' || I->output[I->out_len - 1] == '\r')) {
+                    I->output[--I->out_len] = '\0';
+                }
+                text = make_character(I->output);
+                text = resize_character_value(text, target->char_len);
+                free_value(&target->val);
+                target->val = text;
+                I->out_len = saved_len;
+                copy_cstr(I->output, sizeof(I->output), saved_output);
+            } else {
+                OfortValue uv = eval_node(I, n->children[0]);
+                int unit = (int)val_to_int(uv);
+                OfortUnitFile *entry = find_unit_file(I, unit);
+                free_value(&uv);
+                if (!entry && unit == 6) {
+                    format_output(I, n->format_str, vals, nvals);
+                } else {
+                    if (!entry) ofort_error(I, "Unit %d is not open", unit);
+                    if (n->bool_val) write_values_to_stream_file(I, entry->path, vals, nvals);
+                    else write_values_to_file(I, entry->path, vals, nvals);
+                }
+            }
+        } else if (n->children[0]) {
             OfortValue uv = eval_node(I, n->children[0]);
             int unit = (int)val_to_int(uv);
             OfortUnitFile *entry = find_unit_file(I, unit);
