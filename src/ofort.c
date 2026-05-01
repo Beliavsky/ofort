@@ -630,6 +630,19 @@ static OfortVar *find_var(OfortInterpreter *I, const char *name) {
     return NULL;
 }
 
+static OfortVar *find_var_in_current_scope(OfortInterpreter *I, const char *name) {
+    OfortScope *s = I->current_scope;
+    char upper[256];
+    if (!s) return NULL;
+    str_upper(upper, name, 256);
+    for (int i = 0; i < s->n_vars; i++) {
+        char vu[256];
+        str_upper(vu, s->vars[i].name, 256);
+        if (strcmp(upper, vu) == 0) return &s->vars[i];
+    }
+    return NULL;
+}
+
 static int current_scope_has_implicit_none(OfortInterpreter *I) {
     return I->current_scope && I->current_scope->implicit_none;
 }
@@ -4947,7 +4960,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         OfortVar *v = find_var(I, n->name);
         if (!v) ofort_error(I, "Undefined variable '%s' at line %d", n->name, n->line);
         if (v->is_pointer) {
-            if (!v->pointer_associated) return make_void_val();
+            if (!v->pointer_associated && v->val.type == FVAL_VOID) return make_void_val();
             return copy_value(v->val);
         }
         return copy_value(v->val);
@@ -6703,6 +6716,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (n->val_type == FVAL_CHARACTER) existing->char_len = decl_char_len;
             break;
         }
+        if (existing && existing == find_var_in_current_scope(I, n->name) &&
+            I->procedure_depth > 0) {
+            existing->intent = n->intent;
+            existing->is_pointer = n->is_pointer;
+            existing->is_allocatable = n->is_allocatable;
+            existing->is_target = n->is_target;
+            if (n->is_pointer && existing->val.type != FVAL_VOID)
+                existing->pointer_associated = 1;
+            if (n->val_type == FVAL_CHARACTER) existing->char_len = decl_char_len;
+            break;
+        }
         if (existing && n->type == FND_PARAMDECL && n->n_children > 0 && n->children[0]) {
             val = eval_node(I, n->children[0]);
             val = coerce_assignment_value(I, n->name, existing->val.type, val);
@@ -6725,7 +6749,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             } else {
                 val = make_array_from_decl(I, n);
             }
-        } else if (n->is_allocatable) {
+        } else if (n->is_allocatable && n->val_type != FVAL_DERIVED) {
             /* Allocatable: create empty array placeholder */
             val.type = FVAL_ARRAY;
             memset(&val.v.arr, 0, sizeof(val.v.arr));
@@ -7754,6 +7778,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             free_value(&source);
         } else {
+            if (var->val.type == FVAL_DERIVED && (var->is_pointer || var->is_allocatable)) {
+                char type_name[64];
+                copy_cstr(type_name, sizeof(type_name), var->val.v.dt.type_name);
+                free_value(&var->val);
+                var->val = default_derived_value(I, type_name);
+                var->pointer_associated = var->is_pointer ? 1 : var->pointer_associated;
+                break;
+            }
             ofort_error(I, "ALLOCATE requires dimensions, SOURCE, or MOLD");
         }
         free_value(&var->val);
@@ -7788,6 +7820,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         OfortVar *var = find_var(I, n->name);
         if (!var) ofort_error(I, "Variable '%s' not found for DEALLOCATE", n->name);
+        if (var->val.type == FVAL_DERIVED && (var->is_pointer || var->is_allocatable)) {
+            if (var->is_pointer) var->pointer_associated = 0;
+            break;
+        }
         free_value(&var->val);
         var->val.type = FVAL_ARRAY;
         memset(&var->val.v.arr, 0, sizeof(var->val.v.arr));
