@@ -5171,6 +5171,152 @@ static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n
     return 1;
 }
 
+static int fast_linear_expr_coeff(OfortNode *n, const char *name, double *coef, double *constant) {
+    double lc, lb, rc, rb;
+    if (!n || !coef || !constant) return 0;
+    switch (n->type) {
+    case FND_INT_LIT:
+        *coef = 0.0;
+        *constant = (double)n->int_val;
+        return 1;
+    case FND_REAL_LIT:
+        *coef = 0.0;
+        *constant = n->num_val;
+        return 1;
+    case FND_IDENT:
+        if (!str_eq_nocase(n->name, name)) return 0;
+        *coef = 1.0;
+        *constant = 0.0;
+        return 1;
+    case FND_NEGATE:
+        if (!fast_linear_expr_coeff(n->children[0], name, coef, constant)) return 0;
+        *coef = -*coef;
+        *constant = -*constant;
+        return 1;
+    case FND_ADD:
+    case FND_SUB:
+        if (!fast_linear_expr_coeff(n->children[0], name, &lc, &lb) ||
+            !fast_linear_expr_coeff(n->children[1], name, &rc, &rb)) {
+            return 0;
+        }
+        *coef = n->type == FND_ADD ? lc + rc : lc - rc;
+        *constant = n->type == FND_ADD ? lb + rb : lb - rb;
+        return 1;
+    case FND_MUL:
+        if (!fast_linear_expr_coeff(n->children[0], name, &lc, &lb) ||
+            !fast_linear_expr_coeff(n->children[1], name, &rc, &rb)) {
+            return 0;
+        }
+        if (lc != 0.0 && rc != 0.0) return 0;
+        *coef = lc * rb + rc * lb;
+        *constant = lb * rb;
+        return 1;
+    case FND_DIV:
+        if (!fast_linear_expr_coeff(n->children[0], name, &lc, &lb) ||
+            !fast_linear_expr_coeff(n->children[1], name, &rc, &rb) ||
+            rc != 0.0 || rb == 0.0) {
+            return 0;
+        }
+        *coef = lc / rb;
+        *constant = lb / rb;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int find_single_assignment_in_simple_body(OfortNode *body, OfortNode **assign) {
+    if (!body || !assign) return 0;
+    if (body->type == FND_BLOCK) {
+        for (int i = 0; i < body->n_stmts; i++) {
+            if (!find_single_assignment_in_simple_body(body->stmts[i], assign)) return 0;
+        }
+        return 1;
+    }
+    if (body->type == FND_VARDECL || body->type == FND_PARAMDECL) return 1;
+    if (body->type == FND_ASSIGN) {
+        if (*assign) return 0;
+        *assign = body;
+        return 1;
+    }
+    return 0;
+}
+
+static int exec_fast_affine_subroutine_loop(OfortInterpreter *I, OfortNode *n,
+                                            long long s, long long e, long long st) {
+    OfortNode *body;
+    OfortNode *call;
+    OfortNode *fn_body;
+    OfortNode *assign = NULL;
+    OfortNode *lhs;
+    OfortNode *rhs;
+    OfortFunc *func;
+    OfortNode *fn;
+    OfortVar *actual_var;
+    OfortVar *loop_var;
+    const char *dummy_name;
+    double coef;
+    double constant;
+    double value;
+    long long iter;
+    double profile_start = 0.0;
+
+    if (!I || !I->fast_mode || !n || n->type != FND_DO_LOOP || st == 0) return 0;
+    body = n->children[3];
+    if (!body || body->type != FND_BLOCK || body->n_stmts != 1) return 0;
+    call = body->stmts[0];
+    if (!call || call->type != FND_CALL || call->n_stmts != 1 ||
+        call->stmts[0]->type != FND_IDENT) {
+        return 0;
+    }
+    func = find_func(I, call->name);
+    if (!func || func->is_function || func->n_saved_vars != 0) return 0;
+    fn = func->node;
+    if (!fn || fn->n_params != 1 || fn->param_intents[0] == 1) return 0;
+    dummy_name = fn->param_names[0];
+    fn_body = fn->children[0];
+    if (!fn_body || fn_body->type != FND_BLOCK) return 0;
+
+    if (!find_single_assignment_in_simple_body(fn_body, &assign)) return 0;
+    if (!assign) return 0;
+    lhs = assign->children[0];
+    rhs = assign->children[1];
+    if (!lhs || lhs->type != FND_IDENT || !str_eq_nocase(lhs->name, dummy_name) || !rhs) return 0;
+    if (!fast_linear_expr_coeff(rhs, dummy_name, &coef, &constant)) return 0;
+
+    actual_var = cached_ident_var(I, n, 4, call->stmts[0]);
+    loop_var = find_var(I, n->name);
+    if (!actual_var || !loop_var) return 0;
+    if (actual_var->is_parameter || actual_var->is_protected ||
+        loop_var->is_parameter || loop_var->is_protected) {
+        return 0;
+    }
+    if ((actual_var->val.type != FVAL_REAL && actual_var->val.type != FVAL_DOUBLE) ||
+        loop_var->val.type != FVAL_INTEGER) {
+        return 0;
+    }
+
+    if (I->line_profile_enabled && n->line > 0) profile_start = ofort_monotonic_seconds();
+    value = actual_var->val.v.r;
+    if (st > 0 ? s <= e : s >= e) {
+        iter = s;
+        for (;;) {
+            if (st > 0 && iter > e) break;
+            if (st < 0 && iter < e) break;
+            value = coef * value + constant;
+            iter += st;
+        }
+    } else {
+        iter = s;
+    }
+    actual_var->val.v.r = value;
+    loop_var->val.v.i = iter;
+    if (I->line_profile_enabled && n->line > 0) {
+        add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
+    }
+    return 1;
+}
+
 static int exec_fast_random_sum_loop(OfortInterpreter *I, OfortNode *n,
                                      long long s, long long e, long long st) {
     OfortNode *body;
@@ -5256,6 +5402,113 @@ static int exec_fast_random_sum_loop(OfortInterpreter *I, OfortNode *n,
     I->fast_rng_state = rng_state;
     random_var->val.v.r = last_random;
     sum_var->val.v.r = sum;
+    loop_var->val.v.i = iter;
+    if (I->line_profile_enabled && n->line > 0) {
+        add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
+    }
+    return 1;
+}
+
+static int exec_fast_random_dot_loop(OfortInterpreter *I, OfortNode *n,
+                                     long long s, long long e, long long st) {
+    OfortNode *body;
+    OfortNode *call_x;
+    OfortNode *call_y;
+    OfortNode *assign;
+    OfortNode *lhs;
+    OfortNode *rhs;
+    OfortNode *mul;
+    OfortNode *x_ident;
+    OfortNode *y_ident;
+    OfortVar *x_var;
+    OfortVar *y_var;
+    OfortVar *dot_var;
+    OfortVar *loop_var;
+    uint64_t rng_state;
+    long long iter;
+    double x = 0.0;
+    double y = 0.0;
+    double dot;
+    double profile_start = 0.0;
+
+    if (!I || !I->fast_mode || !n || n->type != FND_DO_LOOP || st == 0) return 0;
+    body = n->children[3];
+    if (!body || body->type != FND_BLOCK || body->n_stmts != 3) return 0;
+    call_x = body->stmts[0];
+    call_y = body->stmts[1];
+    assign = body->stmts[2];
+    if (!call_x || call_x->type != FND_CALL || !str_eq_nocase(call_x->name, "random_number") ||
+        call_x->n_stmts != 1 || call_x->stmts[0]->type != FND_IDENT) {
+        return 0;
+    }
+    if (!call_y || call_y->type != FND_CALL || !str_eq_nocase(call_y->name, "random_number") ||
+        call_y->n_stmts != 1 || call_y->stmts[0]->type != FND_IDENT) {
+        return 0;
+    }
+    if (!assign || assign->type != FND_ASSIGN) return 0;
+    lhs = assign->children[0];
+    rhs = assign->children[1];
+    if (!lhs || lhs->type != FND_IDENT || !rhs || rhs->type != FND_ADD ||
+        !rhs->children[0] || !rhs->children[1]) {
+        return 0;
+    }
+    if (rhs->children[0]->type != FND_IDENT ||
+        !str_eq_nocase(lhs->name, rhs->children[0]->name)) {
+        return 0;
+    }
+    mul = rhs->children[1];
+    if (!mul || mul->type != FND_MUL || !mul->children[0] || !mul->children[1] ||
+        mul->children[0]->type != FND_IDENT || mul->children[1]->type != FND_IDENT) {
+        return 0;
+    }
+    x_ident = call_x->stmts[0];
+    y_ident = call_y->stmts[0];
+    if (!((str_eq_nocase(mul->children[0]->name, x_ident->name) &&
+           str_eq_nocase(mul->children[1]->name, y_ident->name)) ||
+          (str_eq_nocase(mul->children[0]->name, y_ident->name) &&
+           str_eq_nocase(mul->children[1]->name, x_ident->name)))) {
+        return 0;
+    }
+
+    x_var = cached_ident_var(I, n, 1, x_ident);
+    y_var = cached_ident_var(I, n, 2, y_ident);
+    dot_var = cached_ident_var(I, n, 3, lhs);
+    loop_var = find_var(I, n->name);
+    if (!x_var || !y_var || !dot_var || !loop_var) return 0;
+    if (x_var->is_parameter || x_var->is_protected ||
+        y_var->is_parameter || y_var->is_protected ||
+        dot_var->is_parameter || dot_var->is_protected ||
+        loop_var->is_parameter || loop_var->is_protected) {
+        return 0;
+    }
+    if ((x_var->val.type != FVAL_REAL && x_var->val.type != FVAL_DOUBLE) ||
+        (y_var->val.type != FVAL_REAL && y_var->val.type != FVAL_DOUBLE) ||
+        (dot_var->val.type != FVAL_REAL && dot_var->val.type != FVAL_DOUBLE) ||
+        loop_var->val.type != FVAL_INTEGER) {
+        return 0;
+    }
+
+    if (I->line_profile_enabled && n->line > 0) profile_start = ofort_monotonic_seconds();
+    seed_fast_rng_if_needed(I);
+    rng_state = I->fast_rng_state;
+    dot = dot_var->val.v.r;
+    if (st > 0 ? s <= e : s >= e) {
+        iter = s;
+        for (;;) {
+            if (st > 0 && iter > e) break;
+            if (st < 0 && iter < e) break;
+            x = fast_rng_unit_from_u32(fast_rng_next32(&rng_state));
+            y = fast_rng_unit_from_u32(fast_rng_next32(&rng_state));
+            dot += x * y;
+            iter += st;
+        }
+    } else {
+        iter = s;
+    }
+    I->fast_rng_state = rng_state;
+    x_var->val.v.r = x;
+    y_var->val.v.r = y;
+    dot_var->val.v.r = dot;
     loop_var->val.v.i = iter;
     if (I->line_profile_enabled && n->line > 0) {
         add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
@@ -5699,7 +5952,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
         if (st == 0) ofort_error(I, "DO loop step cannot be zero");
 
-        if (exec_fast_random_sum_loop(I, n, s, e, st)) {
+        if (exec_fast_affine_subroutine_loop(I, n, s, e, st) ||
+            exec_fast_random_dot_loop(I, n, s, e, st) ||
+            exec_fast_random_sum_loop(I, n, s, e, st)) {
             break;
         }
 
