@@ -5137,8 +5137,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
         set_var(I, n->name, make_integer(s));
         long long iter = s;
-        int max_iter = 1000000; /* safety limit */
-        while (max_iter-- > 0) {
+        for (;;) {
             if (st > 0 && iter > e) break;
             if (st < 0 && iter < e) break;
             set_var(I, n->name, make_integer(iter));
@@ -5166,6 +5165,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (I->exiting) { I->exiting = 0; break; }
             if (I->cycling) { I->cycling = 0; }
         }
+        if (max_iter < 0 && !I->returning && !I->stopping)
+            ofort_error(I, "DO WHILE exceeded iteration safety limit");
         break;
     }
 
@@ -5177,6 +5178,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (I->exiting) { I->exiting = 0; break; }
             if (I->cycling) { I->cycling = 0; }
         }
+        if (max_iter < 0 && !I->returning && !I->stopping)
+            ofort_error(I, "DO exceeded iteration safety limit");
         break;
     }
 
