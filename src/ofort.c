@@ -5434,10 +5434,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 OfortValue *arr = &harvest->val;
                 if (arr->v.arr.elem_type != FVAL_REAL && arr->v.arr.elem_type != FVAL_DOUBLE)
                     ofort_error(I, "RANDOM_NUMBER harvest array must be REAL");
-                for (int i = 0; i < arr->v.arr.len; i++) {
-                    if (I->fast_mode && (arr->v.arr.data[i].type == FVAL_REAL || arr->v.arr.data[i].type == FVAL_DOUBLE)) {
+                if (I->fast_mode) {
+                    for (int i = 0; i < arr->v.arr.len; i++) {
                         arr->v.arr.data[i].v.r = random_unit();
-                    } else {
+                    }
+                } else {
+                    for (int i = 0; i < arr->v.arr.len; i++) {
                         free_value(&arr->v.arr.data[i]);
                         if (arr->v.arr.elem_type == FVAL_DOUBLE)
                             arr->v.arr.data[i] = make_double(random_unit());
@@ -6915,6 +6917,17 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "SUM") == 0) {
         if (args[0].type != FVAL_ARRAY) return copy_value(args[0]);
         double sum = 0;
+        if (I->fast_mode &&
+            (args[0].v.arr.elem_type == FVAL_REAL || args[0].v.arr.elem_type == FVAL_DOUBLE ||
+             args[0].v.arr.elem_type == FVAL_INTEGER)) {
+            if (args[0].v.arr.elem_type == FVAL_INTEGER) {
+                long long isum = 0;
+                for (int i = 0; i < args[0].v.arr.len; i++) isum += args[0].v.arr.data[i].v.i;
+                return make_integer(isum);
+            }
+            for (int i = 0; i < args[0].v.arr.len; i++) sum += args[0].v.arr.data[i].v.r;
+            return make_real(sum);
+        }
         for (int i = 0; i < args[0].v.arr.len; i++)
             sum += val_to_real(args[0].v.arr.data[i]);
         if (args[0].v.arr.elem_type == FVAL_INTEGER) return make_integer((long long)sum);
