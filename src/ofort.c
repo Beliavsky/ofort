@@ -1392,10 +1392,116 @@ static int check(OfortInterpreter *I, OfortTokenType type) {
     return peek(I)->type == type;
 }
 
+static const char *token_type_name(OfortTokenType type) {
+    switch (type) {
+        case FTOK_EOF: return "end of file";
+        case FTOK_INT_LIT: return "integer literal";
+        case FTOK_REAL_LIT: return "real literal";
+        case FTOK_STRING_LIT: return "string literal";
+        case FTOK_IDENT: return "identifier";
+        case FTOK_INTEGER: return "INTEGER";
+        case FTOK_REAL: return "REAL";
+        case FTOK_DOUBLE_PRECISION: return "DOUBLE PRECISION";
+        case FTOK_CHARACTER: return "CHARACTER";
+        case FTOK_LOGICAL: return "LOGICAL";
+        case FTOK_COMPLEX: return "COMPLEX";
+        case FTOK_PROGRAM: return "PROGRAM";
+        case FTOK_END: return "END";
+        case FTOK_SUBROUTINE: return "SUBROUTINE";
+        case FTOK_FUNCTION: return "FUNCTION";
+        case FTOK_MODULE: return "MODULE";
+        case FTOK_USE: return "USE";
+        case FTOK_CONTAINS: return "CONTAINS";
+        case FTOK_TYPE: return "TYPE";
+        case FTOK_IMPLICIT: return "IMPLICIT";
+        case FTOK_NONE: return "NONE";
+        case FTOK_IF: return "IF";
+        case FTOK_THEN: return "THEN";
+        case FTOK_ELSE: return "ELSE";
+        case FTOK_ELSEIF: return "ELSEIF";
+        case FTOK_DO: return "DO";
+        case FTOK_WHILE: return "WHILE";
+        case FTOK_SELECT: return "SELECT";
+        case FTOK_CASE: return "CASE";
+        case FTOK_EXIT: return "EXIT";
+        case FTOK_CYCLE: return "CYCLE";
+        case FTOK_RETURN: return "RETURN";
+        case FTOK_STOP: return "STOP";
+        case FTOK_CALL: return "CALL";
+        case FTOK_ENTRY: return "ENTRY";
+        case FTOK_DEFAULT: return "DEFAULT";
+        case FTOK_DIMENSION: return "DIMENSION";
+        case FTOK_ALLOCATABLE: return "ALLOCATABLE";
+        case FTOK_ALLOCATE: return "ALLOCATE";
+        case FTOK_DEALLOCATE: return "DEALLOCATE";
+        case FTOK_PARAMETER: return "PARAMETER";
+        case FTOK_INTENT: return "INTENT";
+        case FTOK_IN: return "IN";
+        case FTOK_OUT: return "OUT";
+        case FTOK_INOUT: return "INOUT";
+        case FTOK_RESULT: return "RESULT";
+        case FTOK_SAVE: return "SAVE";
+        case FTOK_DATA: return "DATA";
+        case FTOK_PRINT: return "PRINT";
+        case FTOK_WRITE: return "WRITE";
+        case FTOK_READ: return "READ";
+        case FTOK_OPEN: return "OPEN";
+        case FTOK_CLOSE: return "CLOSE";
+        case FTOK_TRUE: return ".TRUE.";
+        case FTOK_FALSE: return ".FALSE.";
+        case FTOK_PLUS: return "'+'";
+        case FTOK_MINUS: return "'-'";
+        case FTOK_STAR: return "'*'";
+        case FTOK_SLASH: return "'/'";
+        case FTOK_POWER: return "'**'";
+        case FTOK_CONCAT: return "'//'";
+        case FTOK_ASSIGN: return "'='";
+        case FTOK_POINTER_ASSIGN: return "'=>'";
+        case FTOK_EQ: return "'=='";
+        case FTOK_NEQ: return "'/='";
+        case FTOK_LT: return "'<'";
+        case FTOK_GT: return "'>'";
+        case FTOK_LE: return "'<='";
+        case FTOK_GE: return "'>='";
+        case FTOK_AND: return ".AND.";
+        case FTOK_OR: return ".OR.";
+        case FTOK_NOT: return ".NOT.";
+        case FTOK_EQVOP: return ".EQV.";
+        case FTOK_NEQVOP: return ".NEQV.";
+        case FTOK_LPAREN: return "'('";
+        case FTOK_RPAREN: return "')'";
+        case FTOK_LBRACKET: return "'[' or '(/'";
+        case FTOK_RBRACKET: return "']' or '/)'";
+        case FTOK_COMMA: return "','";
+        case FTOK_COLON: return "':'";
+        case FTOK_DCOLON: return "'::'";
+        case FTOK_PERCENT: return "'%'";
+        case FTOK_NEWLINE: return "end of statement";
+        case FTOK_SEMICOLON: return "';'";
+        default: return "unknown token";
+    }
+}
+
+static void describe_token(char *buf, size_t buf_size, const OfortToken *t) {
+    const char *name = token_type_name(t->type);
+    if (t->type == FTOK_IDENT || t->type == FTOK_STRING_LIT) {
+        snprintf(buf, buf_size, "%s '%.80s'", name, t->str_val);
+    } else if (t->type == FTOK_INT_LIT) {
+        snprintf(buf, buf_size, "%s '%lld'", name, t->int_val);
+    } else if (t->type == FTOK_REAL_LIT) {
+        snprintf(buf, buf_size, "%s '%g'", name, t->num_val);
+    } else {
+        snprintf(buf, buf_size, "%s", name);
+    }
+}
+
 static OfortToken *expect(OfortInterpreter *I, OfortTokenType type) {
     OfortToken *t = peek(I);
     if (t->type != type) {
-        ofort_error(I, "Expected token type %d, got %d at line %d", type, t->type, t->line);
+        char found[256];
+        describe_token(found, sizeof(found), t);
+        ofort_error(I, "Syntax error at line %d: expected %s but found %s",
+                    t->line, token_type_name(type), found);
     }
     return advance(I);
 }
@@ -1814,7 +1920,11 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         return n;
     }
 
-    ofort_error(I, "Unexpected token at line %d (type %d)", t->line, t->type);
+    {
+        char found[256];
+        describe_token(found, sizeof(found), t);
+        ofort_error(I, "Syntax error at line %d: unexpected %s", t->line, found);
+    }
     return NULL; /* unreachable */
 }
 
