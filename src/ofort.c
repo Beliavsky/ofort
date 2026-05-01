@@ -101,6 +101,10 @@ struct OfortInterpreter {
     int warn_len;
     int warnings_enabled;
     int fast_mode;
+    int line_profile_enabled;
+    double *line_profile_seconds;
+    int *line_profile_counts;
+    int line_profile_nlines;
     OfortTiming timing;
     /* tokens */
     OfortToken tokens[OFORT_MAX_TOKENS];
@@ -170,6 +174,74 @@ static double ofort_monotonic_seconds(void) {
 
 static void clear_timing(OfortInterpreter *I) {
     if (I) memset(&I->timing, 0, sizeof(I->timing));
+}
+
+static int count_source_lines_text(const char *source) {
+    int n = 1;
+    if (!source || source[0] == '\0') return 0;
+    for (const char *p = source; *p; p++) {
+        if (*p == '\n' && p[1] != '\0') n++;
+    }
+    return n;
+}
+
+static void clear_line_profile(OfortInterpreter *I) {
+    if (!I) return;
+    free(I->line_profile_seconds);
+    free(I->line_profile_counts);
+    I->line_profile_seconds = NULL;
+    I->line_profile_counts = NULL;
+    I->line_profile_nlines = 0;
+}
+
+static int prepare_line_profile(OfortInterpreter *I, const char *source) {
+    int nlines;
+    clear_line_profile(I);
+    if (!I || !I->line_profile_enabled) return 0;
+    nlines = count_source_lines_text(source);
+    if (nlines <= 0) return 0;
+    I->line_profile_seconds = (double *)calloc((size_t)nlines + 1, sizeof(double));
+    I->line_profile_counts = (int *)calloc((size_t)nlines + 1, sizeof(int));
+    if (!I->line_profile_seconds || !I->line_profile_counts) {
+        clear_line_profile(I);
+        return -1;
+    }
+    I->line_profile_nlines = nlines;
+    return 0;
+}
+
+static int node_is_profiled_statement(const OfortNode *n) {
+    if (!n || n->line <= 0) return 0;
+    switch (n->type) {
+    case FND_VARDECL:
+    case FND_PARAMDECL:
+    case FND_ASSIGN:
+    case FND_POINTER_ASSIGN:
+    case FND_CALL:
+    case FND_PRINT:
+    case FND_WRITE:
+    case FND_READ_STMT:
+    case FND_OPEN:
+    case FND_CLOSE:
+    case FND_ALLOCATE:
+    case FND_DEALLOCATE:
+    case FND_RETURN:
+    case FND_EXIT:
+    case FND_CYCLE:
+    case FND_STOP:
+    case FND_EXPR_STMT:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void add_line_profile_time(OfortInterpreter *I, int line, double seconds) {
+    if (!I || !I->line_profile_enabled) return;
+    if (line <= 0 || line > I->line_profile_nlines) return;
+    if (!I->line_profile_seconds || !I->line_profile_counts) return;
+    I->line_profile_seconds[line] += seconds;
+    I->line_profile_counts[line]++;
 }
 
 /* ── Helpers ─────────────────────────────────── */
@@ -4719,9 +4791,15 @@ static void annotate_procedure_params(OfortNode *n) {
 
 /* Execute statement node */
 static void exec_node(OfortInterpreter *I, OfortNode *n) {
+    int profile_line = 0;
+    double profile_start = 0.0;
     if (!n) return;
     if (I->returning || I->exiting || I->cycling || I->stopping) return;
     if (n->line > 0) I->current_line = n->line;
+    if (I->line_profile_enabled && node_is_profiled_statement(n)) {
+        profile_line = n->line;
+        profile_start = ofort_monotonic_seconds();
+    }
 
     switch (n->type) {
     case FND_BLOCK: {
@@ -5805,6 +5883,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
     default:
         break;
+    }
+    if (profile_line > 0) {
+        add_line_profile_time(I, profile_line, ofort_monotonic_seconds() - profile_start);
     }
 }
 
@@ -7470,6 +7551,7 @@ OfortInterpreter *ofort_create(void) {
 
 void ofort_destroy(OfortInterpreter *interp) {
     if (!interp) return;
+    clear_line_profile(interp);
     /* Free node pool */
     if (interp->node_pool) {
         for (int i = 0; i < interp->node_pool_len; i++) {
@@ -7517,6 +7599,11 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     interp->warnings[0] = '\0';
     interp->warn_len = 0;
     interp->procedure_depth = 0;
+    if (prepare_line_profile(interp, source) != 0) {
+        snprintf(interp->error, sizeof(interp->error), "Out of memory for line profiler");
+        interp->has_error = 1;
+        return -1;
+    }
 
     if (setjmp(interp->err_jmp) != 0) {
         return -1;
@@ -7626,6 +7713,13 @@ void ofort_set_warnings_enabled(OfortInterpreter *interp, int enabled) {
 void ofort_set_fast_mode(OfortInterpreter *interp, int enabled) {
     if (interp) {
         interp->fast_mode = enabled ? 1 : 0;
+    }
+}
+
+void ofort_set_line_profile_enabled(OfortInterpreter *interp, int enabled) {
+    if (interp) {
+        interp->line_profile_enabled = enabled ? 1 : 0;
+        if (!enabled) clear_line_profile(interp);
     }
 }
 
@@ -8213,6 +8307,23 @@ int ofort_get_timing(OfortInterpreter *interp, OfortTiming *timing) {
     return 0;
 }
 
+int ofort_get_line_profile(OfortInterpreter *interp, OfortLineProfileEntry *entries,
+                           int max_entries, int *n_entries) {
+    int count = 0;
+    if (!interp || !n_entries) return -1;
+    for (int line = 1; line <= interp->line_profile_nlines; line++) {
+        if (!interp->line_profile_counts || interp->line_profile_counts[line] <= 0) continue;
+        if (entries && count < max_entries) {
+            entries[count].line = line;
+            entries[count].count = interp->line_profile_counts[line];
+            entries[count].seconds = interp->line_profile_seconds ? interp->line_profile_seconds[line] : 0.0;
+        }
+        count++;
+    }
+    *n_entries = count;
+    return 0;
+}
+
 void ofort_reset(OfortInterpreter *interp) {
     if (!interp) return;
     interp->output[0] = '\0';
@@ -8228,4 +8339,5 @@ void ofort_reset(OfortInterpreter *interp) {
     interp->current_line = 0;
     interp->procedure_depth = 0;
     clear_timing(interp);
+    clear_line_profile(interp);
 }
