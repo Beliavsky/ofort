@@ -21,6 +21,8 @@
 #include <limits.h>
 #include <stdint.h>
 #include <time.h>
+
+#define OFORT_ALLOC_TARGET_CHILD (OFORT_MAX_CHILDREN - 1)
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -3078,9 +3080,23 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
     OfortNode *mold_expr = NULL;
     n->line = at->line;
     expect(I, FTOK_LPAREN);
-    /* parse: array_name(dim1, dim2, ...) */
+    /* parse: target or array_name(dim1, dim2, ...) */
     OfortToken *name = expect(I, FTOK_IDENT);
     copy_cstr(n->name, sizeof(n->name), name->str_val);
+    OfortNode *target = alloc_node(I, FND_IDENT);
+    copy_cstr(target->name, sizeof(target->name), name->str_val);
+    target->line = name->line;
+    while (check(I, FTOK_PERCENT)) {
+        advance(I);
+        OfortToken *mt = expect(I, FTOK_IDENT);
+        OfortNode *mem = alloc_node(I, FND_MEMBER);
+        mem->children[0] = target;
+        mem->n_children = 1;
+        copy_cstr(mem->name, sizeof(mem->name), mt->str_val);
+        mem->line = mt->line;
+        target = mem;
+    }
+    if (target->type != FND_IDENT) n->children[OFORT_ALLOC_TARGET_CHILD] = target;
     n->stmts = NULL; n->n_stmts = 0;
     int cap = 0;
     if (check(I, FTOK_LPAREN)) {
@@ -3137,6 +3153,20 @@ static OfortNode *parse_deallocate(OfortInterpreter *I) {
     expect(I, FTOK_LPAREN);
     OfortToken *name = expect(I, FTOK_IDENT);
     copy_cstr(n->name, sizeof(n->name), name->str_val);
+    OfortNode *target = alloc_node(I, FND_IDENT);
+    copy_cstr(target->name, sizeof(target->name), name->str_val);
+    target->line = name->line;
+    while (check(I, FTOK_PERCENT)) {
+        advance(I);
+        OfortToken *mt = expect(I, FTOK_IDENT);
+        OfortNode *mem = alloc_node(I, FND_MEMBER);
+        mem->children[0] = target;
+        mem->n_children = 1;
+        copy_cstr(mem->name, sizeof(mem->name), mt->str_val);
+        mem->line = mt->line;
+        target = mem;
+    }
+    if (target->type != FND_IDENT) n->children[OFORT_ALLOC_TARGET_CHILD] = target;
     expect(I, FTOK_RPAREN);
     return n;
 }
@@ -3683,6 +3713,29 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
         v.v.dt.fields[i] = default_value(td->field_types[i], td->field_char_lens[i]);
     }
     return v;
+}
+
+static OfortValue *member_lvalue(OfortInterpreter *I, OfortNode *n) {
+    if (!n) return NULL;
+    if (n->type == FND_IDENT) {
+        OfortVar *v = find_var(I, n->name);
+        return v ? &v->val : NULL;
+    }
+    if (n->type == FND_MEMBER) {
+        OfortValue *obj = member_lvalue(I, n->children[0]);
+        if (!obj) return NULL;
+        if (obj->type != FVAL_DERIVED)
+            ofort_error(I, "Cannot access member of non-derived type");
+        char upper[256];
+        str_upper(upper, n->name, 256);
+        for (int i = 0; i < obj->v.dt.n_fields; i++) {
+            char fu[256];
+            str_upper(fu, obj->v.dt.field_names[i], 256);
+            if (strcmp(upper, fu) == 0) return &obj->v.dt.fields[i];
+        }
+        ofort_error(I, "Unknown member '%s'", n->name);
+    }
+    return NULL;
 }
 
 static int eval_character_length(OfortInterpreter *I, OfortNode *n) {
@@ -7490,7 +7543,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             if (!arg_alias[i] && fn->param_intents[i] != 1) {
                 OfortVar *pv = find_var(I, fn->param_names[i]);
-                if (pv && pv->present && n->stmts[i]->type == FND_IDENT) {
+                if (pv && pv->present &&
+                    (n->stmts[i]->type == FND_IDENT || n->stmts[i]->type == FND_MEMBER)) {
                     free_value(&args[i]);
                     args[i] = copy_value(pv->val);
                 }
@@ -7503,6 +7557,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (!arg_alias[i] && n->stmts[i]->type == FND_IDENT && fn->param_intents[i] != 1 &&
                 args[i].type != FVAL_VOID) {
                 set_var(I, n->stmts[i]->name, copy_value(args[i]));
+            } else if (!arg_alias[i] && n->stmts[i]->type == FND_MEMBER && fn->param_intents[i] != 1 &&
+                       args[i].type != FVAL_VOID) {
+                OfortValue *target = member_lvalue(I, n->stmts[i]);
+                if (target) {
+                    free_value(target);
+                    *target = copy_value(args[i]);
+                }
             }
         }
         for (int i = 0; i < nargs; i++) free_value(&args[i]);
@@ -7558,6 +7619,71 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_ALLOCATE: {
+        if (n->children[OFORT_ALLOC_TARGET_CHILD]) {
+            OfortValue *target = member_lvalue(I, n->children[OFORT_ALLOC_TARGET_CHILD]);
+            if (!target) ofort_error(I, "ALLOCATE target not found");
+            int dims[7];
+            int lower_bounds[7];
+            int ndims = n->n_stmts;
+            OfortValType elem_type = target->type == FVAL_ARRAY ? target->v.arr.elem_type : target->type;
+            for (int i = 0; i < 7; i++) lower_bounds[i] = 1;
+
+            if (ndims > 0) {
+                for (int i = 0; i < ndims; i++) {
+                    int lower = 1;
+                    OfortValue dv = eval_node(I, n->stmts[i]);
+                    int upper = (int)val_to_int(dv);
+                    free_value(&dv);
+                    if (n->has_lower_bound[i]) {
+                        if (n->children[2 + i]) {
+                            OfortValue lv = eval_node(I, n->children[2 + i]);
+                            lower = (int)val_to_int(lv);
+                            free_value(&lv);
+                        } else {
+                            lower = n->lower_bounds[i];
+                        }
+                        dims[i] = upper - lower + 1;
+                        lower_bounds[i] = lower;
+                    } else {
+                        dims[i] = upper;
+                    }
+                    if (dims[i] < 0) dims[i] = 0;
+                }
+                free_value(target);
+                *target = make_array(elem_type, dims, ndims);
+                set_array_lower_bounds(target, lower_bounds, ndims);
+            } else if (n->children[1]) {
+                OfortValue mold = eval_node(I, n->children[1]);
+                if (mold.type == FVAL_ARRAY) {
+                    ndims = mold.v.arr.n_dims;
+                    elem_type = mold.v.arr.elem_type;
+                    for (int i = 0; i < ndims; i++) {
+                        dims[i] = mold.v.arr.dims[i];
+                        lower_bounds[i] = mold.v.arr.lower_bounds[i];
+                    }
+                    free_value(target);
+                    *target = make_array(elem_type, dims, ndims);
+                    set_array_lower_bounds(target, lower_bounds, ndims);
+                } else {
+                    free_value(target);
+                    *target = default_value(mold.type, 1);
+                }
+                free_value(&mold);
+            } else if (n->children[0]) {
+                OfortValue source = eval_node(I, n->children[0]);
+                free_value(target);
+                *target = copy_value(source);
+                free_value(&source);
+            } else {
+                if (target->type == FVAL_VOID)
+                    ofort_error(I, "ALLOCATE component target has no declared type");
+                OfortValType target_type = target->type;
+                int char_len = target_type == FVAL_CHARACTER && target->v.s ? (int)strlen(target->v.s) : 1;
+                free_value(target);
+                *target = default_value(target_type, char_len);
+            }
+            break;
+        }
         OfortVar *var = find_var(I, n->name);
         if (!var) ofort_error(I, "Variable '%s' not found for ALLOCATE", n->name);
         /* Get dimensions */
@@ -7640,6 +7766,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_DEALLOCATE: {
+        if (n->children[OFORT_ALLOC_TARGET_CHILD]) {
+            OfortValue *target = member_lvalue(I, n->children[OFORT_ALLOC_TARGET_CHILD]);
+            if (!target) ofort_error(I, "DEALLOCATE target not found");
+            free_value(target);
+            *target = make_void_val();
+            break;
+        }
         OfortVar *var = find_var(I, n->name);
         if (!var) ofort_error(I, "Variable '%s' not found for DEALLOCATE", n->name);
         free_value(&var->val);
