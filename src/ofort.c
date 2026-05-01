@@ -71,9 +71,11 @@ typedef struct {
     OfortFunc funcs[OFORT_MAX_FUNCS];
     int n_funcs;
     OfortVar vars[OFORT_MAX_VARS];
+    int var_public[OFORT_MAX_VARS];
     int n_vars;
     OfortTypeDef types[32];
     int n_types;
+    int default_private;
 } OfortModule;
 
 typedef struct {
@@ -249,6 +251,13 @@ static int str_eq_nocase(const char *a, const char *b) {
         a++; b++;
     }
     return *a == *b;
+}
+
+static int name_in_list_nocase(const char *name, char names[OFORT_MAX_PARAMS][256], int n_names) {
+    for (int i = 0; i < n_names; i++) {
+        if (str_eq_nocase(name, names[i])) return 1;
+    }
+    return 0;
 }
 
 /* ── Value constructors ─────────────────────── */
@@ -2688,6 +2697,29 @@ static OfortNode *parse_implicit_stmt(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_access_stmt(OfortInterpreter *I) {
+    OfortToken *t = advance(I);
+    OfortNode *n = alloc_node(I, FND_ACCESS);
+    n->line = t->line;
+    n->bool_val = token_ident_upper(t, "PUBLIC") ? 1 : 0;
+    n->n_params = 0;
+
+    if (check(I, FTOK_DCOLON)) advance(I);
+    while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+            continue;
+        }
+        if (check(I, FTOK_IDENT) && n->n_params < OFORT_MAX_PARAMS) {
+            OfortToken *name = advance(I);
+            copy_cstr(n->param_names[n->n_params++], sizeof(n->param_names[0]), name->str_val);
+        } else {
+            advance(I);
+        }
+    }
+    return n;
+}
+
 static OfortNode *parse_statement(OfortInterpreter *I) {
     skip_newlines(I);
     OfortToken *t = peek(I);
@@ -2705,6 +2737,11 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* IMPLICIT NONE */
     if (t->type == FTOK_IMPLICIT) {
         return parse_implicit_stmt(I);
+    }
+
+    /* Module access statements: PUBLIC, PRIVATE, PUBLIC :: x, PRIVATE :: x */
+    if (token_ident_upper(t, "PUBLIC") || token_ident_upper(t, "PRIVATE")) {
+        return parse_access_stmt(I);
     }
 
     /* USE module_name */
@@ -4527,10 +4564,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* Register module: execute declarations, collect functions */
         if (I->n_modules >= OFORT_MAX_MODULES) ofort_error(I, "Too many modules");
         OfortModule *mod = &I->modules[I->n_modules++];
+        char public_names[OFORT_MAX_PARAMS][256];
+        char private_names[OFORT_MAX_PARAMS][256];
+        int n_public_names = 0;
+        int n_private_names = 0;
         copy_cstr(mod->name, sizeof(mod->name), n->name);
         mod->n_funcs = 0;
         mod->n_vars = 0;
         mod->n_types = 0;
+        mod->default_private = 0;
 
         /* Execute the module body to register functions and declarations */
         push_scope(I);
@@ -4538,7 +4580,26 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (body) {
             for (int i = 0; i < body->n_stmts; i++) {
                 OfortNode *s = body->stmts[i];
-                if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION) {
+                if (s->type != FND_ACCESS) continue;
+                if (s->n_params == 0) {
+                    mod->default_private = s->bool_val ? 0 : 1;
+                    continue;
+                }
+                for (int j = 0; j < s->n_params; j++) {
+                    if (s->bool_val) {
+                        if (n_public_names < OFORT_MAX_PARAMS)
+                            copy_cstr(public_names[n_public_names++], sizeof(public_names[0]), s->param_names[j]);
+                    } else {
+                        if (n_private_names < OFORT_MAX_PARAMS)
+                            copy_cstr(private_names[n_private_names++], sizeof(private_names[0]), s->param_names[j]);
+                    }
+                }
+            }
+            for (int i = 0; i < body->n_stmts; i++) {
+                OfortNode *s = body->stmts[i];
+                if (s->type == FND_ACCESS) {
+                    continue;
+                } else if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION) {
                     annotate_procedure_params(s);
                     register_func(I, s->name, s, s->type == FND_FUNCTION);
                 } else if (s->type == FND_TYPE_DEF) {
@@ -4550,6 +4611,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             /* Copy module variables */
             OfortScope *ms = I->current_scope;
             for (int i = 0; i < ms->n_vars && i < OFORT_MAX_VARS; i++) {
+                int is_public = mod->default_private ? 0 : 1;
+                if (name_in_list_nocase(ms->vars[i].name, public_names, n_public_names)) is_public = 1;
+                if (name_in_list_nocase(ms->vars[i].name, private_names, n_private_names)) is_public = 0;
+                mod->var_public[mod->n_vars] = is_public;
                 mod->vars[mod->n_vars++] = ms->vars[i];
                 ms->vars[i].val = make_void_val(); /* prevent double-free */
             }
@@ -4584,6 +4649,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         /* import variables */
         for (int i = 0; i < mod->n_vars; i++) {
+            if (!mod->var_public[i]) continue;
             declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
         }
         break;
