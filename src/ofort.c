@@ -36,6 +36,7 @@ typedef struct {
     int is_allocatable;
     int is_pointer;
     int is_target;
+    int is_protected;
     int pointer_associated;
     char pointer_target[256];
     int pointer_has_slice;
@@ -537,6 +538,10 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
         str_upper(vu, s->vars[i].name, 256);
         if (strcmp(upper, vu) == 0) {
             val = coerce_assignment_value(I, name, s->vars[i].val.type, val);
+            if (s->vars[i].is_parameter)
+                ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
+            if (s->vars[i].is_protected)
+                ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
             val = resize_character_value(val, s->vars[i].char_len);
             free_value(&s->vars[i].val);
             s->vars[i].val = val;
@@ -552,6 +557,8 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
             if (strcmp(upper, vu) == 0) {
                 if (ps->vars[i].is_parameter)
                     ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
+                if (ps->vars[i].is_protected)
+                    ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
                 val = coerce_assignment_value(I, name, ps->vars[i].val.type, val);
                 val = resize_character_value(val, ps->vars[i].char_len);
                 free_value(&ps->vars[i].val);
@@ -583,6 +590,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->is_allocatable = 0;
     v->is_pointer = 0;
     v->is_target = 0;
+    v->is_protected = 0;
     v->pointer_associated = 0;
     v->pointer_target[0] = '\0';
     v->pointer_has_slice = 0;
@@ -619,6 +627,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->is_allocatable = 0;
     v->is_pointer = 0;
     v->is_target = 0;
+    v->is_protected = 0;
     v->pointer_associated = 0;
     v->pointer_target[0] = '\0';
     v->pointer_has_slice = 0;
@@ -1627,6 +1636,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     int is_allocatable = 0;
     int is_pointer = 0;
     int is_target = 0;
+    int is_protected = 0;
     int is_parameter = 0;
     int is_optional = 0;
     int intent = 0;
@@ -1711,6 +1721,9 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "target")) {
             advance(I);
             is_target = 1;
+        } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "protected")) {
+            advance(I);
+            is_protected = 1;
         } else if (check(I, FTOK_PARAMETER)) {
             advance(I);
             is_parameter = 1;
@@ -1753,6 +1766,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         decl->is_allocatable = is_allocatable;
         decl->is_pointer = is_pointer;
         decl->is_target = is_target;
+        decl->is_protected = is_protected;
         decl->is_parameter = is_parameter;
         decl->is_optional = is_optional;
         decl->intent = intent;
@@ -4650,7 +4664,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* import variables */
         for (int i = 0; i < mod->n_vars; i++) {
             if (!mod->var_public[i]) continue;
-            declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+            OfortVar *v = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+            v->is_protected = mod->vars[i].is_protected;
         }
         break;
     }
@@ -4775,6 +4790,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         v->is_allocatable = n->is_allocatable;
         v->is_pointer = n->is_pointer;
         v->is_target = n->is_target;
+        v->is_protected = n->is_protected;
         v->pointer_associated = 0;
         v->pointer_target[0] = '\0';
         v->pointer_has_slice = 0;
@@ -4819,6 +4835,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             /* Simple variable assignment */
             OfortVar *v = find_var(I, lhs->name);
             if (v && v->is_parameter) ofort_error(I, "Cannot assign to PARAMETER '%s'", lhs->name);
+            if (v && v->is_protected) ofort_error(I, "Cannot assign to PROTECTED variable '%s'", lhs->name);
             if (v && v->val.type == FVAL_ARRAY) {
                 if (rhs.type == FVAL_ARRAY) {
                     if (!v->val.v.arr.allocated || v->val.v.arr.len == 0 ||
@@ -4854,6 +4871,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             /* Array element assignment: arr(i) = val */
             OfortVar *var = find_var(I, lhs->name);
             if (!var) ofort_error(I, "Undefined variable '%s'", lhs->name);
+            if (var->is_protected) ofort_error(I, "Cannot assign to PROTECTED variable '%s'", lhs->name);
             if (var->val.type != FVAL_ARRAY)
                 ofort_error(I, "'%s' is not an array", lhs->name);
 
