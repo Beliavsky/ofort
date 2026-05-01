@@ -3756,13 +3756,35 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
                 }
             }
         } else if (fc == 'I') {
-            int width = 0;
+            int width = 0, min_digits = 0;
             p++;
             while (isdigit((unsigned char)*p)) { width = width * 10 + (*p - '0'); p++; }
-            if (*p == '.') { p++; while (isdigit((unsigned char)*p)) p++; }
+            if (*p == '.') { p++; while (isdigit((unsigned char)*p)) { min_digits = min_digits * 10 + (*p - '0'); p++; } }
             for (int r = 0; r < repeat && *vidx < nvals; r++, (*vidx)++) {
                 char buf[64];
-                snprintf(buf, sizeof(buf), "%*lld", width, val_to_int(vals[*vidx]));
+                long long iv = val_to_int(vals[*vidx]);
+                if (min_digits > 0) {
+                    char raw[64];
+                    char padded[64];
+                    int raw_len, zero_count, digit_len, pad_count, out_pos = 0;
+                    unsigned long long mag = iv < 0 ? (unsigned long long)(-iv) : (unsigned long long)iv;
+                    if (min_digits > 60) min_digits = 60;
+                    if (width < 0) width = 0;
+                    if (width > 60) width = 60;
+                    snprintf(raw, sizeof(raw), "%llu", mag);
+                    raw_len = (int)strlen(raw);
+                    zero_count = min_digits > raw_len ? min_digits - raw_len : 0;
+                    digit_len = zero_count + raw_len + (iv < 0 ? 1 : 0);
+                    pad_count = width > digit_len ? width - digit_len : 0;
+                    for (int k = 0; k < pad_count && out_pos < (int)sizeof(padded) - 1; k++) padded[out_pos++] = ' ';
+                    if (iv < 0 && out_pos < (int)sizeof(padded) - 1) padded[out_pos++] = '-';
+                    for (int k = 0; k < zero_count && out_pos < (int)sizeof(padded) - 1; k++) padded[out_pos++] = '0';
+                    for (int k = 0; raw[k] && out_pos < (int)sizeof(padded) - 1; k++) padded[out_pos++] = raw[k];
+                    padded[out_pos] = '\0';
+                    copy_cstr(buf, sizeof(buf), padded);
+                } else {
+                    snprintf(buf, sizeof(buf), "%*lld", width, iv);
+                }
                 out_append(I, buf);
             }
         } else if (fc == 'F' || fc == 'E' || fc == 'D' || fc == 'G') {
@@ -5061,6 +5083,66 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             seconds = (double)clock() / (double)CLOCKS_PER_SEC;
             free_value(&time_var->val);
             time_var->val = time_type == FVAL_DOUBLE ? make_double(seconds) : make_real(seconds);
+            break;
+        }
+        if (strcmp(call_upper, "DATE_AND_TIME") == 0) {
+            time_t now = time(NULL);
+            struct tm local_tm;
+            struct tm utc_tm;
+            time_t local_epoch;
+            time_t utc_as_local_epoch;
+            int offset_minutes;
+            int millisecond = 0;
+            char date_buf[32];
+            char time_buf[16];
+            char zone_buf[16];
+
+            local_tm = *localtime(&now);
+            utc_tm = *gmtime(&now);
+            local_epoch = mktime(&local_tm);
+            utc_as_local_epoch = mktime(&utc_tm);
+            offset_minutes = (int)(difftime(local_epoch, utc_as_local_epoch) / 60.0);
+
+            snprintf(date_buf, sizeof(date_buf), "%04d%02d%02d",
+                     local_tm.tm_year + 1900, local_tm.tm_mon + 1, local_tm.tm_mday);
+            snprintf(time_buf, sizeof(time_buf), "%02d%02d%02d.%03d",
+                     local_tm.tm_hour, local_tm.tm_min, local_tm.tm_sec, millisecond);
+            snprintf(zone_buf, sizeof(zone_buf), "%c%02d%02d",
+                     offset_minutes < 0 ? '-' : '+',
+                     abs(offset_minutes) / 60, abs(offset_minutes) % 60);
+
+            for (int i = 0; i < n->n_stmts; i++) {
+                OfortNode *arg = n->stmts[i];
+                const char *name = n->param_names[i];
+                if (arg->type != FND_IDENT) continue;
+                if (str_eq_nocase(name, "date") || (name[0] == '\0' && i == 0)) {
+                    set_var(I, arg->name, make_character(date_buf));
+                } else if (str_eq_nocase(name, "time") || (name[0] == '\0' && i == 1)) {
+                    set_var(I, arg->name, make_character(time_buf));
+                } else if (str_eq_nocase(name, "zone") || (name[0] == '\0' && i == 2)) {
+                    set_var(I, arg->name, make_character(zone_buf));
+                } else if (str_eq_nocase(name, "values") || (name[0] == '\0' && i == 3)) {
+                    OfortVar *values_var = find_var(I, arg->name);
+                    int values[8];
+                    if (!values_var)
+                        ofort_error(I, "Undefined variable '%s' in DATE_AND_TIME", arg->name);
+                    if (values_var->val.type != FVAL_ARRAY || values_var->val.v.arr.elem_type != FVAL_INTEGER ||
+                        values_var->val.v.arr.len < 8)
+                        ofort_error(I, "DATE_AND_TIME VALUES must be an integer array of size at least 8");
+                    values[0] = local_tm.tm_year + 1900;
+                    values[1] = local_tm.tm_mon + 1;
+                    values[2] = local_tm.tm_mday;
+                    values[3] = offset_minutes;
+                    values[4] = local_tm.tm_hour;
+                    values[5] = local_tm.tm_min;
+                    values[6] = local_tm.tm_sec;
+                    values[7] = millisecond;
+                    for (int j = 0; j < 8; j++) {
+                        free_value(&values_var->val.v.arr.data[j]);
+                        values_var->val.v.arr.data[j] = make_integer(values[j]);
+                    }
+                }
+            }
             break;
         }
         if (strcmp(call_upper, "RANDOM_NUMBER") == 0) {
