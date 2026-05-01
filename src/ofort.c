@@ -2861,6 +2861,128 @@ static OfortNode *parse_type_def(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
+    OfortToken *type_tok = advance(I); /* TYPE */
+    OfortToken *type_name;
+    int is_allocatable = 0;
+    int is_pointer = 0;
+    int is_target = 0;
+    int is_protected = 0;
+    int is_save = 0;
+    int is_parameter = 0;
+    int is_optional = 0;
+    int intent = 0;
+    int decl_dims[7] = {0};
+    int n_decl_dims = 0;
+    OfortNode *block;
+    int cap = 0;
+
+    expect(I, FTOK_LPAREN);
+    type_name = expect(I, FTOK_IDENT);
+    expect(I, FTOK_RPAREN);
+
+    while (check(I, FTOK_COMMA)) {
+        advance(I);
+        if (check(I, FTOK_DIMENSION)) {
+            advance(I);
+            expect(I, FTOK_LPAREN);
+            while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                if (check(I, FTOK_COLON)) {
+                    advance(I);
+                    decl_dims[n_decl_dims++] = 0;
+                } else {
+                    OfortNode *dim_expr = parse_expr(I);
+                    if (dim_expr->type == FND_INT_LIT)
+                        decl_dims[n_decl_dims++] = (int)dim_expr->int_val;
+                    else
+                        decl_dims[n_decl_dims++] = 0;
+                }
+                if (check(I, FTOK_COMMA)) advance(I);
+                else break;
+            }
+            expect(I, FTOK_RPAREN);
+        } else if (check(I, FTOK_ALLOCATABLE)) {
+            advance(I);
+            is_allocatable = 1;
+        } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "pointer")) {
+            advance(I);
+            is_pointer = 1;
+        } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "target")) {
+            advance(I);
+            is_target = 1;
+        } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "protected")) {
+            advance(I);
+            is_protected = 1;
+        } else if (check(I, FTOK_PARAMETER)) {
+            advance(I);
+            is_parameter = 1;
+        } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "optional")) {
+            advance(I);
+            is_optional = 1;
+        } else if (check(I, FTOK_INTENT)) {
+            advance(I);
+            expect(I, FTOK_LPAREN);
+            if (check(I, FTOK_IN)) { advance(I); intent = 1; }
+            else if (check(I, FTOK_OUT)) { advance(I); intent = 2; }
+            else if (check(I, FTOK_INOUT)) { advance(I); intent = 3; }
+            if (intent == 1 && check(I, FTOK_OUT)) { advance(I); intent = 3; }
+            expect(I, FTOK_RPAREN);
+        } else if (check(I, FTOK_SAVE)) {
+            advance(I);
+            is_save = 1;
+        } else {
+            advance(I);
+        }
+    }
+
+    if (check(I, FTOK_DCOLON)) advance(I);
+
+    block = alloc_node(I, FND_BLOCK);
+    block->line = type_tok->line;
+    block->stmts = NULL;
+    block->n_stmts = 0;
+
+    do {
+        OfortToken *name_tok = peek(I);
+        OfortNode *decl;
+        if (!token_can_be_name(name_tok))
+            expect(I, FTOK_IDENT);
+        else
+            advance(I);
+        decl = alloc_node(I, is_parameter ? FND_PARAMDECL : FND_VARDECL);
+        copy_cstr(decl->name, sizeof(decl->name), token_name_text(name_tok));
+        copy_cstr(decl->str_val, sizeof(decl->str_val), token_name_text(type_name));
+        decl->val_type = FVAL_DERIVED;
+        decl->is_allocatable = is_allocatable;
+        decl->is_pointer = is_pointer;
+        decl->is_target = is_target;
+        decl->is_protected = is_protected;
+        decl->is_save = is_save;
+        decl->is_parameter = is_parameter;
+        decl->is_optional = is_optional;
+        decl->intent = intent;
+        decl->line = name_tok->line;
+        memcpy(decl->dims, decl_dims, sizeof(decl_dims));
+        decl->n_dims = n_decl_dims;
+
+        if (check(I, FTOK_ASSIGN)) {
+            advance(I);
+            decl->children[0] = parse_expr(I);
+            decl->n_children = 1;
+        }
+
+        if (block->n_stmts >= cap) {
+            cap = cap ? cap * 2 : 4;
+            block->stmts = (OfortNode **)realloc(block->stmts, sizeof(OfortNode *) * cap);
+        }
+        block->stmts[block->n_stmts++] = decl;
+        if (check(I, FTOK_COMMA)) advance(I);
+        else break;
+    } while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF));
+
+    return block;
+}
+
 static OfortNode *parse_allocate(OfortInterpreter *I) {
     OfortToken *at = advance(I); /* ALLOCATE */
     OfortNode *n = alloc_node(I, FND_ALLOCATE);
@@ -3147,7 +3269,9 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         if (next->type == FTOK_DCOLON || next->type == FTOK_IDENT) {
             return parse_type_def(I);
         }
-        /* TYPE(typename) is used as a type — skip for now */
+        if (next->type == FTOK_LPAREN) {
+            return parse_derived_type_declaration(I);
+        }
         advance(I);
         return NULL;
     }
@@ -3419,6 +3543,27 @@ static OfortValue default_value(OfortValType vtype, int char_len) {
         case FVAL_LOGICAL: return make_logical(0);
         default: return make_void_val();
     }
+}
+
+static OfortValue default_derived_value(OfortInterpreter *I, const char *type_name) {
+    OfortTypeDef *td = find_type_def(I, type_name);
+    OfortValue v;
+    memset(&v, 0, sizeof(v));
+    if (!td) return make_void_val();
+    v.type = FVAL_DERIVED;
+    v.v.dt.n_fields = td->n_fields;
+    v.v.dt.fields = (OfortValue *)calloc((size_t)td->n_fields, sizeof(OfortValue));
+    v.v.dt.field_names = (char(*)[64])calloc((size_t)td->n_fields, sizeof(char[64]));
+    copy_cstr(v.v.dt.type_name, sizeof(v.v.dt.type_name), td->name);
+    if (!v.v.dt.fields || !v.v.dt.field_names) {
+        free_value(&v);
+        return make_void_val();
+    }
+    for (int i = 0; i < td->n_fields; i++) {
+        copy_cstr(v.v.dt.field_names[i], sizeof(v.v.dt.field_names[i]), td->field_names[i]);
+        v.v.dt.fields[i] = default_value(td->field_types[i], td->field_char_lens[i]);
+    }
+    return v;
 }
 
 static int eval_character_length(OfortInterpreter *I, OfortNode *n) {
@@ -6089,6 +6234,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             val.v.arr.allocated = 0;
         } else if (n->n_children > 0 && n->children[0]) {
             val = eval_node(I, n->children[0]);
+        } else if (n->val_type == FVAL_DERIVED) {
+            val = default_derived_value(I, n->str_val);
         } else {
             val = default_value(n->val_type, n->val_type == FVAL_CHARACTER ? decl_char_len : n->char_len);
         }
@@ -6103,11 +6250,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 /* copy elements */
                 int count = init.v.arr.len < val.v.arr.len ? init.v.arr.len : val.v.arr.len;
                 for (int i = 0; i < count; i++) {
-                    OfortValue elem = copy_value(init.v.arr.data[i]);
+                    OfortValue elem = array_element_value(&init, i);
                     if (val.v.arr.elem_type == FVAL_CHARACTER)
                         elem = resize_character_value(elem, decl_char_len);
-                    free_value(&val.v.arr.data[i]);
-                    val.v.arr.data[i] = elem;
+                    if (assign_packed_array_element(&val, i, elem)) {
+                        free_value(&elem);
+                    } else if (val.v.arr.data) {
+                        free_value(&val.v.arr.data[i]);
+                        val.v.arr.data[i] = elem;
+                    } else {
+                        free_value(&elem);
+                    }
                 }
             }
             free_value(&init);
