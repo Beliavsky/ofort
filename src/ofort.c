@@ -5071,12 +5071,10 @@ static void annotate_procedure_params(OfortNode *n) {
 }
 
 static OfortVar *cached_ident_var(OfortInterpreter *I, OfortNode *owner, int slot, OfortNode *ident) {
-    if (!I || !owner || !ident || ident->type != FND_IDENT || slot < 0 || slot > 2) return NULL;
-    if (owner->fast_cache[3] != I->current_scope) {
-        owner->fast_cache[0] = NULL;
-        owner->fast_cache[1] = NULL;
-        owner->fast_cache[2] = NULL;
-        owner->fast_cache[3] = I->current_scope;
+    if (!I || !owner || !ident || ident->type != FND_IDENT || slot < 0 || slot > 6) return NULL;
+    if (owner->fast_cache[7] != I->current_scope) {
+        for (int i = 0; i < 7; i++) owner->fast_cache[i] = NULL;
+        owner->fast_cache[7] = I->current_scope;
     }
     if (!owner->fast_cache[slot]) {
         owner->fast_cache[slot] = find_var(I, ident->name);
@@ -5112,11 +5110,41 @@ static int simple_numeric_node_value(OfortInterpreter *I, OfortNode *owner, int 
     }
 }
 
+static int fast_numeric_expr_value(OfortInterpreter *I, OfortNode *owner, int *slot,
+                                   OfortNode *n, double *value) {
+    double left;
+    double right;
+    int right_slot;
+
+    if (!n || !value || !slot || *slot > 6) return 0;
+    if (n->type == FND_ADD || n->type == FND_SUB ||
+        n->type == FND_MUL || n->type == FND_DIV) {
+        if (!fast_numeric_expr_value(I, owner, slot, n->children[0], &left)) return 0;
+        right_slot = *slot;
+        if (!fast_numeric_expr_value(I, owner, slot, n->children[1], &right)) {
+            *slot = right_slot;
+            return 0;
+        }
+        switch (n->type) {
+        case FND_ADD: *value = left + right; break;
+        case FND_SUB: *value = left - right; break;
+        case FND_MUL: *value = left * right; break;
+        case FND_DIV: *value = right != 0.0 ? left / right : 0.0; break;
+        default: return 0;
+        }
+        return 1;
+    }
+    if (!simple_numeric_node_value(I, owner, *slot, n, value)) return 0;
+    if (n->type == FND_IDENT) (*slot)++;
+    return 1;
+}
+
 static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n) {
     OfortNode *lhs;
     OfortNode *rhs;
     OfortVar *target;
     double result;
+    int slot;
 
     if (!I || !I->fast_mode || !n || n->type != FND_ASSIGN) return 0;
     lhs = n->children[0];
@@ -5130,22 +5158,8 @@ static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n
         return 0;
     }
 
-    if (rhs->type == FND_ADD || rhs->type == FND_SUB ||
-        rhs->type == FND_MUL || rhs->type == FND_DIV) {
-        double left;
-        double right;
-        if (!simple_numeric_node_value(I, n, 1, rhs->children[0], &left) ||
-            !simple_numeric_node_value(I, n, 2, rhs->children[1], &right)) {
-            return 0;
-        }
-        switch (rhs->type) {
-        case FND_ADD: result = left + right; break;
-        case FND_SUB: result = left - right; break;
-        case FND_MUL: result = left * right; break;
-        case FND_DIV: result = right != 0.0 ? left / right : 0.0; break;
-        default: return 0;
-        }
-    } else if (!simple_numeric_node_value(I, n, 1, rhs, &result)) {
+    slot = 1;
+    if (!fast_numeric_expr_value(I, n, &slot, rhs, &result)) {
         return 0;
     }
 
