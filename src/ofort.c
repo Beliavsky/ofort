@@ -488,10 +488,14 @@ static int val_to_logical(OfortValue v) {
 static void free_value(OfortValue *v) {
     if (v->type == FVAL_CHARACTER && v->v.s) {
         free(v->v.s); v->v.s = NULL;
-    } else if (v->type == FVAL_ARRAY && v->v.arr.data) {
-        int i;
-        for (i = 0; i < v->v.arr.len; i++) free_value(&v->v.arr.data[i]);
-        free(v->v.arr.data); v->v.arr.data = NULL;
+    } else if (v->type == FVAL_ARRAY) {
+        if (v->v.arr.data) {
+            int i;
+            for (i = 0; i < v->v.arr.len; i++) free_value(&v->v.arr.data[i]);
+            free(v->v.arr.data); v->v.arr.data = NULL;
+        }
+        if (v->v.arr.real_data) { free(v->v.arr.real_data); v->v.arr.real_data = NULL; }
+        if (v->v.arr.int_data) { free(v->v.arr.int_data); v->v.arr.int_data = NULL; }
     } else if (v->type == FVAL_DERIVED) {
         if (v->v.dt.fields) {
             int i;
@@ -511,6 +515,12 @@ static OfortValue copy_value(OfortValue v) {
         r.v.arr.data = (OfortValue *)malloc(sizeof(OfortValue) * v.v.arr.cap);
         for (i = 0; i < v.v.arr.len; i++)
             r.v.arr.data[i] = copy_value(v.v.arr.data[i]);
+    } else if (v.type == FVAL_ARRAY && v.v.arr.real_data) {
+        r.v.arr.real_data = (double *)malloc(sizeof(double) * v.v.arr.cap);
+        if (r.v.arr.real_data) memcpy(r.v.arr.real_data, v.v.arr.real_data, sizeof(double) * v.v.arr.len);
+    } else if (v.type == FVAL_ARRAY && v.v.arr.int_data) {
+        r.v.arr.int_data = (long long *)malloc(sizeof(long long) * v.v.arr.cap);
+        if (r.v.arr.int_data) memcpy(r.v.arr.int_data, v.v.arr.int_data, sizeof(long long) * v.v.arr.len);
     } else if (v.type == FVAL_DERIVED && v.v.dt.fields) {
         int i;
         r.v.dt.fields = (OfortValue *)malloc(sizeof(OfortValue) * v.v.dt.n_fields);
@@ -3374,6 +3384,43 @@ static int can_defer_numeric_array_tags(OfortValType elem_type) {
            elem_type == FVAL_DOUBLE || elem_type == FVAL_COMPLEX;
 }
 
+static int can_pack_numeric_array(OfortValType elem_type) {
+    return elem_type == FVAL_INTEGER || elem_type == FVAL_REAL || elem_type == FVAL_DOUBLE;
+}
+
+static int array_has_packed_numeric(const OfortValue *v) {
+    return v && v->type == FVAL_ARRAY &&
+           ((v->v.arr.real_data && (v->v.arr.elem_type == FVAL_REAL || v->v.arr.elem_type == FVAL_DOUBLE)) ||
+            (v->v.arr.int_data && v->v.arr.elem_type == FVAL_INTEGER));
+}
+
+static OfortValue packed_array_element_value(const OfortValue *arr, int index) {
+    if (!arr || arr->type != FVAL_ARRAY || index < 0 || index >= arr->v.arr.len) return make_void_val();
+    if (arr->v.arr.real_data) {
+        return arr->v.arr.elem_type == FVAL_DOUBLE ?
+               make_double(arr->v.arr.real_data[index]) :
+               make_real(arr->v.arr.real_data[index]);
+    }
+    if (arr->v.arr.int_data) {
+        return make_integer(arr->v.arr.int_data[index]);
+    }
+    return make_void_val();
+}
+
+static int assign_packed_array_element(OfortValue *arr, int index, OfortValue rhs) {
+    if (!arr || arr->type != FVAL_ARRAY || index < 0 || index >= arr->v.arr.len) return 0;
+    if (arr->v.arr.real_data &&
+        (arr->v.arr.elem_type == FVAL_REAL || arr->v.arr.elem_type == FVAL_DOUBLE)) {
+        arr->v.arr.real_data[index] = val_to_real(rhs);
+        return 1;
+    }
+    if (arr->v.arr.int_data && arr->v.arr.elem_type == FVAL_INTEGER) {
+        arr->v.arr.int_data[index] = val_to_int(rhs);
+        return 1;
+    }
+    return 0;
+}
+
 static OfortValue make_array_with_char_len_options(OfortValType elem_type, int *dims, int n_dims,
                                                    int char_len, int defer_numeric_tags) {
     OfortValue v; memset(&v, 0, sizeof(v));
@@ -3389,6 +3436,14 @@ static OfortValue make_array_with_char_len_options(OfortValType elem_type, int *
     v.v.arr.cap = total;
     v.v.arr.elem_type = elem_type;
     v.v.arr.allocated = 1;
+    if (defer_numeric_tags && can_pack_numeric_array(elem_type)) {
+        if (elem_type == FVAL_INTEGER) {
+            v.v.arr.int_data = (long long *)calloc((size_t)total, sizeof(long long));
+        } else {
+            v.v.arr.real_data = (double *)calloc((size_t)total, sizeof(double));
+        }
+        if (v.v.arr.int_data || v.v.arr.real_data) return v;
+    }
     v.v.arr.data = (OfortValue *)calloc(total, sizeof(OfortValue));
     if (!v.v.arr.data) return v;
     if (defer_numeric_tags && can_defer_numeric_array_tags(elem_type)) {
@@ -3554,6 +3609,9 @@ static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNo
         int index = section_linear_index(&var->val, subscripts, nargs);
         if (index < 0 || index >= var->val.v.arr.len)
             ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, var->val.v.arr.len);
+        if (array_has_packed_numeric(&var->val)) {
+            return packed_array_element_value(&var->val, index);
+        }
         if (var->val.v.arr.data[index].kind == 0 &&
             can_defer_numeric_array_tags(var->val.v.arr.elem_type)) {
             return default_value(var->val.v.arr.elem_type, 1);
@@ -3641,6 +3699,10 @@ static void assign_section_recursive(OfortInterpreter *I, OfortValue *dst, Ofort
             value = copy_value(*rhs);
         }
 
+        if (assign_packed_array_element(dst, dst_index, value)) {
+            free_value(&value);
+            return;
+        }
         free_value(&dst->v.arr.data[dst_index]);
         dst->v.arr.data[dst_index] = value;
         return;
@@ -3673,6 +3735,9 @@ static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs,
         int index = section_linear_index(&var->val, subscripts, nargs);
         if (index < 0 || index >= var->val.v.arr.len)
             ofort_error(I, "Array index out of bounds");
+        if (assign_packed_array_element(&var->val, index, *rhs)) {
+            return;
+        }
         free_value(&var->val.v.arr.data[index]);
         var->val.v.arr.data[index] = copy_value(*rhs);
         return;
@@ -4386,6 +4451,40 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 if (left.v.arr.len != right.v.arr.len)
                     ofort_error(I, "Array size mismatch in operation");
                 arr_op = copy_value(left);
+                if (arr_op.v.arr.real_data && right.v.arr.real_data) {
+                    for (int i = 0; i < left.v.arr.len; i++) {
+                        double a = left.v.arr.real_data[i];
+                        double b = right.v.arr.real_data[i];
+                        switch (n->type) {
+                            case FND_ADD: arr_op.v.arr.real_data[i] = a + b; break;
+                            case FND_SUB: arr_op.v.arr.real_data[i] = a - b; break;
+                            case FND_MUL: arr_op.v.arr.real_data[i] = a * b; break;
+                            case FND_DIV: arr_op.v.arr.real_data[i] = b != 0 ? a / b : 0; break;
+                            case FND_POWER: arr_op.v.arr.real_data[i] = pow(a, b); break;
+                            default: break;
+                        }
+                    }
+                    free_value(&left); free_value(&right);
+                    return arr_op;
+                }
+                if (arr_op.v.arr.int_data && right.v.arr.int_data) {
+                    for (int i = 0; i < left.v.arr.len; i++) {
+                        double a = (double)left.v.arr.int_data[i];
+                        double b = (double)right.v.arr.int_data[i];
+                        double res;
+                        switch (n->type) {
+                            case FND_ADD: res = a + b; break;
+                            case FND_SUB: res = a - b; break;
+                            case FND_MUL: res = a * b; break;
+                            case FND_DIV: res = b != 0 ? a / b : 0; break;
+                            case FND_POWER: res = pow(a, b); break;
+                            default: res = 0; break;
+                        }
+                        arr_op.v.arr.int_data[i] = (long long)res;
+                    }
+                    free_value(&left); free_value(&right);
+                    return arr_op;
+                }
                 for (int i = 0; i < left.v.arr.len; i++) {
                     OfortValue lv = left.v.arr.data[i];
                     OfortValue rv = right.v.arr.data[i];
@@ -4415,6 +4514,60 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 arr_op = copy_value(right); scalar = left; arr_len = right.v.arr.len;
             }
             double sv = val_to_real(scalar);
+            if (arr_op.v.arr.real_data) {
+                for (int i = 0; i < arr_len; i++) {
+                    double ev = arr_op.v.arr.real_data[i];
+                    if (left.type == FVAL_ARRAY) {
+                        switch (n->type) {
+                            case FND_ADD: arr_op.v.arr.real_data[i] = ev + sv; break;
+                            case FND_SUB: arr_op.v.arr.real_data[i] = ev - sv; break;
+                            case FND_MUL: arr_op.v.arr.real_data[i] = ev * sv; break;
+                            case FND_DIV: arr_op.v.arr.real_data[i] = sv != 0 ? ev / sv : 0; break;
+                            case FND_POWER: arr_op.v.arr.real_data[i] = pow(ev, sv); break;
+                            default: break;
+                        }
+                    } else {
+                        switch (n->type) {
+                            case FND_ADD: arr_op.v.arr.real_data[i] = sv + ev; break;
+                            case FND_SUB: arr_op.v.arr.real_data[i] = sv - ev; break;
+                            case FND_MUL: arr_op.v.arr.real_data[i] = sv * ev; break;
+                            case FND_DIV: arr_op.v.arr.real_data[i] = ev != 0 ? sv / ev : 0; break;
+                            case FND_POWER: arr_op.v.arr.real_data[i] = pow(sv, ev); break;
+                            default: break;
+                        }
+                    }
+                }
+                free_value(&left); free_value(&right);
+                return arr_op;
+            }
+            if (arr_op.v.arr.int_data) {
+                for (int i = 0; i < arr_len; i++) {
+                    double ev = (double)arr_op.v.arr.int_data[i];
+                    double res;
+                    if (left.type == FVAL_ARRAY) {
+                        switch (n->type) {
+                            case FND_ADD: res = ev + sv; break;
+                            case FND_SUB: res = ev - sv; break;
+                            case FND_MUL: res = ev * sv; break;
+                            case FND_DIV: res = sv != 0 ? ev / sv : 0; break;
+                            case FND_POWER: res = pow(ev, sv); break;
+                            default: res = 0; break;
+                        }
+                    } else {
+                        switch (n->type) {
+                            case FND_ADD: res = sv + ev; break;
+                            case FND_SUB: res = sv - ev; break;
+                            case FND_MUL: res = sv * ev; break;
+                            case FND_DIV: res = ev != 0 ? sv / ev : 0; break;
+                            case FND_POWER: res = pow(sv, ev); break;
+                            default: res = 0; break;
+                        }
+                    }
+                    arr_op.v.arr.int_data[i] = (long long)res;
+                }
+                free_value(&left); free_value(&right);
+                return arr_op;
+            }
             for (int i = 0; i < arr_len; i++) {
                 double ev = val_to_real(arr_op.v.arr.data[i]);
                 double res;
@@ -4656,6 +4809,17 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             OfortVar *array_var = find_var(I, n->stmts[0]->name);
             if (array_var && array_var->val.type == FVAL_ARRAY) {
                 OfortValue *array = &array_var->val;
+                if (array->v.arr.int_data && array->v.arr.elem_type == FVAL_INTEGER) {
+                    long long isum = 0;
+                    for (int i = 0; i < array->v.arr.len; i++) isum += array->v.arr.int_data[i];
+                    return make_integer(isum);
+                }
+                if (array->v.arr.real_data &&
+                    (array->v.arr.elem_type == FVAL_REAL || array->v.arr.elem_type == FVAL_DOUBLE)) {
+                    double sum = 0.0;
+                    for (int i = 0; i < array->v.arr.len; i++) sum += array->v.arr.real_data[i];
+                    return make_real(sum);
+                }
                 if (array->v.arr.elem_type == FVAL_INTEGER) {
                     long long isum = 0;
                     for (int i = 0; i < array->v.arr.len; i++) isum += array->v.arr.data[i].v.i;
@@ -5617,7 +5781,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 OfortValue *arr = &harvest->val;
                 if (arr->v.arr.elem_type != FVAL_REAL && arr->v.arr.elem_type != FVAL_DOUBLE)
                     ofort_error(I, "RANDOM_NUMBER harvest array must be REAL");
-                if (I->fast_mode) {
+                if (I->fast_mode && arr->v.arr.real_data) {
+                    double *data = arr->v.arr.real_data;
+                    uint64_t rng_state;
+                    seed_fast_rng_if_needed(I);
+                    rng_state = I->fast_rng_state;
+                    for (int i = 0; i < arr->v.arr.len; i++) {
+                        data[i] = fast_rng_unit_from_u32(fast_rng_next32(&rng_state));
+                    }
+                    I->fast_rng_state = rng_state;
+                } else if (I->fast_mode) {
                     OfortValue *data = arr->v.arr.data;
                     OfortValType elem_type = arr->v.arr.elem_type;
                     int elem_kind = elem_type == FVAL_DOUBLE ? 8 : 4;
@@ -7113,6 +7286,16 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "SUM") == 0) {
         if (args[0].type != FVAL_ARRAY) return copy_value(args[0]);
         double sum = 0;
+        if (args[0].v.arr.int_data && args[0].v.arr.elem_type == FVAL_INTEGER) {
+            long long isum = 0;
+            for (int i = 0; i < args[0].v.arr.len; i++) isum += args[0].v.arr.int_data[i];
+            return make_integer(isum);
+        }
+        if (args[0].v.arr.real_data &&
+            (args[0].v.arr.elem_type == FVAL_REAL || args[0].v.arr.elem_type == FVAL_DOUBLE)) {
+            for (int i = 0; i < args[0].v.arr.len; i++) sum += args[0].v.arr.real_data[i];
+            return make_real(sum);
+        }
         if (I->fast_mode &&
             (args[0].v.arr.elem_type == FVAL_REAL || args[0].v.arr.elem_type == FVAL_DOUBLE ||
              args[0].v.arr.elem_type == FVAL_INTEGER)) {
