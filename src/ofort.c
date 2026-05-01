@@ -153,6 +153,8 @@ struct OfortInterpreter {
 };
 
 /* ── Forward declarations ────────────────────── */
+static char fast_local_array_cache_tag;
+
 static void ofort_error(OfortInterpreter *I, const char *fmt, ...);
 static OfortValue eval_node(OfortInterpreter *I, OfortNode *n);
 static const char *type_token_intrinsic_name(OfortTokenType t);
@@ -3784,6 +3786,60 @@ static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
     return arr;
 }
 
+static int can_reuse_fast_local_array(OfortInterpreter *I, OfortNode *n) {
+    return I && I->fast_mode && I->procedure_depth > 0 &&
+           n && n->type == FND_VARDECL &&
+           n->n_dims > 0 && !n->is_allocatable && !n->is_pointer &&
+           !n->is_save && !n->is_implicit_save && !n->is_parameter &&
+           n->intent == 0 && n->n_children == 0 &&
+           can_pack_numeric_array(n->val_type);
+}
+
+static void clear_packed_numeric_array(OfortValue *arr) {
+    if (!arr || arr->type != FVAL_ARRAY) return;
+    if (arr->v.arr.real_data) {
+        memset(arr->v.arr.real_data, 0, sizeof(double) * (size_t)arr->v.arr.len);
+    } else if (arr->v.arr.int_data) {
+        memset(arr->v.arr.int_data, 0, sizeof(long long) * (size_t)arr->v.arr.len);
+    }
+}
+
+static int fast_local_array_shape_matches(OfortInterpreter *I, OfortNode *n, OfortValue *arr) {
+    if (!arr || arr->type != FVAL_ARRAY || arr->v.arr.n_dims != n->n_dims) return 0;
+    for (int i = 0; i < n->n_dims; i++) {
+        int lower = n->has_lower_bound[i] ? n->lower_bounds[i] : 1;
+        int dim = n->dims[i];
+        if (dim <= 0 && n->stmts && i < n->n_stmts && n->stmts[i]) {
+            OfortValue dv = eval_node(I, n->stmts[i]);
+            dim = (int)val_to_int(dv);
+            free_value(&dv);
+        }
+        if (n->has_lower_bound[i]) dim = dim - lower + 1;
+        if (dim < 0) dim = 0;
+        if (arr->v.arr.dims[i] != dim || arr->v.arr.lower_bounds[i] != lower) return 0;
+    }
+    return 1;
+}
+
+static OfortValue fast_reusable_local_array_value(OfortInterpreter *I, OfortNode *n) {
+    OfortValue *cached = NULL;
+    if (n->fast_cache[6] == &fast_local_array_cache_tag) {
+        cached = (OfortValue *)n->fast_cache[2];
+    }
+    if (!cached) {
+        cached = (OfortValue *)calloc(1, sizeof(*cached));
+        if (!cached) ofort_error(I, "Out of memory for fast local array cache");
+        n->fast_cache[2] = cached;
+        n->fast_cache[6] = &fast_local_array_cache_tag;
+        *cached = make_array_from_decl(I, n);
+    } else if (!fast_local_array_shape_matches(I, n, cached)) {
+        free_value(cached);
+        *cached = make_array_from_decl(I, n);
+    }
+    clear_packed_numeric_array(cached);
+    return *cached;
+}
+
 typedef struct {
     int start;
     int end;
@@ -6379,6 +6435,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_VARDECL:
     case FND_PARAMDECL: {
         OfortValue val;
+        int val_is_alias = 0;
         int decl_char_len = n->val_type == FVAL_CHARACTER ? eval_character_length(I, n) : 0;
         OfortVar *existing = find_var(I, n->name);
         if (existing && (n->is_save || (I->procedure_depth > 0 && n->is_implicit_save))) {
@@ -6421,7 +6478,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             val.v.arr.allocated = 0;
         } else if (n->n_dims > 0 && !n->is_allocatable) {
             /* Array declaration */
-            val = make_array_from_decl(I, n);
+            if (can_reuse_fast_local_array(I, n)) {
+                val = fast_reusable_local_array_value(I, n);
+                val_is_alias = 1;
+            } else {
+                val = make_array_from_decl(I, n);
+            }
         } else if (n->is_allocatable) {
             /* Allocatable: create empty array placeholder */
             val.type = FVAL_ARRAY;
@@ -6463,6 +6525,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
 
         OfortVar *v = declare_var(I, n->name, val);
+        if (val_is_alias) v->is_alias = 1;
         if (n->is_parameter || n->type == FND_PARAMDECL) v->is_parameter = 1;
         v->is_allocatable = n->is_allocatable;
         v->is_pointer = n->is_pointer;
@@ -9134,6 +9197,11 @@ void ofort_destroy(OfortInterpreter *interp) {
         for (int i = 0; i < interp->node_pool_len; i++) {
             OfortNode *n = interp->node_pool[i];
             if (n->stmts) free(n->stmts);
+            if (n->fast_cache[6] == &fast_local_array_cache_tag && n->fast_cache[2]) {
+                OfortValue *cached = (OfortValue *)n->fast_cache[2];
+                free_value(cached);
+                free(cached);
+            }
             free(n);
         }
         free(interp->node_pool);
