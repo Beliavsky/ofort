@@ -1907,6 +1907,27 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     int decl_dims[7] = {0};
     int n_decl_dims = 0;
 
+    if (vtype == FVAL_REAL && check(I, FTOK_STAR)) {
+        OfortToken *kind_tok;
+        advance(I);
+        kind_tok = expect(I, FTOK_INT_LIT);
+        if (kind_tok->int_val == 8) {
+            vtype = FVAL_DOUBLE;
+        } else if (kind_tok->int_val == 4) {
+            vtype = FVAL_REAL;
+        } else {
+            ofort_warning(I, type_tok->line,
+                          "warning: nonstandard REAL*%lld treated as REAL*8 extension",
+                          kind_tok->int_val);
+            vtype = FVAL_DOUBLE;
+        }
+        if (kind_tok->int_val == 4 || kind_tok->int_val == 8) {
+            ofort_warning(I, type_tok->line,
+                          "warning: nonstandard REAL*%lld treated as REAL(KIND=%lld) extension",
+                          kind_tok->int_val, kind_tok->int_val);
+        }
+    }
+
     /* optional (LEN=n) or (KIND=n) for CHARACTER */
     if (vtype == FVAL_CHARACTER && check(I, FTOK_LPAREN)) {
         advance(I);
