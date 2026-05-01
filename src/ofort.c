@@ -1009,7 +1009,7 @@ static const KeywordEntry fortran_keywords[] = {
     {"DEFAULT", FTOK_DEFAULT},
     {"EXIT", FTOK_EXIT}, {"CYCLE", FTOK_CYCLE},
     {"RETURN", FTOK_RETURN}, {"STOP", FTOK_STOP},
-    {"CALL", FTOK_CALL},
+    {"CALL", FTOK_CALL}, {"ENTRY", FTOK_ENTRY},
     {"DIMENSION", FTOK_DIMENSION}, {"ALLOCATABLE", FTOK_ALLOCATABLE},
     {"ALLOCATE", FTOK_ALLOCATE}, {"DEALLOCATE", FTOK_DEALLOCATE},
     {"PARAMETER", FTOK_PARAMETER},
@@ -1669,6 +1669,10 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
 
             while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
                 const char *arg_name = NULL;
+                if (check(I, FTOK_STAR) &&
+                    peek_ahead(I, 1)->type == FTOK_INT_LIT) {
+                    ofort_error(I, "alternate returns are obsolescent and are not supported");
+                }
                 if (check_keyword_arg(I)) {
                     arg_name = token_arg_name(advance(I));
                     advance(I); /* = */
@@ -1714,6 +1718,10 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
 
             while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
                 const char *arg_name = NULL;
+                if (check(I, FTOK_STAR) &&
+                    peek_ahead(I, 1)->type == FTOK_INT_LIT) {
+                    ofort_error(I, "alternate returns are obsolescent and are not supported");
+                }
                 if (check_keyword_arg(I)) {
                     arg_name = token_arg_name(advance(I));
                     advance(I); /* = */
@@ -3501,6 +3509,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
             advance(I);
             while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
                 const char *arg_name = NULL;
+                if (check(I, FTOK_STAR) &&
+                    peek_ahead(I, 1)->type == FTOK_INT_LIT) {
+                    ofort_error(I, "alternate returns are obsolescent and are not supported");
+                }
                 if (check_keyword_arg(I)) {
                     arg_name = token_arg_name(advance(I));
                     advance(I); /* = */
@@ -3517,6 +3529,11 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
             expect(I, FTOK_RPAREN);
         }
         return n;
+    }
+
+    /* ENTRY */
+    if (t->type == FTOK_ENTRY) {
+        ofort_error(I, "ENTRY statement is obsolescent and is not supported");
     }
 
     /* RETURN */
