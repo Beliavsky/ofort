@@ -6847,7 +6847,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             break;
         }
-        if (strcmp(call_upper, "GET_COMMAND_ARGUMENT") == 0) {
+        if (strcmp(call_upper, "GET_COMMAND_ARGUMENT") == 0 || strcmp(call_upper, "GETARG") == 0) {
+            int is_getarg = strcmp(call_upper, "GETARG") == 0;
+            const char *diag_name = is_getarg ? "GETARG" : "GET_COMMAND_ARGUMENT";
             int number = 0;
             const char *arg = "";
             int arg_len = 0;
@@ -6857,7 +6859,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             int status_idx = -1;
 
             if (n->n_stmts < 1)
-                ofort_error(I, "GET_COMMAND_ARGUMENT requires NUMBER");
+                ofort_error(I, "%s requires NUMBER", diag_name);
+            if (is_getarg) {
+                ofort_warning(I, n->line,
+                              "warning: nonstandard GETARG extension; prefer GET_COMMAND_ARGUMENT");
+            }
 
             for (int i = 0; i < n->n_stmts; i++) {
                 if (str_eq_nocase(n->param_names[i], "value")) {
@@ -6868,9 +6874,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     status_idx = i;
                 } else if (i == 1 && n->param_names[i][0] == '\0') {
                     value_idx = i;
-                } else if (i == 2 && n->param_names[i][0] == '\0') {
+                } else if (!is_getarg && i == 2 && n->param_names[i][0] == '\0') {
                     length_idx = i;
-                } else if (i == 3 && n->param_names[i][0] == '\0') {
+                } else if (!is_getarg && i == 3 && n->param_names[i][0] == '\0') {
                     status_idx = i;
                 }
             }
@@ -6897,12 +6903,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
             if (value_idx >= 0) {
                 if (n->stmts[value_idx]->type != FND_IDENT)
-                    ofort_error(I, "GET_COMMAND_ARGUMENT VALUE must be a variable");
+                    ofort_error(I, "%s VALUE must be a variable", diag_name);
                 OfortVar *value_var = find_var(I, n->stmts[value_idx]->name);
                 if (!value_var)
-                    ofort_error(I, "Undefined variable '%s' in GET_COMMAND_ARGUMENT", n->stmts[value_idx]->name);
+                    ofort_error(I, "Undefined variable '%s' in %s", n->stmts[value_idx]->name, diag_name);
                 if (value_var->val.type != FVAL_CHARACTER)
-                    ofort_error(I, "GET_COMMAND_ARGUMENT VALUE must be CHARACTER");
+                    ofort_error(I, "%s VALUE must be CHARACTER", diag_name);
                 if (status == 0 && value_var->char_len > 0 && arg_len > value_var->char_len) {
                     status = -1;
                 }
@@ -6910,12 +6916,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             if (length_idx >= 0) {
                 if (n->stmts[length_idx]->type != FND_IDENT)
-                    ofort_error(I, "GET_COMMAND_ARGUMENT LENGTH must be a variable");
+                    ofort_error(I, "%s LENGTH must be a variable", diag_name);
                 set_var(I, n->stmts[length_idx]->name, make_integer(arg_len));
             }
             if (status_idx >= 0) {
                 if (n->stmts[status_idx]->type != FND_IDENT)
-                    ofort_error(I, "GET_COMMAND_ARGUMENT STATUS must be a variable");
+                    ofort_error(I, "%s STATUS must be a variable", diag_name);
                 set_var(I, n->stmts[status_idx]->name, make_integer(status));
             }
             break;
