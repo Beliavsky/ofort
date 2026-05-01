@@ -19,6 +19,7 @@
 #include <setjmp.h>
 #include <float.h>
 #include <limits.h>
+#include <stdint.h>
 #include <time.h>
 
 /* ══════════════════════════════════════════════
@@ -5525,8 +5526,8 @@ static const char *intrinsic_names[] = {
     /* Math */
     "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
-    "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND",
-    "BIT_SIZE", "BTEST", "IAND", "IEOR", "IOR", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC",
+    "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "TRANSFER",
+    "BIT_SIZE", "BTEST", "IAND", "IEOR", "IOR", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC", "MASKL", "MASKR",
     "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
     "SET_EXPONENT",
     "SELECTED_INT_KIND", "SELECTED_REAL_KIND",
@@ -5602,6 +5603,143 @@ static OfortValType elemental_result_type(const char *upper, OfortValType input_
     return FVAL_REAL;
 }
 
+static int integer_kind_bits(int kind) {
+    if (kind == 1) return 8;
+    if (kind == 2) return 16;
+    if (kind == 8) return 64;
+    return 32;
+}
+
+static long long signed_mask_value(unsigned long long value, int bits) {
+    unsigned long long mask;
+    unsigned long long sign_bit;
+    if (bits >= 64) return (long long)value;
+    mask = (1ULL << (unsigned int)bits) - 1ULL;
+    value &= mask;
+    sign_bit = 1ULL << (unsigned int)(bits - 1);
+    if (value & sign_bit) value |= ~mask;
+    return (long long)value;
+}
+
+static int transfer_type_size(OfortValType type, int char_len) {
+    switch (type) {
+    case FVAL_INTEGER:
+    case FVAL_REAL:
+    case FVAL_LOGICAL:
+        return 4;
+    case FVAL_DOUBLE:
+        return 8;
+    case FVAL_COMPLEX:
+        return 8;
+    case FVAL_CHARACTER:
+        return char_len > 0 ? char_len : 1;
+    default:
+        return 0;
+    }
+}
+
+static int transfer_mold_char_len(OfortValue mold) {
+    if (mold.type == FVAL_CHARACTER)
+        return mold.v.s ? (int)strlen(mold.v.s) : 1;
+    if (mold.type == FVAL_ARRAY && mold.v.arr.elem_type == FVAL_CHARACTER && mold.v.arr.len > 0)
+        return mold.v.arr.data[0].v.s ? (int)strlen(mold.v.arr.data[0].v.s) : 1;
+    return 1;
+}
+
+static int transfer_append_bytes_from_value(OfortValue value, unsigned char *bytes, int max_bytes) {
+    int used = 0;
+    if (max_bytes <= 0) return 0;
+    if (value.type == FVAL_ARRAY) {
+        for (int i = 0; i < value.v.arr.len && used < max_bytes; i++) {
+            used += transfer_append_bytes_from_value(value.v.arr.data[i], bytes + used, max_bytes - used);
+        }
+        return used;
+    }
+    if (value.type == FVAL_INTEGER) {
+        uint32_t u = (uint32_t)value.v.i;
+        int n = max_bytes < 4 ? max_bytes : 4;
+        memcpy(bytes, &u, (size_t)n);
+        return n;
+    }
+    if (value.type == FVAL_REAL) {
+        float f = (float)value.v.r;
+        int n = max_bytes < 4 ? max_bytes : 4;
+        memcpy(bytes, &f, (size_t)n);
+        return n;
+    }
+    if (value.type == FVAL_DOUBLE) {
+        double d = value.v.r;
+        int n = max_bytes < 8 ? max_bytes : 8;
+        memcpy(bytes, &d, (size_t)n);
+        return n;
+    }
+    if (value.type == FVAL_LOGICAL) {
+        uint32_t u = value.v.b ? 1U : 0U;
+        int n = max_bytes < 4 ? max_bytes : 4;
+        memcpy(bytes, &u, (size_t)n);
+        return n;
+    }
+    if (value.type == FVAL_COMPLEX) {
+        float parts[2];
+        int n = max_bytes < 8 ? max_bytes : 8;
+        parts[0] = (float)value.v.cx.re;
+        parts[1] = (float)value.v.cx.im;
+        memcpy(bytes, parts, (size_t)n);
+        return n;
+    }
+    if (value.type == FVAL_CHARACTER) {
+        int n = value.v.s ? (int)strlen(value.v.s) : 0;
+        if (n > max_bytes) n = max_bytes;
+        if (n > 0) memcpy(bytes, value.v.s, (size_t)n);
+        return n;
+    }
+    return 0;
+}
+
+static OfortValue transfer_value_from_bytes(OfortValType type, int kind, int char_len,
+                                           const unsigned char *bytes, int nbytes, int offset) {
+    unsigned char tmp[16];
+    int size = transfer_type_size(type, char_len);
+    memset(tmp, 0, sizeof(tmp));
+    if (size > (int)sizeof(tmp)) size = (int)sizeof(tmp);
+    for (int i = 0; i < size; i++) {
+        int src = offset + i;
+        if (src >= 0 && src < nbytes) tmp[i] = bytes[src];
+    }
+    switch (type) {
+    case FVAL_INTEGER: {
+        uint32_t u = 0;
+        memcpy(&u, tmp, sizeof(u));
+        return make_integer_kind(signed_mask_value(u, 32), kind > 0 ? kind : 4);
+    }
+    case FVAL_REAL: {
+        float f = 0.0f;
+        memcpy(&f, tmp, sizeof(f));
+        return make_real((double)f);
+    }
+    case FVAL_DOUBLE: {
+        double d = 0.0;
+        memcpy(&d, tmp, sizeof(d));
+        return make_double(d);
+    }
+    case FVAL_LOGICAL: {
+        uint32_t u = 0;
+        memcpy(&u, tmp, sizeof(u));
+        return make_logical(u != 0);
+    }
+    case FVAL_CHARACTER: {
+        char buf[OFORT_MAX_STRLEN];
+        if (char_len <= 0) char_len = 1;
+        if (char_len >= OFORT_MAX_STRLEN) char_len = OFORT_MAX_STRLEN - 1;
+        memset(buf, 0, sizeof(buf));
+        memcpy(buf, tmp, (size_t)char_len);
+        return make_character(buf);
+    }
+    default:
+        return make_void_val();
+    }
+}
+
 static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs,
                                 char arg_names[OFORT_MAX_PARAMS][256]) {
     char upper[256];
@@ -5653,6 +5791,49 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     }
 
     /* === Math intrinsics === */
+    if (strcmp(upper, "TRANSFER") == 0) {
+        int size_idx;
+        int result_len = 0;
+        int elem_size;
+        int char_len;
+        OfortValType result_type;
+        int result_kind;
+        unsigned char bytes[OFORT_MAX_STRLEN * 16];
+        int nbytes;
+        if (nargs < 2) ofort_error(I, "TRANSFER requires SOURCE and MOLD arguments");
+        size_idx = intrinsic_arg_index(arg_names, nargs, "size");
+        if (size_idx < 0 && nargs >= 3) size_idx = 2;
+        result_type = args[1].type == FVAL_ARRAY ? args[1].v.arr.elem_type : args[1].type;
+        result_kind = args[1].type == FVAL_ARRAY && args[1].v.arr.len > 0 ? args[1].v.arr.data[0].kind : args[1].kind;
+        char_len = transfer_mold_char_len(args[1]);
+        elem_size = transfer_type_size(result_type, char_len);
+        if (elem_size <= 0) ofort_error(I, "TRANSFER mold type is not supported");
+        memset(bytes, 0, sizeof(bytes));
+        nbytes = transfer_append_bytes_from_value(args[0], bytes, (int)sizeof(bytes));
+        if (size_idx >= 0) {
+            int dims[1];
+            OfortValue result;
+            result_len = (int)val_to_int(args[size_idx]);
+            if (result_len < 0) result_len = 0;
+            dims[0] = result_len;
+            result = make_array_with_char_len(result_type, dims, 1, char_len);
+            for (int i = 0; i < result.v.arr.len; i++) {
+                free_value(&result.v.arr.data[i]);
+                result.v.arr.data[i] = transfer_value_from_bytes(result_type, result_kind, char_len, bytes, nbytes, i * elem_size);
+            }
+            return result;
+        }
+        if (args[1].type == FVAL_ARRAY) {
+            OfortValue result = make_array_with_char_len(result_type, args[1].v.arr.dims, args[1].v.arr.n_dims, char_len);
+            for (int i = 0; i < result.v.arr.len; i++) {
+                free_value(&result.v.arr.data[i]);
+                result.v.arr.data[i] = transfer_value_from_bytes(result_type, result_kind, char_len, bytes, nbytes, i * elem_size);
+            }
+            return result;
+        }
+        return transfer_value_from_bytes(result_type, result_kind, char_len, bytes, nbytes, 0);
+    }
+
     if (strcmp(upper, "ABS") == 0) {
         if (nargs < 1) ofort_error(I, "ABS requires 1 argument");
         if (args[0].type == FVAL_INTEGER) return make_integer(args[0].v.i < 0 ? -args[0].v.i : args[0].v.i);
@@ -5787,10 +5968,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (nargs < 1) ofort_error(I, "BIT_SIZE requires 1 argument");
         if (args[0].type != FVAL_INTEGER) ofort_error(I, "BIT_SIZE requires an integer argument");
         kind = args[0].kind ? args[0].kind : 4;
-        if (kind == 1) return make_integer(8);
-        if (kind == 2) return make_integer(16);
-        if (kind == 8) return make_integer(64);
-        return make_integer(32);
+        return make_integer(integer_kind_bits(kind));
     }
     if (strcmp(upper, "BTEST") == 0) {
         int kind, bits;
@@ -5922,6 +6100,27 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (rshift == 0) rotated = field;
         else rotated = ((field << rshift) | (field >> ((unsigned int)size - rshift))) & mask;
         return make_integer_kind((long long)(rest | rotated), kind);
+    }
+    if (strcmp(upper, "MASKL") == 0 || strcmp(upper, "MASKR") == 0) {
+        int kind = 4;
+        int bits;
+        long long i;
+        unsigned long long value;
+        if (nargs < 1) ofort_error(I, "%s requires 1 argument", upper);
+        if (args[0].type != FVAL_INTEGER)
+            ofort_error(I, "%s requires an integer argument", upper);
+        if (nargs >= 2) {
+            if (args[1].type != FVAL_INTEGER) ofort_error(I, "%s KIND must be integer", upper);
+            kind = (int)args[1].v.i;
+        }
+        bits = integer_kind_bits(kind);
+        i = args[0].v.i;
+        if (i < 0 || i > bits) ofort_error(I, "%s bit count out of range", upper);
+        if (i == 0) return make_integer_kind(0, kind);
+        if (i == bits) value = ~0ULL;
+        else if (strcmp(upper, "MASKR") == 0) value = (1ULL << (unsigned int)i) - 1ULL;
+        else value = (~0ULL) << (unsigned int)(bits - i);
+        return make_integer_kind(signed_mask_value(value, bits), kind);
     }
     if (strcmp(upper, "DIGITS") == 0) {
         int kind;
