@@ -175,6 +175,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n);
 static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs,
                                 char arg_names[OFORT_MAX_PARAMS][256]);
 static int is_intrinsic(const char *name);
+static int paren_item_has_top_level_comma(OfortInterpreter *I);
+static OfortNode *parse_implied_do(OfortInterpreter *I);
 
 static double ofort_monotonic_seconds(void) {
 #ifdef _WIN32
@@ -1625,7 +1627,11 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
             if (check(I, FTOK_DCOLON)) advance(I);
         }
         while (!check(I, FTOK_RBRACKET) && !check(I, FTOK_EOF)) {
-            OfortNode *elem = parse_expr(I);
+            OfortNode *elem;
+            if (check(I, FTOK_LPAREN) && paren_item_has_top_level_comma(I))
+                elem = parse_implied_do(I);
+            else
+                elem = parse_expr(I);
             if (n->n_stmts >= cap) {
                 cap = cap ? cap * 2 : 8;
                 n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
@@ -4053,7 +4059,7 @@ static int section_linear_index(OfortValue *arr, int *subscripts, int nsubs) {
 static void copy_section_recursive(OfortInterpreter *I, OfortValue *src, OfortValue *dst,
                                    OfortSubscriptRange *ranges, int nranges,
                                    int dim, int *subscripts, int *out_index) {
-    if (dim == nranges) {
+    if (dim < 0) {
         int src_index = section_linear_index(src, subscripts, nranges);
         if (src_index < 0 || src_index >= src->v.arr.len)
             ofort_error(I, "Array section index out of bounds");
@@ -4072,7 +4078,7 @@ static void copy_section_recursive(OfortInterpreter *I, OfortValue *src, OfortVa
          ranges[dim].step > 0 ? idx <= ranges[dim].end : idx >= ranges[dim].end;
          idx += ranges[dim].step) {
         subscripts[dim] = idx;
-        copy_section_recursive(I, src, dst, ranges, nranges, dim + 1, subscripts, out_index);
+        copy_section_recursive(I, src, dst, ranges, nranges, dim - 1, subscripts, out_index);
         if (!ranges[dim].is_slice) break;
     }
 }
@@ -4112,7 +4118,7 @@ static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNo
     OfortValue result = make_array(var->val.v.arr.elem_type, result_dims, n_result_dims);
     int subscripts[7] = {0};
     int out_index = 0;
-    copy_section_recursive(I, &var->val, &result, ranges, nargs, 0, subscripts, &out_index);
+    copy_section_recursive(I, &var->val, &result, ranges, nargs, nargs - 1, subscripts, &out_index);
     return result;
 }
 
@@ -4173,7 +4179,7 @@ static int section_element_count(OfortSubscriptRange *ranges, int nranges) {
 static void assign_section_recursive(OfortInterpreter *I, OfortValue *dst, OfortValue *rhs,
                                      OfortSubscriptRange *ranges, int nranges,
                                      int dim, int *subscripts, int *rhs_index) {
-    if (dim == nranges) {
+    if (dim < 0) {
         int dst_index = section_linear_index(dst, subscripts, nranges);
         if (dst_index < 0 || dst_index >= dst->v.arr.len)
             ofort_error(I, "Array section index out of bounds");
@@ -4201,7 +4207,7 @@ static void assign_section_recursive(OfortInterpreter *I, OfortValue *dst, Ofort
          ranges[dim].step > 0 ? idx <= ranges[dim].end : idx >= ranges[dim].end;
          idx += ranges[dim].step) {
         subscripts[dim] = idx;
-        assign_section_recursive(I, dst, rhs, ranges, nranges, dim + 1, subscripts, rhs_index);
+        assign_section_recursive(I, dst, rhs, ranges, nranges, dim - 1, subscripts, rhs_index);
         if (!ranges[dim].is_slice) break;
     }
 }
@@ -4238,7 +4244,7 @@ static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs,
 
     int subscripts[7] = {0};
     int rhs_index = 0;
-    assign_section_recursive(I, &var->val, rhs, ranges, nargs, 0, subscripts, &rhs_index);
+    assign_section_recursive(I, &var->val, rhs, ranges, nargs, nargs - 1, subscripts, &rhs_index);
 }
 
 static double random_unit(void) {
@@ -4859,6 +4865,31 @@ static OfortValue *eval_io_list(OfortInterpreter *I, OfortNode *n, int *nvals_ou
     if (!vals) vals = (OfortValue *)calloc(1, sizeof(OfortValue));
     *nvals_out = nvals;
     return vals;
+}
+
+static void collect_constructor_values(OfortInterpreter *I, OfortNode *node,
+                                       OfortValue **vals, int *nvals, int *cap) {
+    if (node->type == FND_IMPLIED_DO) {
+        OfortValue start_v = eval_node(I, node->children[0]);
+        OfortValue end_v = eval_node(I, node->children[1]);
+        OfortValue step_v = eval_node(I, node->children[2]);
+        long long start = val_to_int(start_v);
+        long long end = val_to_int(end_v);
+        long long step = val_to_int(step_v);
+        free_value(&start_v);
+        free_value(&end_v);
+        free_value(&step_v);
+        if (step == 0) ofort_error(I, "Implied DO step cannot be zero");
+        for (long long iter = start; step > 0 ? iter <= end : iter >= end; iter += step) {
+            set_var(I, node->name, make_integer(iter));
+            for (int i = 0; i < node->n_stmts; i++) {
+                collect_constructor_values(I, node->stmts[i], vals, nvals, cap);
+            }
+        }
+        return;
+    }
+
+    append_io_value(I, vals, nvals, cap, eval_node(I, node));
 }
 
 static void compute_fannkuchredux(int n, long long *checksum_out, long long *max_flips_out) {
@@ -5563,16 +5594,18 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_ARRAY_CONSTRUCTOR: {
-        int nelem = n->n_stmts;
-        int dims[1] = {nelem};
-        /* determine element type from first element */
-        OfortValType etype = FVAL_INTEGER;
-        OfortValue *elems = (OfortValue *)calloc(nelem, sizeof(OfortValue));
-        for (int i = 0; i < nelem; i++) {
-            elems[i] = eval_node(I, n->stmts[i]);
-            if (i == 0) etype = elems[i].type;
+        int nelem = 0;
+        int cap = 0;
+        OfortValue *elems = NULL;
+        for (int i = 0; i < n->n_stmts; i++) {
+            collect_constructor_values(I, n->stmts[i], &elems, &nelem, &cap);
         }
-        OfortValue arr = make_array(etype, dims, 1);
+        int dims[1] = {nelem};
+        OfortValType etype = FVAL_INTEGER;
+        int char_len = 1;
+        if (nelem > 0) etype = elems[0].type;
+        if (etype == FVAL_CHARACTER && elems[0].v.s) char_len = (int)strlen(elems[0].v.s);
+        OfortValue arr = make_array_with_char_len(etype, dims, 1, char_len);
         for (int i = 0; i < nelem; i++) {
             free_value(&arr.v.arr.data[i]);
             arr.v.arr.data[i] = elems[i];
@@ -9290,23 +9323,86 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         return result;
     }
     if (strcmp(upper, "RESHAPE") == 0) {
+        int source_idx = intrinsic_arg_index(arg_names, nargs, "source");
+        int shape_idx = intrinsic_arg_index(arg_names, nargs, "shape");
+        int pad_idx = intrinsic_arg_index(arg_names, nargs, "pad");
+        int order_idx = intrinsic_arg_index(arg_names, nargs, "order");
         if (nargs < 2) ofort_error(I, "RESHAPE requires 2 arguments");
-        if (args[0].type != FVAL_ARRAY || args[1].type != FVAL_ARRAY)
-            ofort_error(I, "RESHAPE requires arrays");
-        int new_dims[7], n_new_dims = args[1].v.arr.len;
+        if (source_idx < 0) source_idx = 0;
+        if (shape_idx < 0) shape_idx = 1;
+        if (source_idx >= nargs || shape_idx >= nargs)
+            ofort_error(I, "RESHAPE requires SOURCE and SHAPE");
+        if (args[source_idx].type != FVAL_ARRAY || args[shape_idx].type != FVAL_ARRAY)
+            ofort_error(I, "RESHAPE requires SOURCE and SHAPE arrays");
+        if (pad_idx >= 0 && args[pad_idx].type != FVAL_ARRAY)
+            ofort_error(I, "RESHAPE PAD must be an array");
+        if (order_idx >= 0 && args[order_idx].type != FVAL_ARRAY)
+            ofort_error(I, "RESHAPE ORDER must be an array");
+
+        OfortValue *source = &args[source_idx];
+        OfortValue *shape = &args[shape_idx];
+        OfortValue *pad = pad_idx >= 0 ? &args[pad_idx] : NULL;
+        OfortValue *order = order_idx >= 0 ? &args[order_idx] : NULL;
+        int new_dims[7], order_dims[7], n_new_dims = shape->v.arr.len;
         int total = 1;
+        if (n_new_dims < 0 || n_new_dims > 7) ofort_error(I, "RESHAPE rank is out of range");
         for (int i = 0; i < n_new_dims && i < 7; i++) {
-            new_dims[i] = (int)val_to_int(args[1].v.arr.data[i]);
+            OfortValue dim_v = array_element_value(shape, i);
+            new_dims[i] = (int)val_to_int(dim_v);
+            free_value(&dim_v);
+            if (new_dims[i] < 0) ofort_error(I, "RESHAPE SHAPE values must be nonnegative");
             total *= new_dims[i];
         }
-        OfortValue result = make_array(args[0].v.arr.elem_type, new_dims, n_new_dims);
-        int src_len = args[0].v.arr.len;
+        for (int i = 0; i < n_new_dims; i++) order_dims[i] = i;
+        if (order) {
+            if (order->v.arr.len != n_new_dims)
+                ofort_error(I, "RESHAPE ORDER length must match SHAPE length");
+            int seen[7] = {0};
+            for (int i = 0; i < n_new_dims; i++) {
+                OfortValue ov = array_element_value(order, i);
+                int od = (int)val_to_int(ov);
+                free_value(&ov);
+                if (od < 1 || od > n_new_dims || seen[od - 1])
+                    ofort_error(I, "RESHAPE ORDER must be a permutation of result dimensions");
+                seen[od - 1] = 1;
+                order_dims[i] = od - 1;
+            }
+        }
+
+        int char_len = 1;
+        if (source->v.arr.elem_type == FVAL_CHARACTER && source->v.arr.len > 0) {
+            OfortValue first = array_element_value(source, 0);
+            if (first.type == FVAL_CHARACTER && first.v.s) char_len = (int)strlen(first.v.s);
+            free_value(&first);
+        }
+        OfortValue result = make_array_with_char_len(source->v.arr.elem_type, new_dims, n_new_dims, char_len);
+        int src_len = source->v.arr.len;
+        int pad_len = pad ? pad->v.arr.len : 0;
+        int strides[7];
+        int stride = 1;
+        for (int i = 0; i < n_new_dims; i++) {
+            strides[i] = stride;
+            stride *= new_dims[i];
+        }
         for (int i = 0; i < total; i++) {
-            free_value(&result.v.arr.data[i]);
-            if (i < src_len)
-                result.v.arr.data[i] = copy_value(args[0].v.arr.data[i]);
-            else
-                result.v.arr.data[i] = make_integer(0);
+            int rem = i;
+            int subs[7] = {0};
+            int result_index = 0;
+            for (int j = 0; j < n_new_dims; j++) {
+                int d = order_dims[j];
+                subs[d] = new_dims[d] ? rem % new_dims[d] : 0;
+                if (new_dims[d]) rem /= new_dims[d];
+            }
+            for (int j = 0; j < n_new_dims; j++) result_index += subs[j] * strides[j];
+
+            free_value(&result.v.arr.data[result_index]);
+            if (i < src_len) {
+                result.v.arr.data[result_index] = array_element_value(source, i);
+            } else if (pad_len > 0) {
+                result.v.arr.data[result_index] = array_element_value(pad, (i - src_len) % pad_len);
+            } else {
+                result.v.arr.data[result_index] = default_value(source->v.arr.elem_type, char_len);
+            }
         }
         return result;
     }
