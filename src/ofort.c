@@ -917,13 +917,14 @@ static OfortFunc *find_func(OfortInterpreter *I, const char *name) {
 
 static OfortGeneric *find_generic(OfortInterpreter *I, const char *name);
 
-static OfortFunc *find_matching_generic_func(OfortInterpreter *I, const char *name,
-                                             OfortValue *args, int nargs) {
+static OfortFunc *find_matching_generic_proc(OfortInterpreter *I, const char *name,
+                                             OfortValue *args, int nargs,
+                                             int want_function) {
     OfortGeneric *g = find_generic(I, name);
     if (!g) return NULL;
     for (int i = 0; i < g->n_procedures; i++) {
         OfortFunc *func = find_func(I, g->procedures[i]);
-        if (!func || !func->is_function || !func->node) continue;
+        if (!func || func->is_function != want_function || !func->node) continue;
         OfortNode *fn = func->node;
         int match = 1;
         if (nargs > fn->n_params) continue;
@@ -952,6 +953,16 @@ static OfortFunc *find_matching_generic_func(OfortInterpreter *I, const char *na
         if (match) return func;
     }
     return NULL;
+}
+
+static OfortFunc *find_matching_generic_func(OfortInterpreter *I, const char *name,
+                                             OfortValue *args, int nargs) {
+    return find_matching_generic_proc(I, name, args, nargs, 1);
+}
+
+static OfortFunc *find_matching_generic_subroutine(OfortInterpreter *I, const char *name,
+                                                   OfortValue *args, int nargs) {
+    return find_matching_generic_proc(I, name, args, nargs, 0);
 }
 
 static OfortGeneric *find_generic(OfortInterpreter *I, const char *name) {
@@ -8644,18 +8655,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* Check for intrinsic subroutines */
         /* (none currently — user subroutines only) */
 
-        OfortFunc *func = find_func(I, n->name);
-        if (!func) {
-            ofort_error(I, "Unknown subroutine '%s' at line %d", n->name, n->line);
-        }
-
-        OfortNode *fn = func->node;
         OfortValue args[OFORT_MAX_PARAMS];
         int arg_alias[OFORT_MAX_PARAMS] = {0};
         OfortVar *arg_alias_var[OFORT_MAX_PARAMS] = {0};
+        OfortFunc *func = find_func(I, n->name);
+        OfortNode *fn = func ? func->node : NULL;
         for (int i = 0; i < nargs; i++) {
             args[i] = make_void_val();
-            if (I->fast_mode && i < fn->n_params && n->stmts[i]->type == FND_IDENT) {
+            if (fn && I->fast_mode && i < fn->n_params && n->stmts[i]->type == FND_IDENT) {
                 OfortVar *actual = find_var(I, n->stmts[i]->name);
                 if (actual && actual->val.type == FVAL_ARRAY && array_has_packed_numeric(&actual->val)) {
                     arg_alias[i] = 1;
@@ -8664,6 +8671,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
             }
             args[i] = eval_node(I, n->stmts[i]);
+        }
+        if (!func) {
+            func = find_matching_generic_subroutine(I, n->name, args, nargs);
+            fn = func ? func->node : NULL;
+        }
+        if (!func) {
+            ofort_error(I, "Unknown subroutine '%s' at line %d", n->name, n->line);
+        }
+        if (func->is_function) {
+            ofort_error(I, "'%s' is a function, not a subroutine", n->name);
         }
         push_scope(I);
         /* Bind parameters */
