@@ -148,6 +148,7 @@ struct OfortInterpreter {
     int command_argc;
     char command_args[OFORT_MAX_PARAMS][OFORT_MAX_STRLEN];
     int procedure_depth;
+    int consumed_bare_end;
     /* node pool for memory management */
     OfortNode **node_pool;
     int node_pool_len;
@@ -1616,9 +1617,45 @@ static int check_end(OfortInterpreter *I, const char *what) {
     return strcmp(upper, wup) == 0;
 }
 
+static int source_ends_with_bare_end(OfortInterpreter *I) {
+    const char *p;
+    const char *line_start;
+    const char *q;
+    if (!I->source) return 0;
+    p = I->source + strlen(I->source);
+    while (p > I->source && isspace((unsigned char)p[-1])) p--;
+    line_start = p;
+    while (line_start > I->source && line_start[-1] != '\n' && line_start[-1] != '\r') line_start--;
+    while (line_start < p && (*line_start == ' ' || *line_start == '\t')) line_start++;
+    q = line_start;
+    if (p - q < 3) return 0;
+    if (toupper((unsigned char)q[0]) != 'E' ||
+        toupper((unsigned char)q[1]) != 'N' ||
+        toupper((unsigned char)q[2]) != 'D') {
+        return 0;
+    }
+    q += 3;
+    while (q < p && (*q == ' ' || *q == '\t')) q++;
+    return q == p || *q == '!';
+}
+
 static void consume_end(OfortInterpreter *I, const char *what) {
     if (what && check_end(I, what) && peek(I)->type == FTOK_IDENT) {
         advance(I);
+        return;
+    }
+    if (what && I->consumed_bare_end) {
+        I->consumed_bare_end = 0;
+        return;
+    }
+    if (what && check(I, FTOK_EOF)) {
+        for (int pos = I->n_tokens - 1; pos >= 0; pos--) {
+            OfortTokenType t = I->tokens[pos].type;
+            if (t == FTOK_EOF || t == FTOK_NEWLINE || t == FTOK_SEMICOLON) continue;
+            if (t == FTOK_END) return;
+            break;
+        }
+        if (source_ends_with_bare_end(I)) return;
         return;
     }
     expect(I, FTOK_END);
@@ -3707,6 +3744,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
 
     /* END (bare) — shouldn't be reached normally */
     if (t->type == FTOK_END) {
+        I->consumed_bare_end = 1;
         skip_to_next_line(I);
         return NULL;
     }
@@ -3794,7 +3832,9 @@ static OfortNode *parse_block_until_end(OfortInterpreter *I, const char *end_key
         }
         skip_newlines(I);
         if (check_end(I, end_keyword)) break;
+        I->consumed_bare_end = 0;
         OfortNode *s = parse_statement(I);
+        if (I->consumed_bare_end) break;
         if (s) {
             if (block->n_stmts >= cap) {
                 cap = cap ? cap * 2 : 8;
@@ -3815,7 +3855,15 @@ static OfortNode *parse_program(OfortInterpreter *I) {
 
     skip_newlines(I);
     while (peek(I)->type != FTOK_EOF) {
+        if (peek(I)->type == FTOK_END &&
+            (peek_ahead(I, 1)->type == FTOK_NEWLINE || peek_ahead(I, 1)->type == FTOK_EOF)) {
+            advance(I);
+            skip_newlines(I);
+            continue;
+        }
+        I->consumed_bare_end = 0;
         OfortNode *s = parse_statement(I);
+        I->consumed_bare_end = 0;
         if (s) {
             if (prog->n_stmts >= cap) {
                 cap = cap ? cap * 2 : 16;
@@ -9892,6 +9940,7 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     interp->warnings[0] = '\0';
     interp->warn_len = 0;
     interp->procedure_depth = 0;
+    interp->consumed_bare_end = 0;
     if (prepare_line_profile(interp, source) != 0) {
         snprintf(interp->error, sizeof(interp->error), "Out of memory for line profiler");
         interp->has_error = 1;
@@ -9960,6 +10009,7 @@ int ofort_check(OfortInterpreter *interp, const char *source) {
     interp->warnings[0] = '\0';
     interp->warn_len = 0;
     interp->procedure_depth = 0;
+    interp->consumed_bare_end = 0;
 
     if (setjmp(interp->err_jmp) != 0) {
         return -1;
@@ -10637,6 +10687,7 @@ void ofort_reset(OfortInterpreter *interp) {
     interp->stopping = 0;
     interp->current_line = 0;
     interp->procedure_depth = 0;
+    interp->consumed_bare_end = 0;
     clear_timing(interp);
     clear_line_profile(interp);
 }
