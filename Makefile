@@ -4,6 +4,7 @@ LDFLAGS ?=
 LDLIBS ?= -lm
 
 TARGET = ofort.exe
+BUILD_INFO = ofort.build
 SOURCES = src/main.c src/ofort.c
 HEADERS = include/ofort.h
 
@@ -13,6 +14,7 @@ all: $(TARGET)
 
 $(TARGET): $(SOURCES) $(HEADERS)
 	$(CC) $(CFLAGS) $(SOURCES) $(LDFLAGS) $(LDLIBS) -o $(TARGET)
+	printf "cc=%s\n" "$(CC)" > $(BUILD_INFO)
 
 gcc:
 	$(MAKE) --always-make CC=gcc
@@ -24,4 +26,4 @@ test: $(TARGET)
 	powershell -NoProfile -Command "'program t'; '  print *, \"ofort works\"'; 'end program t'" | ./$(TARGET)
 
 clean:
-	rm -f $(TARGET) NUL
+	rm -f $(TARGET) $(BUILD_INFO) NUL
