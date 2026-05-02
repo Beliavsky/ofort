@@ -1207,9 +1207,15 @@ static void tokenize(OfortInterpreter *I, const char *src) {
             int literal_kind = 0;
             while (isdigit((unsigned char)*p)) p++;
             if (*p == '.' && *(p+1) != '.') { /* avoid confusing with .. if ever */
-                is_real = 1;
-                p++;
-                while (isdigit((unsigned char)*p)) p++;
+                int dot_begins_exponent = (p[1] == 'e' || p[1] == 'E' ||
+                                           p[1] == 'd' || p[1] == 'D') &&
+                    (isdigit((unsigned char)p[2]) ||
+                     ((p[2] == '+' || p[2] == '-') && isdigit((unsigned char)p[3])));
+                if (!isalpha((unsigned char)p[1]) || dot_begins_exponent) {
+                    is_real = 1;
+                    p++;
+                    while (isdigit((unsigned char)*p)) p++;
+                }
             }
             if (*p == 'e' || *p == 'E' || *p == 'd' || *p == 'D') {
                 is_real = 1;
@@ -8454,7 +8460,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
 static const char *intrinsic_names[] = {
     /* Math */
-    "ABS", "SQRT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
+    "ABS", "SQRT", "HYPOT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "TRANSFER",
     "BIT_SIZE", "BTEST", "IAND", "IEOR", "IOR", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC", "MASKL", "MASKR",
@@ -8691,6 +8697,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     }
 
     if ((strcmp(upper, "MOD") == 0 || strcmp(upper, "MODULO") == 0 ||
+         strcmp(upper, "HYPOT") == 0 ||
          strcmp(upper, "DIM") == 0 || strcmp(upper, "SIGN") == 0) &&
         nargs >= 2 && (args[0].type == FVAL_ARRAY || args[1].type == FVAL_ARRAY)) {
         OfortValue *shape_arg = args[0].type == FVAL_ARRAY ? &args[0] : &args[1];
@@ -8773,6 +8780,10 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "SQRT") == 0) {
         if (nargs < 1) ofort_error(I, "SQRT requires 1 argument");
         return make_real(sqrt(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "HYPOT") == 0) {
+        if (nargs < 2) ofort_error(I, "HYPOT requires 2 arguments");
+        return make_real(hypot(val_to_real(args[0]), val_to_real(args[1])));
     }
     if (strcmp(upper, "SIN") == 0) {
         if (nargs < 1) ofort_error(I, "SIN requires 1 argument");
