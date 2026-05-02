@@ -72,6 +72,7 @@ typedef struct {
 typedef struct {
     char name[128];
     char field_names[OFORT_MAX_FIELDS][64];
+    char field_type_names[OFORT_MAX_FIELDS][64];
     OfortValType field_types[OFORT_MAX_FIELDS];
     int field_char_lens[OFORT_MAX_FIELDS];
     int field_dims[OFORT_MAX_FIELDS][7];
@@ -3334,6 +3335,49 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
         memcpy(decl->dims, decl_dims, sizeof(decl_dims));
         decl->n_dims = n_decl_dims;
 
+        if (check(I, FTOK_LPAREN) && n_decl_dims == 0) {
+            advance(I);
+            decl->n_dims = 0;
+            int dim_cap = 0;
+            while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                if (check(I, FTOK_COLON)) {
+                    advance(I);
+                    decl->dims[decl->n_dims++] = 0;
+                } else if (check(I, FTOK_STAR)) {
+                    advance(I);
+                    decl->dims[decl->n_dims++] = 0;
+                } else {
+                    OfortNode *de = parse_expr(I);
+                    int dim_index = decl->n_dims;
+                    if (de->type == FND_INT_LIT)
+                        decl->dims[decl->n_dims++] = (int)de->int_val;
+                    else
+                        decl->dims[decl->n_dims++] = 0;
+                    if (decl->n_stmts >= dim_cap) {
+                        dim_cap = dim_cap ? dim_cap * 2 : 4;
+                        decl->stmts = (OfortNode **)realloc(decl->stmts, sizeof(OfortNode *) * dim_cap);
+                    }
+                    decl->stmts[decl->n_stmts++] = de;
+                    if (check(I, FTOK_COLON)) {
+                        advance(I);
+                        OfortNode *dh = parse_expr(I);
+                        if (de->type == FND_INT_LIT) {
+                            decl->lower_bounds[dim_index] = (int)de->int_val;
+                            decl->has_lower_bound[dim_index] = 1;
+                        }
+                        if (dh->type == FND_INT_LIT) {
+                            decl->dims[dim_index] = (int)dh->int_val;
+                        } else if (dim_index < decl->n_stmts) {
+                            decl->stmts[dim_index] = dh;
+                        }
+                    }
+                }
+                if (check(I, FTOK_COMMA)) advance(I);
+                else break;
+            }
+            expect(I, FTOK_RPAREN);
+        }
+
         if (check(I, FTOK_ASSIGN)) {
             advance(I);
             decl->children[0] = parse_expr(I);
@@ -3979,6 +4023,7 @@ static OfortValue default_value(OfortValType vtype, int char_len) {
 }
 
 static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims);
+static OfortValue make_derived_array(OfortInterpreter *I, const char *type_name, int *dims, int n_dims);
 
 static OfortValue default_derived_value(OfortInterpreter *I, const char *type_name) {
     OfortTypeDef *td = find_type_def(I, type_name);
@@ -3997,7 +4042,14 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
     for (int i = 0; i < td->n_fields; i++) {
         copy_cstr(v.v.dt.field_names[i], sizeof(v.v.dt.field_names[i]), td->field_names[i]);
         if (td->field_n_dims[i] > 0) {
-            v.v.dt.fields[i] = make_array(td->field_types[i], td->field_dims[i], td->field_n_dims[i]);
+            if (td->field_types[i] == FVAL_DERIVED && td->field_type_names[i][0]) {
+                v.v.dt.fields[i] = make_derived_array(I, td->field_type_names[i],
+                                                       td->field_dims[i], td->field_n_dims[i]);
+            } else {
+                v.v.dt.fields[i] = make_array(td->field_types[i], td->field_dims[i], td->field_n_dims[i]);
+            }
+        } else if (td->field_types[i] == FVAL_DERIVED && td->field_type_names[i][0]) {
+            v.v.dt.fields[i] = default_derived_value(I, td->field_type_names[i]);
         } else {
             v.v.dt.fields[i] = default_value(td->field_types[i], td->field_char_lens[i]);
         }
@@ -4022,6 +4074,25 @@ static OfortValue *member_lvalue(OfortInterpreter *I, OfortNode *n) {
     if (n->type == FND_IDENT) {
         OfortVar *v = find_var(I, n->name);
         return v ? &v->val : NULL;
+    }
+    if (n->type == FND_FUNC_CALL) {
+        OfortVar *var = find_var(I, n->name);
+        OfortSubscriptRange ranges[7];
+        int has_slice = 0;
+        int subscripts[7];
+        int index;
+        if (!var || var->val.type != FVAL_ARRAY) return NULL;
+        for (int i = 0; i < n->n_stmts; i++) {
+            int extent = i < var->val.v.arr.n_dims ? var->val.v.arr.dims[i] : var->val.v.arr.len;
+            if (eval_subscript_range(I, n->stmts[i], extent, &ranges[i])) has_slice = 1;
+        }
+        if (has_slice) return NULL;
+        for (int i = 0; i < n->n_stmts; i++) subscripts[i] = ranges[i].start;
+        index = section_linear_index(&var->val, subscripts, n->n_stmts);
+        if (index < 0 || index >= var->val.v.arr.len)
+            ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, var->val.v.arr.len);
+        if (!var->val.v.arr.data) return NULL;
+        return &var->val.v.arr.data[index];
     }
     if (n->type == FND_MEMBER) {
         OfortValue *obj = member_lvalue(I, n->children[0]);
@@ -4193,6 +4264,18 @@ static void set_array_lower_bounds(OfortValue *arr, int *lower_bounds, int n_dim
 
 static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims) {
     return make_array_with_char_len(elem_type, dims, n_dims, 1);
+}
+
+static OfortValue make_derived_array(OfortInterpreter *I, const char *type_name, int *dims, int n_dims) {
+    OfortValue v = make_array(FVAL_DERIVED, dims, n_dims);
+    copy_cstr(v.v.arr.elem_type_name, sizeof(v.v.arr.elem_type_name), type_name);
+    if (v.v.arr.data) {
+        for (int i = 0; i < v.v.arr.len; i++) {
+            free_value(&v.v.arr.data[i]);
+            v.v.arr.data[i] = default_derived_value(I, type_name);
+        }
+    }
+    return v;
 }
 
 static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
@@ -5873,13 +5956,19 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             copy_cstr(v.v.dt.type_name, sizeof(v.v.dt.type_name), td->name);
             for (int i = 0; i < td->n_fields; i++) {
                 strcpy(v.v.dt.field_names[i], td->field_names[i]);
-                if (i < nargs)
+                if (i < nargs) {
                     v.v.dt.fields[i] = copy_value(args[i]);
-                else
+                } else if (td->field_n_dims[i] > 0) {
+                    if (td->field_types[i] == FVAL_DERIVED && td->field_type_names[i][0]) {
+                        v.v.dt.fields[i] = make_derived_array(I, td->field_type_names[i],
+                                                               td->field_dims[i], td->field_n_dims[i]);
+                    } else {
+                        v.v.dt.fields[i] = make_array(td->field_types[i], td->field_dims[i], td->field_n_dims[i]);
+                    }
+                } else if (td->field_types[i] == FVAL_DERIVED && td->field_type_names[i][0]) {
+                    v.v.dt.fields[i] = default_derived_value(I, td->field_type_names[i]);
+                } else {
                     v.v.dt.fields[i] = default_value(td->field_types[i], td->field_char_lens[i]);
-                if (i >= nargs && td->field_n_dims[i] > 0) {
-                    free_value(&v.v.dt.fields[i]);
-                    v.v.dt.fields[i] = make_array(td->field_types[i], td->field_dims[i], td->field_n_dims[i]);
                 }
             }
             for (int i = 0; i < nargs; i++) free_value(&args[i]);
@@ -7053,6 +7142,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     if ((d->type == FND_VARDECL || d->type == FND_PARAMDECL) && td->n_fields < OFORT_MAX_FIELDS) {
                         copy_cstr(td->field_names[td->n_fields], sizeof(td->field_names[td->n_fields]), d->name);
                         td->field_types[td->n_fields] = d->val_type;
+                        if (d->val_type == FVAL_DERIVED)
+                            copy_cstr(td->field_type_names[td->n_fields],
+                                      sizeof(td->field_type_names[td->n_fields]), d->str_val);
                         td->field_char_lens[td->n_fields] = d->char_len;
                         td->field_n_dims[td->n_fields] = d->n_dims;
                         memcpy(td->field_dims[td->n_fields], d->dims, sizeof(td->field_dims[td->n_fields]));
@@ -7062,6 +7154,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             } else if ((s->type == FND_VARDECL || s->type == FND_PARAMDECL) && td->n_fields < OFORT_MAX_FIELDS) {
                 copy_cstr(td->field_names[td->n_fields], sizeof(td->field_names[td->n_fields]), s->name);
                 td->field_types[td->n_fields] = s->val_type;
+                if (s->val_type == FVAL_DERIVED)
+                    copy_cstr(td->field_type_names[td->n_fields],
+                              sizeof(td->field_type_names[td->n_fields]), s->str_val);
                 td->field_char_lens[td->n_fields] = s->char_len;
                 td->field_n_dims[td->n_fields] = s->n_dims;
                 memcpy(td->field_dims[td->n_fields], s->dims, sizeof(td->field_dims[td->n_fields]));
@@ -7140,21 +7235,29 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             val.type = FVAL_ARRAY;
             memset(&val.v.arr, 0, sizeof(val.v.arr));
             val.v.arr.elem_type = n->val_type;
+            if (n->val_type == FVAL_DERIVED)
+                copy_cstr(val.v.arr.elem_type_name, sizeof(val.v.arr.elem_type_name), n->str_val);
             val.v.arr.allocated = 0;
         } else if (n->n_dims > 0 && !n->is_allocatable) {
             /* Array declaration */
-            if (can_reuse_fast_local_array(I, n)) {
+            if (n->val_type == FVAL_DERIVED) {
+                val = make_derived_array(I, n->str_val, n->dims, n->n_dims);
+            } else if (can_reuse_fast_local_array(I, n)) {
                 val = fast_reusable_local_array_value(I, n);
                 val_is_alias = 1;
             } else {
                 val = make_array_from_decl(I, n);
             }
-        } else if (n->is_allocatable && n->val_type != FVAL_DERIVED) {
+        } else if (n->is_allocatable && n->n_dims > 0) {
             /* Allocatable: create empty array placeholder */
             val.type = FVAL_ARRAY;
             memset(&val.v.arr, 0, sizeof(val.v.arr));
             val.v.arr.elem_type = n->val_type;
+            if (n->val_type == FVAL_DERIVED)
+                copy_cstr(val.v.arr.elem_type_name, sizeof(val.v.arr.elem_type_name), n->str_val);
             val.v.arr.allocated = 0;
+        } else if (n->is_allocatable && n->val_type != FVAL_DERIVED) {
+            val = make_void_val();
         } else if (n->n_children > 0 && n->children[0]) {
             val = eval_node(I, n->children[0]);
         } else if (n->val_type == FVAL_DERIVED) {
@@ -7358,26 +7461,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     break;
                 }
             }
-            OfortValue obj = eval_node(I, lhs->children[0]);
-            if (obj.type != FVAL_DERIVED) ofort_error(I, "Cannot access member of non-derived type");
-            /* Find the variable to modify in place */
-            if (lhs->children[0]->type == FND_IDENT) {
-                OfortVar *v = find_var(I, lhs->children[0]->name);
-                if (!v) ofort_error(I, "Undefined variable");
-                char upper[256];
-                str_upper(upper, lhs->name, 256);
-                for (int i = 0; i < v->val.v.dt.n_fields; i++) {
-                    char fu[256];
-                    str_upper(fu, v->val.v.dt.field_names[i], 256);
-                    if (strcmp(upper, fu) == 0) {
-                        free_value(&v->val.v.dt.fields[i]);
-                        v->val.v.dt.fields[i] = rhs;
-                        free_value(&obj);
-                        return;
-                    }
-                }
+            OfortValue *target = member_lvalue(I, lhs);
+            if (target) {
+                free_value(target);
+                *target = rhs;
+                break;
             }
-            free_value(&obj);
             free_value(&rhs);
             ofort_error(I, "Unknown member '%s'", lhs->name);
         } else {
@@ -8071,6 +8160,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             int lower_bounds[7];
             int ndims = n->n_stmts;
             OfortValType elem_type = target->type == FVAL_ARRAY ? target->v.arr.elem_type : target->type;
+            char elem_type_name[64] = "";
+            if (target->type == FVAL_ARRAY)
+                copy_cstr(elem_type_name, sizeof(elem_type_name), target->v.arr.elem_type_name);
+            else if (target->type == FVAL_DERIVED)
+                copy_cstr(elem_type_name, sizeof(elem_type_name), target->v.dt.type_name);
             for (int i = 0; i < 7; i++) lower_bounds[i] = 1;
 
             if (ndims > 0) {
@@ -8095,7 +8189,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     if (dims[i] < 0) dims[i] = 0;
                 }
                 free_value(target);
-                *target = make_array(elem_type, dims, ndims);
+                if (elem_type == FVAL_DERIVED && elem_type_name[0])
+                    *target = make_derived_array(I, elem_type_name, dims, ndims);
+                else
+                    *target = make_array(elem_type, dims, ndims);
                 set_array_lower_bounds(target, lower_bounds, ndims);
             } else if (n->children[1]) {
                 OfortValue mold = eval_node(I, n->children[1]);
@@ -8135,7 +8232,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int dims[7];
         int lower_bounds[7];
         int ndims = n->n_stmts;
-        OfortValType elem_type = var->val.v.arr.elem_type ? var->val.v.arr.elem_type : FVAL_REAL;
+        OfortValType elem_type = var->val.type == FVAL_ARRAY && var->val.v.arr.elem_type ?
+            var->val.v.arr.elem_type : var->val.type == FVAL_DERIVED ? FVAL_DERIVED : FVAL_REAL;
+        char elem_type_name[64] = "";
+        if (var->val.type == FVAL_ARRAY)
+            copy_cstr(elem_type_name, sizeof(elem_type_name), var->val.v.arr.elem_type_name);
+        else if (var->val.type == FVAL_DERIVED)
+            copy_cstr(elem_type_name, sizeof(elem_type_name), var->val.v.dt.type_name);
 
         for (int i = 0; i < 7; i++) lower_bounds[i] = 1;
         if (ndims > 0) {
@@ -8197,7 +8300,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             ofort_error(I, "ALLOCATE requires dimensions, SOURCE, or MOLD");
         }
         free_value(&var->val);
-        var->val = make_array(elem_type, dims, ndims);
+        if (elem_type == FVAL_DERIVED && elem_type_name[0])
+            var->val = make_derived_array(I, elem_type_name, dims, ndims);
+        else
+            var->val = make_array(elem_type, dims, ndims);
         set_array_lower_bounds(&var->val, lower_bounds, ndims);
         if (n->children[0]) {
             OfortValue source = eval_node(I, n->children[0]);
