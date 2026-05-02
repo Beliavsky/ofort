@@ -39,6 +39,10 @@ typedef struct {
     int char_len;     /* declared CHARACTER length, 0 if not CHARACTER */
     int present;      /* 0 for absent OPTIONAL dummy arguments */
     int is_allocatable;
+    int scalar_allocated;
+    OfortValType declared_type;
+    int declared_kind;
+    char declared_type_name[64];
     int is_pointer;
     int is_target;
     int is_protected;
@@ -758,11 +762,16 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
         str_upper(vu, s->vars[i].name, 256);
         if (strcmp(upper, vu) == 0) {
             int target_kind = s->vars[i].val.kind;
-            val = coerce_assignment_value(I, name, s->vars[i].val.type, val);
             if (s->vars[i].is_parameter)
                 ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
             if (s->vars[i].is_protected)
                 ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
+            if (s->vars[i].is_allocatable && s->vars[i].val.type != FVAL_ARRAY &&
+                !s->vars[i].scalar_allocated) {
+                free_value(&val);
+                ofort_error(I, "Allocatable variable '%s' is not allocated", name);
+            }
+            val = coerce_assignment_value(I, name, s->vars[i].val.type, val);
             val = resize_character_value(val, s->vars[i].char_len);
             if (target_kind > 0 && is_numeric_type(val.type)) val.kind = target_kind;
             if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
@@ -783,6 +792,11 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                     ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
                 if (ps->vars[i].is_protected)
                     ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
+                if (ps->vars[i].is_allocatable && ps->vars[i].val.type != FVAL_ARRAY &&
+                    !ps->vars[i].scalar_allocated) {
+                    free_value(&val);
+                    ofort_error(I, "Allocatable variable '%s' is not allocated", name);
+                }
                 val = coerce_assignment_value(I, name, ps->vars[i].val.type, val);
                 val = resize_character_value(val, ps->vars[i].char_len);
                 if (target_kind > 0 && is_numeric_type(val.type)) val.kind = target_kind;
@@ -814,6 +828,12 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     v->present = 1;
     v->is_allocatable = 0;
+    v->scalar_allocated = 0;
+    v->declared_type = val.type;
+    v->declared_kind = val.kind;
+    v->declared_type_name[0] = '\0';
+    if (val.type == FVAL_DERIVED)
+        copy_cstr(v->declared_type_name, sizeof(v->declared_type_name), val.v.dt.type_name);
     v->is_pointer = 0;
     v->is_target = 0;
     v->is_protected = 0;
@@ -844,6 +864,13 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
             s->vars[i].is_alias = 0;
             s->vars[i].char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
             s->vars[i].present = val.type != FVAL_VOID;
+            s->vars[i].scalar_allocated = 0;
+            s->vars[i].declared_type = val.type;
+            s->vars[i].declared_kind = val.kind;
+            s->vars[i].declared_type_name[0] = '\0';
+            if (val.type == FVAL_DERIVED)
+                copy_cstr(s->vars[i].declared_type_name,
+                          sizeof(s->vars[i].declared_type_name), val.v.dt.type_name);
             return &s->vars[i];
         }
     }
@@ -855,6 +882,12 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     v->present = val.type != FVAL_VOID;
     v->is_allocatable = 0;
+    v->scalar_allocated = 0;
+    v->declared_type = val.type;
+    v->declared_kind = val.kind;
+    v->declared_type_name[0] = '\0';
+    if (val.type == FVAL_DERIVED)
+        copy_cstr(v->declared_type_name, sizeof(v->declared_type_name), val.v.dt.type_name);
     v->is_pointer = 0;
     v->is_target = 0;
     v->is_protected = 0;
@@ -883,6 +916,10 @@ static OfortVar *declare_alias_var(OfortInterpreter *I, const char *name, OfortV
     v->char_len = target->char_len;
     v->present = target->present;
     v->is_allocatable = target->is_allocatable;
+    v->scalar_allocated = target->scalar_allocated;
+    v->declared_type = target->declared_type;
+    v->declared_kind = target->declared_kind;
+    copy_cstr(v->declared_type_name, sizeof(v->declared_type_name), target->declared_type_name);
     v->is_pointer = target->is_pointer;
     v->is_target = target->is_target;
     v->is_protected = target->is_protected;
@@ -1081,6 +1118,11 @@ static void restore_saved_vars(OfortInterpreter *I, OfortFunc *func) {
         v->char_len = func->saved_vars[i].char_len;
         v->present = func->saved_vars[i].present;
         v->is_allocatable = func->saved_vars[i].is_allocatable;
+        v->scalar_allocated = func->saved_vars[i].scalar_allocated;
+        v->declared_type = func->saved_vars[i].declared_type;
+        v->declared_kind = func->saved_vars[i].declared_kind;
+        copy_cstr(v->declared_type_name, sizeof(v->declared_type_name),
+                  func->saved_vars[i].declared_type_name);
         v->is_pointer = func->saved_vars[i].is_pointer;
         v->is_target = func->saved_vars[i].is_target;
         v->is_protected = func->saved_vars[i].is_protected;
@@ -1114,6 +1156,11 @@ static void store_saved_vars(OfortFunc *func, OfortScope *scope) {
         dst->char_len = src->char_len;
         dst->present = src->present;
         dst->is_allocatable = src->is_allocatable;
+        dst->scalar_allocated = src->scalar_allocated;
+        dst->declared_type = src->declared_type;
+        dst->declared_kind = src->declared_kind;
+        copy_cstr(dst->declared_type_name, sizeof(dst->declared_type_name),
+                  src->declared_type_name);
         dst->is_pointer = src->is_pointer;
         dst->is_target = src->is_target;
         dst->is_protected = src->is_protected;
@@ -6455,6 +6502,17 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             return make_logical(pointer_matches_target(I, ptr, n->stmts[1]));
         }
 
+        if (str_eq_nocase(n->name, "allocated")) {
+            OfortVar *alloc_var;
+            if (nargs != 1 || n->stmts[0]->type != FND_IDENT)
+                ofort_error(I, "ALLOCATED requires one allocatable variable argument");
+            alloc_var = find_var(I, n->stmts[0]->name);
+            if (!alloc_var || !alloc_var->is_allocatable) return make_logical(0);
+            if (alloc_var->val.type == FVAL_ARRAY)
+                return make_logical(alloc_var->val.v.arr.allocated);
+            return make_logical(alloc_var->scalar_allocated);
+        }
+
         if (str_eq_nocase(n->name, "sum") && nargs == 1 &&
             n->stmts[0]->type == FND_IDENT) {
             OfortVar *array_var = find_var(I, n->stmts[0]->name);
@@ -7950,12 +8008,54 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (has_assumed_shape) {
                 existing->intent = n->intent;
                 existing->is_pointer = n->is_pointer;
+                existing->is_allocatable = n->is_allocatable;
                 existing->is_target = n->is_target;
+                existing->declared_type = n->val_type;
+                existing->declared_kind = n->kind;
+                existing->declared_type_name[0] = '\0';
+                if (n->val_type == FVAL_DERIVED)
+                    copy_cstr(existing->declared_type_name,
+                              sizeof(existing->declared_type_name), n->str_val);
+                if (n->is_allocatable && n->intent == 2) {
+                    free_value(&existing->val);
+                    existing->val.type = FVAL_ARRAY;
+                    memset(&existing->val.v.arr, 0, sizeof(existing->val.v.arr));
+                    existing->val.v.arr.elem_type = n->val_type;
+                    if (n->val_type == FVAL_DERIVED)
+                        copy_cstr(existing->val.v.arr.elem_type_name,
+                                  sizeof(existing->val.v.arr.elem_type_name), n->str_val);
+                    existing->val.v.arr.allocated = 0;
+                    existing->scalar_allocated = 0;
+                }
                 break;
             }
         }
         if (existing && (n->intent != 0 || n->is_optional)) {
             existing->intent = n->intent;
+            existing->is_allocatable = n->is_allocatable;
+            existing->is_pointer = n->is_pointer;
+            existing->is_target = n->is_target;
+            existing->declared_type = n->val_type;
+            existing->declared_kind = n->kind;
+            existing->declared_type_name[0] = '\0';
+            if (n->val_type == FVAL_DERIVED)
+                copy_cstr(existing->declared_type_name,
+                          sizeof(existing->declared_type_name), n->str_val);
+            if (n->is_allocatable && n->intent == 2) {
+                free_value(&existing->val);
+                if (n->n_dims > 0) {
+                    existing->val.type = FVAL_ARRAY;
+                    memset(&existing->val.v.arr, 0, sizeof(existing->val.v.arr));
+                    existing->val.v.arr.elem_type = n->val_type;
+                    if (n->val_type == FVAL_DERIVED)
+                        copy_cstr(existing->val.v.arr.elem_type_name,
+                                  sizeof(existing->val.v.arr.elem_type_name), n->str_val);
+                    existing->val.v.arr.allocated = 0;
+                } else {
+                    existing->val = make_void_val();
+                }
+                existing->scalar_allocated = 0;
+            }
             if (n->val_type == FVAL_CHARACTER) existing->char_len = decl_char_len;
             break;
         }
@@ -7965,6 +8065,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             existing->is_pointer = n->is_pointer;
             existing->is_allocatable = n->is_allocatable;
             existing->is_target = n->is_target;
+            existing->declared_type = n->val_type;
+            existing->declared_kind = n->kind;
+            existing->declared_type_name[0] = '\0';
+            if (n->val_type == FVAL_DERIVED)
+                copy_cstr(existing->declared_type_name,
+                          sizeof(existing->declared_type_name), n->str_val);
             if (n->is_pointer && existing->val.type != FVAL_VOID)
                 existing->pointer_associated = 1;
             if (n->val_type == FVAL_CHARACTER) existing->char_len = decl_char_len;
@@ -8054,6 +8160,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (val_is_alias) v->is_alias = 1;
         if (n->is_parameter || n->type == FND_PARAMDECL) v->is_parameter = 1;
         v->is_allocatable = n->is_allocatable;
+        v->scalar_allocated = 0;
+        v->declared_type = n->val_type;
+        v->declared_kind = n->kind;
+        v->declared_type_name[0] = '\0';
+        if (n->val_type == FVAL_DERIVED)
+            copy_cstr(v->declared_type_name, sizeof(v->declared_type_name), n->str_val);
         v->is_pointer = n->is_pointer;
         v->is_target = n->is_target;
         v->is_protected = n->is_protected;
@@ -9044,6 +9156,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (var->val.type == FVAL_ARRAY && var->val.v.arr.allocated) {
             ofort_error(I, "Attempting to allocate already allocated variable '%s'", n->name);
         }
+        if (var->is_allocatable && var->val.type != FVAL_ARRAY && var->scalar_allocated) {
+            ofort_error(I, "Attempting to allocate already allocated variable '%s'", n->name);
+        }
         /* Get dimensions */
         int dims[7];
         int lower_bounds[7];
@@ -9057,6 +9172,39 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             copy_cstr(elem_type_name, sizeof(elem_type_name), var->val.v.dt.type_name);
 
         for (int i = 0; i < 7; i++) lower_bounds[i] = 1;
+        if (ndims == 0 && var->is_allocatable && var->val.type != FVAL_ARRAY) {
+            OfortValue new_val;
+            if (n->children[0]) {
+                OfortValue source = eval_node(I, n->children[0]);
+                new_val = copy_value(source);
+                free_value(&source);
+            } else if (n->children[1]) {
+                OfortValue mold = eval_node(I, n->children[1]);
+                if (mold.type == FVAL_DERIVED) {
+                    new_val = default_derived_value(I, mold.v.dt.type_name);
+                } else {
+                    int char_len = mold.type == FVAL_CHARACTER && mold.v.s ? (int)strlen(mold.v.s) : 1;
+                    new_val = default_value(mold.type, char_len);
+                }
+                free_value(&mold);
+            } else if (var->declared_type == FVAL_DERIVED) {
+                const char *type_name = var->declared_type_name[0] ? var->declared_type_name :
+                    (var->val.type == FVAL_DERIVED ? var->val.v.dt.type_name : "");
+                new_val = default_derived_value(I, type_name);
+            } else {
+                int char_len = var->char_len > 0 ? var->char_len : 1;
+                OfortValType target_type = var->declared_type != FVAL_VOID ?
+                    var->declared_type : var->val.type;
+                new_val = default_value(target_type, char_len);
+            }
+            if (var->declared_kind > 0 && is_numeric_type(new_val.type))
+                new_val.kind = var->declared_kind;
+            free_value(&var->val);
+            var->val = new_val;
+            var->scalar_allocated = 1;
+            if (var->is_pointer) var->pointer_associated = 1;
+            break;
+        }
         if (ndims > 0) {
             for (int i = 0; i < ndims; i++) {
                 int lower = 1;
@@ -9120,6 +9268,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             var->val = make_derived_array(I, elem_type_name, dims, ndims);
         else
             var->val = make_array(elem_type, dims, ndims);
+        var->scalar_allocated = 0;
         set_array_lower_bounds(&var->val, lower_bounds, ndims);
         if (n->children[0]) {
             OfortValue source = eval_node(I, n->children[0]);
@@ -9150,14 +9299,23 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         OfortVar *var = find_var(I, n->name);
         if (!var) ofort_error(I, "Variable '%s' not found for DEALLOCATE", n->name);
+        if (var->is_allocatable && var->val.type != FVAL_ARRAY) {
+            free_value(&var->val);
+            var->val = make_void_val();
+            var->scalar_allocated = 0;
+            if (var->is_pointer) var->pointer_associated = 0;
+            break;
+        }
         if (var->val.type == FVAL_DERIVED && (var->is_pointer || var->is_allocatable)) {
             if (var->is_pointer) var->pointer_associated = 0;
+            var->scalar_allocated = 0;
             break;
         }
         free_value(&var->val);
         var->val.type = FVAL_ARRAY;
         memset(&var->val.v.arr, 0, sizeof(var->val.v.arr));
         var->val.v.arr.allocated = 0;
+        var->scalar_allocated = 0;
         break;
     }
 
