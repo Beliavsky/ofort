@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <math.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 #include <io.h>
@@ -29,6 +30,12 @@ static int starts_with_word_nocase(const char *line, const char *word);
 static int identifier_char(int c);
 static int line_is_terminal_end(const char *start, const char *end);
 static int add_repl_line_to_buffer(char **buf, size_t *len, size_t *cap, const char *line);
+
+typedef struct {
+    const char **items;
+    int count;
+    int cap;
+} PathList;
 
 static int append_text(char **buf, size_t *len, size_t *cap, const char *text) {
     size_t n = strlen(text);
@@ -260,6 +267,79 @@ static double monotonic_seconds(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
 #endif
+}
+
+static void print_elapsed_time(double start) {
+    fprintf(stderr, "time: %.6f s\n", monotonic_seconds() - start);
+}
+
+static void print_detailed_time(double setup, const OfortTiming *timing) {
+    double total = setup;
+    OfortTiming zero;
+
+    if (!timing) {
+        memset(&zero, 0, sizeof(zero));
+        timing = &zero;
+    }
+    total += timing->total;
+    fprintf(stderr, "time:\n");
+    fprintf(stderr, "  setup:    %.6f s\n", setup);
+    fprintf(stderr, "  lex:      %.6f s\n", timing->lex);
+    fprintf(stderr, "  parse:    %.6f s\n", timing->parse);
+    fprintf(stderr, "  register: %.6f s\n", timing->register_time);
+    fprintf(stderr, "  execute:  %.6f s\n", timing->execute);
+    fprintf(stderr, "  total:    %.6f s\n", total);
+}
+
+static void print_source_line_fragment(FILE *fp, const char *source, int line_no) {
+    const char *p = source ? source : "";
+    const char *start;
+    const char *end;
+
+    if (line_no < 1) return;
+    for (int line = 1; line < line_no && *p; line++) {
+        p = strchr(p, '\n');
+        if (!p) return;
+        p++;
+    }
+    start = p;
+    end = strchr(start, '\n');
+    if (!end) end = start + strlen(start);
+    while (end > start && (end[-1] == '\r' || end[-1] == '\n')) end--;
+    fprintf(fp, "%.*s", (int)(end - start), start);
+}
+
+static void print_line_profile(OfortInterpreter *interp, const char *source) {
+    int n_entries = 0;
+    OfortLineProfileEntry *entries;
+    OfortTiming timing;
+    double accounted = 0.0;
+    double unprofiled;
+
+    if (!interp) return;
+    if (ofort_get_line_profile(interp, NULL, 0, &n_entries) != 0 || n_entries <= 0) return;
+    entries = (OfortLineProfileEntry *)calloc((size_t)n_entries, sizeof(*entries));
+    if (!entries) return;
+    if (ofort_get_line_profile(interp, entries, n_entries, &n_entries) != 0) {
+        free(entries);
+        return;
+    }
+
+    fprintf(stderr, "\nline profile:\n");
+    fprintf(stderr, "%6s %8s %12s  %s\n", "line", "count", "seconds", "source");
+    for (int i = 0; i < n_entries; i++) {
+        accounted += entries[i].seconds;
+        fprintf(stderr, "%6d %8d %12.6f  ", entries[i].line, entries[i].count, entries[i].seconds);
+        print_source_line_fragment(stderr, source, entries[i].line);
+        fputc('\n', stderr);
+    }
+    if (ofort_get_timing(interp, &timing) == 0 && timing.execute > accounted) {
+        unprofiled = timing.execute - accounted;
+        if (unprofiled > 0.0000005) {
+            fprintf(stderr, "%6s %8s %12.6f  %s\n", "-", "-", unprofiled, "(unprofiled interpreter overhead)");
+        }
+    }
+    free(entries);
 }
 
 static int word_at_line_start(const char *line, int line_len, const char *word) {
@@ -844,6 +924,70 @@ static int source_indent_level(const char *source) {
     return indent;
 }
 
+static int source_inside_procedure(const char *source) {
+    const char *line = source;
+    int depth = 0;
+
+    while (line && *line) {
+        const char *end = strchr(line, '\n');
+        char local[4096];
+        char lower[4096];
+        size_t len = end ? (size_t)(end - line) : strlen(line);
+        if (len >= sizeof(local)) len = sizeof(local) - 1;
+        memcpy(local, line, len);
+        local[len] = '\0';
+        lower_logical_line(lower, sizeof(lower), local);
+        if (line_starts_word_lower(lower, "end") &&
+            (line_contains_word_lower(lower, "subroutine") ||
+             line_contains_word_lower(lower, "function"))) {
+            if (depth > 0) depth--;
+        } else if (line_starts_word_lower(lower, "subroutine") ||
+                   line_starts_word_lower(lower, "function")) {
+            depth++;
+        }
+        line = end ? end + 1 : NULL;
+    }
+
+    return depth > 0;
+}
+
+static int repl_line_has_implicit_save(const char *line, char *name, size_t name_size) {
+    char lower[4096];
+    const char *p;
+    const char *dc;
+    const char *eq;
+
+    lower_logical_line(lower, sizeof(lower), line);
+    if (!(line_starts_word_lower(lower, "integer") ||
+          line_starts_word_lower(lower, "real") ||
+          line_starts_word_lower(lower, "double") ||
+          line_starts_word_lower(lower, "character") ||
+          line_starts_word_lower(lower, "logical") ||
+          line_starts_word_lower(lower, "complex"))) {
+        return 0;
+    }
+    if (!strstr(lower, "::") || !strchr(lower, '=')) return 0;
+    if (line_contains_word_lower(lower, "save") || line_contains_word_lower(lower, "parameter")) return 0;
+
+    dc = strstr(line, "::");
+    eq = strchr(dc ? dc + 2 : line, '=');
+    if (!dc || !eq) return 0;
+    p = dc + 2;
+    while (p < eq && isspace((unsigned char)*p)) p++;
+    if (!(isalpha((unsigned char)*p) || *p == '_')) return 0;
+    {
+        const char *start = p;
+        while (p < eq && identifier_char(*p)) p++;
+        if (name_size > 0) {
+            size_t len = (size_t)(p - start);
+            if (len >= name_size) len = name_size - 1;
+            memcpy(name, start, len);
+            name[len] = '\0';
+        }
+    }
+    return 1;
+}
+
 static int is_buffer_declaration_line(const char *line) {
     const char *p = skip_space(line);
     return is_blank_or_comment_line(line) ||
@@ -1175,20 +1319,30 @@ static int is_immediate_expression_line(const char *line) {
 }
 
 static int g_implicit_typing = 0;
+static int g_warnings_enabled = 1;
+static int g_time_detail = 0;
+static int g_fast_mode = 0;
+static int g_specialized_fast_paths = 1;
+static int g_line_profile = 0;
 
 static OfortInterpreter *create_ofort_interpreter(void) {
     OfortInterpreter *interp = ofort_create();
     if (interp) {
         ofort_set_implicit_typing(interp, g_implicit_typing);
+        ofort_set_warnings_enabled(interp, g_warnings_enabled);
+        ofort_set_fast_mode(interp, g_fast_mode);
+        ofort_set_specialized_fast_paths(interp, g_specialized_fast_paths);
+        ofort_set_line_profile_enabled(interp, g_line_profile);
     }
     return interp;
 }
 
 static int execute_source_text(const char *text, int print_expr_statements, int suppress_output,
-                               int command_argc, char **command_args) {
+                               int command_argc, char **command_args, double setup_start) {
     char *source = copy_string(text);
     OfortInterpreter *interp;
     int rc;
+    double setup_elapsed;
 
     if (!source) {
         return 2;
@@ -1199,6 +1353,7 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
     if (!source) {
         return 2;
     }
+    setup_elapsed = monotonic_seconds() - setup_start;
 
     interp = create_ofort_interpreter();
     if (!interp) {
@@ -1212,12 +1367,31 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
 
     rc = ofort_execute(interp, source);
     if (rc == 0) {
+        const char *warnings = ofort_get_warnings(interp);
         const char *output = ofort_get_output(interp);
+        if (g_time_detail) {
+            OfortTiming timing;
+            if (ofort_get_timing(interp, &timing) == 0) {
+                print_detailed_time(setup_elapsed, &timing);
+            }
+        }
+        if (warnings && warnings[0] != '\0') {
+            fputs(warnings, stderr);
+        }
         if (output && output[0] != '\0') {
             fputs(output, stdout);
         }
+        if (g_line_profile) {
+            print_line_profile(interp, source);
+        }
     } else {
         const char *error = ofort_get_error(interp);
+        if (g_time_detail) {
+            OfortTiming timing;
+            if (ofort_get_timing(interp, &timing) == 0) {
+                print_detailed_time(setup_elapsed, &timing);
+            }
+        }
         fprintf(stderr, "%s\n", (error && error[0] != '\0') ? error : "Fortran execution failed");
     }
 
@@ -1251,7 +1425,11 @@ static int execute_source_text_on_interpreter(OfortInterpreter *interp, const ch
 
     rc = ofort_execute(interp, source);
     if (rc == 0) {
+        const char *warnings = ofort_get_warnings(interp);
         const char *output = ofort_get_output(interp);
+        if (warnings && warnings[0] != '\0') {
+            fputs(warnings, stderr);
+        }
         if (output && output[0] != '\0') {
             fputs(output, stdout);
         }
@@ -1288,6 +1466,10 @@ static int run_ofort_file_to_path(const char *source_path, const char *out_path)
 
     rc = ofort_execute(interp, source);
     if (rc == 0) {
+        const char *warnings = ofort_get_warnings(interp);
+        if (warnings && warnings[0] != '\0') {
+            fputs(warnings, stderr);
+        }
         fp = fopen(out_path, "wb");
         if (!fp) {
             fprintf(stderr, "failed to open %s\n", out_path);
@@ -1308,9 +1490,11 @@ static int run_ofort_file_to_path(const char *source_path, const char *out_path)
 }
 
 static int check_ofort_file(const char *source_path) {
+    double setup_start = monotonic_seconds();
     char *source = read_file(source_path);
     OfortInterpreter *interp;
     int rc;
+    double setup_elapsed;
 
     if (!source) {
         return 2;
@@ -1320,6 +1504,7 @@ static int check_ofort_file(const char *source_path) {
     if (!source) {
         return 2;
     }
+    setup_elapsed = monotonic_seconds() - setup_start;
 
     interp = create_ofort_interpreter();
     if (!interp) {
@@ -1329,6 +1514,12 @@ static int check_ofort_file(const char *source_path) {
     }
 
     rc = ofort_check(interp, source);
+    if (g_time_detail) {
+        OfortTiming timing;
+        if (ofort_get_timing(interp, &timing) == 0) {
+            print_detailed_time(setup_elapsed, &timing);
+        }
+    }
     if (rc == 0) {
         printf("ofort check passed\n");
     } else {
@@ -1339,6 +1530,41 @@ static int check_ofort_file(const char *source_path) {
     ofort_destroy(interp);
     free(source);
     return rc == 0 ? 0 : 1;
+}
+
+static int run_each_file(const char *const *paths, int npaths, int syntax_check,
+                         int command_argc, char **command_args, int time_operation) {
+    int failures = 0;
+
+    for (int i = 0; i < npaths; i++) {
+        int rc;
+        double start = monotonic_seconds();
+        if (i > 0) {
+            printf("\n");
+        }
+        printf("==> %s\n", paths[i]);
+        fflush(stdout);
+
+        if (syntax_check) {
+            rc = check_ofort_file(paths[i]);
+        } else {
+            char *source = read_file(paths[i]);
+            if (!source) {
+                rc = 2;
+            } else {
+                rc = execute_source_text(source, 0, 0, command_argc, command_args, start);
+                free(source);
+            }
+        }
+        if (time_operation && !g_time_detail) {
+            print_elapsed_time(start);
+        }
+        if (rc != 0) {
+            failures++;
+        }
+    }
+
+    return failures == 0 ? 0 : 1;
 }
 
 static int next_normalized_char(FILE *fp) {
@@ -1831,6 +2057,97 @@ static char *copy_edit_text_with_newline(const char *text) {
     copy[len] = '\0';
     return copy;
 }
+
+static int path_list_add(PathList *list, const char *path) {
+    const char **new_items;
+    char *copy;
+
+    if (list->count >= list->cap) {
+        int new_cap = list->cap ? list->cap * 2 : 16;
+        new_items = (const char **)realloc(list->items, (size_t)new_cap * sizeof(*list->items));
+        if (!new_items) {
+            fprintf(stderr, "out of memory\n");
+            return 0;
+        }
+        list->items = new_items;
+        list->cap = new_cap;
+    }
+    copy = copy_string(path);
+    if (!copy) return 0;
+    list->items[list->count++] = copy;
+    return 1;
+}
+
+static void path_list_free(PathList *list) {
+    if (!list) return;
+    for (int i = 0; i < list->count; i++) {
+        free((void *)list->items[i]);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->cap = 0;
+}
+
+static int has_glob_wildcard(const char *path) {
+    return path && (strchr(path, '*') || strchr(path, '?'));
+}
+
+#ifdef _WIN32
+static int expand_windows_glob(PathList *list, const char *pattern) {
+    intptr_t handle;
+    struct _finddata_t data;
+    char dir[1024];
+    const char *slash1;
+    const char *slash2;
+    const char *base;
+    size_t dir_len;
+    int matched = 0;
+
+    if (!has_glob_wildcard(pattern)) {
+        return path_list_add(list, pattern);
+    }
+
+    slash1 = strrchr(pattern, '\\');
+    slash2 = strrchr(pattern, '/');
+    base = slash1 > slash2 ? slash1 : slash2;
+    if (base) {
+        dir_len = (size_t)(base - pattern + 1);
+        if (dir_len >= sizeof(dir)) {
+            fprintf(stderr, "path too long: %s\n", pattern);
+            return 0;
+        }
+        memcpy(dir, pattern, dir_len);
+        dir[dir_len] = '\0';
+    } else {
+        dir[0] = '\0';
+    }
+
+    handle = _findfirst(pattern, &data);
+    if (handle == -1) {
+        return path_list_add(list, pattern);
+    }
+
+    do {
+        char full[2048];
+        if (data.attrib & _A_SUBDIR) continue;
+        snprintf(full, sizeof(full), "%s%s", dir, data.name);
+        if (!path_list_add(list, full)) {
+            _findclose(handle);
+            return 0;
+        }
+        matched = 1;
+    } while (_findnext(handle, &data) == 0);
+
+    _findclose(handle);
+    if (!matched) return path_list_add(list, pattern);
+    return 1;
+}
+#else
+static int expand_windows_glob(PathList *list, const char *pattern) {
+    return path_list_add(list, pattern);
+}
+#endif
 
 static int insert_source_line(char **buf, size_t *len, size_t *cap, int line_no, const char *text) {
     int n_lines = source_line_count(*buf ? *buf : "");
@@ -2543,6 +2860,17 @@ static int run_interactive(const char *load_path, int run_after_load) {
         }
 
         {
+            char save_name[256];
+            if (g_warnings_enabled &&
+                source_inside_procedure(buf ? buf : "") &&
+                repl_line_has_implicit_save(line, save_name, sizeof(save_name))) {
+                fprintf(stderr,
+                        "warning: local variable '%s' has implicit SAVE due to initialization\n",
+                        save_name);
+            }
+        }
+
+        {
             int line_indent = source_indent_level(buf ? buf : "");
             if (repl_line_pre_dedent(line) && line_indent > 0) {
                 line_indent--;
@@ -2725,54 +3053,84 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
-    fprintf(stderr, "       %s [--implicit-typing] --load file.f90\n", program);
-    fprintf(stderr, "       %s [--implicit-typing] --load-run file.f90\n", program);
-    fprintf(stderr, "       %s [--implicit-typing] --check file.f90\n", program);
+    fprintf(stderr, "usage: %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "       %s --each [--check] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
+    fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing] --load file.f90\n", program);
+    fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing] --load-run file.f90\n", program);
+    fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing] --check file.f90\n", program);
     fprintf(stderr, "       %s --check-gfortran file.f90\n", program);
     fprintf(stderr, "       %s < file.f90\n", program);
+    fprintf(stderr, "       -w suppresses warnings\n");
+    fprintf(stderr, "       --fast enables safe interpreter fast paths and suppresses warnings\n");
+    fprintf(stderr, "       --no-specialize disables specialized pattern/program fast paths\n");
+    fprintf(stderr, "       --time prints elapsed time for the requested operation\n");
+    fprintf(stderr, "       --time-detail prints setup, lex, parse, register, execute, and total times\n");
+    fprintf(stderr, "       --profile-lines prints elapsed execution time by source line\n");
+    fprintf(stderr, "       --each treats each file or Windows glob match as a separate program\n");
     fprintf(stderr, "       --implicit-typing, --legacy-implicit enables historical I-N integer/rest real implicit typing\n");
     fprintf(stderr, "       with no file in a console, start an interactive session\n");
 }
 
 int main(int argc, char **argv) {
     char *source;
-    const char **source_paths = NULL;
+    PathList source_paths = {0};
     const char *load_path = NULL;
     const char *syntax_check_path = NULL;
     const char *check_path = NULL;
     char **program_args = NULL;
     int program_argc = 0;
     int run_after_load = 0;
-    int nsource_paths = 0;
+    int time_operation = 0;
+    int each_mode = 0;
+    int each_check = 0;
+    double setup_start = 0.0;
     int i;
 
-    source_paths = (const char **)calloc((size_t)argc, sizeof(*source_paths));
-    if (!source_paths) {
-        fprintf(stderr, "out of memory\n");
-        return 2;
+    for (i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--each") == 0) {
+            each_mode = 1;
+            break;
+        }
     }
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--implicit-typing") == 0 || strcmp(argv[i], "--legacy-implicit") == 0) {
             g_implicit_typing = 1;
+        } else if (strcmp(argv[i], "-w") == 0) {
+            g_warnings_enabled = 0;
+        } else if (strcmp(argv[i], "--fast") == 0) {
+            g_fast_mode = 1;
+            g_warnings_enabled = 0;
+        } else if (strcmp(argv[i], "--no-specialize") == 0) {
+            g_specialized_fast_paths = 0;
+        } else if (strcmp(argv[i], "--time") == 0) {
+            time_operation = 1;
+        } else if (strcmp(argv[i], "--time-detail") == 0) {
+            time_operation = 1;
+            g_time_detail = 1;
+        } else if (strcmp(argv[i], "--profile-lines") == 0) {
+            g_line_profile = 1;
+        } else if (strcmp(argv[i], "--each") == 0) {
+            each_mode = 1;
         } else if (strcmp(argv[i], "--") == 0) {
             program_args = &argv[i + 1];
             program_argc = argc - i - 1;
             break;
+        } else if (each_mode && strcmp(argv[i], "--check") == 0) {
+            each_check = 1;
         } else if (strcmp(argv[i], "--load") == 0 ||
                    strcmp(argv[i], "--load-run") == 0 ||
-                   strcmp(argv[i], "--check") == 0 ||
+                   (!each_mode && strcmp(argv[i], "--check") == 0) ||
                    strcmp(argv[i], "--check-gfortran") == 0) {
             const char *opt = argv[i];
             if (++i >= argc) {
                 print_usage(argv[0]);
-                free(source_paths);
+                path_list_free(&source_paths);
                 return 2;
             }
-            if (load_path || syntax_check_path || check_path || nsource_paths > 0) {
+            if (each_mode || load_path || syntax_check_path || check_path || source_paths.count > 0) {
                 print_usage(argv[0]);
-                free(source_paths);
+                path_list_free(&source_paths);
                 return 2;
             }
             if (strcmp(opt, "--load") == 0) {
@@ -2787,52 +3145,83 @@ int main(int argc, char **argv) {
             }
         } else if (argv[i][0] == '-') {
             print_usage(argv[0]);
-            free(source_paths);
+            path_list_free(&source_paths);
             return 2;
         } else {
             if (load_path || syntax_check_path || check_path) {
                 print_usage(argv[0]);
-                free(source_paths);
+                path_list_free(&source_paths);
                 return 2;
             }
-            source_paths[nsource_paths++] = argv[i];
+            if (each_mode) {
+                if (!expand_windows_glob(&source_paths, argv[i])) {
+                    path_list_free(&source_paths);
+                    return 2;
+                }
+            } else if (!path_list_add(&source_paths, argv[i])) {
+                path_list_free(&source_paths);
+                return 2;
+            }
         }
     }
 
     if (check_path) {
+        double start = monotonic_seconds();
         int rc = check_with_gfortran(check_path);
-        free(source_paths);
+        if (time_operation) print_elapsed_time(start);
+        path_list_free(&source_paths);
         return rc;
     }
 
     if (syntax_check_path) {
+        double start = monotonic_seconds();
         int rc = check_ofort_file(syntax_check_path);
-        free(source_paths);
+        if (time_operation && !g_time_detail) print_elapsed_time(start);
+        path_list_free(&source_paths);
         return rc;
     }
 
     if (load_path) {
+        double start = monotonic_seconds();
         int rc = run_interactive(load_path, run_after_load);
-        free(source_paths);
+        if (time_operation) print_elapsed_time(start);
+        path_list_free(&source_paths);
         return rc;
     }
 
-    if (nsource_paths > 0) {
-        source = read_files_concatenated(source_paths, nsource_paths);
+    if (each_mode) {
+        int rc;
+        if (source_paths.count == 0) {
+            print_usage(argv[0]);
+            path_list_free(&source_paths);
+            return 2;
+        }
+        rc = run_each_file(source_paths.items, source_paths.count, each_check,
+                           program_argc, program_args, time_operation);
+        path_list_free(&source_paths);
+        return rc;
+    }
+
+    if (source_paths.count > 0) {
+        setup_start = monotonic_seconds();
+        source = read_files_concatenated(source_paths.items, source_paths.count);
     } else if (ISATTY(FILENO(stdin))) {
-        free(source_paths);
+        path_list_free(&source_paths);
         return run_interactive(NULL, 0);
     } else {
+        setup_start = monotonic_seconds();
         source = read_stream(stdin, "stdin");
     }
     if (!source) {
-        free(source_paths);
+        path_list_free(&source_paths);
         return 2;
     }
     {
-        int rc = execute_source_text(source, 0, 0, program_argc, program_args);
+        double start = setup_start > 0.0 ? setup_start : monotonic_seconds();
+        int rc = execute_source_text(source, 0, 0, program_argc, program_args, start);
+        if (time_operation && !g_time_detail) print_elapsed_time(start);
         free(source);
-        free(source_paths);
+        path_list_free(&source_paths);
         return rc;
     }
 }
