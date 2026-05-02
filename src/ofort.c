@@ -4522,6 +4522,19 @@ typedef struct {
 static int eval_subscript_range(OfortInterpreter *I, OfortNode *sub, int dim_extent,
                                 OfortSubscriptRange *range);
 static int section_linear_index(OfortValue *arr, int *subscripts, int nsubs);
+static OfortValue array_element_value(const OfortValue *arr, int index);
+
+static int derived_field_index(OfortValue *obj, const char *name) {
+    char upper[256];
+    if (!obj || obj->type != FVAL_DERIVED) return -1;
+    str_upper(upper, name, 256);
+    for (int i = 0; i < obj->v.dt.n_fields; i++) {
+        char fu[256];
+        str_upper(fu, obj->v.dt.field_names[i], 256);
+        if (strcmp(upper, fu) == 0) return i;
+    }
+    return -1;
+}
 
 static OfortValue *member_lvalue(OfortInterpreter *I, OfortNode *n) {
     if (!n) return NULL;
@@ -4582,6 +4595,34 @@ static OfortValue *member_lvalue(OfortInterpreter *I, OfortNode *n) {
         return &arr->v.arr.data[index];
     }
     return NULL;
+}
+
+static int assign_derived_array_member(OfortInterpreter *I, OfortNode *lhs, OfortValue *rhs) {
+    OfortVar *var;
+    int field_idx;
+    OfortValue *first_field;
+    if (!lhs || lhs->type != FND_MEMBER || !lhs->children[0] ||
+        lhs->children[0]->type != FND_IDENT) {
+        return 0;
+    }
+    var = find_var(I, lhs->children[0]->name);
+    if (!var || var->val.type != FVAL_ARRAY || !var->val.v.arr.data ||
+        var->val.v.arr.len <= 0 || var->val.v.arr.data[0].type != FVAL_DERIVED) {
+        return 0;
+    }
+    field_idx = derived_field_index(&var->val.v.arr.data[0], lhs->name);
+    if (field_idx < 0) ofort_error(I, "Unknown member '%s'", lhs->name);
+    first_field = &var->val.v.arr.data[0].v.dt.fields[field_idx];
+    if (rhs->type == FVAL_ARRAY && rhs->v.arr.len != var->val.v.arr.len)
+        ofort_error(I, "Array assignment shape mismatch");
+    for (int i = 0; i < var->val.v.arr.len; i++) {
+        OfortValue *field = &var->val.v.arr.data[i].v.dt.fields[field_idx];
+        OfortValue elem = rhs->type == FVAL_ARRAY ? array_element_value(rhs, i) : copy_value(*rhs);
+        elem = coerce_assignment_value(I, lhs->name, first_field->type, elem);
+        free_value(field);
+        *field = elem;
+    }
+    return 1;
 }
 
 static int eval_character_length(OfortInterpreter *I, OfortNode *n) {
@@ -4730,6 +4771,30 @@ static OfortValue make_derived_array(OfortInterpreter *I, const char *type_name,
         }
     }
     return v;
+}
+
+static OfortValue make_derived_array_from_decl(OfortInterpreter *I, OfortNode *n) {
+    int dims[7];
+    int lower_bounds[7];
+    int ndims = n->n_dims;
+
+    for (int i = 0; i < ndims; i++) {
+        lower_bounds[i] = n->has_lower_bound[i] ? n->lower_bounds[i] : 1;
+        dims[i] = n->dims[i];
+        if (dims[i] <= 0 && n->stmts && i < n->n_stmts && n->stmts[i]) {
+            OfortValue dv = eval_node(I, n->stmts[i]);
+            dims[i] = (int)val_to_int(dv);
+            free_value(&dv);
+        }
+        if (n->has_lower_bound[i]) {
+            dims[i] = dims[i] - lower_bounds[i] + 1;
+        }
+        if (dims[i] < 0) dims[i] = 0;
+    }
+
+    OfortValue arr = make_derived_array(I, n->str_val, dims, ndims);
+    set_array_lower_bounds(&arr, lower_bounds, ndims);
+    return arr;
 }
 
 static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
@@ -5270,6 +5335,9 @@ static OfortUnitFile *ensure_unit_file(OfortInterpreter *I, int unit, int for_wr
     if (entry) return entry;
     if (unit < 0 || unit == 5 || unit == 6) return NULL;
     snprintf(path, sizeof(path), "fort.%d", unit);
+    ofort_warning(I, I->current_line,
+                  "warning: implicit external unit %d uses default file '%s'; prefer OPEN with FILE=",
+                  unit, path);
     set_unit_file(I, unit, path);
     if (for_write) {
         FILE *fp = fopen(path, "w");
@@ -5724,31 +5792,48 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
     }
 }
 
+static void append_flattened_output_value(OfortInterpreter *I, OfortValue value,
+                                          OfortValue **flat, int *count, int *cap) {
+    (void)I;
+    if (value.type == FVAL_ARRAY) {
+        for (int i = 0; i < value.v.arr.len; i++) {
+            OfortValue elem = array_element_value(&value, i);
+            append_flattened_output_value(I, elem, flat, count, cap);
+            free_value(&elem);
+        }
+        return;
+    }
+    if (value.type == FVAL_DERIVED && value.v.dt.fields) {
+        for (int i = 0; i < value.v.dt.n_fields; i++) {
+            append_flattened_output_value(I, value.v.dt.fields[i], flat, count, cap);
+        }
+        return;
+    }
+    if (*count >= *cap) {
+        *cap = *cap ? *cap * 2 : 8;
+        *flat = (OfortValue *)realloc(*flat, sizeof(OfortValue) * (size_t)*cap);
+        if (!*flat) ofort_error(I, "Out of memory flattening output list");
+    }
+    (*flat)[(*count)++] = copy_value(value);
+}
+
 /* Format output using Fortran format descriptors */
 static void format_output(OfortInterpreter *I, const char *fmt, OfortValue *vals, int nvals) {
-    int flattened_count = 0;
     int needs_flatten = 0;
     for (int i = 0; i < nvals; i++) {
-        if (vals[i].type == FVAL_ARRAY) {
+        if (vals[i].type == FVAL_ARRAY || vals[i].type == FVAL_DERIVED) {
             needs_flatten = 1;
-            flattened_count += vals[i].v.arr.len;
-        } else {
-            flattened_count++;
         }
     }
     if (needs_flatten) {
-        OfortValue *flat = (OfortValue *)calloc(flattened_count ? flattened_count : 1, sizeof(OfortValue));
-        int k = 0;
-        if (!flat) ofort_error(I, "Out of memory flattening output list");
+        OfortValue *flat = NULL;
+        int flattened_count = 0;
+        int flat_cap = 0;
         for (int i = 0; i < nvals; i++) {
-            if (vals[i].type == FVAL_ARRAY) {
-                for (int j = 0; j < vals[i].v.arr.len; j++) {
-                    flat[k++] = copy_value(vals[i].v.arr.data[j]);
-                }
-            } else {
-                flat[k++] = copy_value(vals[i]);
-            }
+            append_flattened_output_value(I, vals[i], &flat, &flattened_count, &flat_cap);
         }
+        if (!flat) flat = (OfortValue *)calloc(1, sizeof(OfortValue));
+        if (!flat) ofort_error(I, "Out of memory flattening output list");
         format_output(I, fmt, flat, flattened_count);
         for (int i = 0; i < flattened_count; i++) free_value(&flat[i]);
         free(flat);
@@ -6570,18 +6655,34 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 return result;
             }
         }
+        if (obj.type == FVAL_ARRAY && obj.v.arr.data && obj.v.arr.len > 0 &&
+            obj.v.arr.data[0].type == FVAL_DERIVED) {
+            int field_idx;
+            OfortValue result;
+            OfortValue first;
+            if (!obj.v.arr.data || obj.v.arr.len <= 0) {
+                free_value(&obj);
+                return make_void_val();
+            }
+            field_idx = derived_field_index(&obj.v.arr.data[0], n->name);
+            if (field_idx < 0) ofort_error(I, "Unknown member '%s'", n->name);
+            first = obj.v.arr.data[0].v.dt.fields[field_idx];
+            result = make_array(first.type, obj.v.arr.dims, obj.v.arr.n_dims);
+            for (int i = 0; i < obj.v.arr.len; i++) {
+                OfortValue elem = copy_value(obj.v.arr.data[i].v.dt.fields[field_idx]);
+                free_value(&result.v.arr.data[i]);
+                result.v.arr.data[i] = elem;
+            }
+            free_value(&obj);
+            return result;
+        }
         if (obj.type != FVAL_DERIVED)
             ofort_error(I, "Cannot access member of non-derived type");
-        char upper[256];
-        str_upper(upper, n->name, 256);
-        for (int i = 0; i < obj.v.dt.n_fields; i++) {
-            char fu[256];
-            str_upper(fu, obj.v.dt.field_names[i], 256);
-            if (strcmp(upper, fu) == 0) {
-                OfortValue result = copy_value(obj.v.dt.fields[i]);
-                free_value(&obj);
-                return result;
-            }
+        int field_idx = derived_field_index(&obj, n->name);
+        if (field_idx >= 0) {
+            OfortValue result = copy_value(obj.v.dt.fields[field_idx]);
+            free_value(&obj);
+            return result;
         }
         ofort_error(I, "Unknown member '%s'", n->name);
         return make_void_val();
@@ -7889,7 +7990,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         } else if (n->n_dims > 0 && !n->is_allocatable) {
             /* Array declaration */
             if (n->val_type == FVAL_DERIVED) {
-                val = make_derived_array(I, n->str_val, n->dims, n->n_dims);
+                val = make_derived_array_from_decl(I, n);
             } else if (can_reuse_fast_local_array(I, n)) {
                 val = fast_reusable_local_array_value(I, n);
                 val_is_alias = 1;
@@ -8108,6 +8209,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     free_value(&rhs);
                     break;
                 }
+            }
+            if (assign_derived_array_member(I, lhs, &rhs)) {
+                free_value(&rhs);
+                break;
             }
             OfortValue *target = member_lvalue(I, lhs);
             if (target) {
