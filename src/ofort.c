@@ -9041,6 +9041,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         OfortVar *var = find_var(I, n->name);
         if (!var) ofort_error(I, "Variable '%s' not found for ALLOCATE", n->name);
+        if (var->val.type == FVAL_ARRAY && var->val.v.arr.allocated) {
+            ofort_error(I, "Attempting to allocate already allocated variable '%s'", n->name);
+        }
         /* Get dimensions */
         int dims[7];
         int lower_bounds[7];
