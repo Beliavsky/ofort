@@ -1624,6 +1624,7 @@ static const char *token_arg_name(OfortToken *t) {
     if (t->type == FTOK_INTENT) return "intent";
     if (t->type == FTOK_RESULT) return "result";
     if (t->type == FTOK_ALLOCATABLE) return "allocatable";
+    if (t->type == FTOK_END) return "end";
     if (t->type == FTOK_IN || t->type == FTOK_OUT || t->type == FTOK_INOUT) return NULL;
     return NULL;
 }
