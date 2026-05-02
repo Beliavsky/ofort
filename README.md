@@ -3,7 +3,7 @@
 `ofort` is a small offline interpreter for a practical subset of Fortran.
 It is written in C and runs Fortran source directly from the command line or
 from an interactive REPL. The project began as an extraction from
-[CodeBench](https://github.com/yu314-coder/CodeBench) and is now organized as a
+[CodeBench](https://github.com/yu314-coder/CodeBench) by [yu314-coder](https://github.com/yu314-coder) and is now organized as a
 standalone command-line interpreter.
 
 `ofort` is intended for experimentation, small examples, tests, and interpreter
