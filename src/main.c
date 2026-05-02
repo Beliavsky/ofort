@@ -1318,7 +1318,7 @@ static int is_immediate_expression_line(const char *line) {
     return 1;
 }
 
-static int g_implicit_typing = 0;
+static int g_implicit_typing = 1;
 static int g_warnings_enabled = 1;
 static int g_time_detail = 0;
 static int g_fast_mode = 0;
@@ -3053,11 +3053,11 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
     fprintf(stderr, "       %s --each [--check] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
-    fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing] --load file.f90\n", program);
-    fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing] --load-run file.f90\n", program);
-    fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing] --check file.f90\n", program);
+    fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
+    fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
+    fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --check file.f90\n", program);
     fprintf(stderr, "       %s --check-gfortran file.f90\n", program);
     fprintf(stderr, "       %s < file.f90\n", program);
     fprintf(stderr, "       -w suppresses warnings\n");
@@ -3067,7 +3067,8 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --time-detail prints setup, lex, parse, register, execute, and total times\n");
     fprintf(stderr, "       --profile-lines prints elapsed execution time by source line\n");
     fprintf(stderr, "       --each treats each file or Windows glob match as a separate program\n");
-    fprintf(stderr, "       --implicit-typing, --legacy-implicit enables historical I-N integer/rest real implicit typing\n");
+    fprintf(stderr, "       --implicit-typing, --legacy-implicit uses I-N integer/rest real implicit typing (default)\n");
+    fprintf(stderr, "       --no-implicit-typing rejects undeclared variables unless declared or covered by IMPLICIT\n");
     fprintf(stderr, "       with no file in a console, start an interactive session\n");
 }
 
@@ -3096,6 +3097,8 @@ int main(int argc, char **argv) {
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--implicit-typing") == 0 || strcmp(argv[i], "--legacy-implicit") == 0) {
             g_implicit_typing = 1;
+        } else if (strcmp(argv[i], "--no-implicit-typing") == 0) {
+            g_implicit_typing = 0;
         } else if (strcmp(argv[i], "-w") == 0) {
             g_warnings_enabled = 0;
         } else if (strcmp(argv[i], "--fast") == 0) {
