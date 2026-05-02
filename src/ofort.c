@@ -923,9 +923,19 @@ static OfortFunc *find_matching_generic_func(OfortInterpreter *I, const char *na
         OfortFunc *func = find_func(I, g->procedures[i]);
         if (!func || !func->is_function || !func->node) continue;
         OfortNode *fn = func->node;
-        if (fn->n_params != nargs) continue;
         int match = 1;
+        if (nargs > fn->n_params) continue;
+        for (int j = nargs; j < fn->n_params; j++) {
+            if (!fn->param_optional[j]) {
+                match = 0;
+                break;
+            }
+        }
+        if (!match) continue;
         for (int j = 0; j < nargs; j++) {
+            if (args[j].type == FVAL_VOID && fn->param_optional[j]) {
+                continue;
+            }
             OfortValType actual_type = args[j].type == FVAL_ARRAY ? args[j].v.arr.elem_type : args[j].type;
             int actual_rank = args[j].type == FVAL_ARRAY ? args[j].v.arr.n_dims : 0;
             if (fn->param_types[j] != FVAL_VOID && fn->param_types[j] != actual_type) {
@@ -949,6 +959,18 @@ static OfortGeneric *find_generic(OfortInterpreter *I, const char *name) {
         char gu[256];
         str_upper(gu, I->generics[i].name, 256);
         if (strcmp(upper, gu) == 0) return &I->generics[i];
+    }
+    return NULL;
+}
+
+static OfortModule *find_module(OfortInterpreter *I, const char *name) {
+    char upper[256];
+    if (!name || !name[0]) return NULL;
+    str_upper(upper, name, 256);
+    for (int i = 0; i < I->n_modules; i++) {
+        char mu[256];
+        str_upper(mu, I->modules[i].name, 256);
+        if (strcmp(upper, mu) == 0) return &I->modules[i];
     }
     return NULL;
 }
@@ -1015,7 +1037,7 @@ static void register_generic(OfortInterpreter *I, OfortNode *node) {
     }
 }
 
-static void register_func(OfortInterpreter *I, const char *name, OfortNode *node, int is_function) {
+static OfortFunc *register_func(OfortInterpreter *I, const char *name, OfortNode *node, int is_function) {
     ensure_func_capacity(I, 1);
     OfortFunc *f = &I->funcs[I->n_funcs++];
     copy_cstr(f->name, sizeof(f->name), name);
@@ -1023,6 +1045,7 @@ static void register_func(OfortInterpreter *I, const char *name, OfortNode *node
     f->is_function = is_function;
     f->module_name[0] = '\0';
     f->n_saved_vars = 0;
+    return f;
 }
 
 static OfortVar *find_saved_var(OfortFunc *func, const char *name) {
@@ -6148,19 +6171,18 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         /* Evaluate all args */
         for (int i = 0; i < nargs; i++) args[i] = eval_node(I, n->stmts[i]);
 
-        /* Check for intrinsic */
-        if (is_intrinsic(n->name)) {
-            OfortValue result = call_intrinsic(I, n->name, args, nargs, n->param_names);
-            for (int i = 0; i < nargs; i++) free_value(&args[i]);
-            return result;
-        }
-
         /* Check for user function */
         OfortFunc *func = find_func(I, n->name);
         if (!func) func = find_matching_generic_func(I, n->name, args, nargs);
         if (func && func->is_function) {
             OfortNode *fn = func->node;
             push_scope(I);
+            OfortModule *mod = find_module(I, func->module_name);
+            if (mod) {
+                for (int i = 0; i < mod->n_vars; i++) {
+                    declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+                }
+            }
             /* Bind parameters */
             for (int i = 0; i < fn->n_params; i++) {
                 if (i < nargs && args[i].type != FVAL_VOID) {
@@ -6211,6 +6233,13 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 }
             }
 
+            for (int i = 0; i < nargs; i++) free_value(&args[i]);
+            return result;
+        }
+
+        /* Check for intrinsic after user/module procedures so names such as RANGE can be overridden. */
+        if (is_intrinsic(n->name)) {
+            OfortValue result = call_intrinsic(I, n->name, args, nargs, n->param_names);
             for (int i = 0; i < nargs; i++) free_value(&args[i]);
             return result;
         }
@@ -7306,7 +7335,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 OfortNode *s = body->stmts[i];
                 if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION)) {
                     annotate_procedure_params(s);
-                    register_func(I, s->name, s, s->type == FND_FUNCTION);
+                    (void)register_func(I, s->name, s, s->type == FND_FUNCTION);
                 }
             }
             for (int i = 0; i < body->n_stmts; i++) {
@@ -7364,8 +7393,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 } else if (s->type == FND_INTERFACE) {
                     register_generic(I, s);
                 } else if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION) {
+                    OfortFunc *func;
                     annotate_procedure_params(s);
-                    register_func(I, s->name, s, s->type == FND_FUNCTION);
+                    func = register_func(I, s->name, s, s->type == FND_FUNCTION);
+                    copy_cstr(func->module_name, sizeof(func->module_name), mod->name);
                 } else if (s->type == FND_TYPE_DEF) {
                     exec_node(I, s);
                 } else {
@@ -8455,7 +8486,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
             }
         }
-        register_func(I, n->name, n, n->type == FND_FUNCTION);
+        (void)register_func(I, n->name, n, n->type == FND_FUNCTION);
         break;
     }
 
