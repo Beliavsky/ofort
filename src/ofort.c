@@ -1109,6 +1109,51 @@ static void tokenize(OfortInterpreter *I, const char *src) {
         t->kind = 0;
         t->str_val[0] = '\0';
 
+        /* leading-dot real literal, e.g. .5 */
+        if (*p == '.' && isdigit((unsigned char)p[1])) {
+            const char *start = p;
+            int is_double_lit = 0;
+            int literal_kind = 0;
+            p++;
+            while (isdigit((unsigned char)*p)) p++;
+            if (*p == 'e' || *p == 'E' || *p == 'd' || *p == 'D') {
+                if (*p == 'd' || *p == 'D') is_double_lit = 1;
+                p++;
+                if (*p == '+' || *p == '-') p++;
+                while (isdigit((unsigned char)*p)) p++;
+            }
+            t->length = (int)(p - start);
+            if (*p == '_') {
+                const char *kind_start;
+                char kindbuf[32];
+                int kind_len;
+                p++;
+                kind_start = p;
+                while (isalnum((unsigned char)*p) || *p == '_') p++;
+                kind_len = (int)(p - kind_start);
+                if (kind_len > 0 && kind_len < (int)sizeof(kindbuf)) {
+                    memcpy(kindbuf, kind_start, (size_t)kind_len);
+                    kindbuf[kind_len] = '\0';
+                    if (isdigit((unsigned char)kindbuf[0])) {
+                        literal_kind = atoi(kindbuf);
+                    }
+                }
+            }
+            char numbuf[128];
+            int nl = t->length < 127 ? t->length : 127;
+            memcpy(numbuf, start, nl);
+            numbuf[nl] = '\0';
+            for (int k = 0; k < nl; k++) {
+                if (numbuf[k] == 'd' || numbuf[k] == 'D') numbuf[k] = 'E';
+            }
+            t->type = FTOK_REAL_LIT;
+            t->num_val = strtod(numbuf, NULL);
+            t->int_val = is_double_lit ? 1 : 0;
+            t->kind = literal_kind ? literal_kind : (is_double_lit ? 8 : 4);
+            I->n_tokens++;
+            continue;
+        }
+
         /* dot-operators: .AND. .OR. .NOT. .EQ. .NE. .LT. .GT. .LE. .GE.
            .TRUE. .FALSE. .EQV. .NEQV. */
         if (*p == '.') {
