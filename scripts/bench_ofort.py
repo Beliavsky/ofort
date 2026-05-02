@@ -296,19 +296,26 @@ def build_tasks(args: argparse.Namespace) -> list[Task]:
     gfortran_exe = args.gfortran or "gfortran"
     ifx_exe = args.ifx or "ifx"
     lfortran_exe = args.lfortran or "lfortran"
+    restricted_ofort_set = args.ofort_only or args.ofort_fast
     use_gfortran = RUN_GFORTRAN and not args.no_gfortran and (
-        not args.ofort_only or args.gfortran is not None
+        not restricted_ofort_set or args.gfortran is not None
     )
     use_ifx = RUN_IFX and not args.no_ifx and (
-        not args.ofort_only or args.ifx is not None
+        not restricted_ofort_set or args.ifx is not None
     )
     use_lfortran = RUN_LFORTRAN and not args.no_lfortran and (
-        not args.ofort_only or args.lfortran is not None
+        not restricted_ofort_set or args.lfortran is not None
     )
     return [
-        make_task("ofort", RUN_OFORT and not args.no_ofort, "interpreter", str(args.ofort), []),
         make_task(
-            "ofort_fast",
+            "ofort",
+            RUN_OFORT and not args.no_ofort and not args.ofort_fast,
+            "interpreter",
+            str(args.ofort),
+            [],
+        ),
+        make_task(
+            "ofort" if args.ofort_fast else "ofort_fast",
             RUN_OFORT_FAST and not args.no_ofort_fast,
             "interpreter",
             str(args.ofort),
@@ -420,7 +427,23 @@ def make_totals_by_program(df: "pd.DataFrame") -> "pd.DataFrame":
     ):
         pivot = table_source.pivot(index="program", columns="task", values=column)
         for task in tasks:
+            task_kind = table_source.loc[table_source["task"] == task, "kind"].iloc[0]
+            if time_name == "compile" and task_kind == "interpreter":
+                continue
             result[f"{task}_{time_name}"] = result["program"].map(pivot[task])
+    numeric_cols = [col for col in result.columns if col != "program"]
+    aggregate_rows: list[dict[str, object]] = []
+    for label, func in (
+        ("*MEAN*", lambda series: series.mean(skipna=True)),
+        ("*GEOMEAN*", geomean),
+        ("*MEDIAN*", lambda series: series.median(skipna=True)),
+    ):
+        row: dict[str, object] = {"program": label}
+        for col in numeric_cols:
+            row[col] = func(pd.to_numeric(result[col], errors="coerce"))
+        aggregate_rows.append(row)
+    if aggregate_rows:
+        result = pd.concat([result, pd.DataFrame(aggregate_rows)], ignore_index=True)
     return result
 
 
@@ -510,9 +533,20 @@ def print_totals_by_program(df: "pd.DataFrame", run_only: bool = False) -> None:
     for col in totals.columns:
         if col != "program":
             totals[col] = totals[col].map(format_seconds)
+    display = totals.copy()
+    display_columns: list[tuple[str, str]] = []
+    for col in display.columns:
+        if col == "program":
+            display_columns.append(("program", ""))
+        elif col == "ratio":
+            display_columns.append(("ratio", ""))
+        else:
+            task, sep, metric = col.rpartition("_")
+            display_columns.append((task if sep else col, metric if sep else ""))
+    display.columns = pd.MultiIndex.from_tuples(display_columns)
     print()
     print("time sums by program")
-    print(totals.to_string(index=False))
+    print(display.to_string(index=False))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -556,6 +590,11 @@ def main(argv: list[str] | None = None) -> int:
         help="run only ofort and ofort --fast",
     )
     parser.add_argument(
+        "--ofort-fast",
+        action="store_true",
+        help="run ofort --fast, plus explicitly requested compilers",
+    )
+    parser.add_argument(
         "--timeout",
         type=float,
         default=60.0,
@@ -588,6 +627,8 @@ def main(argv: list[str] | None = None) -> int:
         return missing_rc
     run_only_output = args.ofort_only and all(task.kind == "interpreter" for task in tasks)
     rows: list[dict[str, object]] = []
+    if args.ofort_fast and not args.quiet:
+        print("note: ofort refers to ofort --fast")
     for task in tasks:
         if not tool_available(task):
             for source in sources:
