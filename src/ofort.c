@@ -175,7 +175,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n);
 static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs,
                                 char arg_names[OFORT_MAX_PARAMS][256]);
 static int is_intrinsic(const char *name);
-static int paren_item_has_top_level_comma(OfortInterpreter *I);
+static int paren_item_is_implied_do(OfortInterpreter *I);
 static OfortNode *parse_implied_do(OfortInterpreter *I);
 
 static double ofort_monotonic_seconds(void) {
@@ -1734,7 +1734,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         }
         while (!check(I, FTOK_RBRACKET) && !check(I, FTOK_EOF)) {
             OfortNode *elem;
-            if (check(I, FTOK_LPAREN) && paren_item_has_top_level_comma(I))
+            if (check(I, FTOK_LPAREN) && paren_item_is_implied_do(I))
                 elem = parse_implied_do(I);
             else
                 elem = parse_expr(I);
@@ -2599,7 +2599,7 @@ static OfortNode *parse_select_case(OfortInterpreter *I) {
 
 static OfortNode *parse_io_item(OfortInterpreter *I);
 
-static int paren_item_has_top_level_comma(OfortInterpreter *I) {
+static int paren_item_is_implied_do(OfortInterpreter *I) {
     int depth = 0;
     for (int pos = I->tok_pos; pos < I->n_tokens; pos++) {
         OfortTokenType type = I->tokens[pos].type;
@@ -2609,7 +2609,12 @@ static int paren_item_has_top_level_comma(OfortInterpreter *I) {
             depth--;
             if (depth == 0) return 0;
         } else if (type == FTOK_COMMA && depth == 1) {
-            return 1;
+            OfortTokenType next = pos + 1 < I->n_tokens ? I->tokens[pos + 1].type : FTOK_EOF;
+            OfortTokenType after = pos + 2 < I->n_tokens ? I->tokens[pos + 2].type : FTOK_EOF;
+            if ((next == FTOK_IDENT || next == FTOK_IN || next == FTOK_OUT) &&
+                after == FTOK_ASSIGN) {
+                return 1;
+            }
         } else if (type == FTOK_NEWLINE || type == FTOK_EOF) {
             return 0;
         }
@@ -2664,7 +2669,7 @@ static OfortNode *parse_implied_do(OfortInterpreter *I) {
 }
 
 static OfortNode *parse_io_item(OfortInterpreter *I) {
-    if (check(I, FTOK_LPAREN) && paren_item_has_top_level_comma(I)) {
+    if (check(I, FTOK_LPAREN) && paren_item_is_implied_do(I)) {
         return parse_implied_do(I);
     }
     if (check(I, FTOK_LPAREN)) {
