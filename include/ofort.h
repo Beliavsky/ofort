@@ -45,20 +45,21 @@ typedef enum {
     /* control keywords */
     FTOK_IF, FTOK_THEN, FTOK_ELSE, FTOK_ELSEIF,
     FTOK_DO, FTOK_WHILE, FTOK_SELECT, FTOK_CASE,
-    FTOK_EXIT, FTOK_CYCLE, FTOK_RETURN, FTOK_STOP, FTOK_CALL,
+    FTOK_EXIT, FTOK_CYCLE, FTOK_RETURN, FTOK_STOP, FTOK_CALL, FTOK_ENTRY,
     FTOK_DEFAULT,
     /* declaration keywords */
     FTOK_DIMENSION, FTOK_ALLOCATABLE, FTOK_ALLOCATE, FTOK_DEALLOCATE,
     FTOK_PARAMETER, FTOK_INTENT, FTOK_IN, FTOK_OUT, FTOK_INOUT,
     FTOK_RESULT, FTOK_SAVE, FTOK_DATA,
     /* I/O keywords */
-    FTOK_PRINT, FTOK_WRITE, FTOK_READ, FTOK_OPEN, FTOK_CLOSE,
+    FTOK_PRINT, FTOK_WRITE, FTOK_READ, FTOK_OPEN, FTOK_CLOSE, FTOK_REWIND,
     /* logical literal keywords */
     FTOK_TRUE, FTOK_FALSE,
     /* operators */
     FTOK_PLUS, FTOK_MINUS, FTOK_STAR, FTOK_SLASH, FTOK_POWER,
     FTOK_CONCAT,        /* // */
     FTOK_ASSIGN,        /* = */
+    FTOK_POINTER_ASSIGN,/* => */
     FTOK_EQ,            /* == or .EQ. */
     FTOK_NEQ,           /* /= or .NE. */
     FTOK_LT,            /* < or .LT. */
@@ -86,6 +87,7 @@ typedef struct {
     int line;
     double num_val;
     long long int_val;
+    int kind;
     char str_val[OFORT_MAX_STRLEN];
 } OfortToken;
 
@@ -104,6 +106,7 @@ typedef enum {
 
 typedef struct OfortValue {
     OfortValType type;
+    int kind;
     union {
         long long       i;       /* INTEGER */
         double          r;       /* REAL / DOUBLE PRECISION */
@@ -112,10 +115,14 @@ typedef struct OfortValue {
         int             b;       /* LOGICAL: 1=.TRUE., 0=.FALSE. */
         struct {
             struct OfortValue *data;
+            double *real_data;
+            long long *int_data;
             int len;
             int cap;
             OfortValType elem_type;
+            char elem_type_name[64];
             int dims[7];    /* up to 7 dimensions (Fortran standard) */
+            int lower_bounds[7];
             int n_dims;
             int allocated;  /* 1 if ALLOCATABLE and currently allocated */
         } arr;
@@ -134,13 +141,14 @@ typedef enum {
     FND_VARDECL, FND_PARAMDECL,
     FND_SUBROUTINE, FND_FUNCTION, FND_MODULE,
     FND_TYPE_DEF,
-    FND_IF, FND_DO_LOOP, FND_DO_WHILE, FND_DO_FOREVER, FND_SELECT_CASE, FND_CASE_BLOCK,
-    FND_RETURN, FND_EXIT, FND_CYCLE, FND_STOP,
-    FND_CALL, FND_PRINT, FND_WRITE, FND_READ_STMT, FND_OPEN, FND_CLOSE,
-    FND_ALLOCATE, FND_DEALLOCATE, FND_USE,
+    FND_IF, FND_DO_LOOP, FND_DO_WHILE, FND_DO_FOREVER, FND_FORALL, FND_SELECT_CASE, FND_CASE_BLOCK,
+    FND_RETURN, FND_EXIT, FND_CYCLE, FND_STOP, FND_GOTO, FND_CONTINUE,
+    FND_CALL, FND_PRINT, FND_WRITE, FND_READ_STMT, FND_OPEN, FND_CLOSE, FND_REWIND,
+    FND_ALLOCATE, FND_DEALLOCATE, FND_USE, FND_ACCESS, FND_INTERFACE,
     FND_EXPR_STMT,
     /* expressions */
     FND_ASSIGN,
+    FND_POINTER_ASSIGN,
     FND_OR, FND_AND, FND_NOT,
     FND_EQV, FND_NEQV,
     FND_EQ, FND_NEQ, FND_LT, FND_GT, FND_LE, FND_GE,
@@ -159,6 +167,7 @@ typedef struct OfortNode {
     /* data */
     double num_val;
     long long int_val;
+    int kind;
     char name[256];
     char str_val[OFORT_MAX_STRLEN];
     OfortValType val_type;
@@ -167,7 +176,14 @@ typedef struct OfortNode {
     int char_len;           /* CHARACTER(LEN=n) */
     int intent;             /* 0=none, 1=IN, 2=OUT, 3=INOUT */
     int is_allocatable;
+    int is_pointer;
+    int is_target;
+    int is_protected;
+    int is_save;
+    int is_implicit_save;
     int is_parameter;
+    int is_optional;
+    int is_elemental;
     char result_name[256];  /* for FUNCTION ... RESULT(name) */
     char format_str[512];   /* for WRITE format */
     /* children */
@@ -180,11 +196,16 @@ typedef struct OfortNode {
     char param_names[OFORT_MAX_PARAMS][256];
     OfortValType param_types[OFORT_MAX_PARAMS];
     int param_intents[OFORT_MAX_PARAMS];
+    int param_optional[OFORT_MAX_PARAMS];
+    int param_n_dims[OFORT_MAX_PARAMS];
     int n_params;
     /* array dimensions in declarations */
     int dims[7];
+    int lower_bounds[7];
+    int has_lower_bound[7];
     int n_dims;
     struct OfortNode *char_len_expr;
+    void *fast_cache[8];
     /* source location */
     int line;
 } OfortNode;
@@ -192,6 +213,20 @@ typedef struct OfortNode {
 /* ── Public API ──────────────────────────────── */
 
 typedef struct OfortInterpreter OfortInterpreter;
+
+typedef struct {
+    double lex;
+    double parse;
+    double register_time;
+    double execute;
+    double total;
+} OfortTiming;
+
+typedef struct {
+    int line;
+    int count;
+    double seconds;
+} OfortLineProfileEntry;
 
 /* Create/destroy */
 OfortInterpreter *ofort_create(void);
@@ -209,8 +244,20 @@ void ofort_set_print_expr_statements(OfortInterpreter *interp, int enabled);
 /* If enabled, normal program output is suppressed. Bare expression output remains enabled. */
 void ofort_set_suppress_output(OfortInterpreter *interp, int enabled);
 
-/* If enabled, use historical Fortran implicit typing for undeclared names. Disabled by default. */
+/* Enable or disable historical Fortran implicit typing for undeclared names. Enabled by default. */
 void ofort_set_implicit_typing(OfortInterpreter *interp, int enabled);
+
+/* If disabled, warnings are suppressed. Errors are unaffected. */
+void ofort_set_warnings_enabled(OfortInterpreter *interp, int enabled);
+
+/* If enabled, use safe interpreter fast paths. */
+void ofort_set_fast_mode(OfortInterpreter *interp, int enabled);
+
+/* If disabled, suppress specialized pattern/program fast paths while keeping general fast mode. */
+void ofort_set_specialized_fast_paths(OfortInterpreter *interp, int enabled);
+
+/* If enabled, accumulate elapsed execution time by source line. */
+void ofort_set_line_profile_enabled(OfortInterpreter *interp, int enabled);
 
 /* Set command-line arguments visible to COMMAND_ARGUMENT_COUNT/GET_COMMAND_ARGUMENT. */
 void ofort_set_command_args(OfortInterpreter *interp, int argc, const char *const *argv);
@@ -240,6 +287,16 @@ const char *ofort_get_output(OfortInterpreter *interp);
 
 /* Get error message (if ofort_execute returned -1) */
 const char *ofort_get_error(OfortInterpreter *interp);
+
+/* Get warning messages from the last execution, if any. */
+const char *ofort_get_warnings(OfortInterpreter *interp);
+
+/* Get timing data from the last execution or check. */
+int ofort_get_timing(OfortInterpreter *interp, OfortTiming *timing);
+
+/* Copy nonzero line-profile entries into entries and set n_entries to the total available. */
+int ofort_get_line_profile(OfortInterpreter *interp, OfortLineProfileEntry *entries,
+                           int max_entries, int *n_entries);
 
 /* Reset for next execution (clears output/errors but keeps state) */
 void ofort_reset(OfortInterpreter *interp);
