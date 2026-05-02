@@ -8461,7 +8461,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 static const char *intrinsic_names[] = {
     /* Math */
     "ABS", "SQRT", "HYPOT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
-    "EXP", "LOG", "LOG10", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
+    "EXP", "LOG", "LOG10", "GAMMA", "LOG_GAMMA", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "TRANSFER",
     "BIT_SIZE", "BTEST", "IAND", "IEOR", "IOR", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC", "MASKL", "MASKR",
     "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
@@ -8502,6 +8502,8 @@ static int is_elemental_unary_intrinsic(const char *upper) {
            strcmp(upper, "EXP") == 0 ||
            strcmp(upper, "LOG") == 0 ||
            strcmp(upper, "LOG10") == 0 ||
+           strcmp(upper, "GAMMA") == 0 ||
+           strcmp(upper, "LOG_GAMMA") == 0 ||
            strcmp(upper, "FLOOR") == 0 ||
            strcmp(upper, "CEILING") == 0 ||
            strcmp(upper, "AINT") == 0 ||
@@ -8817,6 +8819,14 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     }
     if (strcmp(upper, "LOG10") == 0) {
         return make_real(log10(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "GAMMA") == 0) {
+        if (nargs < 1) ofort_error(I, "GAMMA requires 1 argument");
+        return make_real(tgamma(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "LOG_GAMMA") == 0) {
+        if (nargs < 1) ofort_error(I, "LOG_GAMMA requires 1 argument");
+        return make_real(lgamma(val_to_real(args[0])));
     }
     if (strcmp(upper, "MOD") == 0) {
         if (nargs < 2) ofort_error(I, "MOD requires 2 arguments");
