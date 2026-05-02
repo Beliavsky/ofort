@@ -2470,6 +2470,33 @@ static int parse_kind_selector(OfortInterpreter *I) {
 }
 
 /* ── Declaration parsing ────────────────────── */
+static int int_constant_node(OfortNode *n, int *value) {
+    if (!n || !value) return 0;
+    if (n->type == FND_INT_LIT) {
+        *value = (int)n->int_val;
+        return 1;
+    }
+    if (n->type == FND_NEGATE && n->children[0] &&
+        n->children[0]->type == FND_INT_LIT) {
+        *value = -(int)n->children[0]->int_val;
+        return 1;
+    }
+    return 0;
+}
+
+static OfortNode *parse_dimension_bound_expr(OfortInterpreter *I) {
+    if (check(I, FTOK_MINUS) && peek_ahead(I, 1)->type == FTOK_INT_LIT) {
+        OfortToken *mt = advance(I);
+        OfortToken *it = advance(I);
+        OfortNode *n = alloc_node(I, FND_INT_LIT);
+        n->int_val = -it->int_val;
+        n->num_val = (double)n->int_val;
+        n->line = mt->line;
+        return n;
+    }
+    return parse_expr(I);
+}
+
 static OfortNode *parse_declaration(OfortInterpreter *I) {
     OfortToken *type_tok = advance(I); /* consume type keyword */
     OfortValType vtype = token_to_valtype(type_tok->type);
@@ -2580,7 +2607,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                     advance(I);
                     decl_dims[n_decl_dims++] = 0; /* inferred/assumed size */
                 } else {
-                    OfortNode *dim_expr = parse_expr(I);
+                    OfortNode *dim_expr = parse_dimension_bound_expr(I);
                     /* For now assume it's a simple integer */
                     if (dim_expr->type == FND_INT_LIT)
                         decl_dims[n_decl_dims++] = (int)dim_expr->int_val;
@@ -2698,10 +2725,11 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                     advance(I);
                     decl->dims[decl->n_dims++] = 0;
                 } else {
-                    OfortNode *de = parse_expr(I);
+                    OfortNode *de = parse_dimension_bound_expr(I);
                     int dim_index = decl->n_dims;
-                    if (de->type == FND_INT_LIT)
-                        decl->dims[decl->n_dims++] = (int)de->int_val;
+                    int de_value = 0;
+                    if (int_constant_node(de, &de_value))
+                        decl->dims[decl->n_dims++] = de_value;
                     else
                         decl->dims[decl->n_dims++] = 0;
                     if (decl->n_stmts >= dim_cap) {
@@ -3278,6 +3306,42 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_forall_stmt(OfortInterpreter *I) {
+    OfortToken *ft = advance(I); /* FORALL */
+    OfortNode *n = alloc_node(I, FND_FORALL);
+    n->line = ft->line;
+    expect(I, FTOK_LPAREN);
+    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+        OfortToken *name;
+        if (n->n_params >= OFORT_MAX_PARAMS || n->n_children + 3 >= OFORT_MAX_CHILDREN)
+            ofort_error(I, "FORALL has too many control variables");
+        name = expect(I, FTOK_IDENT);
+        copy_cstr(n->param_names[n->n_params++], sizeof(n->param_names[0]), name->str_val);
+        expect(I, FTOK_ASSIGN);
+        n->children[n->n_children++] = parse_expr(I);
+        expect(I, FTOK_COLON);
+        n->children[n->n_children++] = parse_expr(I);
+        if (check(I, FTOK_COLON)) {
+            advance(I);
+            n->children[n->n_children++] = parse_expr(I);
+        } else {
+            OfortNode *one = alloc_node(I, FND_INT_LIT);
+            one->int_val = 1;
+            one->num_val = 1.0;
+            one->line = name->line;
+            n->children[n->n_children++] = one;
+        }
+        if (check(I, FTOK_COMMA)) advance(I);
+        else break;
+    }
+    expect(I, FTOK_RPAREN);
+    n->stmts = (OfortNode **)calloc(1, sizeof(OfortNode *));
+    if (!n->stmts) ofort_error(I, "Out of memory");
+    n->stmts[0] = parse_statement(I);
+    n->n_stmts = 1;
+    return n;
+}
+
 static OfortNode *parse_open_stmt(OfortInterpreter *I) {
     OfortToken *ot = advance(I); /* OPEN */
     OfortNode *n = alloc_node(I, FND_OPEN);
@@ -3525,7 +3589,7 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
                     advance(I);
                     decl_dims[n_decl_dims++] = 0;
                 } else {
-                    OfortNode *dim_expr = parse_expr(I);
+                    OfortNode *dim_expr = parse_dimension_bound_expr(I);
                     if (dim_expr->type == FND_INT_LIT)
                         decl_dims[n_decl_dims++] = (int)dim_expr->int_val;
                     else
@@ -3611,10 +3675,11 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
                     advance(I);
                     decl->dims[decl->n_dims++] = 0;
                 } else {
-                    OfortNode *de = parse_expr(I);
+                    OfortNode *de = parse_dimension_bound_expr(I);
                     int dim_index = decl->n_dims;
-                    if (de->type == FND_INT_LIT)
-                        decl->dims[decl->n_dims++] = (int)de->int_val;
+                    int de_value = 0;
+                    if (int_constant_node(de, &de_value))
+                        decl->dims[decl->n_dims++] = de_value;
                     else
                         decl->dims[decl->n_dims++] = 0;
                     if (decl->n_stmts >= dim_cap) {
@@ -3625,12 +3690,13 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
                     if (check(I, FTOK_COLON)) {
                         advance(I);
                         OfortNode *dh = parse_expr(I);
-                        if (de->type == FND_INT_LIT) {
-                            decl->lower_bounds[dim_index] = (int)de->int_val;
+                        int dh_value = 0;
+                        if (int_constant_node(de, &de_value)) {
+                            decl->lower_bounds[dim_index] = de_value;
                             decl->has_lower_bound[dim_index] = 1;
                         }
-                        if (dh->type == FND_INT_LIT) {
-                            decl->dims[dim_index] = (int)dh->int_val;
+                        if (int_constant_node(dh, &dh_value)) {
+                            decl->dims[dim_index] = dh_value;
                         } else if (dim_index < decl->n_stmts) {
                             decl->stmts[dim_index] = dh;
                         }
@@ -3969,6 +4035,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         n->int_val = target->int_val;
         n->line = gt->line;
         return n;
+    }
+
+    if (token_ident_upper(t, "FORALL")) {
+        return parse_forall_stmt(I);
     }
 
     if (token_ident_upper(t, "CONTINUE")) {
@@ -4389,6 +4459,13 @@ typedef struct {
     int count;
 } OfortSubscriptRange;
 
+typedef struct {
+    OfortSubscriptRange range;
+    OfortValue vector;
+    int is_vector;
+    int count;
+} OfortSubscriptSpec;
+
 static int eval_subscript_range(OfortInterpreter *I, OfortNode *sub, int dim_extent,
                                 OfortSubscriptRange *range);
 static int section_linear_index(OfortValue *arr, int *subscripts, int nsubs);
@@ -4763,110 +4840,110 @@ static int section_linear_index(OfortValue *arr, int *subscripts, int nsubs) {
     return index;
 }
 
-static OfortValue eval_rank1_vector_subscript(OfortInterpreter *I, OfortValue *arr, OfortNode *sub) {
-    OfortValue idx = eval_node(I, sub);
-    int dims[1];
-    OfortValue result;
-    int lower = arr->v.arr.n_dims > 0 ? arr->v.arr.lower_bounds[0] : 1;
-    if (idx.type != FVAL_ARRAY || idx.v.arr.elem_type != FVAL_INTEGER) {
-        free_value(&idx);
-        ofort_error(I, "Vector subscript must be an integer array");
+static void free_subscript_specs(OfortSubscriptSpec *specs, int nargs) {
+    for (int i = 0; i < nargs; i++) {
+        if (specs[i].is_vector) free_value(&specs[i].vector);
     }
-    dims[0] = idx.v.arr.len;
-    result = make_array(arr->v.arr.elem_type, dims, 1);
-    for (int i = 0; i < idx.v.arr.len; i++) {
-        OfortValue iv = array_element_value(&idx, i);
-        int source_index = (int)val_to_int(iv) - lower;
-        free_value(&iv);
-        if (source_index < 0 || source_index >= arr->v.arr.len) {
-            free_value(&idx);
-            free_value(&result);
-            ofort_error(I, "Array vector subscript out of bounds: %d (size %d)",
-                        source_index + lower, arr->v.arr.len);
-        }
-        free_value(&result.v.arr.data[i]);
-        result.v.arr.data[i] = array_element_value(arr, source_index);
-    }
-    free_value(&idx);
-    return result;
 }
 
-static void copy_section_recursive(OfortInterpreter *I, OfortValue *src, OfortValue *dst,
-                                   OfortSubscriptRange *ranges, int nranges,
-                                   int dim, int *subscripts, int *out_index) {
+static int eval_subscript_spec(OfortInterpreter *I, OfortNode *sub, int extent,
+                               OfortSubscriptSpec *spec) {
+    memset(spec, 0, sizeof(*spec));
+    if (sub->type != FND_SLICE) {
+        OfortValue v = eval_node(I, sub);
+        if (v.type == FVAL_ARRAY) {
+            if (v.v.arr.elem_type != FVAL_INTEGER) {
+                free_value(&v);
+                ofort_error(I, "Vector subscript must be an integer array");
+            }
+            spec->is_vector = 1;
+            spec->vector = v;
+            spec->count = v.v.arr.len;
+            return 1;
+        }
+        spec->range.start = (int)val_to_int(v);
+        spec->range.end = spec->range.start;
+        spec->range.step = 1;
+        spec->range.count = 1;
+        spec->count = 1;
+        free_value(&v);
+        return 0;
+    }
+    if (eval_subscript_range(I, sub, extent, &spec->range)) {
+        spec->count = spec->range.count;
+        return 1;
+    }
+    spec->count = 1;
+    return 0;
+}
+
+static int subscript_spec_value(OfortSubscriptSpec *spec, int pos) {
+    if (spec->is_vector) {
+        OfortValue v = array_element_value(&spec->vector, pos);
+        int subscript = (int)val_to_int(v);
+        free_value(&v);
+        return subscript;
+    }
+    return spec->range.start + pos * spec->range.step;
+}
+
+static void copy_subscripted_recursive(OfortInterpreter *I, OfortValue *src, OfortValue *dst,
+                                       OfortSubscriptSpec *specs, int nargs,
+                                       int dim, int *subscripts, int *out_index) {
     if (dim < 0) {
-        int src_index = section_linear_index(src, subscripts, nranges);
+        int src_index = section_linear_index(src, subscripts, nargs);
         if (src_index < 0 || src_index >= src->v.arr.len)
             ofort_error(I, "Array section index out of bounds");
         free_value(&dst->v.arr.data[*out_index]);
-        if (src->v.arr.data[src_index].kind == 0 &&
-            can_defer_numeric_array_tags(src->v.arr.elem_type)) {
-            dst->v.arr.data[*out_index] = default_value(src->v.arr.elem_type, 1);
-        } else {
-            dst->v.arr.data[*out_index] = copy_value(src->v.arr.data[src_index]);
-        }
+        dst->v.arr.data[*out_index] = array_element_value(src, src_index);
         (*out_index)++;
         return;
     }
-
-    for (int idx = ranges[dim].start;
-         ranges[dim].step > 0 ? idx <= ranges[dim].end : idx >= ranges[dim].end;
-         idx += ranges[dim].step) {
-        subscripts[dim] = idx;
-        copy_section_recursive(I, src, dst, ranges, nranges, dim - 1, subscripts, out_index);
-        if (!ranges[dim].is_slice) break;
+    for (int pos = 0; pos < specs[dim].count; pos++) {
+        subscripts[dim] = subscript_spec_value(&specs[dim], pos);
+        copy_subscripted_recursive(I, src, dst, specs, nargs, dim - 1, subscripts, out_index);
     }
 }
 
-static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNode *n) {
+static OfortValue eval_subscripted_array(OfortInterpreter *I, OfortValue *array, OfortNode *n) {
     int nargs = n->n_stmts;
-    OfortSubscriptRange ranges[7];
+    OfortSubscriptSpec specs[7];
     int result_dims[7];
     int n_result_dims = 0;
-    int has_slice = 0;
-
-    if (nargs == 1 && n->stmts[0] && n->stmts[0]->type == FND_ARRAY_CONSTRUCTOR) {
-        return eval_rank1_vector_subscript(I, &var->val, n->stmts[0]);
-    }
+    int has_section = 0;
+    int subscripts[7] = {0};
+    int out_index = 0;
 
     for (int i = 0; i < nargs; i++) {
-        int extent = i < var->val.v.arr.n_dims ? var->val.v.arr.dims[i] : var->val.v.arr.len;
-        if (eval_subscript_range(I, n->stmts[i], extent, &ranges[i])) {
-            has_slice = 1;
-            result_dims[n_result_dims++] = ranges[i].count;
+        int extent = i < array->v.arr.n_dims ? array->v.arr.dims[i] : array->v.arr.len;
+        if (eval_subscript_spec(I, n->stmts[i], extent, &specs[i])) {
+            has_section = 1;
+            result_dims[n_result_dims++] = specs[i].count;
         }
     }
 
-    if (!has_slice) {
-        int subscripts[7];
-        for (int i = 0; i < nargs; i++) subscripts[i] = ranges[i].start;
-        int index = section_linear_index(&var->val, subscripts, nargs);
-        if (index < 0 || index >= var->val.v.arr.len)
-            ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, var->val.v.arr.len);
-        if (array_has_packed_numeric(&var->val)) {
-            return packed_array_element_value(&var->val, index);
-        }
-        if (var->val.v.arr.data[index].kind == 0 &&
-            can_defer_numeric_array_tags(var->val.v.arr.elem_type)) {
-            return default_value(var->val.v.arr.elem_type, 1);
-        }
-        return copy_value(var->val.v.arr.data[index]);
+    if (!has_section) {
+        int index;
+        for (int i = 0; i < nargs; i++) subscripts[i] = specs[i].range.start;
+        index = section_linear_index(array, subscripts, nargs);
+        if (index < 0 || index >= array->v.arr.len)
+            ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, array->v.arr.len);
+        return array_element_value(array, index);
     }
 
     if (n_result_dims == 0) n_result_dims = 1;
-    OfortValue result = make_array(var->val.v.arr.elem_type, result_dims, n_result_dims);
-    int subscripts[7] = {0};
-    int out_index = 0;
-    copy_section_recursive(I, &var->val, &result, ranges, nargs, nargs - 1, subscripts, &out_index);
+    OfortValue result = make_array(array->v.arr.elem_type, result_dims, n_result_dims);
+    copy_subscripted_recursive(I, array, &result, specs, nargs, nargs - 1, subscripts, &out_index);
+    free_subscript_specs(specs, nargs);
     return result;
+}
+
+static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNode *n) {
+    return eval_subscripted_array(I, &var->val, n);
 }
 
 static OfortValue eval_array_section_value(OfortInterpreter *I, OfortValue *array, OfortNode *n) {
     int nargs = n->n_stmts;
-    OfortSubscriptRange ranges[7];
-    int result_dims[7];
-    int n_result_dims = 0;
-    int has_slice = 0;
 
     if (array && array->type == FVAL_CHARACTER) {
         int len = array->v.s ? (int)strlen(array->v.s) : 0;
@@ -4894,32 +4971,7 @@ static OfortValue eval_array_section_value(OfortInterpreter *I, OfortValue *arra
     }
 
     if (!array || array->type != FVAL_ARRAY) ofort_error(I, "Array reference target is not an array");
-    if (nargs == 1 && n->stmts[0] && n->stmts[0]->type == FND_ARRAY_CONSTRUCTOR) {
-        return eval_rank1_vector_subscript(I, array, n->stmts[0]);
-    }
-    for (int i = 0; i < nargs; i++) {
-        int extent = i < array->v.arr.n_dims ? array->v.arr.dims[i] : array->v.arr.len;
-        if (eval_subscript_range(I, n->stmts[i], extent, &ranges[i])) {
-            has_slice = 1;
-            result_dims[n_result_dims++] = ranges[i].count;
-        }
-    }
-
-    if (!has_slice) {
-        int subscripts[7];
-        for (int i = 0; i < nargs; i++) subscripts[i] = ranges[i].start;
-        int index = section_linear_index(array, subscripts, nargs);
-        if (index < 0 || index >= array->v.arr.len)
-            ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, array->v.arr.len);
-        return array_element_value(array, index);
-    }
-
-    if (n_result_dims == 0) n_result_dims = 1;
-    OfortValue result = make_array(array->v.arr.elem_type, result_dims, n_result_dims);
-    int subscripts[7] = {0};
-    int out_index = 0;
-    copy_section_recursive(I, array, &result, ranges, nargs, nargs - 1, subscripts, &out_index);
-    return result;
+    return eval_subscripted_array(I, array, n);
 }
 
 static int pointer_target_descriptor(OfortInterpreter *I, OfortNode *node,
@@ -4968,23 +5020,23 @@ static int pointer_matches_target(OfortInterpreter *I, OfortVar *ptr, OfortNode 
            (!has_slice || (ptr->pointer_slice_start == start && ptr->pointer_slice_end == end));
 }
 
-static int section_element_count(OfortSubscriptRange *ranges, int nranges) {
+static int subscript_spec_element_count(OfortSubscriptSpec *specs, int nargs) {
     int count = 1;
-    for (int i = 0; i < nranges; i++) {
-        if (ranges[i].is_slice) count *= ranges[i].count;
+    for (int i = 0; i < nargs; i++) {
+        if (specs[i].is_vector || specs[i].range.is_slice) count *= specs[i].count;
     }
     return count;
 }
 
-static void assign_section_recursive(OfortInterpreter *I, OfortValue *dst, OfortValue *rhs,
-                                     OfortSubscriptRange *ranges, int nranges,
-                                     int dim, int *subscripts, int *rhs_index) {
+static void assign_subscripted_recursive(OfortInterpreter *I, OfortValue *dst, OfortValue *rhs,
+                                         OfortSubscriptSpec *specs, int nargs,
+                                         int dim, int *subscripts, int *rhs_index) {
     if (dim < 0) {
-        int dst_index = section_linear_index(dst, subscripts, nranges);
+        int dst_index = section_linear_index(dst, subscripts, nargs);
+        OfortValue value;
         if (dst_index < 0 || dst_index >= dst->v.arr.len)
             ofort_error(I, "Array section index out of bounds");
 
-        OfortValue value;
         if (rhs->type == FVAL_ARRAY) {
             if (*rhs_index >= rhs->v.arr.len)
                 ofort_error(I, "Array assignment shape mismatch");
@@ -4993,7 +5045,6 @@ static void assign_section_recursive(OfortInterpreter *I, OfortValue *dst, Ofort
         } else {
             value = copy_value(*rhs);
         }
-
         if (assign_packed_array_element(dst, dst_index, value)) {
             free_value(&value);
             return;
@@ -5002,31 +5053,25 @@ static void assign_section_recursive(OfortInterpreter *I, OfortValue *dst, Ofort
         dst->v.arr.data[dst_index] = value;
         return;
     }
-
-    for (int idx = ranges[dim].start;
-         ranges[dim].step > 0 ? idx <= ranges[dim].end : idx >= ranges[dim].end;
-         idx += ranges[dim].step) {
-        subscripts[dim] = idx;
-        assign_section_recursive(I, dst, rhs, ranges, nranges, dim - 1, subscripts, rhs_index);
-        if (!ranges[dim].is_slice) break;
+    for (int pos = 0; pos < specs[dim].count; pos++) {
+        subscripts[dim] = subscript_spec_value(&specs[dim], pos);
+        assign_subscripted_recursive(I, dst, rhs, specs, nargs, dim - 1, subscripts, rhs_index);
     }
 }
 
 static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs, OfortValue *rhs) {
     int nargs = lhs->n_stmts;
-    OfortSubscriptRange ranges[7];
-    int has_slice = 0;
+    OfortSubscriptSpec specs[7];
+    int has_section = 0;
 
     for (int i = 0; i < nargs; i++) {
         int extent = i < var->val.v.arr.n_dims ? var->val.v.arr.dims[i] : var->val.v.arr.len;
-        if (eval_subscript_range(I, lhs->stmts[i], extent, &ranges[i])) {
-            has_slice = 1;
-        }
+        if (eval_subscript_spec(I, lhs->stmts[i], extent, &specs[i])) has_section = 1;
     }
 
-    if (!has_slice) {
+    if (!has_section) {
         int subscripts[7];
-        for (int i = 0; i < nargs; i++) subscripts[i] = ranges[i].start;
+        for (int i = 0; i < nargs; i++) subscripts[i] = specs[i].range.start;
         int index = section_linear_index(&var->val, subscripts, nargs);
         if (index < 0 || index >= var->val.v.arr.len)
             ofort_error(I, "Array index out of bounds");
@@ -5038,13 +5083,14 @@ static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs,
         return;
     }
 
-    int selected = section_element_count(ranges, nargs);
+    int selected = subscript_spec_element_count(specs, nargs);
     if (rhs->type == FVAL_ARRAY && rhs->v.arr.len != selected)
         ofort_error(I, "Array assignment shape mismatch");
 
     int subscripts[7] = {0};
     int rhs_index = 0;
-    assign_section_recursive(I, &var->val, rhs, ranges, nargs, nargs - 1, subscripts, &rhs_index);
+    assign_subscripted_recursive(I, &var->val, rhs, specs, nargs, nargs - 1, subscripts, &rhs_index);
+    free_subscript_specs(specs, nargs);
 }
 
 static double random_unit(void) {
@@ -7469,6 +7515,33 @@ static int find_statement_label(OfortNode *block, int label) {
     return -1;
 }
 
+static void exec_forall_level(OfortInterpreter *I, OfortNode *n, int level) {
+    int child = level * 3;
+    OfortValue lv;
+    OfortValue uv;
+    OfortValue sv;
+    int lo, hi, step;
+    if (level >= n->n_params) {
+        if (n->n_stmts > 0) exec_node(I, n->stmts[0]);
+        return;
+    }
+    lv = eval_node(I, n->children[child]);
+    uv = eval_node(I, n->children[child + 1]);
+    sv = eval_node(I, n->children[child + 2]);
+    lo = (int)val_to_int(lv);
+    hi = (int)val_to_int(uv);
+    step = (int)val_to_int(sv);
+    free_value(&lv);
+    free_value(&uv);
+    free_value(&sv);
+    if (step == 0) ofort_error(I, "FORALL stride cannot be zero");
+    for (int i = lo; step > 0 ? i <= hi : i >= hi; i += step) {
+        set_var(I, n->param_names[level], make_integer(i));
+        exec_forall_level(I, n, level + 1);
+        if (I->returning || I->exiting || I->cycling || I->stopping || I->goto_active) break;
+    }
+}
+
 /* Execute statement node */
 static void exec_node(OfortInterpreter *I, OfortNode *n) {
     int profile_line = 0;
@@ -8911,6 +8984,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         break;
 
     case FND_CONTINUE:
+        break;
+
+    case FND_FORALL:
+        exec_forall_level(I, n, 0);
         break;
 
     case FND_STOP:
