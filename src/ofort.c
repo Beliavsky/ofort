@@ -261,6 +261,7 @@ static int node_is_profiled_statement(const OfortNode *n) {
     case FND_READ_STMT:
     case FND_OPEN:
     case FND_CLOSE:
+    case FND_REWIND:
     case FND_ALLOCATE:
     case FND_DEALLOCATE:
     case FND_RETURN:
@@ -1173,7 +1174,7 @@ static const KeywordEntry fortran_keywords[] = {
     {"INOUT", FTOK_INOUT}, {"RESULT", FTOK_RESULT},
     {"SAVE", FTOK_SAVE}, {"DATA", FTOK_DATA},
     {"PRINT", FTOK_PRINT}, {"WRITE", FTOK_WRITE}, {"READ", FTOK_READ},
-    {"OPEN", FTOK_OPEN}, {"CLOSE", FTOK_CLOSE},
+    {"OPEN", FTOK_OPEN}, {"CLOSE", FTOK_CLOSE}, {"REWIND", FTOK_REWIND},
     {NULL, FTOK_EOF}
 };
 
@@ -1693,6 +1694,7 @@ static const char *token_type_name(OfortTokenType type) {
         case FTOK_READ: return "READ";
         case FTOK_OPEN: return "OPEN";
         case FTOK_CLOSE: return "CLOSE";
+        case FTOK_REWIND: return "REWIND";
         case FTOK_TRUE: return ".TRUE.";
         case FTOK_FALSE: return ".FALSE.";
         case FTOK_PLUS: return "'+'";
@@ -3201,12 +3203,12 @@ static OfortNode *parse_write(OfortInterpreter *I) {
             if (positional > 0) saw_fmt = 1;
             copy_cstr(n->format_str, sizeof(n->format_str), peek(I)->str_val);
             advance(I);
-        } else if (check(I, FTOK_INT_LIT)) {
-            if (positional > 0) saw_fmt = 1;
-            advance(I); /* format label number, ignore */
         } else if (positional == 0) {
             n->children[0] = parse_expr(I);
             n->n_children = 1;
+        } else if (check(I, FTOK_INT_LIT)) {
+            saw_fmt = 1;
+            advance(I); /* format label number, ignore */
         } else {
             parse_expr(I);
         }
@@ -3287,6 +3289,9 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
             } else if (positional == 0) {
                 n->children[0] = parse_expr(I);
                 n->n_children = 1;
+            } else if (check(I, FTOK_INT_LIT)) {
+                saw_fmt = 1;
+                advance(I); /* format label number, ignore */
             } else {
                 parse_expr(I);
             }
@@ -3314,6 +3319,42 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
         if (check(I, FTOK_COMMA)) advance(I);
         else break;
     }
+    return n;
+}
+
+static OfortNode *parse_rewind_stmt(OfortInterpreter *I) {
+    OfortToken *rt = advance(I); /* REWIND */
+    OfortNode *n = alloc_node(I, FND_REWIND);
+    n->line = rt->line;
+
+    if (check(I, FTOK_LPAREN)) {
+        advance(I);
+        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            if (check_keyword_arg(I)) {
+                const char *name = token_arg_name(advance(I));
+                advance(I); /* = */
+                if (str_eq_nocase(name, "unit")) {
+                    n->children[0] = parse_expr(I);
+                    n->n_children = 1;
+                } else {
+                    parse_expr(I);
+                }
+            } else if (!n->children[0]) {
+                n->children[0] = parse_expr(I);
+                n->n_children = 1;
+            } else {
+                parse_expr(I);
+            }
+            if (check(I, FTOK_COMMA)) advance(I);
+            else break;
+        }
+        expect(I, FTOK_RPAREN);
+    } else {
+        n->children[0] = parse_expr(I);
+        n->n_children = 1;
+    }
+
+    if (!n->children[0]) ofort_error(I, "REWIND requires UNIT");
     return n;
 }
 
@@ -4174,6 +4215,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* OPEN/CLOSE */
     if (t->type == FTOK_OPEN) return parse_open_stmt(I);
     if (t->type == FTOK_CLOSE) return parse_close_stmt(I);
+    if (t->type == FTOK_REWIND) return parse_rewind_stmt(I);
 
     /* CALL */
     if (t->type == FTOK_CALL && peek_ahead(I, 1)->type == FTOK_IDENT) {
@@ -5220,6 +5262,20 @@ static void set_unit_file(OfortInterpreter *I, int unit, const char *path) {
     copy_cstr(entry->path, sizeof(entry->path), trimmed);
     entry->path[sizeof(entry->path) - 1] = '\0';
     entry->stream_pos = 0;
+}
+
+static OfortUnitFile *ensure_unit_file(OfortInterpreter *I, int unit, int for_write) {
+    OfortUnitFile *entry = find_unit_file(I, unit);
+    char path[64];
+    if (entry) return entry;
+    if (unit < 0 || unit == 5 || unit == 6) return NULL;
+    snprintf(path, sizeof(path), "fort.%d", unit);
+    set_unit_file(I, unit, path);
+    if (for_write) {
+        FILE *fp = fopen(path, "w");
+        if (fp) fclose(fp);
+    }
+    return find_unit_file(I, unit);
 }
 
 static void remove_unit_file(OfortInterpreter *I, int unit) {
@@ -8244,6 +8300,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (!entry && unit == 6) {
                     format_output(I, n->format_str, vals, nvals);
                 } else {
+                    if (!entry) entry = ensure_unit_file(I, unit, 1);
                     if (!entry) ofort_error(I, "Unit %d is not open", unit);
                     if (n->bool_val) write_values_to_stream_file(I, entry->path, vals, nvals);
                     else write_values_to_file(I, entry->path, vals, nvals);
@@ -8257,6 +8314,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (!entry && unit == 6) {
                 format_output(I, n->format_str, vals, nvals);
             } else {
+                if (!entry) entry = ensure_unit_file(I, unit, 1);
                 if (!entry) ofort_error(I, "Unit %d is not open", unit);
                 if (n->bool_val) write_values_to_stream_file(I, entry->path, vals, nvals);
                 else write_values_to_file(I, entry->path, vals, nvals);
@@ -8279,6 +8337,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 int unit = (int)val_to_int(uv);
                 OfortUnitFile *entry = find_unit_file(I, unit);
                 free_value(&uv);
+                if (!entry) entry = ensure_unit_file(I, unit, 0);
                 if (!entry) ofort_error(I, "Unit %d is not open", unit);
                 if (n->bool_val) read_values_from_stream_file(I, entry, n);
                 else {
@@ -8340,6 +8399,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             remove_unit_file(I, (int)val_to_int(uv));
             free_value(&uv);
         }
+        break;
+    }
+
+    case FND_REWIND: {
+        OfortValue uv = eval_node(I, n->children[0]);
+        int unit = (int)val_to_int(uv);
+        OfortUnitFile *entry = find_unit_file(I, unit);
+        free_value(&uv);
+        if (!entry) entry = ensure_unit_file(I, unit, 0);
+        if (!entry) ofort_error(I, "Unit %d is not open", unit);
+        entry->stream_pos = 0;
         break;
     }
 
