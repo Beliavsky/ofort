@@ -4763,6 +4763,34 @@ static int section_linear_index(OfortValue *arr, int *subscripts, int nsubs) {
     return index;
 }
 
+static OfortValue eval_rank1_vector_subscript(OfortInterpreter *I, OfortValue *arr, OfortNode *sub) {
+    OfortValue idx = eval_node(I, sub);
+    int dims[1];
+    OfortValue result;
+    int lower = arr->v.arr.n_dims > 0 ? arr->v.arr.lower_bounds[0] : 1;
+    if (idx.type != FVAL_ARRAY || idx.v.arr.elem_type != FVAL_INTEGER) {
+        free_value(&idx);
+        ofort_error(I, "Vector subscript must be an integer array");
+    }
+    dims[0] = idx.v.arr.len;
+    result = make_array(arr->v.arr.elem_type, dims, 1);
+    for (int i = 0; i < idx.v.arr.len; i++) {
+        OfortValue iv = array_element_value(&idx, i);
+        int source_index = (int)val_to_int(iv) - lower;
+        free_value(&iv);
+        if (source_index < 0 || source_index >= arr->v.arr.len) {
+            free_value(&idx);
+            free_value(&result);
+            ofort_error(I, "Array vector subscript out of bounds: %d (size %d)",
+                        source_index + lower, arr->v.arr.len);
+        }
+        free_value(&result.v.arr.data[i]);
+        result.v.arr.data[i] = array_element_value(arr, source_index);
+    }
+    free_value(&idx);
+    return result;
+}
+
 static void copy_section_recursive(OfortInterpreter *I, OfortValue *src, OfortValue *dst,
                                    OfortSubscriptRange *ranges, int nranges,
                                    int dim, int *subscripts, int *out_index) {
@@ -4796,6 +4824,10 @@ static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNo
     int result_dims[7];
     int n_result_dims = 0;
     int has_slice = 0;
+
+    if (nargs == 1 && n->stmts[0] && n->stmts[0]->type == FND_ARRAY_CONSTRUCTOR) {
+        return eval_rank1_vector_subscript(I, &var->val, n->stmts[0]);
+    }
 
     for (int i = 0; i < nargs; i++) {
         int extent = i < var->val.v.arr.n_dims ? var->val.v.arr.dims[i] : var->val.v.arr.len;
@@ -4862,6 +4894,9 @@ static OfortValue eval_array_section_value(OfortInterpreter *I, OfortValue *arra
     }
 
     if (!array || array->type != FVAL_ARRAY) ofort_error(I, "Array reference target is not an array");
+    if (nargs == 1 && n->stmts[0] && n->stmts[0]->type == FND_ARRAY_CONSTRUCTOR) {
+        return eval_rank1_vector_subscript(I, array, n->stmts[0]);
+    }
     for (int i = 0; i < nargs; i++) {
         int extent = i < array->v.arr.n_dims ? array->v.arr.dims[i] : array->v.arr.len;
         if (eval_subscript_range(I, n->stmts[i], extent, &ranges[i])) {
