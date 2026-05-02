@@ -1039,7 +1039,22 @@ static void tokenize(OfortInterpreter *I, const char *src) {
         if (*p == '&') {
             p++;
             while (*p == ' ' || *p == '\t') p++;
+            if (*p == '\r') p++;
             if (*p == '\n') { p++; line++; }
+            for (;;) {
+                const char *q = p;
+                while (*q == ' ' || *q == '\t') q++;
+                if (*q == '!') {
+                    while (*q && *q != '\n' && *q != '\r') q++;
+                }
+                if (*q == '\r') q++;
+                if (*q == '\n') {
+                    p = q + 1;
+                    line++;
+                    continue;
+                }
+                break;
+            }
             /* skip leading & on next line too */
             while (*p == ' ' || *p == '\t') p++;
             if (*p == '&') p++;
@@ -1047,7 +1062,7 @@ static void tokenize(OfortInterpreter *I, const char *src) {
         }
 
         /* newline = statement separator */
-        if (*p == '\n') {
+        if (*p == '\n' || *p == '\r') {
             /* collapse multiple newlines */
             if (I->n_tokens > 0 && I->tokens[I->n_tokens - 1].type != FTOK_NEWLINE) {
                 OfortToken *t = &I->tokens[I->n_tokens++];
@@ -1056,13 +1071,15 @@ static void tokenize(OfortInterpreter *I, const char *src) {
                 t->length = 1;
                 t->line = line;
             }
-            p++; line++;
+            if (*p == '\r' && p[1] == '\n') p += 2;
+            else p++;
+            line++;
             continue;
         }
 
         /* comment: ! to end of line */
         if (*p == '!') {
-            while (*p && *p != '\n') p++;
+            while (*p && *p != '\n' && *p != '\r') p++;
             continue;
         }
 
