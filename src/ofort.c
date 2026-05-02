@@ -10860,7 +10860,7 @@ OfortInterpreter *ofort_create(void) {
         free(I);
         return NULL;
     }
-    set_scope_explicit_typing(I->global_scope);
+    set_scope_legacy_implicit_typing(I->global_scope);
     I->current_scope = I->global_scope;
     I->node_pool = NULL;
     I->node_pool_len = 0;
