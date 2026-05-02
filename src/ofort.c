@@ -74,6 +74,8 @@ typedef struct {
     char field_names[OFORT_MAX_FIELDS][64];
     OfortValType field_types[OFORT_MAX_FIELDS];
     int field_char_lens[OFORT_MAX_FIELDS];
+    int field_dims[OFORT_MAX_FIELDS][7];
+    int field_n_dims[OFORT_MAX_FIELDS];
     int n_fields;
 } OfortTypeDef;
 
@@ -1691,6 +1693,125 @@ static void consume_end(OfortInterpreter *I, const char *what) {
 static OfortNode *parse_expr(OfortInterpreter *I);
 static OfortNode *parse_statement(OfortInterpreter *I);
 
+static OfortNode *parse_subscript_arg(OfortInterpreter *I) {
+    OfortNode *arg = NULL;
+    if (check(I, FTOK_DCOLON)) {
+        OfortNode *slice = alloc_node(I, FND_SLICE);
+        slice->children[0] = NULL;
+        slice->children[1] = NULL;
+        slice->n_children = 2;
+        advance(I);
+        if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA)) {
+            slice->children[2] = parse_expr(I);
+            slice->n_children = 3;
+        }
+        arg = slice;
+    } else if (check(I, FTOK_COLON)) {
+        OfortNode *slice = alloc_node(I, FND_SLICE);
+        slice->children[0] = NULL;
+        slice->n_children = 2;
+        advance(I);
+        if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA) && !check(I, FTOK_COLON)) {
+            slice->children[1] = parse_expr(I);
+        } else {
+            slice->children[1] = NULL;
+        }
+        if (check(I, FTOK_COLON)) {
+            advance(I);
+            if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA)) {
+                slice->children[2] = parse_expr(I);
+                slice->n_children = 3;
+            }
+        }
+        arg = slice;
+    } else {
+        arg = parse_expr(I);
+    }
+    if (arg && arg->type != FND_SLICE && (check(I, FTOK_COLON) || check(I, FTOK_DCOLON))) {
+        int double_colon = check(I, FTOK_DCOLON);
+        advance(I);
+        OfortNode *slice = alloc_node(I, FND_SLICE);
+        slice->children[0] = arg;
+        slice->n_children = 2;
+        if (!double_colon && !check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA) && !check(I, FTOK_COLON)) {
+            slice->children[1] = parse_expr(I);
+        } else {
+            slice->children[1] = NULL;
+        }
+        if (double_colon || check(I, FTOK_COLON)) {
+            if (!double_colon) advance(I);
+            if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA)) {
+                slice->children[2] = parse_expr(I);
+                slice->n_children = 3;
+            }
+        }
+        arg = slice;
+    }
+    return arg;
+}
+
+static int current_paren_followed_by_percent(OfortInterpreter *I) {
+    int depth = 0;
+    if (!check(I, FTOK_LPAREN)) return 0;
+    for (int pos = I->tok_pos; pos < I->n_tokens; pos++) {
+        OfortTokenType type = I->tokens[pos].type;
+        if (type == FTOK_LPAREN) {
+            depth++;
+        } else if (type == FTOK_RPAREN) {
+            depth--;
+            if (depth == 0) {
+                return pos + 1 < I->n_tokens && I->tokens[pos + 1].type == FTOK_PERCENT;
+            }
+        } else if (type == FTOK_EOF || type == FTOK_NEWLINE) {
+            return 0;
+        }
+    }
+    return 0;
+}
+
+static OfortNode *parse_array_ref_postfix(OfortInterpreter *I, OfortNode *target) {
+    OfortNode *ref = alloc_node(I, FND_ARRAY_REF);
+    int cap = 0;
+    advance(I);
+    ref->children[0] = target;
+    ref->n_children = 1;
+    ref->line = target->line;
+    ref->stmts = NULL;
+    ref->n_stmts = 0;
+    while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+        OfortNode *arg = parse_subscript_arg(I);
+        if (ref->n_stmts >= cap) {
+            cap = cap ? cap * 2 : 4;
+            ref->stmts = (OfortNode **)realloc(ref->stmts, sizeof(OfortNode *) * cap);
+        }
+        ref->stmts[ref->n_stmts++] = arg;
+        if (check(I, FTOK_COMMA)) advance(I);
+        else break;
+    }
+    expect(I, FTOK_RPAREN);
+    return ref;
+}
+
+static OfortNode *parse_component_target_postfix(OfortInterpreter *I, OfortNode *target) {
+    for (;;) {
+        if (check(I, FTOK_PERCENT)) {
+            advance(I);
+            OfortToken *mt = expect(I, FTOK_IDENT);
+            OfortNode *mem = alloc_node(I, FND_MEMBER);
+            mem->children[0] = target;
+            mem->n_children = 1;
+            copy_cstr(mem->name, sizeof(mem->name), mt->str_val);
+            mem->line = mt->line;
+            target = mem;
+        } else if (check(I, FTOK_LPAREN) && current_paren_followed_by_percent(I)) {
+            target = parse_array_ref_postfix(I, target);
+        } else {
+            break;
+        }
+    }
+    return target;
+}
+
 static OfortNode *parse_primary(OfortInterpreter *I) {
     OfortToken *t = peek(I);
 
@@ -1892,61 +2013,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
                     arg_name = token_arg_name(advance(I));
                     advance(I); /* = */
                 }
-                /* Check for slice notation: expr:expr, :expr, expr:, or : */
-                OfortNode *arg = NULL;
-                if (check(I, FTOK_DCOLON)) {
-                    OfortNode *slice = alloc_node(I, FND_SLICE);
-                    slice->children[0] = NULL;
-                    slice->children[1] = NULL;
-                    slice->n_children = 2;
-                    advance(I);
-                    if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA)) {
-                        slice->children[2] = parse_expr(I);
-                        slice->n_children = 3;
-                    }
-                    arg = slice;
-                } else if (check(I, FTOK_COLON)) {
-                    OfortNode *slice = alloc_node(I, FND_SLICE);
-                    slice->children[0] = NULL;
-                    slice->n_children = 2;
-                    advance(I);
-                    if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA) && !check(I, FTOK_COLON)) {
-                        slice->children[1] = parse_expr(I);
-                    } else {
-                        slice->children[1] = NULL;
-                    }
-                    if (check(I, FTOK_COLON)) {
-                        advance(I);
-                        if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA)) {
-                            slice->children[2] = parse_expr(I);
-                            slice->n_children = 3;
-                        }
-                    }
-                    arg = slice;
-                } else {
-                    arg = parse_expr(I);
-                }
-                if (arg && arg->type != FND_SLICE && (check(I, FTOK_COLON) || check(I, FTOK_DCOLON))) {
-                    int double_colon = check(I, FTOK_DCOLON);
-                    advance(I);
-                    OfortNode *slice = alloc_node(I, FND_SLICE);
-                    slice->children[0] = arg;
-                    slice->n_children = 2;
-                    if (!double_colon && !check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA) && !check(I, FTOK_COLON)) {
-                        slice->children[1] = parse_expr(I);
-                    } else {
-                        slice->children[1] = NULL; /* open-ended slice */
-                    }
-                    /* optional stride: start:end:stride */
-                    if (double_colon || check(I, FTOK_COLON)) {
-                        if (!double_colon) advance(I);
-                        if (!check(I, FTOK_RPAREN) && !check(I, FTOK_COMMA)) {
-                            slice->children[2] = parse_expr(I);
-                            slice->n_children = 3;
-                        }
-                    }
-                    arg = slice;
-                }
+                OfortNode *arg = parse_subscript_arg(I);
                 if (call_node->n_stmts >= cap2) {
                     cap2 = cap2 ? cap2 * 2 : 8;
                     call_node->stmts = (OfortNode **)realloc(call_node->stmts, sizeof(OfortNode *) * cap2);
@@ -1959,16 +2026,22 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
             n = call_node;
         }
 
-        /* member access: ident%member */
-        while (check(I, FTOK_PERCENT)) {
-            advance(I);
-            OfortToken *mt = expect(I, FTOK_IDENT);
-            OfortNode *mem = alloc_node(I, FND_MEMBER);
-            mem->children[0] = n;
-            copy_cstr(mem->name, sizeof(mem->name), mt->str_val);
-            mem->n_children = 1;
-            mem->line = mt->line;
-            n = mem;
+        /* postfix member access and array references on expressions */
+        for (;;) {
+            if (check(I, FTOK_PERCENT)) {
+                advance(I);
+                OfortToken *mt = expect(I, FTOK_IDENT);
+                OfortNode *mem = alloc_node(I, FND_MEMBER);
+                mem->children[0] = n;
+                copy_cstr(mem->name, sizeof(mem->name), mt->str_val);
+                mem->n_children = 1;
+                mem->line = mt->line;
+                n = mem;
+            } else if (check(I, FTOK_LPAREN)) {
+                n = parse_array_ref_postfix(I, n);
+            } else {
+                break;
+            }
         }
 
         return n;
@@ -3292,16 +3365,7 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
     OfortNode *target = alloc_node(I, FND_IDENT);
     copy_cstr(target->name, sizeof(target->name), name->str_val);
     target->line = name->line;
-    while (check(I, FTOK_PERCENT)) {
-        advance(I);
-        OfortToken *mt = expect(I, FTOK_IDENT);
-        OfortNode *mem = alloc_node(I, FND_MEMBER);
-        mem->children[0] = target;
-        mem->n_children = 1;
-        copy_cstr(mem->name, sizeof(mem->name), mt->str_val);
-        mem->line = mt->line;
-        target = mem;
-    }
+    target = parse_component_target_postfix(I, target);
     if (target->type != FND_IDENT) n->children[OFORT_ALLOC_TARGET_CHILD] = target;
     n->stmts = NULL; n->n_stmts = 0;
     int cap = 0;
@@ -3362,16 +3426,7 @@ static OfortNode *parse_deallocate(OfortInterpreter *I) {
     OfortNode *target = alloc_node(I, FND_IDENT);
     copy_cstr(target->name, sizeof(target->name), name->str_val);
     target->line = name->line;
-    while (check(I, FTOK_PERCENT)) {
-        advance(I);
-        OfortToken *mt = expect(I, FTOK_IDENT);
-        OfortNode *mem = alloc_node(I, FND_MEMBER);
-        mem->children[0] = target;
-        mem->n_children = 1;
-        copy_cstr(mem->name, sizeof(mem->name), mt->str_val);
-        mem->line = mt->line;
-        target = mem;
-    }
+    target = parse_component_target_postfix(I, target);
     if (target->type != FND_IDENT) n->children[OFORT_ALLOC_TARGET_CHILD] = target;
     expect(I, FTOK_RPAREN);
     return n;
@@ -3788,7 +3843,8 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         t->type == FTOK_NOT) {
         OfortNode *expr = parse_expr(I);
         if (check(I, FTOK_POINTER_ASSIGN)) {
-            if (expr->type != FND_IDENT && expr->type != FND_FUNC_CALL && expr->type != FND_MEMBER) {
+            if (expr->type != FND_IDENT && expr->type != FND_FUNC_CALL &&
+                expr->type != FND_MEMBER && expr->type != FND_ARRAY_REF) {
                 ofort_error(I, "Invalid pointer assignment target at line %d", t->line);
             }
             advance(I);
@@ -3801,7 +3857,8 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
             return n;
         }
         if (check(I, FTOK_ASSIGN)) {
-            if (expr->type != FND_IDENT && expr->type != FND_FUNC_CALL && expr->type != FND_MEMBER) {
+            if (expr->type != FND_IDENT && expr->type != FND_FUNC_CALL &&
+                expr->type != FND_MEMBER && expr->type != FND_ARRAY_REF) {
                 ofort_error(I, "Invalid assignment target at line %d", t->line);
             }
             advance(I);
@@ -3921,6 +3978,8 @@ static OfortValue default_value(OfortValType vtype, int char_len) {
     }
 }
 
+static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims);
+
 static OfortValue default_derived_value(OfortInterpreter *I, const char *type_name) {
     OfortTypeDef *td = find_type_def(I, type_name);
     OfortValue v;
@@ -3937,10 +3996,26 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
     }
     for (int i = 0; i < td->n_fields; i++) {
         copy_cstr(v.v.dt.field_names[i], sizeof(v.v.dt.field_names[i]), td->field_names[i]);
-        v.v.dt.fields[i] = default_value(td->field_types[i], td->field_char_lens[i]);
+        if (td->field_n_dims[i] > 0) {
+            v.v.dt.fields[i] = make_array(td->field_types[i], td->field_dims[i], td->field_n_dims[i]);
+        } else {
+            v.v.dt.fields[i] = default_value(td->field_types[i], td->field_char_lens[i]);
+        }
     }
     return v;
 }
+
+typedef struct {
+    int start;
+    int end;
+    int step;
+    int is_slice;
+    int count;
+} OfortSubscriptRange;
+
+static int eval_subscript_range(OfortInterpreter *I, OfortNode *sub, int dim_extent,
+                                OfortSubscriptRange *range);
+static int section_linear_index(OfortValue *arr, int *subscripts, int nsubs);
 
 static OfortValue *member_lvalue(OfortInterpreter *I, OfortNode *n) {
     if (!n) return NULL;
@@ -3961,6 +4036,25 @@ static OfortValue *member_lvalue(OfortInterpreter *I, OfortNode *n) {
             if (strcmp(upper, fu) == 0) return &obj->v.dt.fields[i];
         }
         ofort_error(I, "Unknown member '%s'", n->name);
+    }
+    if (n->type == FND_ARRAY_REF) {
+        OfortValue *arr = member_lvalue(I, n->children[0]);
+        OfortSubscriptRange ranges[7];
+        int has_slice = 0;
+        int subscripts[7];
+        int index;
+        if (!arr || arr->type != FVAL_ARRAY) ofort_error(I, "Array reference target is not an array");
+        for (int i = 0; i < n->n_stmts; i++) {
+            int extent = i < arr->v.arr.n_dims ? arr->v.arr.dims[i] : arr->v.arr.len;
+            if (eval_subscript_range(I, n->stmts[i], extent, &ranges[i])) has_slice = 1;
+        }
+        if (has_slice) return NULL;
+        for (int i = 0; i < n->n_stmts; i++) subscripts[i] = ranges[i].start;
+        index = section_linear_index(arr, subscripts, n->n_stmts);
+        if (index < 0 || index >= arr->v.arr.len)
+            ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, arr->v.arr.len);
+        if (!arr->v.arr.data) return NULL;
+        return &arr->v.arr.data[index];
     }
     return NULL;
 }
@@ -4209,14 +4303,6 @@ static OfortValue fast_reusable_local_array_value(OfortInterpreter *I, OfortNode
     return *cached;
 }
 
-typedef struct {
-    int start;
-    int end;
-    int step;
-    int is_slice;
-    int count;
-} OfortSubscriptRange;
-
 static int eval_subscript_range(OfortInterpreter *I, OfortNode *sub, int dim_extent,
                                 OfortSubscriptRange *range) {
     range->start = 1;
@@ -4333,6 +4419,39 @@ static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNo
     int subscripts[7] = {0};
     int out_index = 0;
     copy_section_recursive(I, &var->val, &result, ranges, nargs, nargs - 1, subscripts, &out_index);
+    return result;
+}
+
+static OfortValue eval_array_section_value(OfortInterpreter *I, OfortValue *array, OfortNode *n) {
+    int nargs = n->n_stmts;
+    OfortSubscriptRange ranges[7];
+    int result_dims[7];
+    int n_result_dims = 0;
+    int has_slice = 0;
+
+    if (!array || array->type != FVAL_ARRAY) ofort_error(I, "Array reference target is not an array");
+    for (int i = 0; i < nargs; i++) {
+        int extent = i < array->v.arr.n_dims ? array->v.arr.dims[i] : array->v.arr.len;
+        if (eval_subscript_range(I, n->stmts[i], extent, &ranges[i])) {
+            has_slice = 1;
+            result_dims[n_result_dims++] = ranges[i].count;
+        }
+    }
+
+    if (!has_slice) {
+        int subscripts[7];
+        for (int i = 0; i < nargs; i++) subscripts[i] = ranges[i].start;
+        int index = section_linear_index(array, subscripts, nargs);
+        if (index < 0 || index >= array->v.arr.len)
+            ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, array->v.arr.len);
+        return array_element_value(array, index);
+    }
+
+    if (n_result_dims == 0) n_result_dims = 1;
+    OfortValue result = make_array(array->v.arr.elem_type, result_dims, n_result_dims);
+    int subscripts[7] = {0};
+    int out_index = 0;
+    copy_section_recursive(I, array, &result, ranges, nargs, nargs - 1, subscripts, &out_index);
     return result;
 }
 
@@ -5758,6 +5877,10 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     v.v.dt.fields[i] = copy_value(args[i]);
                 else
                     v.v.dt.fields[i] = default_value(td->field_types[i], td->field_char_lens[i]);
+                if (i >= nargs && td->field_n_dims[i] > 0) {
+                    free_value(&v.v.dt.fields[i]);
+                    v.v.dt.fields[i] = make_array(td->field_types[i], td->field_dims[i], td->field_n_dims[i]);
+                }
             }
             for (int i = 0; i < nargs; i++) free_value(&args[i]);
             return v;
@@ -5805,6 +5928,13 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         }
         ofort_error(I, "Unknown member '%s'", n->name);
         return make_void_val();
+    }
+
+    case FND_ARRAY_REF: {
+        OfortValue target = eval_node(I, n->children[0]);
+        OfortValue result = eval_array_section_value(I, &target, n);
+        free_value(&target);
+        return result;
     }
 
     case FND_ARRAY_CONSTRUCTOR: {
@@ -6910,6 +7040,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* Register type definition */
         if (I->n_type_defs >= 64) ofort_error(I, "Too many type definitions");
         OfortTypeDef *td = &I->type_defs[I->n_type_defs++];
+        memset(td, 0, sizeof(*td));
         copy_cstr(td->name, sizeof(td->name), n->name);
         td->n_fields = 0;
         /* Parse field declarations from stmts */
@@ -6923,6 +7054,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         copy_cstr(td->field_names[td->n_fields], sizeof(td->field_names[td->n_fields]), d->name);
                         td->field_types[td->n_fields] = d->val_type;
                         td->field_char_lens[td->n_fields] = d->char_len;
+                        td->field_n_dims[td->n_fields] = d->n_dims;
+                        memcpy(td->field_dims[td->n_fields], d->dims, sizeof(td->field_dims[td->n_fields]));
                         td->n_fields++;
                     }
                 }
@@ -6930,6 +7063,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 copy_cstr(td->field_names[td->n_fields], sizeof(td->field_names[td->n_fields]), s->name);
                 td->field_types[td->n_fields] = s->val_type;
                 td->field_char_lens[td->n_fields] = s->char_len;
+                td->field_n_dims[td->n_fields] = s->n_dims;
+                memcpy(td->field_dims[td->n_fields], s->dims, sizeof(td->field_dims[td->n_fields]));
                 td->n_fields++;
             }
         }
@@ -7186,6 +7321,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
             assign_array_ref(I, var, lhs, &rhs);
             free_value(&rhs);
+        } else if (lhs->type == FND_ARRAY_REF) {
+            OfortValue *target = member_lvalue(I, lhs);
+            if (!target) {
+                free_value(&rhs);
+                ofort_error(I, "Invalid array reference assignment target");
+            }
+            free_value(target);
+            *target = rhs;
         } else if (lhs->type == FND_MEMBER) {
             /* Derived type member assignment: obj%field = val */
             if ((str_eq_nocase(lhs->name, "re") || str_eq_nocase(lhs->name, "im")) &&
