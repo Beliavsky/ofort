@@ -2262,6 +2262,9 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                     /* allocatable dimension (:) */
                     advance(I);
                     decl_dims[n_decl_dims++] = 0; /* unknown size */
+                } else if (check(I, FTOK_STAR)) {
+                    advance(I);
+                    decl_dims[n_decl_dims++] = 0; /* inferred/assumed size */
                 } else {
                     OfortNode *dim_expr = parse_expr(I);
                     /* For now assume it's a simple integer */
@@ -2375,6 +2378,9 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             int dim_cap = 0;
             while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
                 if (check(I, FTOK_COLON)) {
+                    advance(I);
+                    decl->dims[decl->n_dims++] = 0;
+                } else if (check(I, FTOK_STAR)) {
                     advance(I);
                     decl->dims[decl->n_dims++] = 0;
                 } else {
@@ -4119,6 +4125,34 @@ static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
                                                       I->fast_mode);
     set_array_lower_bounds(&arr, lower_bounds, ndims);
     return arr;
+}
+
+static void infer_decl_dims_from_initializer(OfortInterpreter *I, OfortNode *n) {
+    int has_unknown = 0;
+    if (!n || n->n_dims <= 0 || n->n_children <= 0 || !n->children[0]) return;
+    for (int i = 0; i < n->n_dims; i++) {
+        if (n->dims[i] == 0 && !n->has_lower_bound[i]) {
+            has_unknown = 1;
+            break;
+        }
+    }
+    if (!has_unknown) return;
+
+    OfortValue init = eval_node(I, n->children[0]);
+    if (init.type != FVAL_ARRAY) {
+        free_value(&init);
+        return;
+    }
+    if (init.v.arr.n_dims != n->n_dims) {
+        free_value(&init);
+        return;
+    }
+    for (int i = 0; i < n->n_dims; i++) {
+        if (n->dims[i] == 0 && !n->has_lower_bound[i]) {
+            n->dims[i] = init.v.arr.dims[i];
+        }
+    }
+    free_value(&init);
 }
 
 static int can_reuse_fast_local_array(OfortInterpreter *I, OfortNode *n) {
@@ -6966,6 +7000,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             existing->is_parameter = 1;
             break;
         }
+        infer_decl_dims_from_initializer(I, n);
         if (n->is_pointer && n->n_dims > 0) {
             val.type = FVAL_ARRAY;
             memset(&val.v.arr, 0, sizeof(val.v.arr));
