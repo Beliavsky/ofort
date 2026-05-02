@@ -151,6 +151,8 @@ struct OfortInterpreter {
     int exiting;     /* EXIT from DO loop */
     int cycling;     /* CYCLE in DO loop */
     int stopping;    /* STOP statement */
+    int goto_active;
+    int goto_label;
     /* error recovery */
     jmp_buf err_jmp;
     int has_error;
@@ -3230,6 +3232,9 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
                     } else {
                         parse_expr(I);
                     }
+                } else if (str_eq_nocase(name, "iostat")) {
+                    n->children[4] = parse_expr(I);
+                    if (n->n_children < 5) n->n_children = 5;
                 } else {
                     parse_expr(I);
                 }
@@ -3286,9 +3291,19 @@ static OfortNode *parse_open_stmt(OfortInterpreter *I) {
             if (str_eq_nocase(name->str_val, "unit")) {
                 n->children[0] = parse_expr(I);
                 if (n->n_children < 1) n->n_children = 1;
+            } else if (str_eq_nocase(name->str_val, "newunit")) {
+                n->children[0] = parse_expr(I);
+                n->bool_val = 1;
+                if (n->n_children < 1) n->n_children = 1;
             } else if (str_eq_nocase(name->str_val, "file")) {
                 n->children[1] = parse_expr(I);
                 if (n->n_children < 2) n->n_children = 2;
+            } else if (str_eq_nocase(name->str_val, "status")) {
+                n->children[2] = parse_expr(I);
+                if (n->n_children < 3) n->n_children = 3;
+            } else if (str_eq_nocase(name->str_val, "iostat")) {
+                n->children[4] = parse_expr(I);
+                if (n->n_children < 5) n->n_children = 5;
             } else {
                 parse_expr(I);
             }
@@ -3868,7 +3883,23 @@ static OfortNode *parse_access_stmt(OfortInterpreter *I) {
 static OfortNode *parse_statement(OfortInterpreter *I) {
     skip_newlines(I);
     OfortToken *t = peek(I);
+    long long stmt_label = 0;
     if (t->type == FTOK_EOF) return NULL;
+
+    if (t->type == FTOK_INT_LIT) {
+        stmt_label = t->int_val;
+        advance(I);
+        t = peek(I);
+        if (t->type == FTOK_EOF || t->type == FTOK_NEWLINE) {
+            OfortNode *n = alloc_node(I, FND_CONTINUE);
+            n->int_val = stmt_label;
+            n->line = t->line;
+            return n;
+        }
+        OfortNode *n = parse_statement(I);
+        if (n && stmt_label) n->int_val = stmt_label;
+        return n;
+    }
 
     /* Statement label/name prefix, e.g. "outer: do ..." */
     if (t->type == FTOK_IDENT && peek_ahead(I, 1)->type == FTOK_COLON) {
@@ -3929,6 +3960,25 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return n;
     }
 
+    if (token_ident_upper(t, "GOTO") ||
+        (token_ident_upper(t, "GO") && token_ident_upper(peek_ahead(I, 1), "TO"))) {
+        OfortToken *gt = advance(I);
+        if (token_ident_upper(gt, "GO")) advance(I); /* TO */
+        OfortToken *target = expect(I, FTOK_INT_LIT);
+        OfortNode *n = alloc_node(I, FND_GOTO);
+        n->int_val = target->int_val;
+        n->line = gt->line;
+        return n;
+    }
+
+    if (token_ident_upper(t, "CONTINUE")) {
+        OfortToken *ct = advance(I);
+        OfortNode *n = alloc_node(I, FND_CONTINUE);
+        n->int_val = stmt_label;
+        n->line = ct->line;
+        return n;
+    }
+
     /* CONTAINS */
     if (t->type == FTOK_CONTAINS) {
         advance(I);
@@ -3973,7 +4023,9 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* declarations */
     if (is_type_keyword(t->type)) {
         if (typed_function_follows_type_prefix(I)) {
-            return parse_typed_function(I);
+        OfortNode *n = parse_typed_function(I);
+        if (n && stmt_label) n->int_val = stmt_label;
+        return n;
         }
         /* Could be a declaration or a function with type prefix */
         /* Look ahead for :: or ident followed by = or ( or , */
@@ -4106,6 +4158,12 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         OfortNode *n = alloc_node(I, FND_CYCLE);
         n->line = t->line;
         return n;
+    }
+
+    /* ERROR STOP */
+    if (token_ident_upper(t, "ERROR") && peek_ahead(I, 1)->type == FTOK_STOP) {
+        advance(I);
+        t = peek(I);
     }
 
     /* STOP */
@@ -5082,8 +5140,16 @@ static void remove_unit_file(OfortInterpreter *I, int unit) {
     }
 }
 
+static int next_newunit(OfortInterpreter *I) {
+    for (int unit = 10; unit < 10000; unit++) {
+        if (!find_unit_file(I, unit)) return unit;
+    }
+    ofort_error(I, "No available NEWUNIT value");
+    return -1;
+}
+
 static void write_values_to_file(OfortInterpreter *I, const char *path, OfortValue *vals, int nvals) {
-    FILE *fp = fopen(path, "w");
+    FILE *fp = fopen(path, "a");
     if (!fp) ofort_error(I, "Cannot open '%s' for writing", path);
     for (int i = 0; i < nvals; i++) {
         char buf[4096];
@@ -5185,36 +5251,88 @@ static void assign_line_to_character_target(OfortInterpreter *I, OfortNode *targ
     v->val = make_character(line ? line : "");
 }
 
-static void read_values_from_file(OfortInterpreter *I, const char *path, OfortNode *n) {
-    FILE *fp = fopen(path, "r");
-    char tok[1024];
-    if (!fp) ofort_error(I, "Cannot open '%s' for reading", path);
-
-    if (format_is_character_line_read(n->format_str) && n->n_stmts > 0) {
-        char line[OFORT_MAX_STRLEN];
-        if (!fgets(line, sizeof(line), fp)) line[0] = '\0';
-        line[strcspn(line, "\r\n")] = '\0';
-        assign_line_to_character_target(I, n->stmts[0], line);
-        fclose(fp);
-        return;
-    }
-
-    for (int i = 0; i < n->n_stmts; i++) {
-        if (n->stmts[i]->type != FND_IDENT) continue;
-        OfortVar *v = find_var(I, n->stmts[i]->name);
-        if (!v) ofort_error(I, "Undefined variable '%s'", n->stmts[i]->name);
+static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, const char *tok) {
+    if (target->type == FND_IDENT) {
+        OfortVar *v = find_var(I, target->name);
+        if (!v) ofort_error(I, "Undefined variable '%s'", target->name);
         if (v->val.type == FVAL_ARRAY) {
             for (int j = 0; j < v->val.v.arr.len; j++) {
-                if (!read_next_token(fp, tok, sizeof(tok))) break;
                 assign_token_to_value(&v->val.v.arr.data[j], tok);
             }
         } else {
-            if (read_next_token(fp, tok, sizeof(tok))) {
-                assign_token_to_value(&v->val, tok);
+            assign_token_to_value(&v->val, tok);
+        }
+        return 1;
+    }
+    if (target->type == FND_ARRAY_REF && target->children[0] &&
+        target->children[0]->type == FND_IDENT) {
+        OfortVar *v = find_var(I, target->children[0]->name);
+        OfortValue tmp;
+        if (!v) ofort_error(I, "Undefined variable '%s'", target->children[0]->name);
+        if (v->val.type != FVAL_ARRAY)
+            ofort_error(I, "'%s' is not an array", target->children[0]->name);
+        tmp = default_value(v->val.v.arr.elem_type, 1);
+        assign_token_to_value(&tmp, tok);
+        assign_array_ref(I, v, target, &tmp);
+        free_value(&tmp);
+        return 1;
+    }
+    if (target->type == FND_FUNC_CALL) {
+        OfortVar *v = find_var(I, target->name);
+        OfortValue tmp;
+        if (!v || v->val.type != FVAL_ARRAY) return 0;
+        tmp = default_value(v->val.v.arr.elem_type, 1);
+        assign_token_to_value(&tmp, tok);
+        assign_array_ref(I, v, target, &tmp);
+        free_value(&tmp);
+        return 1;
+    }
+    return 0;
+}
+
+static int read_values_from_file(OfortInterpreter *I, OfortUnitFile *entry, OfortNode *n) {
+    FILE *fp = fopen(entry->path, "r");
+    char tok[1024];
+    int status = 0;
+    if (!fp) ofort_error(I, "Cannot open '%s' for reading", entry->path);
+    fseek(fp, entry->stream_pos, SEEK_SET);
+
+    if (format_is_character_line_read(n->format_str) && n->n_stmts > 0) {
+        char line[OFORT_MAX_STRLEN];
+        if (!fgets(line, sizeof(line), fp)) {
+            line[0] = '\0';
+            status = 1;
+        }
+        line[strcspn(line, "\r\n")] = '\0';
+        assign_line_to_character_target(I, n->stmts[0], line);
+        entry->stream_pos = (int)ftell(fp);
+        fclose(fp);
+        return status;
+    }
+
+    for (int i = 0; i < n->n_stmts; i++) {
+        if (n->stmts[i]->type == FND_IDENT) {
+            OfortVar *v = find_var(I, n->stmts[i]->name);
+            if (v && v->val.type == FVAL_ARRAY) {
+                for (int j = 0; j < v->val.v.arr.len; j++) {
+                    if (!read_next_token(fp, tok, sizeof(tok))) {
+                        status = 1;
+                        break;
+                    }
+                    assign_token_to_value(&v->val.v.arr.data[j], tok);
+                }
+                continue;
             }
         }
+        if (!read_next_token(fp, tok, sizeof(tok))) {
+            status = 1;
+            break;
+        }
+        assign_token_to_read_target(I, n->stmts[i], tok);
     }
+    entry->stream_pos = (int)ftell(fp);
     fclose(fp);
+    return status;
 }
 
 static void read_values_from_string(OfortInterpreter *I, const char *text, OfortNode *n) {
@@ -6204,6 +6322,9 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             I->procedure_depth++;
             exec_node(I, fn->children[0]);
             I->procedure_depth--;
+            if (I->goto_active) {
+                ofort_error(I, "GOTO target label %d not found", I->goto_label);
+            }
             I->returning = 0;
 
             /* Get result */
@@ -7305,6 +7426,14 @@ static int exec_fast_random_dot_loop(OfortInterpreter *I, OfortNode *n,
     return 1;
 }
 
+static int find_statement_label(OfortNode *block, int label) {
+    if (!block || block->type != FND_BLOCK) return -1;
+    for (int i = 0; i < block->n_stmts; i++) {
+        if (block->stmts[i] && block->stmts[i]->int_val == label) return i;
+    }
+    return -1;
+}
+
 /* Execute statement node */
 static void exec_node(OfortInterpreter *I, OfortNode *n) {
     int profile_line = 0;
@@ -7322,6 +7451,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int i;
         for (i = 0; i < n->n_stmts; i++) {
             exec_node(I, n->stmts[i]);
+            if (I->goto_active) {
+                int target = find_statement_label(n, I->goto_label);
+                if (target >= 0) {
+                    I->goto_active = 0;
+                    i = target - 1;
+                    continue;
+                }
+                break;
+            }
             if (I->returning || I->exiting || I->cycling || I->stopping) break;
         }
         break;
@@ -7342,6 +7480,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 OfortNode *s = body->stmts[i];
                 if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION)) continue;
                 exec_node(I, s);
+                if (I->goto_active) {
+                    int target = find_statement_label(body, I->goto_label);
+                    if (target >= 0) {
+                        I->goto_active = 0;
+                        i = target - 1;
+                        continue;
+                    }
+                    break;
+                }
                 if (I->returning || I->exiting || I->cycling || I->stopping) break;
             }
         } else {
@@ -8015,7 +8162,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 free_value(&uv);
                 if (!entry) ofort_error(I, "Unit %d is not open", unit);
                 if (n->bool_val) read_values_from_stream_file(I, entry, n);
-                else read_values_from_file(I, entry->path, n);
+                else {
+                    int status = read_values_from_file(I, entry, n);
+                    if (n->children[4] && n->children[4]->type == FND_IDENT) {
+                        set_var(I, n->children[4]->name, make_integer(status));
+                    }
+                }
             }
             break;
         }
@@ -8033,13 +8185,32 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_OPEN: {
         if (!n->children[0] || !n->children[1])
             ofort_error(I, "OPEN requires UNIT and FILE");
-        OfortValue uv = eval_node(I, n->children[0]);
         OfortValue fv = eval_node(I, n->children[1]);
-        int unit = (int)val_to_int(uv);
+        int unit;
         if (fv.type != FVAL_CHARACTER)
             ofort_error(I, "OPEN FILE must be CHARACTER");
+        if (n->bool_val) {
+            unit = next_newunit(I);
+            if (n->children[0]->type == FND_IDENT) {
+                set_var(I, n->children[0]->name, make_integer(unit));
+            }
+        } else {
+            OfortValue uv = eval_node(I, n->children[0]);
+            unit = (int)val_to_int(uv);
+            free_value(&uv);
+        }
         set_unit_file(I, unit, fv.v.s ? fv.v.s : "");
-        free_value(&uv);
+        if (n->children[2]) {
+            OfortValue sv = eval_node(I, n->children[2]);
+            if (sv.type == FVAL_CHARACTER && sv.v.s && str_eq_nocase(sv.v.s, "replace")) {
+                FILE *fp = fopen(fv.v.s ? fv.v.s : "", "w");
+                if (fp) fclose(fp);
+            }
+            free_value(&sv);
+        }
+        if (n->children[4] && n->children[4]->type == FND_IDENT) {
+            set_var(I, n->children[4]->name, make_integer(0));
+        }
         free_value(&fv);
         break;
     }
@@ -8697,6 +8868,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
     case FND_CYCLE:
         I->cycling = 1;
+        break;
+
+    case FND_GOTO:
+        I->goto_active = 1;
+        I->goto_label = (int)n->int_val;
+        break;
+
+    case FND_CONTINUE:
         break;
 
     case FND_STOP:
@@ -10621,6 +10800,10 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     interp->exiting = 0;
     interp->cycling = 0;
     interp->stopping = 0;
+    interp->goto_active = 0;
+    interp->goto_label = 0;
+    interp->goto_active = 0;
+    interp->goto_label = 0;
     interp->current_line = 0;
     interp->warnings[0] = '\0';
     interp->warn_len = 0;
@@ -10669,6 +10852,9 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
             if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION || s->type == FND_MODULE)
                 continue; /* already registered */
             exec_node(interp, s);
+            if (interp->goto_active) {
+                ofort_error(interp, "GOTO target label %d not found", interp->goto_label);
+            }
             if (interp->stopping) break;
         }
     }
@@ -10690,6 +10876,8 @@ int ofort_check(OfortInterpreter *interp, const char *source) {
     interp->exiting = 0;
     interp->cycling = 0;
     interp->stopping = 0;
+    interp->goto_active = 0;
+    interp->goto_label = 0;
     interp->current_line = 0;
     interp->warnings[0] = '\0';
     interp->warn_len = 0;
