@@ -3929,7 +3929,8 @@ static int token_letter_index(OfortToken *t) {
 }
 
 static int is_procedure_prefix_token(OfortToken *t) {
-    return token_ident_upper(t, "PURE") ||
+    return token_ident_upper(t, "IMPURE") ||
+           token_ident_upper(t, "PURE") ||
            token_ident_upper(t, "ELEMENTAL") ||
            token_ident_upper(t, "RECURSIVE");
 }
@@ -4076,14 +4077,26 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     }
 
     if (is_procedure_prefix_token(t)) {
+        int is_elemental = 0;
         while (is_procedure_prefix_token(peek(I))) {
+            if (token_ident_upper(peek(I), "ELEMENTAL")) is_elemental = 1;
             advance(I);
         }
         t = peek(I);
-        if (t->type == FTOK_SUBROUTINE) return parse_subroutine(I);
-        if (t->type == FTOK_FUNCTION) return parse_function(I);
+        if (t->type == FTOK_SUBROUTINE) {
+            OfortNode *n = parse_subroutine(I);
+            n->is_elemental = is_elemental;
+            return n;
+        }
+        if (t->type == FTOK_FUNCTION) {
+            OfortNode *n = parse_function(I);
+            n->is_elemental = is_elemental;
+            return n;
+        }
         if (is_type_keyword(t->type) && typed_function_follows_type_prefix(I)) {
-            return parse_typed_function(I);
+            OfortNode *n = parse_typed_function(I);
+            n->is_elemental = is_elemental;
+            return n;
         }
     }
 
@@ -6836,6 +6849,106 @@ static int procedure_body_declares_name(OfortNode *body, const char *name) {
     return 0;
 }
 
+static OfortValue elemental_actual_value(OfortValue *args, int *arg_alias,
+                                         OfortVar **arg_alias_var, int i, int elem_index) {
+    OfortValue *v = arg_alias[i] && arg_alias_var[i] ? &arg_alias_var[i]->val : &args[i];
+    if (v->type == FVAL_ARRAY) return array_element_value(v, elem_index);
+    return copy_value(*v);
+}
+
+static void assign_elemental_actual(OfortInterpreter *I, OfortNode *actual_node,
+                                    OfortValue *args, int *arg_alias,
+                                    OfortVar **arg_alias_var, int arg_index,
+                                    int elem_index, OfortValue *value) {
+    OfortValue *arg = arg_alias[arg_index] && arg_alias_var[arg_index] ?
+        &arg_alias_var[arg_index]->val : &args[arg_index];
+    if (!actual_node || value->type == FVAL_VOID) return;
+    if (arg->type == FVAL_ARRAY) {
+        if (actual_node->type == FND_IDENT) {
+            OfortVar *actual = arg_alias[arg_index] && arg_alias_var[arg_index] ?
+                arg_alias_var[arg_index] : find_var(I, actual_node->name);
+            OfortValue elem = copy_value(*value);
+            if (!actual || actual->val.type != FVAL_ARRAY) {
+                free_value(&elem);
+                return;
+            }
+            if (assign_packed_array_element(&actual->val, elem_index, elem)) {
+                free_value(&elem);
+            } else if (actual->val.v.arr.data && elem_index >= 0 && elem_index < actual->val.v.arr.len) {
+                free_value(&actual->val.v.arr.data[elem_index]);
+                actual->val.v.arr.data[elem_index] = elem;
+            } else {
+                free_value(&elem);
+            }
+        }
+        return;
+    }
+    if (actual_node->type == FND_IDENT) {
+        set_var(I, actual_node->name, copy_value(*value));
+    } else if (actual_node->type == FND_MEMBER) {
+        OfortValue *target = member_lvalue(I, actual_node);
+        if (target) {
+            free_value(target);
+            *target = copy_value(*value);
+        }
+    }
+}
+
+static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *call,
+                                             OfortFunc *func, OfortNode *fn,
+                                             OfortValue *args, int nargs,
+                                             int *arg_alias,
+                                             OfortVar **arg_alias_var) {
+    int elem_count = 0;
+    if (!fn || !fn->is_elemental) return 0;
+    for (int i = 0; i < nargs; i++) {
+        OfortValue *v = arg_alias[i] && arg_alias_var[i] ? &arg_alias_var[i]->val : &args[i];
+        if (v->type != FVAL_ARRAY) continue;
+        if (elem_count == 0) {
+            elem_count = v->v.arr.len;
+        } else if (v->v.arr.len != elem_count) {
+            ofort_error(I, "Elemental subroutine array arguments must have the same size");
+        }
+    }
+    if (elem_count == 0) return 0;
+
+    for (int elem = 0; elem < elem_count; elem++) {
+        push_scope(I);
+        for (int i = 0; i < fn->n_params; i++) {
+            OfortVar *pv;
+            if (i < nargs && (arg_alias[i] || args[i].type != FVAL_VOID)) {
+                OfortValue actual = elemental_actual_value(args, arg_alias, arg_alias_var, i, elem);
+                pv = declare_var(I, fn->param_names[i], actual);
+            } else if (fn->param_optional[i]) {
+                pv = declare_absent_optional_var(I, fn->param_names[i]);
+            } else {
+                ofort_error(I, "Missing required argument '%s' in call to '%s'",
+                            fn->param_names[i], fn->name);
+            }
+            pv->intent = fn->param_intents[i];
+        }
+        restore_saved_vars(I, func);
+        I->procedure_depth++;
+        exec_node(I, fn->children[0]);
+        I->procedure_depth--;
+        I->returning = 0;
+
+        for (int i = 0; i < fn->n_params && i < nargs; i++) {
+            if (fn->param_intents[i] != 1 &&
+                (call->stmts[i]->type == FND_IDENT || call->stmts[i]->type == FND_MEMBER)) {
+                OfortVar *pv = find_var(I, fn->param_names[i]);
+                if (pv && pv->present)
+                    assign_elemental_actual(I, call->stmts[i], args, arg_alias,
+                                            arg_alias_var, i, elem, &pv->val);
+            }
+        }
+        store_saved_vars(func, I->current_scope);
+        pop_scope(I);
+        if (I->stopping) break;
+    }
+    return 1;
+}
+
 static OfortVar *cached_ident_var(OfortInterpreter *I, OfortNode *owner, int slot, OfortNode *ident) {
     if (!I || !owner || !ident || ident->type != FND_IDENT || slot < 0 || slot > 6) return NULL;
     if (owner->fast_cache[7] != I->current_scope) {
@@ -8968,6 +9081,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         if (func->is_function) {
             ofort_error(I, "'%s' is a function, not a subroutine", n->name);
+        }
+        if (execute_elemental_subroutine_call(I, n, func, fn, args, nargs,
+                                              arg_alias, arg_alias_var)) {
+            for (int i = 0; i < nargs; i++) free_value(&args[i]);
+            break;
         }
         push_scope(I);
         /* Bind parameters */
