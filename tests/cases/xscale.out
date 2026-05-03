@@ -1,0 +1,44 @@
+scale(x, i) returns x * radix(x)**i.
+
+default real examples:
+x = -3.5
+  scale(x,  1) = -7
+  scale(x, -1) = -1.75
+  scale(x,  2) = -14
+x = -1
+  scale(x,  1) = -2
+  scale(x, -1) = -0.5
+  scale(x,  2) = -4
+x = -0.5
+  scale(x,  1) = -1
+  scale(x, -1) = -0.25
+  scale(x,  2) = -2
+x = 0
+  scale(x,  1) = 0
+  scale(x, -1) = 0
+  scale(x,  2) = 0
+x = 0.5
+  scale(x,  1) = 1
+  scale(x, -1) = 0.25
+  scale(x,  2) = 2
+x = 1
+  scale(x,  1) = 2
+  scale(x, -1) = 0.5
+  scale(x,  2) = 4
+x = 3.5
+  scale(x,  1) = 7
+  scale(x, -1) = 1.75
+  scale(x,  2) = 14
+
+kind examples:
+scale(1.5,   3) = 12
+scale(1.5_4, 3) = 12
+scale(1.5_8, 3) = 12
+
+using exponent:
+x = -3.5  exponent(x) = 2  scale(fraction(x), exponent(x)) = -3.5
+x = -1  exponent(x) = 1  scale(fraction(x), exponent(x)) = -1
+x = -0.5  exponent(x) = 0  scale(fraction(x), exponent(x)) = -0.5
+x = 0.5  exponent(x) = 0  scale(fraction(x), exponent(x)) = 0.5
+x = 1  exponent(x) = 1  scale(fraction(x), exponent(x)) = 1
+x = 3.5  exponent(x) = 2  scale(fraction(x), exponent(x)) = 3.5

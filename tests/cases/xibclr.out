@@ -1,0 +1,43 @@
+ibclr(i, pos) returns i with bit pos cleared (set to 0).
+Bit positions start at 0.
+
+i = 0
+  pos = 0  ibclr = 0
+  pos = 1  ibclr = 0
+  pos = 2  ibclr = 0
+  pos = 3  ibclr = 0
+  pos = 4  ibclr = 0
+
+i = 1
+  pos = 0  ibclr = 0
+  pos = 1  ibclr = 1
+  pos = 2  ibclr = 1
+  pos = 3  ibclr = 1
+  pos = 4  ibclr = 1
+
+i = 3
+  pos = 0  ibclr = 2
+  pos = 1  ibclr = 1
+  pos = 2  ibclr = 3
+  pos = 3  ibclr = 3
+  pos = 4  ibclr = 3
+
+i = 10
+  pos = 0  ibclr = 10
+  pos = 1  ibclr = 8
+  pos = 2  ibclr = 10
+  pos = 3  ibclr = 2
+  pos = 4  ibclr = 10
+
+i = 15
+  pos = 0  ibclr = 14
+  pos = 1  ibclr = 13
+  pos = 2  ibclr = 11
+  pos = 3  ibclr = 7
+  pos = 4  ibclr = 15
+
+direct examples:
+ibclr(10, 1) = 8
+ibclr(10, 3) = 2
+ibclr(15, 0) = 14
+ibclr(15, 3) = 7

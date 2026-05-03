@@ -1,0 +1,7 @@
+a = -7  p = 3
+mod(a,p)    = -1
+modulo(a,p) = 2
+
+a = 7  p = -3
+mod(a,p)    = 1
+modulo(a,p) = -2

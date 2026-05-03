@@ -1,0 +1,24 @@
+spacing(x) returns the absolute spacing of model numbers near x.
+
+default real examples:
+x = -10  spacing(x) = 9.536743e-07
+x = -1  spacing(x) = 1.192093e-07
+x = -0.5  spacing(x) = 5.960464e-08
+x = 0  spacing(x) = 1.175494e-38
+x = 0.5  spacing(x) = 5.960464e-08
+x = 1  spacing(x) = 1.192093e-07
+x = 10  spacing(x) = 9.536743e-07
+
+kind examples:
+spacing(1.0)   = 1.192093e-07
+spacing(1.0_4) = 1.192093e-07
+spacing(1.0_8) = 2.22044604925031e-16
+
+nearby-value examples:
+spacing(1.0)              = 1.192093e-07
+spacing(nearest(1.0,1.0)) = 1.192093e-07
+spacing(2.0)              = 2.384186e-07
+
+spacing(0.0) is the spacing near zero:
+spacing(0.0) = 1.175494e-38
+tiny(0.0)    = 1.175494e-38

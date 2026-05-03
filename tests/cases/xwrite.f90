@@ -1,0 +1,2 @@
+write (*,fmt=*) "hello"
+end

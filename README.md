@@ -172,6 +172,18 @@ directory when present. The benchmark script can compare `ofort`, `ofort
 --fast`, `gfortran`, `ifx`, and `lfortran`, depending on which tools are
 installed.
 
+Generate or resize the benchmark programs with one base problem-size parameter:
+
+```powershell
+python .\scripts\generate_benchmarks.py --size 1000000
+python .\scripts\generate_benchmarks.py --size 5000000 --list
+```
+
+The generator writes the `benchmarks\xbench_*.f90` files. Each benchmark derives
+its own `n` from the base size so that the current mix of array and scalar-loop
+tests remains roughly balanced. Increase `--size` until benchmark run times are
+large enough to be meaningful on your machine.
+
 Example:
 
 ```powershell

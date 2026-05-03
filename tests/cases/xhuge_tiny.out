@@ -1,0 +1,29 @@
+huge(x) returns the largest model number of the same type and kind as x.
+tiny(x) returns the smallest positive normalized real number of the same kind as x.
+
+integer huge examples:
+ia(i) = 0  huge(ia(i)) = 2147483647
+ia(i) = 1  huge(ia(i)) = 2147483647
+ia(i) = -1  huge(ia(i)) = 2147483647
+ia(i) = 100  huge(ia(i)) = 2147483647
+
+integer kind examples:
+huge(0)   = 2147483647
+huge(0_1) = 127
+huge(0_2) = 32767
+huge(0_4) = 2147483647
+huge(0_8) = 9223372036854775807
+
+real huge and tiny examples:
+ra(i) = 0  huge(ra(i)) = 3.402823e+38  tiny(ra(i)) = 1.175494e-38
+ra(i) = 1  huge(ra(i)) = 3.402823e+38  tiny(ra(i)) = 1.175494e-38
+ra(i) = -1  huge(ra(i)) = 3.402823e+38  tiny(ra(i)) = 1.175494e-38
+ra(i) = 100  huge(ra(i)) = 3.402823e+38  tiny(ra(i)) = 1.175494e-38
+
+real kind examples:
+huge(1.0)   = 3.402823e+38
+tiny(1.0)   = 1.175494e-38
+huge(1.0_4) = 3.402823e+38
+tiny(1.0_4) = 1.175494e-38
+huge(1.0_8) = 1.79769313486232e+308
+tiny(1.0_8) = 2.2250738585072e-308

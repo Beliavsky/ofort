@@ -1,0 +1,7 @@
+after allocation and assignment:
+allocated(i) =  T , i =  42
+allocated(x) =  T , x =  3.141593
+
+after deallocation:
+allocated(i) =  F
+allocated(x) =  F

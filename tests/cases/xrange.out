@@ -1,0 +1,30 @@
+range(x) returns the decimal exponent range of x.
+
+integer examples:
+ia(i) = 0  range(ia(i)) = 9
+ia(i) = 1  range(ia(i)) = 9
+ia(i) = -1  range(ia(i)) = 9
+ia(i) = 100  range(ia(i)) = 9
+
+integer kind examples:
+range(0)   = 9
+range(0_1) = 2
+range(0_2) = 4
+range(0_4) = 9
+range(0_8) = 18
+
+real examples:
+ra(i) = 0  range(ra(i)) = 37
+ra(i) = 1  range(ra(i)) = 37
+ra(i) = -1  range(ra(i)) = 37
+ra(i) = 100  range(ra(i)) = 37
+
+real kind examples:
+range(1.0)   = 37
+range(1.0_4) = 37
+range(1.0_8) = 307
+
+complex examples:
+range((1.0, 2.0))     = 37
+range((1.0_4, 2.0_4)) = 37
+range((1.0_8, 2.0_8)) = 307

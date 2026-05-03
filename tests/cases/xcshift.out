@@ -1,0 +1,44 @@
+a =  10 20 30 40 50
+
+cshift(a, shift=2):
+30 40 50 10 20
+
+cshift(a, shift=-2):
+40 50 10 20 30
+
+b:
+11 12 13 14
+21 22 23 24
+31 32 33 34
+
+cshift(b, shift=1, dim=1):
+21 22 23 24
+31 32 33 34
+11 12 13 14
+
+cshift(b, shift=-1, dim=1):
+31 32 33 34
+11 12 13 14
+21 22 23 24
+
+cshift(b, shift=1, dim=2):
+12 13 14 11
+22 23 24 21
+32 33 34 31
+
+cshift(b, shift=-1, dim=2):
+14 11 12 13
+24 21 22 23
+34 31 32 33
+
+cshift(b, shift=shift_rows, dim=1):
+shift_rows =  0 1 -1 2
+11 22 33 34
+21 32 13 14
+31 12 23 24
+
+cshift(b, shift=shift_cols, dim=2):
+shift_cols =  0 1 -1
+11 12 13 14
+22 23 24 21
+34 31 32 33

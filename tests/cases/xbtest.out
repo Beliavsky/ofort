@@ -1,0 +1,48 @@
+btest(i, pos) is true if bit pos of integer i is 1.
+Bit positions start at 0.
+
+i = 0
+  pos = 0  btest = F
+  pos = 1  btest = F
+  pos = 2  btest = F
+  pos = 3  btest = F
+  pos = 4  btest = F
+  pos = 5  btest = F
+
+i = 1
+  pos = 0  btest = T
+  pos = 1  btest = F
+  pos = 2  btest = F
+  pos = 3  btest = F
+  pos = 4  btest = F
+  pos = 5  btest = F
+
+i = 2
+  pos = 0  btest = F
+  pos = 1  btest = T
+  pos = 2  btest = F
+  pos = 3  btest = F
+  pos = 4  btest = F
+  pos = 5  btest = F
+
+i = 3
+  pos = 0  btest = T
+  pos = 1  btest = T
+  pos = 2  btest = F
+  pos = 3  btest = F
+  pos = 4  btest = F
+  pos = 5  btest = F
+
+i = 10
+  pos = 0  btest = F
+  pos = 1  btest = T
+  pos = 2  btest = F
+  pos = 3  btest = T
+  pos = 4  btest = F
+  pos = 5  btest = F
+
+some direct examples:
+btest(10, 0) = F
+btest(10, 1) = T
+btest(10, 2) = F
+btest(10, 3) = T

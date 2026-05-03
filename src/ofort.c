@@ -7662,6 +7662,280 @@ static int fast_linear_expr_coeff(OfortNode *n, const char *name, double *coef, 
     }
 }
 
+static int expr_mentions_ident(OfortNode *n, const char *name) {
+    if (!n || !name) return 0;
+    if (n->type == FND_IDENT && str_eq_nocase(n->name, name)) return 1;
+    for (int i = 0; i < n->n_children; i++) {
+        if (expr_mentions_ident(n->children[i], name)) return 1;
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        if (expr_mentions_ident(n->stmts[i], name)) return 1;
+    }
+    return 0;
+}
+
+static int fast_scalar_affine_expr_coeff(OfortInterpreter *I, OfortNode *n,
+                                         const char *name, double *coef,
+                                         double *constant) {
+    double lc, lb, rc, rb, sv;
+    if (!I || !n || !name || !coef || !constant) return 0;
+    if (n->type == FND_IDENT && str_eq_nocase(n->name, name)) {
+        *coef = 1.0;
+        *constant = 0.0;
+        return 1;
+    }
+    if (!expr_mentions_ident(n, name) && fast_numeric_expr_value_node(I, n, constant)) {
+        *coef = 0.0;
+        return 1;
+    }
+    if (!n->children[0] || !n->children[1]) return 0;
+    switch (n->type) {
+    case FND_ADD:
+        if (!fast_scalar_affine_expr_coeff(I, n->children[0], name, &lc, &lb) ||
+            !fast_scalar_affine_expr_coeff(I, n->children[1], name, &rc, &rb))
+            return 0;
+        *coef = lc + rc;
+        *constant = lb + rb;
+        return 1;
+    case FND_SUB:
+        if (!fast_scalar_affine_expr_coeff(I, n->children[0], name, &lc, &lb) ||
+            !fast_scalar_affine_expr_coeff(I, n->children[1], name, &rc, &rb))
+            return 0;
+        *coef = lc - rc;
+        *constant = lb - rb;
+        return 1;
+    case FND_MUL:
+        if (fast_numeric_expr_value_node(I, n->children[0], &sv) &&
+            !expr_mentions_ident(n->children[0], name) &&
+            fast_scalar_affine_expr_coeff(I, n->children[1], name, &rc, &rb)) {
+            *coef = sv * rc;
+            *constant = sv * rb;
+            return 1;
+        }
+        if (fast_numeric_expr_value_node(I, n->children[1], &sv) &&
+            !expr_mentions_ident(n->children[1], name) &&
+            fast_scalar_affine_expr_coeff(I, n->children[0], name, &lc, &lb)) {
+            *coef = lc * sv;
+            *constant = lb * sv;
+            return 1;
+        }
+        return 0;
+    case FND_DIV:
+        if (fast_numeric_expr_value_node(I, n->children[1], &sv) &&
+            !expr_mentions_ident(n->children[1], name) && sv != 0.0 &&
+            fast_scalar_affine_expr_coeff(I, n->children[0], name, &lc, &lb)) {
+            *coef = lc / sv;
+            *constant = lb / sv;
+            return 1;
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static int fast_scalar_poly2_expr_coeff(OfortInterpreter *I, OfortNode *n,
+                                        const char *name, double coeff[3]) {
+    double left[3], right[3], sv;
+    if (!I || !n || !name || !coeff) return 0;
+    coeff[0] = coeff[1] = coeff[2] = 0.0;
+    if (n->type == FND_IDENT && str_eq_nocase(n->name, name)) {
+        coeff[1] = 1.0;
+        return 1;
+    }
+    if (!expr_mentions_ident(n, name) && fast_numeric_expr_value_node(I, n, &sv)) {
+        coeff[0] = sv;
+        return 1;
+    }
+    if (!n->children[0] || !n->children[1]) return 0;
+    switch (n->type) {
+    case FND_ADD:
+        if (!fast_scalar_poly2_expr_coeff(I, n->children[0], name, left) ||
+            !fast_scalar_poly2_expr_coeff(I, n->children[1], name, right))
+            return 0;
+        for (int i = 0; i < 3; i++) coeff[i] = left[i] + right[i];
+        return 1;
+    case FND_SUB:
+        if (!fast_scalar_poly2_expr_coeff(I, n->children[0], name, left) ||
+            !fast_scalar_poly2_expr_coeff(I, n->children[1], name, right))
+            return 0;
+        for (int i = 0; i < 3; i++) coeff[i] = left[i] - right[i];
+        return 1;
+    case FND_MUL:
+        if (!fast_scalar_poly2_expr_coeff(I, n->children[0], name, left) ||
+            !fast_scalar_poly2_expr_coeff(I, n->children[1], name, right))
+            return 0;
+        if ((left[2] != 0.0 && (right[1] != 0.0 || right[2] != 0.0)) ||
+            (right[2] != 0.0 && (left[1] != 0.0 || left[2] != 0.0)))
+            return 0;
+        coeff[0] = left[0] * right[0];
+        coeff[1] = left[0] * right[1] + left[1] * right[0];
+        coeff[2] = left[0] * right[2] + left[1] * right[1] + left[2] * right[0];
+        return 1;
+    case FND_DIV:
+        if (!fast_numeric_expr_value_node(I, n->children[1], &sv) ||
+            expr_mentions_ident(n->children[1], name) || sv == 0.0)
+            return 0;
+        if (!fast_scalar_poly2_expr_coeff(I, n->children[0], name, left))
+            return 0;
+        for (int i = 0; i < 3; i++) coeff[i] = left[i] / sv;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int fast_accum_poly2_expr_coeff(OfortInterpreter *I, OfortNode *n,
+                                       const char *sum_name, const char *x_name,
+                                       double *sum_coef, double poly[3]) {
+    double lsum, rsum, lpoly[3], rpoly[3];
+    if (!I || !n || !sum_name || !x_name || !sum_coef || !poly) return 0;
+    *sum_coef = 0.0;
+    poly[0] = poly[1] = poly[2] = 0.0;
+    if (n->type == FND_IDENT && str_eq_nocase(n->name, sum_name)) {
+        *sum_coef = 1.0;
+        return 1;
+    }
+    if (!expr_mentions_ident(n, sum_name)) {
+        return fast_scalar_poly2_expr_coeff(I, n, x_name, poly);
+    }
+    if (!n->children[0] || !n->children[1]) return 0;
+    switch (n->type) {
+    case FND_ADD:
+        if (!fast_accum_poly2_expr_coeff(I, n->children[0], sum_name, x_name, &lsum, lpoly) ||
+            !fast_accum_poly2_expr_coeff(I, n->children[1], sum_name, x_name, &rsum, rpoly))
+            return 0;
+        *sum_coef = lsum + rsum;
+        for (int i = 0; i < 3; i++) poly[i] = lpoly[i] + rpoly[i];
+        return 1;
+    case FND_SUB:
+        if (!fast_accum_poly2_expr_coeff(I, n->children[0], sum_name, x_name, &lsum, lpoly) ||
+            !fast_accum_poly2_expr_coeff(I, n->children[1], sum_name, x_name, &rsum, rpoly))
+            return 0;
+        *sum_coef = lsum - rsum;
+        for (int i = 0; i < 3; i++) poly[i] = lpoly[i] - rpoly[i];
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int exec_fast_scalar_affine_recurrence_loop(OfortInterpreter *I, OfortNode *n,
+                                                   long long s, long long e, long long st) {
+    OfortNode *body;
+    OfortNode *assign;
+    OfortNode *lhs;
+    OfortNode *rhs;
+    OfortVar *target;
+    OfortVar *loop_var;
+    double coef;
+    double constant;
+    double value;
+    long long iter;
+    double profile_start = 0.0;
+
+    if (!I || !I->fast_mode || !n || n->type != FND_DO_LOOP || st == 0) return 0;
+    body = n->children[3];
+    if (!body || body->type != FND_BLOCK || body->n_stmts != 1) return 0;
+    assign = body->stmts[0];
+    if (!assign || assign->type != FND_ASSIGN) return 0;
+    lhs = assign->children[0];
+    rhs = assign->children[1];
+    if (!lhs || lhs->type != FND_IDENT || !rhs) return 0;
+    if (!fast_scalar_affine_expr_coeff(I, rhs, lhs->name, &coef, &constant)) return 0;
+    target = find_var(I, lhs->name);
+    loop_var = find_var(I, n->name);
+    if (!target || !loop_var || target->is_parameter || target->is_protected ||
+        loop_var->is_parameter || loop_var->is_protected)
+        return 0;
+    if ((target->val.type != FVAL_REAL && target->val.type != FVAL_DOUBLE) ||
+        loop_var->val.type != FVAL_INTEGER)
+        return 0;
+
+    if (I->line_profile_enabled && n->line > 0) profile_start = ofort_monotonic_seconds();
+    value = target->val.v.r;
+    iter = s;
+    while (st > 0 ? iter <= e : iter >= e) {
+        value = coef * value + constant;
+        iter += st;
+    }
+    target->val.v.r = value;
+    loop_var->val.v.i = iter;
+    if (I->line_profile_enabled && n->line > 0) {
+        add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
+    }
+    return 1;
+}
+
+static int exec_fast_scalar_poly_accum_loop(OfortInterpreter *I, OfortNode *n,
+                                            long long s, long long e, long long st) {
+    OfortNode *body;
+    OfortNode *update;
+    OfortNode *accum;
+    OfortNode *update_lhs;
+    OfortNode *accum_lhs;
+    OfortVar *x_var;
+    OfortVar *sum_var;
+    OfortVar *loop_var;
+    double update_coef, update_constant;
+    double sum_coef;
+    double poly[3];
+    double x, sum;
+    long long iter;
+    double profile_start = 0.0;
+
+    if (!I || !I->fast_mode || !n || n->type != FND_DO_LOOP || st == 0) return 0;
+    body = n->children[3];
+    if (!body || body->type != FND_BLOCK || body->n_stmts != 2) return 0;
+    update = body->stmts[0];
+    accum = body->stmts[1];
+    if (!update || update->type != FND_ASSIGN || !accum || accum->type != FND_ASSIGN)
+        return 0;
+    update_lhs = update->children[0];
+    accum_lhs = accum->children[0];
+    if (!update_lhs || update_lhs->type != FND_IDENT ||
+        !accum_lhs || accum_lhs->type != FND_IDENT)
+        return 0;
+    if (!fast_scalar_affine_expr_coeff(I, update->children[1], update_lhs->name,
+                                       &update_coef, &update_constant))
+        return 0;
+    if (!accum->children[1]) return 0;
+    if (!fast_accum_poly2_expr_coeff(I, accum->children[1], accum_lhs->name,
+                                     update_lhs->name, &sum_coef, poly))
+        return 0;
+    if (fabs(sum_coef - 1.0) > 1.0e-12) return 0;
+
+    x_var = find_var(I, update_lhs->name);
+    sum_var = find_var(I, accum_lhs->name);
+    loop_var = find_var(I, n->name);
+    if (!x_var || !sum_var || !loop_var ||
+        x_var->is_parameter || x_var->is_protected ||
+        sum_var->is_parameter || sum_var->is_protected ||
+        loop_var->is_parameter || loop_var->is_protected)
+        return 0;
+    if ((x_var->val.type != FVAL_REAL && x_var->val.type != FVAL_DOUBLE) ||
+        (sum_var->val.type != FVAL_REAL && sum_var->val.type != FVAL_DOUBLE) ||
+        loop_var->val.type != FVAL_INTEGER)
+        return 0;
+
+    if (I->line_profile_enabled && n->line > 0) profile_start = ofort_monotonic_seconds();
+    x = x_var->val.v.r;
+    sum = sum_var->val.v.r;
+    iter = s;
+    while (st > 0 ? iter <= e : iter >= e) {
+        x = update_coef * x + update_constant;
+        sum += (poly[2] * x + poly[1]) * x + poly[0];
+        iter += st;
+    }
+    x_var->val.v.r = x;
+    sum_var->val.v.r = sum;
+    loop_var->val.v.i = iter;
+    if (I->line_profile_enabled && n->line > 0) {
+        add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
+    }
+    return 1;
+}
+
 static int find_single_assignment_in_simple_body(OfortNode *body, OfortNode **assign) {
     if (!body || !assign) return 0;
     if (body->type == FND_BLOCK) {
@@ -8778,6 +9052,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
         if (I->specialized_fast_paths &&
             (exec_fast_affine_subroutine_loop(I, n, s, e, st) ||
+             exec_fast_scalar_poly_accum_loop(I, n, s, e, st) ||
+             exec_fast_scalar_affine_recurrence_loop(I, n, s, e, st) ||
              exec_fast_array_affine_loop(I, n, s, e, st) ||
              exec_fast_random_dot_loop(I, n, s, e, st) ||
              exec_fast_random_sum_loop(I, n, s, e, st))) {

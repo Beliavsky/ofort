@@ -1,0 +1,44 @@
+selected_int_kind(r) returns an integer kind with decimal exponent range >= r.
+negative results mean no such kind exists.
+
+selected_int_kind examples:
+r = 1  selected_int_kind(r) = 1
+r = 2  selected_int_kind(r) = 1
+r = 4  selected_int_kind(r) = 2
+r = 9  selected_int_kind(r) = 4
+r = 18  selected_int_kind(r) = 8
+r = 30  selected_int_kind(r) = -1
+
+selected_real_kind(p, r) returns a real kind with precision >= p and range >= r.
+negative results mean no such kind exists.
+
+selected_real_kind with precision only:
+p = 3  selected_real_kind(p=p) = 4
+p = 6  selected_real_kind(p=p) = 4
+p = 12  selected_real_kind(p=p) = 8
+p = 15  selected_real_kind(p=p) = 8
+p = 30  selected_real_kind(p=p) = -1
+p = 100  selected_real_kind(p=p) = -1
+
+selected_real_kind with range only:
+r = 10  selected_real_kind(r=r) = 4
+r = 30  selected_real_kind(r=r) = 4
+r = 100  selected_real_kind(r=r) = 8
+r = 300  selected_real_kind(r=r) = 8
+r = 3000  selected_real_kind(r=r) = -2
+r = 10000  selected_real_kind(r=r) = -2
+
+selected_real_kind with precision and range:
+p = 3  r = 10  selected_real_kind(p=p, r=r) = 4
+p = 6  r = 30  selected_real_kind(p=p, r=r) = 4
+p = 12  r = 100  selected_real_kind(p=p, r=r) = 8
+p = 15  r = 300  selected_real_kind(p=p, r=r) = 8
+p = 30  r = 3000  selected_real_kind(p=p, r=r) = -3
+p = 100  r = 10000  selected_real_kind(p=p, r=r) = -3
+
+using the returned kinds:
+ik = 4
+rk = 8
+range(0_ik) cannot be written directly because kind values in literals
+must be compile-time constants, not variables.
+similarly, 1.0_rk is not valid when rk is an ordinary variable.

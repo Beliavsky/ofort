@@ -1,0 +1,23 @@
+digits(x) returns the number of significant binary digits.
+
+integer examples:
+a(i) = 0  digits(a(i)) = 31
+a(i) = 1  digits(a(i)) = 31
+a(i) = -1  digits(a(i)) = 31
+a(i) = 2147483647  digits(a(i)) = 31
+
+integer kind examples:
+digits(0)   = 31
+digits(0_1) = 7
+digits(0_2) = 15
+digits(0_4) = 31
+digits(0_8) = 63
+
+real examples:
+digits(1.0) = 24
+digits(x)   = 24
+
+real kind examples:
+digits(1.0)    = 24
+digits(1.0_4)  = 24
+digits(1.0_8)  = 53

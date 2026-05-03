@@ -1,0 +1,38 @@
+ibits(i, pos, len) extracts len bits from i, starting at bit pos.
+Bit positions start at 0.
+
+i = 0
+  ibits(i, 0, 1) = 0
+  ibits(i, 0, 2) = 0
+  ibits(i, 1, 2) = 0
+  ibits(i, 2, 2) = 0
+
+i = 1
+  ibits(i, 0, 1) = 1
+  ibits(i, 0, 2) = 1
+  ibits(i, 1, 2) = 0
+  ibits(i, 2, 2) = 0
+
+i = 3
+  ibits(i, 0, 1) = 1
+  ibits(i, 0, 2) = 3
+  ibits(i, 1, 2) = 1
+  ibits(i, 2, 2) = 0
+
+i = 10
+  ibits(i, 0, 1) = 0
+  ibits(i, 0, 2) = 2
+  ibits(i, 1, 2) = 1
+  ibits(i, 2, 2) = 2
+
+i = 15
+  ibits(i, 0, 1) = 1
+  ibits(i, 0, 2) = 3
+  ibits(i, 1, 2) = 3
+  ibits(i, 2, 2) = 3
+
+direct examples:
+ibits(10, 0, 1) = 0
+ibits(10, 1, 2) = 1
+ibits(15, 0, 4) = 15
+ibits(15, 2, 2) = 3

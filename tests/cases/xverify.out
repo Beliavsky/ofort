@@ -1,0 +1,35 @@
+verify(string, set) returns the position of the first character
+in string that is not in set. It returns 0 if all characters are in set.
+
+string = [ abc123 ]
+  verify(s, 'abcdefghijklmnopqrstuvwxyz') = 4
+  verify(s, '0123456789') = 1
+string = [ abcdef ]
+  verify(s, 'abcdefghijklmnopqrstuvwxyz') = 7
+  verify(s, '0123456789') = 1
+string = [ 12345 ]
+  verify(s, 'abcdefghijklmnopqrstuvwxyz') = 1
+  verify(s, '0123456789') = 6
+string = [ abc def ]
+  verify(s, 'abcdefghijklmnopqrstuvwxyz') = 4
+  verify(s, '0123456789') = 1
+string = [ ABCdef ]
+  verify(s, 'abcdefghijklmnopqrstuvwxyz') = 1
+  verify(s, '0123456789') = 1
+string = [  ]
+  verify(s, 'abcdefghijklmnopqrstuvwxyz') = 1
+  verify(s, '0123456789') = 1
+
+direct examples:
+verify('abc123', 'abcdefghijklmnopqrstuvwxyz') = 4
+verify('abcdef', 'abcdefghijklmnopqrstuvwxyz') = 0
+verify('12345',  '0123456789') = 0
+verify('abc def', 'abcdefghijklmnopqrstuvwxyz') = 4
+
+back=.true. searches from the right:
+verify('abc123abc', 'abc')              = 4
+verify('abc123abc', 'abc', back=.true.) = 6
+
+case-sensitive examples:
+verify('ABCdef', 'abcdef') = 1
+verify('ABCdef', 'ABCdef') = 0

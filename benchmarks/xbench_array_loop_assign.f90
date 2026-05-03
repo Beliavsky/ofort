@@ -1,4 +1,4 @@
-integer, parameter :: n = 200000
+integer, parameter :: n = 10000000
 integer, parameter :: dp = kind(1.0d0)
 real(kind=dp) :: x(n), y(n), a, b
 integer :: i

@@ -1,0 +1,41 @@
+maskl(i) returns an integer with the leftmost i bits set to 1.
+maskr(i) returns an integer with the rightmost i bits set to 1.
+
+bit_size(0) = 32
+full mask   = -1
+
+i = 0
+  maskl(i) = 0
+  maskr(i) = 0
+
+i = 1
+  maskl(i) = -2147483648
+  maskr(i) = 1
+
+i = 2
+  maskl(i) = -1073741824
+  maskr(i) = 3
+
+i = 4
+  maskl(i) = -268435456
+  maskr(i) = 15
+
+i = 8
+  maskl(i) = -16777216
+  maskr(i) = 255
+
+i = 32
+  maskl(i) = -1
+  maskr(i) = -1
+
+using masks with iand:
+iand(15, maskr(1)) = 1
+iand(15, maskr(2)) = 3
+iand(15, maskr(3)) = 7
+iand(15, maskr(4)) = 15
+
+left-mask examples depend on the integer bit size:
+maskl(1) = -2147483648
+maskl(2) = -1073741824
+maskl(3) = -536870912
+maskl(4) = -268435456

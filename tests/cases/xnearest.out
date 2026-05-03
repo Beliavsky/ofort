@@ -1,0 +1,26 @@
+nearest(x, s) returns the nearest representable number to x
+in the direction of the sign of s.
+
+default real examples:
+x = -1
+  nearest(x,  1.0) = -0.9999999
+  nearest(x, -1.0) = -1
+x = 0
+  nearest(x,  1.0) = 1.401298e-45
+  nearest(x, -1.0) = -1.401298e-45
+x = 1
+  nearest(x,  1.0) = 1
+  nearest(x, -1.0) = 0.9999999
+x = 10
+  nearest(x,  1.0) = 10
+  nearest(x, -1.0) = 9.999999
+x = 3.402823e+38
+  nearest(x,  1.0) = inf
+  nearest(x, -1.0) = 3.402823e+38
+
+kind examples:
+nearest(1.0_4,  1.0_4) = 1
+nearest(1.0_4, -1.0_4) = 0.9999999
+
+nearest(1.0_8,  1.0_8) = 1
+nearest(1.0_8, -1.0_8) = 1

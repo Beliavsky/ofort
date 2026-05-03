@@ -1,0 +1,20 @@
+bit_size returns the number of bits used to represent an integer.
+
+bit_size(0)       = 32
+bit_size(0_1)     = 8
+bit_size(0_2)     = 16
+bit_size(0_4)     = 32
+bit_size(0_8)     = 64
+
+scalar examples:
+a(i) = 0  bit_size(a(i)) = 32
+a(i) = 1  bit_size(a(i)) = 32
+a(i) = -1  bit_size(a(i)) = 32
+a(i) = 2147483647  bit_size(a(i)) = 32
+
+huge examples:
+huge(0)   = 2147483647  bit_size = 32
+huge(0_1) = 127  bit_size = 8
+huge(0_2) = 32767  bit_size = 16
+huge(0_4) = 2147483647  bit_size = 32
+huge(0_8) = 9223372036854775807  bit_size = 64

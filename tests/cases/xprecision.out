@@ -1,0 +1,17 @@
+precision(x) returns the decimal precision of a real or complex kind.
+
+default real examples:
+a(i) = 0  precision(a(i)) = 6
+a(i) = 1  precision(a(i)) = 6
+a(i) = -1  precision(a(i)) = 6
+a(i) = 100  precision(a(i)) = 6
+
+real kind examples:
+precision(1.0)   = 6
+precision(1.0_4) = 6
+precision(1.0_8) = 15
+
+complex examples:
+precision((1.0, 2.0))     = 6
+precision((1.0_4, 2.0_4)) = 6
+precision((1.0_8, 2.0_8)) = 15

@@ -1,0 +1,16 @@
+a =  1 2 3 4 5 6
+
+pack(a, a > 3) =  4 5 6
+pack(a, even mask) =  2 4 6
+pack(a, scalar .true.) =  1 2 3 4 5 6
+
+b:
+1 3 5
+2 4 6
+pack(b, b >= 3) =  3 4 5 6
+
+pack with vector argument:
+5 6 300 400 500 600
+
+empty result when no mask values are true:
+size(pack(a, a > 99)) = 0

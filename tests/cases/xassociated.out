@@ -1,0 +1,34 @@
+associated(pointer) tells whether a pointer is associated.
+associated(pointer, target) tells whether it is associated with target.
+
+after nullify:
+associated(p) = F
+associated(q) = F
+associated(r) = F
+
+after p => a, q => a, r => x:
+associated(p) = T
+associated(q) = T
+associated(r) = T
+
+target tests:
+associated(p, a) = T
+associated(p, b) = F
+associated(q, a) = T
+associated(r, x) = T
+
+pointer-to-pointer target tests:
+associated(p, q) = T
+
+after q => b:
+associated(p, q) = F
+associated(q, b) = T
+
+after p => a(2:4):
+p = 2 3 4
+associated(p) = T
+associated(p, a) = F
+associated(p, a(2:4)) = T
+
+after nullify(p):
+associated(p) = F

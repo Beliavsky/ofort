@@ -1,0 +1,23 @@
+fraction(x) returns the fractional part of the model representation of x.
+x = fraction(x) * radix(x)**exponent(x), except when x is zero.
+
+default real examples:
+x = -8  fraction(x) = -0.5  exponent(x) = 4
+x = -3.5  fraction(x) = -0.875  exponent(x) = 2
+x = -1  fraction(x) = -0.5  exponent(x) = 1
+x = 0  fraction(x) = 0  exponent(x) = 0
+x = 1  fraction(x) = 0.5  exponent(x) = 1
+x = 3.5  fraction(x) = 0.875  exponent(x) = 2
+x = 8  fraction(x) = 0.5  exponent(x) = 4
+
+reconstruct nonzero values:
+x = -8  reconstructed = -8
+x = -3.5  reconstructed = -3.5
+x = -1  reconstructed = -1
+x = 1  reconstructed = 1
+x = 3.5  reconstructed = 3.5
+x = 8  reconstructed = 8
+
+real kind examples:
+fraction(3.5_4) = 0.875
+fraction(3.5_8) = 0.875

@@ -1,0 +1,10 @@
+integer scalar:
+twice( 7 ) = 14
+real scalar:
+twice( 1.25 ) = 2.5
+integer array:
+ia =  1 2 3 4
+twice(ia) =  2 4 6 8
+real array:
+ra =  1 2.5 -3 4.25
+twice(ra) =  2 5 -6 8.5

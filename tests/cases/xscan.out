@@ -1,0 +1,25 @@
+scan(string, set) returns the position of the first character
+in string that is also in set. It returns 0 if none is found.
+
+string = [ abc123 ] scan(s,set) = 4
+string = [ no digits ] scan(s,set) = 0
+string = [   leading ] scan(s,set) = 0
+string = [ hello, world ] scan(s,set) = 0
+string = [ ABCdef ] scan(s,set) = 0
+string = [  ] scan(s,set) = 0
+
+different sets:
+scan('abc123', '0123456789') = 4
+scan('abc123', 'abc')        = 1
+scan('abc123', 'xyz')        = 0
+
+back=.true. searches from the right:
+scan('abc123abc', 'abc')              = 1
+scan('abc123abc', 'abc', back=.true.) = 9
+
+blank is just another character in set:
+scan('no digits', ' ') = 3
+
+case-sensitive examples:
+scan('ABCdef', 'abc') = 0
+scan('ABCdef', 'ABC') = 1

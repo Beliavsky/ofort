@@ -1,0 +1,22 @@
+epsilon(x) returns the smallest positive number e such that 1 + e > 1.
+
+default real examples:
+epsilon(1.0) = 1.192093e-07
+epsilon(x)   = 1.192093e-07
+
+epsilon depends on kind, not value:
+epsilon(0.0)       = 1.192093e-07
+epsilon(1.0)       = 1.192093e-07
+epsilon(10.0)      = 1.192093e-07
+epsilon(huge(0.0)) = 1.192093e-07
+
+array element examples:
+a =  0 1 10 3.402823e+38
+epsilon(a(1)) = 1.192093e-07
+epsilon(a(2)) = 1.192093e-07
+epsilon(a(3)) = 1.192093e-07
+epsilon(a(4)) = 1.192093e-07
+
+real kind examples:
+epsilon(1.0_4) = 1.192093e-07
+epsilon(1.0_8) = 2.22044604925031e-16

@@ -1,0 +1,21 @@
+rrspacing(x) returns the reciprocal of the relative spacing near x.
+It is roughly abs(fraction(x)) * radix(x)**digits(x).
+
+default real examples:
+x = -10  rrspacing(x) = 1.048576e+07
+x = -1  rrspacing(x) = 8388608
+x = -0.5  rrspacing(x) = 8388608
+x = 0  rrspacing(x) = 0
+x = 0.5  rrspacing(x) = 8388608
+x = 1  rrspacing(x) = 8388608
+x = 10  rrspacing(x) = 1.048576e+07
+
+kind examples:
+rrspacing(1.0)   = 8388608
+rrspacing(1.0_4) = 8388608
+rrspacing(1.0_8) = 4.5035996273705e+15
+
+nearby-value examples:
+rrspacing(1.0)              = 8388608
+rrspacing(nearest(1.0,1.0)) = 8388609
+rrspacing(2.0)              = 8388608

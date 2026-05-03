@@ -1,0 +1,14 @@
+iand(i, j) returns the bitwise logical and of integers i and j.
+
+i = 0  j = 0  iand(i,j) = 0
+i = 1  j = 1  iand(i,j) = 1
+i = 2  j = 1  iand(i,j) = 0
+i = 3  j = 2  iand(i,j) = 2
+i = 10  j = 12  iand(i,j) = 8
+i = 15  j = 5  iand(i,j) = 5
+
+direct examples:
+iand(10, 12) = 8
+iand(15,  5) = 5
+iand( 7,  3) = 3
+iand( 8,  1) = 0

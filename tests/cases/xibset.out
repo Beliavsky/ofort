@@ -1,0 +1,43 @@
+ibset(i, pos) returns i with bit pos set to 1.
+Bit positions start at 0.
+
+i = 0
+  pos = 0  ibset = 1
+  pos = 1  ibset = 2
+  pos = 2  ibset = 4
+  pos = 3  ibset = 8
+  pos = 4  ibset = 16
+
+i = 1
+  pos = 0  ibset = 1
+  pos = 1  ibset = 3
+  pos = 2  ibset = 5
+  pos = 3  ibset = 9
+  pos = 4  ibset = 17
+
+i = 3
+  pos = 0  ibset = 3
+  pos = 1  ibset = 3
+  pos = 2  ibset = 7
+  pos = 3  ibset = 11
+  pos = 4  ibset = 19
+
+i = 10
+  pos = 0  ibset = 11
+  pos = 1  ibset = 10
+  pos = 2  ibset = 14
+  pos = 3  ibset = 10
+  pos = 4  ibset = 26
+
+i = 15
+  pos = 0  ibset = 15
+  pos = 1  ibset = 15
+  pos = 2  ibset = 15
+  pos = 3  ibset = 15
+  pos = 4  ibset = 31
+
+direct examples:
+ibset(10, 0) = 11
+ibset(10, 1) = 10
+ibset(10, 2) = 14
+ibset(10, 3) = 10

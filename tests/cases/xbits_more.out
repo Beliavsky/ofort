@@ -1,0 +1,86 @@
+ieor(i,j) returns bitwise exclusive or.
+ior(i,j)  returns bitwise inclusive or.
+
+i = 0  j = 0  ieor = 0  ior = 0
+i = 1  j = 1  ieor = 0  ior = 1
+i = 3  j = 5  ieor = 6  ior = 7
+i = 10  j = 12  ieor = 6  ior = 14
+i = 15  j = 7  ieor = 8  ior = 15
+
+ishft(i, shift) shifts bits.
+positive shift moves left; negative shift moves right.
+
+i = 0
+  ishft(i,-2) = 0
+  ishft(i,-1) = 0
+  ishft(i, 0) = 0
+  ishft(i, 1) = 0
+  ishft(i, 2) = 0
+i = 1
+  ishft(i,-2) = 0
+  ishft(i,-1) = 0
+  ishft(i, 0) = 1
+  ishft(i, 1) = 2
+  ishft(i, 2) = 4
+i = 3
+  ishft(i,-2) = 0
+  ishft(i,-1) = 1
+  ishft(i, 0) = 3
+  ishft(i, 1) = 6
+  ishft(i, 2) = 12
+i = 10
+  ishft(i,-2) = 2
+  ishft(i,-1) = 5
+  ishft(i, 0) = 10
+  ishft(i, 1) = 20
+  ishft(i, 2) = 40
+i = 15
+  ishft(i,-2) = 3
+  ishft(i,-1) = 7
+  ishft(i, 0) = 15
+  ishft(i, 1) = 30
+  ishft(i, 2) = 60
+
+ishftc(i, shift, size) circularly shifts the rightmost size bits.
+
+i = 0
+  ishftc(i, 1, 4)  = 0
+  ishftc(i, 2, 4)  = 0
+  ishftc(i,-1, 4)  = 0
+  ishftc(i,-2, 4)  = 0
+i = 1
+  ishftc(i, 1, 4)  = 2
+  ishftc(i, 2, 4)  = 4
+  ishftc(i,-1, 4)  = 8
+  ishftc(i,-2, 4)  = 4
+i = 3
+  ishftc(i, 1, 4)  = 6
+  ishftc(i, 2, 4)  = 12
+  ishftc(i,-1, 4)  = 9
+  ishftc(i,-2, 4)  = 12
+i = 10
+  ishftc(i, 1, 4)  = 5
+  ishftc(i, 2, 4)  = 10
+  ishftc(i,-1, 4)  = 5
+  ishftc(i,-2, 4)  = 10
+i = 15
+  ishftc(i, 1, 4)  = 15
+  ishftc(i, 2, 4)  = 15
+  ishftc(i,-1, 4)  = 15
+  ishftc(i,-2, 4)  = 15
+
+mvbits(from, frompos, len, to, topos) copies bits from one integer to another.
+The destination integer is modified.
+
+from = 10, to = 0
+call mvbits(from, 1, 2, to, 0)
+to = 1
+from = 15, to = 0
+call mvbits(from, 0, 4, to, 0)
+to = 15
+from = 10, to = 15
+call mvbits(from, 1, 2, to, 2)
+to = 7
+from = 5, to = 8
+call mvbits(from, 0, 3, to, 1)
+to = 10

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import math
 import re
 import shutil
@@ -20,16 +21,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-try:
-    import pandas as pd
-except ImportError as exc:  # pragma: no cover - depends on local environment
-    raise SystemExit("bench_ofort.py requires pandas: python -m pip install pandas") from exc
-
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BENCHMARK_GLOB = str(ROOT / "benchmarks" / "*.f90")
 DEFAULT_OUTPUT = ROOT / "benchmarks" / "benchmark_results.csv"
 DEFAULT_OFORT = ROOT / ("ofort.exe" if sys.platform.startswith("win") else "ofort")
+BENCHMARK_METADATA_NAME = "benchmark_parameters.json"
 
 # Easy script-level switches.
 RUN_OFORT = True
@@ -42,6 +39,19 @@ RUN_LFORTRAN = True
 GFORTRAN_OPTIONS = ["-O3", "-march=native"]
 IFX_OPTIONS = ["/O3", "/QxHost", "/fp:precise"]
 LFORTRAN_OPTIONS = ["--fast"]
+
+pd = None
+
+
+def require_pandas():
+    global pd
+    if pd is None:
+        try:
+            import pandas as pandas_module
+        except ImportError as exc:  # pragma: no cover - depends on local environment
+            raise SystemExit("bench_ofort.py requires pandas: python -m pip install pandas") from exc
+        pd = pandas_module
+    return pd
 
 
 @dataclass
@@ -71,6 +81,46 @@ def expand_patterns(patterns: list[str]) -> list[Path]:
             seen.add(resolved)
             files.append(resolved)
     return files
+
+
+def benchmark_metadata_path(sources: list[Path]) -> Path | None:
+    if not sources:
+        return None
+    directories = {source.parent for source in sources}
+    if len(directories) != 1:
+        return None
+    path = next(iter(directories)) / BENCHMARK_METADATA_NAME
+    return path if path.exists() else None
+
+
+def print_benchmark_parameters(sources: list[Path]) -> None:
+    path = benchmark_metadata_path(sources)
+    if not path:
+        print("benchmark parameters: not found; run scripts\\generate_benchmarks.py to record them")
+        return
+    try:
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"benchmark parameters: could not read {path}: {exc}")
+        return
+    size = metadata.get("size", "unknown")
+    generator = metadata.get("generator", "unknown")
+    print(f"benchmark parameters: size={size} generator={generator}")
+    benchmarks = metadata.get("benchmarks")
+    if isinstance(benchmarks, list) and benchmarks:
+        parts = []
+        source_names = {source.name for source in sources}
+        for item in benchmarks:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("file", ""))
+            if name not in source_names:
+                continue
+            stem = Path(name).stem
+            n = item.get("n", "?")
+            parts.append(f"{stem}: n={n}")
+        if parts:
+            print("benchmark sizes: " + "; ".join(parts))
 
 
 def run_command(
@@ -203,6 +253,43 @@ def run_compiler(source: Path, task: Task, timeout: float | None) -> dict[str, o
         }
     )
     return row
+
+
+WINDOWS_STATUS_NAMES = {
+    0xC0000005: "access violation",
+    0xC00000FD: "stack overflow",
+    0xC0000006: "in-page error",
+    0xC000013A: "control-c exit",
+}
+
+
+def format_returncode(value: object) -> str:
+    try:
+        code = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+    status = code & 0xFFFFFFFF
+    name = WINDOWS_STATUS_NAMES.get(status)
+    if name:
+        return f"{code} ({name})"
+    return str(code)
+
+
+def print_failure(row: dict[str, object]) -> None:
+    print("benchmark failed", file=sys.stderr)
+    print(f"  benchmark:  {row.get('benchmark', '')}", file=sys.stderr)
+    print(f"  task:       {row.get('task', '')}", file=sys.stderr)
+    print(f"  command:    {row.get('command', '')}", file=sys.stderr)
+    print(f"  returncode: {format_returncode(row.get('returncode', ''))}", file=sys.stderr)
+    print(f"  timed out:  {row.get('timed_out', '')}", file=sys.stderr)
+    stderr = str(row.get("stderr") or "").strip()
+    stdout = str(row.get("stdout") or "").strip()
+    if stderr:
+        print("\nstderr:", file=sys.stderr)
+        print(stderr, file=sys.stderr)
+    elif stdout:
+        print("\nstdout:", file=sys.stderr)
+        print(stdout, file=sys.stderr)
 
 
 def tool_available(task: Task) -> bool:
@@ -437,6 +524,8 @@ def make_totals_by_program(df: "pd.DataFrame") -> "pd.DataFrame":
         ("*MEAN*", lambda series: series.mean(skipna=True)),
         ("*GEOMEAN*", geomean),
         ("*MEDIAN*", lambda series: series.median(skipna=True)),
+        ("*MIN*", lambda series: series.min(skipna=True)),
+        ("*MAX*", lambda series: series.max(skipna=True)),
     ):
         row: dict[str, object] = {"program": label}
         for col in numeric_cols:
@@ -517,7 +606,45 @@ def print_totals_by_task(df: "pd.DataFrame", run_only: bool = False) -> None:
     print(totals.to_string(index=False))
 
 
-def print_totals_by_program(df: "pd.DataFrame", run_only: bool = False) -> None:
+def add_run_ratio_columns(totals: "pd.DataFrame", df: "pd.DataFrame") -> "pd.DataFrame":
+    tasks = list(dict.fromkeys(df["task"]))
+    kinds = {
+        task: df.loc[df["task"] == task, "kind"].iloc[0]
+        for task in tasks
+    }
+    ofort_task = "ofort" if "ofort" in tasks else None
+    if not ofort_task:
+        return totals
+    ofort_run = f"{ofort_task}_run"
+    if ofort_run not in totals.columns:
+        return totals
+    ratio_cols: dict[str, object] = {}
+    for task in tasks:
+        if task == ofort_task or kinds.get(task) != "compiler":
+            continue
+        compiler_run = f"{task}_run"
+        if compiler_run not in totals.columns:
+            continue
+        ratio_cols[f"ratio_ofort_{task}"] = totals[ofort_run] / totals[compiler_run]
+    if not ratio_cols:
+        return totals
+
+    result = totals.copy()
+    insert_at = 1
+    for i, col in enumerate(result.columns):
+        if col.endswith("_run"):
+            insert_at = i + 1
+    for name, values in ratio_cols.items():
+        result.insert(insert_at, name, values)
+        insert_at += 1
+    return result
+
+
+def print_totals_by_program(
+    df: "pd.DataFrame",
+    run_only: bool = False,
+    include_ratios: bool = True,
+) -> None:
     totals = make_totals_by_program(df)
     if run_only:
         drop_cols = [
@@ -526,10 +653,8 @@ def print_totals_by_program(df: "pd.DataFrame", run_only: bool = False) -> None:
             if col.endswith("_compile") or col.endswith("_total")
         ]
         totals = totals.drop(columns=drop_cols)
-    timing_cols = [col for col in totals.columns if col != "program"]
-    if len(timing_cols) == 2:
-        left_col, right_col = timing_cols
-        totals["ratio"] = totals[left_col] / totals[right_col]
+    if include_ratios:
+        totals = add_run_ratio_columns(totals, df)
     for col in totals.columns:
         if col != "program":
             totals[col] = totals[col].map(format_seconds)
@@ -538,8 +663,9 @@ def print_totals_by_program(df: "pd.DataFrame", run_only: bool = False) -> None:
     for col in display.columns:
         if col == "program":
             display_columns.append(("program", ""))
-        elif col == "ratio":
-            display_columns.append(("ratio", ""))
+        elif col.startswith("ratio_ofort_"):
+            compiler = col.removeprefix("ratio_ofort_")
+            display_columns.append(("run ratio", f"ofort/{compiler}"))
         else:
             task, sep, metric = col.rpartition("_")
             display_columns.append((task if sep else col, metric if sep else ""))
@@ -603,6 +729,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--no-csv", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--noratio",
+        action="store_true",
+        help="do not show ofort/compiler run-time ratios in the per-program table",
+    )
+    parser.add_argument(
+        "--run-only",
+        action="store_true",
+        help="show only run times, omitting compile and total times",
+    )
+    parser.add_argument(
+        "--no-list",
+        action="store_true",
+        help="do not print each benchmark/task name before it runs",
+    )
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="stop at the first failed benchmark row and print its error",
+    )
     parser.add_argument("--limit", type=int, metavar="N", help="run at most N benchmark files")
     args = parser.parse_args(argv)
 
@@ -625,25 +771,44 @@ def main(argv: list[str] | None = None) -> int:
     missing_rc = validate_required_tools(tasks)
     if missing_rc:
         return missing_rc
-    run_only_output = args.ofort_only and all(task.kind == "interpreter" for task in tasks)
+    run_only_output = args.run_only or (
+        args.ofort_only and all(task.kind == "interpreter" for task in tasks)
+    )
+    suppress_summary = args.ofort_only and all(task.kind == "interpreter" for task in tasks)
     rows: list[dict[str, object]] = []
+    if not args.quiet:
+        print_benchmark_parameters(sources)
     if args.ofort_fast and not args.quiet:
         print("note: ofort refers to ofort --fast")
     for task in tasks:
         if not tool_available(task):
             for source in sources:
                 row = make_base_row(source, task)
-                row.update({"stderr": f"tool not found: {task.executable}", "returncode": 127})
+                row.update(
+                    {
+                        "command": task.executable,
+                        "stderr": f"tool not found: {task.executable}",
+                        "returncode": 127,
+                    }
+                )
                 rows.append(row)
+                if args.fail_fast:
+                    print_failure(row)
+                    return 1
             continue
         for source in sources:
-            if not args.quiet:
+            if not args.quiet and not args.no_list:
                 print(f"{task.name}: {source.name}", flush=True)
             if task.kind == "interpreter":
-                rows.append(run_ofort(source, task, timeout))
+                row = run_ofort(source, task, timeout)
             else:
-                rows.append(run_compiler(source, task, timeout))
+                row = run_compiler(source, task, timeout)
+            rows.append(row)
+            if args.fail_fast and not bool(row["success"]):
+                print_failure(row)
+                return 1
 
+    require_pandas()
     df = pd.DataFrame(rows)
     if not args.no_csv:
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -651,11 +816,15 @@ def main(argv: list[str] | None = None) -> int:
         if not args.quiet:
             print(f"\nwrote {args.output}")
     if not args.quiet:
-        if not run_only_output:
+        if not suppress_summary and not args.run_only:
             print()
-            print_summary(df)
+            print_summary(df, run_only=run_only_output)
         print_totals_by_task(df, run_only=run_only_output)
-        print_totals_by_program(df, run_only=run_only_output)
+        print_totals_by_program(
+            df,
+            run_only=run_only_output,
+            include_ratios=not args.noratio,
+        )
     return 0 if bool(df["success"].all()) else 1
 
 

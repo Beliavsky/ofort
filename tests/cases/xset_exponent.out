@@ -1,0 +1,51 @@
+set_exponent(x, i) returns a real with fraction(x) and exponent i.
+It is like fraction(x) * radix(x)**i.
+
+default real examples:
+x = -3.5
+  fraction(x)        = -0.875
+  exponent(x)        = 2
+  set_exponent(x, 0) = -0.875
+  set_exponent(x, 1) = -1.75
+  set_exponent(x, 2) = -3.5
+x = -1
+  fraction(x)        = -0.5
+  exponent(x)        = 1
+  set_exponent(x, 0) = -0.5
+  set_exponent(x, 1) = -1
+  set_exponent(x, 2) = -2
+x = -0.5
+  fraction(x)        = -0.5
+  exponent(x)        = 0
+  set_exponent(x, 0) = -0.5
+  set_exponent(x, 1) = -1
+  set_exponent(x, 2) = -2
+x = 0
+  fraction(x)        = 0
+  exponent(x)        = 0
+  set_exponent(x, 0) = 0
+  set_exponent(x, 1) = 0
+  set_exponent(x, 2) = 0
+x = 0.5
+  fraction(x)        = 0.5
+  exponent(x)        = 0
+  set_exponent(x, 0) = 0.5
+  set_exponent(x, 1) = 1
+  set_exponent(x, 2) = 2
+x = 1
+  fraction(x)        = 0.5
+  exponent(x)        = 1
+  set_exponent(x, 0) = 0.5
+  set_exponent(x, 1) = 1
+  set_exponent(x, 2) = 2
+x = 3.5
+  fraction(x)        = 0.875
+  exponent(x)        = 2
+  set_exponent(x, 0) = 0.875
+  set_exponent(x, 1) = 1.75
+  set_exponent(x, 2) = 3.5
+
+kind examples:
+set_exponent(1.5,   3) = 6
+set_exponent(1.5_4, 3) = 6
+set_exponent(1.5_8, 3) = 6

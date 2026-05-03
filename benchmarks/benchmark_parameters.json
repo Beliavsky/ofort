@@ -1,0 +1,66 @@
+{
+  "generator": "scripts/generate_benchmarks.py",
+  "size": 50000000,
+  "benchmarks": [
+    {
+      "file": "xbench_array_axpy.f90",
+      "n": 50000000,
+      "factor": "1/1"
+    },
+    {
+      "file": "xbench_array_expr_assign.f90",
+      "n": 50000000,
+      "factor": "1/1"
+    },
+    {
+      "file": "xbench_array_loop_assign.f90",
+      "n": 10000000,
+      "factor": "1/5"
+    },
+    {
+      "file": "xbench_array_minmax.f90",
+      "n": 50000000,
+      "factor": "1/1"
+    },
+    {
+      "file": "xbench_array_moments.f90",
+      "n": 50000000,
+      "factor": "1/1"
+    },
+    {
+      "file": "xbench_array_product_reduction.f90",
+      "n": 50000000,
+      "factor": "1/1"
+    },
+    {
+      "file": "xbench_scalar_affine_loop.f90",
+      "n": 250000000,
+      "factor": "5/1"
+    },
+    {
+      "file": "xbench_scalar_dot_loop.f90",
+      "n": 100000000,
+      "factor": "2/1"
+    },
+    {
+      "file": "xbench_scalar_random_sum_loop.f90",
+      "n": 100000000,
+      "factor": "2/1"
+    },
+    {
+      "file": "xbench_scalar_poly_loop.f90",
+      "n": 250000000,
+      "factor": "5/1"
+    },
+    {
+      "file": "xbench_scalar_recurrence.f90",
+      "n": 250000000,
+      "factor": "5/1"
+    },
+    {
+      "file": "xbench_subroutine_loop.f90",
+      "n": 50000000,
+      "factor": "1/1"
+    }
+  ]
+}

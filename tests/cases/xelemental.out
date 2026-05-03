@@ -1,0 +1,27 @@
+scalar function test:
+radius = 2
+height = 5
+volume = 62.83185
+
+scalar subroutine test:
+radius       = 2
+height       = 5
+volume       = 62.83185
+surface area = 87.96459
+
+array function test:
+radii   = 1 2 3 4
+heights = 10 5 2 1
+volumes = 31.41593 62.83185 56.54867 50.26548
+
+array subroutine test:
+radii         = 1 2 3 4
+heights       = 10 5 2 1
+volumes       = 31.41593 62.83185 56.54867 50.26548
+surface areas = 69.11504 87.96459 94.24778 125.6637
+
+array radius with scalar height:
+radii         = 1 2 3 4
+height        = 2
+volumes       = 6.283185 25.13274 56.54867 100.531
+surface areas = 18.84956 50.26548 94.24778 150.7964

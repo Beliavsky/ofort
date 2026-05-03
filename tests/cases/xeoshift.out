@@ -1,0 +1,50 @@
+a =  10 20 30 40 50
+
+eoshift(a, shift=2):
+30 40 50 0 0
+
+eoshift(a, shift=-2):
+0 0 10 20 30
+
+eoshift(a, shift=2, boundary=-999):
+30 40 50 -999 -999
+
+eoshift(a, shift=-2, boundary=-999):
+-999 -999 10 20 30
+
+b:
+11 12 13 14
+21 22 23 24
+31 32 33 34
+
+eoshift(b, shift=1, dim=1):
+21 22 23 24
+31 32 33 34
+0 0 0 0
+
+eoshift(b, shift=-1, dim=1, boundary=-9):
+-9 -9 -9 -9
+11 12 13 14
+21 22 23 24
+
+eoshift(b, shift=1, dim=2):
+12 13 14 0
+22 23 24 0
+32 33 34 0
+
+eoshift(b, shift=-1, dim=2, boundary=-9):
+-9 11 12 13
+-9 21 22 23
+-9 31 32 33
+
+eoshift(b, shift=shift_rows, dim=1, boundary=-9):
+shift_rows =  0 1 -1 2
+11 22 -9 34
+21 32 13 -9
+31 -9 23 -9
+
+eoshift(b, shift=shift_cols, dim=2, boundary=-9):
+shift_cols =  0 1 -1
+11 12 13 14
+22 23 24 -9
+-9 31 32 33
