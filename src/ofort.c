@@ -814,17 +814,32 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
         str_upper(vu, s->vars[i].name, 256);
         if (strcmp(upper, vu) == 0) {
             int target_kind = s->vars[i].val.kind;
+            int deferred_char_alloc =
+                s->vars[i].is_allocatable && s->vars[i].val.type != FVAL_ARRAY &&
+                s->vars[i].declared_type == FVAL_CHARACTER &&
+                s->vars[i].declared_type != FVAL_VOID && s->vars[i].char_len == 0;
+            OfortValType target_type = s->vars[i].val.type;
+            int assign_char_len = s->vars[i].char_len;
             if (s->vars[i].is_parameter)
                 ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
             if (s->vars[i].is_protected)
                 ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
             if (s->vars[i].is_allocatable && s->vars[i].val.type != FVAL_ARRAY &&
-                !s->vars[i].scalar_allocated) {
+                    !s->vars[i].scalar_allocated && !deferred_char_alloc) {
                 free_value(&val);
                 ofort_error(I, "Allocatable variable '%s' is not allocated", name);
             }
-            val = coerce_assignment_value(I, name, s->vars[i].val.type, val);
-            val = resize_character_value(val, s->vars[i].char_len);
+            if (deferred_char_alloc && s->vars[i].declared_type != FVAL_VOID) {
+                target_type = FVAL_CHARACTER;
+                if (val.type == FVAL_CHARACTER && val.v.s) {
+                    assign_char_len = (int)strlen(val.v.s);
+                }
+            }
+            val = coerce_assignment_value(I, name, target_type, val);
+            val = resize_character_value(val, assign_char_len);
+            if (deferred_char_alloc) {
+                s->vars[i].scalar_allocated = 1;
+            }
             if (target_kind > 0 && is_numeric_type(val.type)) val.kind = target_kind;
             if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
             s->vars[i].val = val;
@@ -840,17 +855,32 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
             str_upper(vu, ps->vars[i].name, 256);
             if (strcmp(upper, vu) == 0) {
                 int target_kind = ps->vars[i].val.kind;
+                int deferred_char_alloc =
+                    ps->vars[i].is_allocatable && ps->vars[i].val.type != FVAL_ARRAY &&
+                    ps->vars[i].declared_type == FVAL_CHARACTER &&
+                    ps->vars[i].declared_type != FVAL_VOID && ps->vars[i].char_len == 0;
+                OfortValType target_type = ps->vars[i].val.type;
+                int assign_char_len = ps->vars[i].char_len;
                 if (ps->vars[i].is_parameter)
                     ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
                 if (ps->vars[i].is_protected)
                     ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
                 if (ps->vars[i].is_allocatable && ps->vars[i].val.type != FVAL_ARRAY &&
-                    !ps->vars[i].scalar_allocated) {
+                    !ps->vars[i].scalar_allocated && !deferred_char_alloc) {
                     free_value(&val);
                     ofort_error(I, "Allocatable variable '%s' is not allocated", name);
                 }
-                val = coerce_assignment_value(I, name, ps->vars[i].val.type, val);
-                val = resize_character_value(val, ps->vars[i].char_len);
+                if (deferred_char_alloc && ps->vars[i].declared_type != FVAL_VOID) {
+                    target_type = FVAL_CHARACTER;
+                    if (val.type == FVAL_CHARACTER && val.v.s) {
+                        assign_char_len = (int)strlen(val.v.s);
+                    }
+                }
+                val = coerce_assignment_value(I, name, target_type, val);
+                val = resize_character_value(val, assign_char_len);
+                if (deferred_char_alloc) {
+                    ps->vars[i].scalar_allocated = 1;
+                }
                 if (target_kind > 0 && is_numeric_type(val.type)) val.kind = target_kind;
                 if (!ps->vars[i].is_alias) free_value(&ps->vars[i].val);
                 ps->vars[i].val = val;
@@ -2959,6 +2989,9 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             if (check(I, FTOK_STAR)) {
                 advance(I);
                 char_len = OFORT_MAX_STRLEN - 1;
+            } else if (check(I, FTOK_COLON)) {
+                advance(I);
+                char_len = 0;
             } else {
                 char_len_expr = parse_expr(I);
                 if (char_len_expr->type == FND_INT_LIT)
@@ -2966,8 +2999,13 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             }
             expect(I, FTOK_RPAREN);
         } else {
-            OfortToken *len_tok = expect(I, FTOK_INT_LIT);
-            char_len = (int)len_tok->int_val;
+            if (check(I, FTOK_COLON)) {
+                advance(I);
+                char_len = 0;
+            } else {
+                OfortToken *len_tok = expect(I, FTOK_INT_LIT);
+                char_len = (int)len_tok->int_val;
+            }
         }
     }
 
@@ -2981,6 +3019,9 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             if (check(I, FTOK_STAR)) {
                 advance(I);
                 char_len = OFORT_MAX_STRLEN - 1;
+            } else if (check(I, FTOK_COLON)) {
+                advance(I);
+                char_len = 0;
             } else {
                 char_len_expr = parse_expr(I);
                 if (char_len_expr->type == FND_INT_LIT)
@@ -3118,14 +3159,26 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             advance(I);
             if (check(I, FTOK_LPAREN)) {
                 advance(I);
-                decl->char_len_expr = parse_expr(I);
-                if (decl->char_len_expr->type == FND_INT_LIT)
-                    decl->char_len = (int)decl->char_len_expr->int_val;
+                if (check(I, FTOK_COLON)) {
+                    advance(I);
+                    decl->char_len = 0;
+                    decl->char_len_expr = NULL;
+                } else {
+                    decl->char_len_expr = parse_expr(I);
+                    if (decl->char_len_expr->type == FND_INT_LIT)
+                        decl->char_len = (int)decl->char_len_expr->int_val;
+                }
                 expect(I, FTOK_RPAREN);
             } else {
-                OfortToken *len_tok = expect(I, FTOK_INT_LIT);
-                decl->char_len = (int)len_tok->int_val;
-                decl->char_len_expr = NULL;
+                if (check(I, FTOK_COLON)) {
+                    advance(I);
+                    decl->char_len = 0;
+                    decl->char_len_expr = NULL;
+                } else {
+                    OfortToken *len_tok = expect(I, FTOK_INT_LIT);
+                    decl->char_len = (int)len_tok->int_val;
+                    decl->char_len_expr = NULL;
+                }
             }
         }
 
@@ -4386,6 +4439,133 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
         } else {
             OfortNode *n = alloc_node(I, FND_ALLOCATE);
             int dcap = 0;
+            OfortNode *len_expr = NULL;
+            OfortNode *kind_expr = NULL;
+            int kind = 0;
+            int char_len = 1;
+            int has_type_spec = 0;
+            OfortValType parsed_type = FVAL_VOID;
+            n->val_type = FVAL_VOID;
+            if (is_type_keyword(peek(I)->type) ||
+                (peek(I)->type == FTOK_IDENT &&
+                 (check_ident_upper(I, "INTEGER") || check_ident_upper(I, "REAL") ||
+                  check_ident_upper(I, "DOUBLE") || check_ident_upper(I, "CHARACTER") ||
+                  check_ident_upper(I, "LOGICAL") || check_ident_upper(I, "COMPLEX") ||
+                  check_ident_upper(I, "PRECISION")))) {
+                if (is_type_keyword(peek(I)->type)) {
+                    parsed_type = token_to_valtype(advance(I)->type);
+                } else {
+                    if (check_ident_upper(I, "INTEGER")) parsed_type = FVAL_INTEGER;
+                    else if (check_ident_upper(I, "REAL")) parsed_type = FVAL_REAL;
+                    else if (check_ident_upper(I, "DOUBLE")) parsed_type = FVAL_DOUBLE;
+                    else if (check_ident_upper(I, "CHARACTER")) parsed_type = FVAL_CHARACTER;
+                    else if (check_ident_upper(I, "LOGICAL")) parsed_type = FVAL_LOGICAL;
+                    else if (check_ident_upper(I, "COMPLEX")) parsed_type = FVAL_COMPLEX;
+                    else parsed_type = token_to_valtype(FTOK_DOUBLE_PRECISION);
+                    advance(I);
+                    if (parsed_type == FVAL_DOUBLE && check(I, FTOK_IDENT) && check_ident_upper(I, "PRECISION")) {
+                        advance(I);
+                    }
+                }
+                has_type_spec = 1;
+                if (parsed_type == FVAL_REAL && check(I, FTOK_STAR)) {
+                    OfortToken *kind_tok;
+                    advance(I);
+                    kind_tok = expect(I, FTOK_INT_LIT);
+                    if (kind_tok->int_val == 8) {
+                        parsed_type = FVAL_DOUBLE;
+                        kind = 8;
+                    } else if (kind_tok->int_val == 4) {
+                        parsed_type = FVAL_REAL;
+                        kind = 4;
+                    } else {
+                        kind = (int)kind_tok->int_val;
+                    }
+                }
+                if (parsed_type == FVAL_CHARACTER && check(I, FTOK_STAR)) {
+                    advance(I);
+                    if (check(I, FTOK_LPAREN)) {
+                        advance(I);
+                        if (check(I, FTOK_STAR)) {
+                            advance(I);
+                            char_len = OFORT_MAX_STRLEN - 1;
+                        } else if (check(I, FTOK_COLON)) {
+                            advance(I);
+                            char_len = 0;
+                        } else if (check(I, FTOK_INT_LIT)) {
+                            OfortToken *len_tok = advance(I);
+                            char_len = (int)len_tok->int_val;
+                        } else if (!check(I, FTOK_RPAREN)) {
+                            OfortNode *len_expr_node = parse_expr(I);
+                            len_expr = len_expr_node;
+                            if (len_expr_node->type == FND_INT_LIT)
+                                char_len = (int)len_expr_node->int_val;
+                        }
+                        expect(I, FTOK_RPAREN);
+                    } else if (check(I, FTOK_INT_LIT)) {
+                        OfortToken *len_tok = advance(I);
+                        char_len = (int)len_tok->int_val;
+                    } else if (check(I, FTOK_COLON)) {
+                        advance(I);
+                        char_len = 0;
+                    } else if (!check(I, FTOK_DCOLON)) {
+                        OfortNode *len_expr_node = parse_expr(I);
+                        len_expr = len_expr_node;
+                        if (len_expr_node->type == FND_INT_LIT)
+                            char_len = (int)len_expr_node->int_val;
+                    }
+                } else if (parsed_type == FVAL_CHARACTER && check(I, FTOK_LPAREN)) {
+                    advance(I);
+                    if (check(I, FTOK_IDENT) && check_ident_upper(I, "LEN") && peek_ahead(I, 1)->type == FTOK_ASSIGN) {
+                        advance(I);
+                        expect(I, FTOK_ASSIGN);
+                        if (check(I, FTOK_STAR)) {
+                            advance(I);
+                            char_len = OFORT_MAX_STRLEN - 1;
+                        } else if (check(I, FTOK_COLON)) {
+                            advance(I);
+                            char_len = 0;
+                        } else if (check(I, FTOK_INT_LIT)) {
+                            OfortToken *len_tok = advance(I);
+                            char_len = (int)len_tok->int_val;
+                        } else if (!check(I, FTOK_RPAREN)) {
+                            OfortNode *len_expr_node = parse_expr(I);
+                            len_expr = len_expr_node;
+                            if (len_expr_node->type == FND_INT_LIT)
+                                char_len = (int)len_expr_node->int_val;
+                        }
+                    } else if (check(I, FTOK_STAR)) {
+                        advance(I);
+                        char_len = OFORT_MAX_STRLEN - 1;
+                    } else if (check(I, FTOK_COLON)) {
+                        advance(I);
+                        char_len = 0;
+                    } else if (check(I, FTOK_INT_LIT)) {
+                        OfortToken *len_tok = advance(I);
+                        char_len = (int)len_tok->int_val;
+                    } else if (!check(I, FTOK_RPAREN)) {
+                        OfortNode *len_expr_node = parse_expr(I);
+                        len_expr = len_expr_node;
+                        if (len_expr_node->type == FND_INT_LIT)
+                            char_len = (int)len_expr_node->int_val;
+                    }
+                    expect(I, FTOK_RPAREN);
+                } else if ((parsed_type == FVAL_INTEGER || parsed_type == FVAL_REAL || parsed_type == FVAL_DOUBLE ||
+                            parsed_type == FVAL_COMPLEX || parsed_type == FVAL_LOGICAL)) {
+                    if (check(I, FTOK_LPAREN)) {
+                        kind = parse_kind_selector_ex(I, &kind_expr);
+                        if (parsed_type == FVAL_REAL && kind == 8) parsed_type = FVAL_DOUBLE;
+                    }
+                } else if (parsed_type == FVAL_DOUBLE && check(I, FTOK_LPAREN)) {
+                    kind = parse_kind_selector_ex(I, &kind_expr);
+                }
+                n->val_type = parsed_type;
+                n->kind = kind;
+                n->kind_expr = kind_expr;
+                n->char_len = char_len;
+                n->char_len_expr = len_expr;
+                if (has_type_spec) expect(I, FTOK_DCOLON);
+            }
             OfortToken *name = expect(I, FTOK_IDENT);
             OfortNode *target = alloc_node(I, FND_IDENT);
             n->line = name->line;
@@ -11516,13 +11696,22 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
     case FND_ALLOCATE: {
         if (n->children[OFORT_ALLOC_TARGET_CHILD]) {
-            OfortValue *target = member_lvalue(I, n->children[OFORT_ALLOC_TARGET_CHILD]);
+        OfortValue *target = member_lvalue(I, n->children[OFORT_ALLOC_TARGET_CHILD]);
             if (!target) ofort_error(I, "ALLOCATE target not found");
             int dims[7];
             int lower_bounds[7];
             int ndims = n->n_stmts;
-            OfortValType elem_type = target->type == FVAL_ARRAY ? target->v.arr.elem_type : target->type;
+            OfortValType elem_type = n->val_type != FVAL_VOID ?
+                n->val_type : (target->type == FVAL_ARRAY ? target->v.arr.elem_type : target->type);
+            int alloc_char_len = 1;
             char elem_type_name[64] = "";
+            if (elem_type == FVAL_CHARACTER) {
+                if (n->val_type == FVAL_CHARACTER) {
+                    alloc_char_len = eval_character_length(I, n);
+                } else if (target->type == FVAL_CHARACTER && target->v.s) {
+                    alloc_char_len = (int)strlen(target->v.s);
+                }
+            }
             if (target->type == FVAL_ARRAY)
                 copy_cstr(elem_type_name, sizeof(elem_type_name), target->v.arr.elem_type_name);
             else if (target->type == FVAL_DERIVED)
@@ -11553,6 +11742,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 free_value(target);
                 if (elem_type == FVAL_DERIVED && elem_type_name[0])
                     *target = make_derived_array(I, elem_type_name, dims, ndims);
+                else if (elem_type == FVAL_CHARACTER)
+                    *target = make_array_with_char_len(elem_type, dims, ndims, alloc_char_len);
                 else
                     *target = make_array(elem_type, dims, ndims);
                 set_array_lower_bounds(target, lower_bounds, ndims);
@@ -11581,8 +11772,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             } else {
                 if (target->type == FVAL_VOID)
                     ofort_error(I, "ALLOCATE component target has no declared type");
-                OfortValType target_type = target->type;
-                int char_len = target_type == FVAL_CHARACTER && target->v.s ? (int)strlen(target->v.s) : 1;
+                OfortValType target_type = n->val_type != FVAL_VOID ? n->val_type : target->type;
+                int char_len = 1;
+                if (target_type == FVAL_CHARACTER) {
+                    if (n->val_type == FVAL_CHARACTER) char_len = alloc_char_len;
+                    else char_len = target->type == FVAL_CHARACTER && target->v.s ? (int)strlen(target->v.s) : 1;
+                }
                 free_value(target);
                 *target = default_value(target_type, char_len);
             }
@@ -11600,8 +11795,25 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int dims[7];
         int lower_bounds[7];
         int ndims = n->n_stmts;
-        OfortValType elem_type = var->val.type == FVAL_ARRAY && var->val.v.arr.elem_type ?
-            var->val.v.arr.elem_type : var->val.type == FVAL_DERIVED ? FVAL_DERIVED : FVAL_REAL;
+        OfortValType explicit_type = n->val_type;
+        int explicit_kind = n->kind;
+        if (explicit_type != FVAL_VOID && n->kind_expr && explicit_kind == 0) {
+            OfortValue kv = eval_node(I, n->kind_expr);
+            explicit_kind = (int)val_to_int(kv);
+            free_value(&kv);
+        }
+        if (explicit_type == FVAL_REAL && explicit_kind == 8) explicit_type = FVAL_DOUBLE;
+        if (explicit_type == FVAL_DOUBLE && explicit_kind == 0) explicit_kind = 8;
+        OfortValType elem_type = explicit_type != FVAL_VOID ? explicit_type :
+            (var->val.type == FVAL_ARRAY && var->val.v.arr.elem_type ?
+             var->val.v.arr.elem_type : var->val.type == FVAL_DERIVED ? FVAL_DERIVED :
+             var->declared_type != FVAL_VOID ? var->declared_type :
+             var->val.type != FVAL_VOID ? var->val.type : FVAL_REAL);
+        int alloc_char_len = 1;
+        if (elem_type == FVAL_CHARACTER) {
+            if (explicit_type == FVAL_CHARACTER) alloc_char_len = eval_character_length(I, n);
+            else alloc_char_len = var->char_len > 0 ? var->char_len : 1;
+        }
         char elem_type_name[64] = "";
         if (var->val.type == FVAL_ARRAY)
             copy_cstr(elem_type_name, sizeof(elem_type_name), var->val.v.arr.elem_type_name);
@@ -11629,13 +11841,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     (var->val.type == FVAL_DERIVED ? var->val.v.dt.type_name : "");
                 new_val = default_derived_value(I, type_name);
             } else {
-                int char_len = var->char_len > 0 ? var->char_len : 1;
-                OfortValType target_type = var->declared_type != FVAL_VOID ?
-                    var->declared_type : var->val.type;
+                OfortValType target_type = elem_type;
+                int char_len = target_type == FVAL_CHARACTER ? alloc_char_len : 1;
                 new_val = default_value(target_type, char_len);
             }
-            if (var->declared_kind > 0 && is_numeric_type(new_val.type))
-                new_val.kind = var->declared_kind;
+            if (is_numeric_type(new_val.type)) {
+                if (explicit_type != FVAL_VOID) {
+                    if (explicit_kind > 0) new_val.kind = explicit_kind;
+                } else if (var->declared_kind > 0) {
+                    new_val.kind = var->declared_kind;
+                }
+            }
             free_value(&var->val);
             var->val = new_val;
             var->scalar_allocated = 1;
@@ -11703,6 +11919,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         free_value(&var->val);
         if (elem_type == FVAL_DERIVED && elem_type_name[0])
             var->val = make_derived_array(I, elem_type_name, dims, ndims);
+        else if (elem_type == FVAL_CHARACTER && explicit_type == FVAL_CHARACTER)
+            var->val = make_array_with_char_len(elem_type, dims, ndims, alloc_char_len);
         else
             var->val = make_array(elem_type, dims, ndims);
         var->scalar_allocated = 0;
