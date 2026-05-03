@@ -71,6 +71,7 @@ typedef enum {
     FTOK_NOT,           /* .NOT. */
     FTOK_EQVOP,        /* .EQV. */
     FTOK_NEQVOP,       /* .NEQV. */
+    FTOK_USER_OP,      /* user-defined .NAME. operator */
     /* punctuation */
     FTOK_LPAREN, FTOK_RPAREN,
     FTOK_LBRACKET, FTOK_RBRACKET,  /* (/ and /) for array constructors, or [ ] */
@@ -194,6 +195,7 @@ typedef struct OfortNode {
     int n_stmts;
     /* for function/subroutine parameters */
     char param_names[OFORT_MAX_PARAMS][256];
+    char binding_proc_names[OFORT_MAX_PARAMS][256];
     OfortValType param_types[OFORT_MAX_PARAMS];
     int param_intents[OFORT_MAX_PARAMS];
     int param_optional[OFORT_MAX_PARAMS];
