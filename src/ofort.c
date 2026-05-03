@@ -3146,6 +3146,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                             decl->dims[dim_index] = (int)dh->int_val;
                         } else if (dim_index < decl->n_stmts) {
                             decl->stmts[dim_index] = dh;
+                            decl->dims[dim_index] = 0;
                         }
                     }
                 }
@@ -4307,6 +4308,7 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
                             decl->dims[dim_index] = dh_value;
                         } else if (dim_index < decl->n_stmts) {
                             decl->stmts[dim_index] = dh;
+                            decl->dims[dim_index] = 0;
                         }
                     }
                 }
