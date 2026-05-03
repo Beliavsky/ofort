@@ -1,0 +1,40 @@
+fix xstorage_size.f90
+
+fix xallocatable_len.f90
+
+fix xforall.f90
+
+fix xreduce.f90
+
+fix xdata.f90
+
+************************************
+
+see why i get results below when code compile and
+run to completion with gfortran
+
+c:\c\ofort>python scripts\xofort_make.py c:\fortran\public_domain\github\Vector-Error-Correction\Makefile
+makefile: C:\fortran\public_domain\github\Vector-Error-Correction\Makefile
+programs: 3
+
+[1/3] xvecm_gfort.exe
+  sources: kind.f90 random.f90 linear.f90 vecm.f90 xvecm.f90
+  PASS elapsed=0.224s
+#obs #col: 1500 4
+STOP invert_matrix failed for s00
+
+[2/3] xvecm_rank_gfort.exe
+  sources: kind.f90 random.f90 linear.f90 vecm.f90 xvecm_rank.f90
+  PASS elapsed=0.269s
+#obs #col: 1500 4
+STOP invert_matrix failed for s00 in johansen_rank_stats
+
+[3/3] xvecm_rank_gap_gfort.exe
+  sources: kind.f90 random.f90 linear.f90 vecm.f90 xvecm_rank_gap.f90
+  PASS elapsed=0.221s
+#obs #col: 1500 4
+STOP invert_matrix failed for s00 in johansen_rank_stats
+
+summary: 3 passed, 0 failed in 0.71s
+
+**************************************************
