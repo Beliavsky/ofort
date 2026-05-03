@@ -11215,7 +11215,7 @@ static const char *intrinsic_names[] = {
     "SET_EXPONENT",
     "SELECTED_INT_KIND", "SELECTED_REAL_KIND",
     /* String */
-    "LEN", "LEN_TRIM", "TRIM", "ADJUSTL", "ADJUSTR", "INDEX", "SCAN", "VERIFY",
+    "LEN", "LEN_TRIM", "TRIM", "NEW_LINE", "ADJUSTL", "ADJUSTR", "INDEX", "SCAN", "VERIFY",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
     /* Array */
     "SIZE", "SHAPE", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC",
@@ -12284,6 +12284,11 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             return make_character(buf);
         }
         return make_character("");
+    }
+    if (strcmp(upper, "NEW_LINE") == 0) {
+        if (nargs < 1) ofort_error(I, "NEW_LINE requires 1 argument");
+        if (args[0].type != FVAL_CHARACTER) ofort_error(I, "NEW_LINE requires a character argument");
+        return make_character("\n");
     }
     if (strcmp(upper, "ADJUSTL") == 0) {
         if (args[0].type == FVAL_CHARACTER && args[0].v.s) {
