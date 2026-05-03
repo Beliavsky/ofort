@@ -220,6 +220,7 @@ static int procedure_body_declares_name(OfortNode *body, const char *name);
 static OfortNode *parse_implied_do(OfortInterpreter *I);
 static OfortNode *parse_expr(OfortInterpreter *I);
 static OfortNode *parse_statement(OfortInterpreter *I);
+static void skip_balanced_parens(OfortInterpreter *I);
 static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
                                            OfortFunc *func, OfortNode *fn,
                                            OfortValue *args, int nargs,
@@ -533,6 +534,20 @@ static OfortValue make_logical(int b) {
 static OfortValue make_void_val(void) {
     OfortValue r; memset(&r, 0, sizeof(r));
     r.type = FVAL_VOID; return r;
+}
+
+static int make_procedure_ref_text(const char *name, char *buf, size_t buf_size) {
+    if (!name || !name[0] || buf_size == 0) return 0;
+    snprintf(buf, buf_size, "__ofort_proc:%s", name);
+    return 1;
+}
+
+static const char *procedure_ref_name(const OfortValue *v) {
+    const char *prefix = "__ofort_proc:";
+    size_t len = strlen(prefix);
+    if (!v || v->type != FVAL_CHARACTER || !v->v.s) return NULL;
+    if (strncmp(v->v.s, prefix, len) != 0) return NULL;
+    return v->v.s + len;
 }
 
 static double val_to_real(OfortValue v) {
@@ -2155,6 +2170,51 @@ static OfortNode *parse_interface_block(OfortInterpreter *I) {
         skip_newlines(I);
     }
     return n;
+}
+
+static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
+    OfortToken *pt = advance(I); /* PROCEDURE */
+    OfortNode *block = alloc_node(I, FND_BLOCK);
+    int cap = 0;
+    block->line = pt->line;
+
+    if (check(I, FTOK_LPAREN)) {
+        skip_balanced_parens(I);
+    }
+    while (check(I, FTOK_COMMA)) {
+        advance(I);
+        if (check(I, FTOK_INTENT)) {
+            advance(I);
+            if (check(I, FTOK_LPAREN)) skip_balanced_parens(I);
+        } else {
+            advance(I);
+        }
+    }
+    if (check(I, FTOK_DCOLON)) advance(I);
+
+    while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+            continue;
+        }
+        if (token_can_be_name(peek(I))) {
+            OfortToken *name_tok = advance(I);
+            OfortNode *decl = alloc_node(I, FND_VARDECL);
+            copy_cstr(decl->name, sizeof(decl->name), token_name_text(name_tok));
+            decl->val_type = FVAL_CHARACTER;
+            decl->char_len = 256;
+            decl->line = name_tok->line;
+            if (block->n_stmts >= cap) {
+                cap = cap ? cap * 2 : 4;
+                block->stmts = (OfortNode **)realloc(block->stmts, sizeof(OfortNode *) * cap);
+                if (!block->stmts) ofort_error(I, "Out of memory");
+            }
+            block->stmts[block->n_stmts++] = decl;
+        } else {
+            advance(I);
+        }
+    }
+    return block;
 }
 
 /* Check if current token is END followed by a keyword (END PROGRAM, END DO, etc.) */
@@ -4484,6 +4544,15 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     OfortToken *t = peek(I);
     long long stmt_label = 0;
     if (t->type == FTOK_EOF) return NULL;
+
+    if (token_ident_upper(t, "ABSTRACT") && token_ident_upper(peek_ahead(I, 1), "INTERFACE")) {
+        advance(I); /* ABSTRACT */
+        return parse_interface_block(I);
+    }
+
+    if (token_ident_upper(t, "PROCEDURE")) {
+        return parse_procedure_declaration(I);
+    }
 
     if (t->type == FTOK_INT_LIT) {
         stmt_label = t->int_val;
@@ -7079,7 +7148,14 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 
     case FND_IDENT: {
         OfortVar *v = find_var(I, n->name);
-        if (!v) ofort_error(I, "Undefined variable '%s' at line %d", n->name, n->line);
+        if (!v) {
+            OfortFunc *func = find_func(I, n->name);
+            char ref[320];
+            if (func && make_procedure_ref_text(n->name, ref, sizeof(ref))) {
+                return make_character(ref);
+            }
+            ofort_error(I, "Undefined variable '%s' at line %d", n->name, n->line);
+        }
         if (v->is_pointer) {
             if (!v->pointer_associated && v->val.type == FVAL_VOID) return make_void_val();
             return copy_value(v->val);
@@ -7527,6 +7603,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         /* Evaluate arguments */
         int nargs = n->n_stmts;
         OfortValue args[OFORT_MAX_PARAMS];
+        char procedure_call_name[256];
+        procedure_call_name[0] = '\0';
 
         if (str_eq_nocase(n->name, "associated")) {
             OfortVar *ptr;
@@ -7603,7 +7681,17 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             return eval_array_section(I, var, n);
         }
         if (var && var->val.type == FVAL_CHARACTER) {
-            return eval_array_section_value(I, &var->val, n);
+            const char *proc_name = procedure_ref_name(&var->val);
+            if (proc_name) {
+                copy_cstr(procedure_call_name, sizeof(procedure_call_name), proc_name);
+                {
+                    size_t len = strlen(procedure_call_name);
+                    while (len > 0 && isspace((unsigned char)procedure_call_name[len - 1]))
+                        procedure_call_name[--len] = '\0';
+                }
+            } else {
+                return eval_array_section_value(I, &var->val, n);
+            }
         }
 
         if (str_eq_nocase(n->name, "present")) {
@@ -7626,8 +7714,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         }
 
         /* Check for user function */
-        OfortFunc *func = find_func(I, n->name);
-        if (!func) func = find_matching_generic_func(I, n->name, args, nargs);
+        OfortFunc *func = find_func(I, procedure_call_name[0] ? procedure_call_name : n->name);
+        if (!func) func = find_matching_generic_func(I, procedure_call_name[0] ? procedure_call_name : n->name, args, nargs);
         if (func && func->is_function) {
             OfortNode *fn = func->node;
             if (fn && fn->type == FND_STMT_FUNCTION) {
@@ -7715,6 +7803,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             /* Write back OUT/INOUT args */
             for (int i = 0; i < fn->n_params && i < nargs; i++) {
                 if (fn->param_intents[i] == 2 || fn->param_intents[i] == 3) {
+                    if (procedure_ref_name(&args[i])) continue;
                     if (n->stmts[i]->type == FND_IDENT && args[i].type != FVAL_VOID) {
                         set_var(I, n->stmts[i]->name, copy_value(args[i]));
                     }
@@ -11104,6 +11193,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* Handle INTENT(OUT/INOUT) — copy back */
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             if (!arg_alias[i] && fn->param_intents[i] != 1) {
+                if (procedure_ref_name(&args[i])) continue;
                 OfortVar *pv = find_var(I, fn->param_names[i]);
                 if (pv && pv->present &&
                     (n->stmts[i]->type == FND_IDENT || n->stmts[i]->type == FND_MEMBER)) {
@@ -11117,10 +11207,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         pop_scope(I);
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             if (!arg_alias[i] && n->stmts[i]->type == FND_IDENT && fn->param_intents[i] != 1 &&
-                args[i].type != FVAL_VOID) {
+                args[i].type != FVAL_VOID && !procedure_ref_name(&args[i])) {
                 set_var(I, n->stmts[i]->name, copy_value(args[i]));
             } else if (!arg_alias[i] && n->stmts[i]->type == FND_MEMBER && fn->param_intents[i] != 1 &&
-                       args[i].type != FVAL_VOID) {
+                       args[i].type != FVAL_VOID && !procedure_ref_name(&args[i])) {
                 OfortValue *target = member_lvalue(I, n->stmts[i]);
                 if (target) {
                     free_value(target);
