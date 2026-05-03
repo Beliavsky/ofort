@@ -92,8 +92,6 @@ typedef struct {
 
 typedef struct {
     char name[128];
-    OfortFunc funcs[OFORT_MAX_FUNCS];
-    int n_funcs;
     OfortVar vars[OFORT_MAX_VARS];
     int var_public[OFORT_MAX_VARS];
     int n_vars;
@@ -199,6 +197,10 @@ static int is_intrinsic(const char *name);
 static int paren_item_is_implied_do(OfortInterpreter *I);
 static int procedure_body_declares_name(OfortNode *body, const char *name);
 static OfortNode *parse_implied_do(OfortInterpreter *I);
+static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
+                                           OfortFunc *func, OfortNode *fn,
+                                           OfortValue *args, int nargs,
+                                           OfortValue *result_out);
 
 static double ofort_monotonic_seconds(void) {
 #ifdef _WIN32
@@ -6598,6 +6600,11 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         if (!func) func = find_matching_generic_func(I, n->name, args, nargs);
         if (func && func->is_function) {
             OfortNode *fn = func->node;
+            OfortValue elemental_result;
+            if (execute_elemental_function_call(I, n, func, fn, args, nargs, &elemental_result)) {
+                for (int i = 0; i < nargs; i++) free_value(&args[i]);
+                return elemental_result;
+            }
             push_scope(I);
             OfortModule *mod = find_module(I, func->module_name);
             if (mod) {
@@ -6949,6 +6956,86 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
     return 1;
 }
 
+static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
+                                           OfortFunc *func, OfortNode *fn,
+                                           OfortValue *args, int nargs,
+                                           OfortValue *result_out) {
+    OfortValue *shape_arg = NULL;
+    OfortValue result = make_void_val();
+    if (!fn || !fn->is_elemental) return 0;
+    for (int i = 0; i < nargs; i++) {
+        if (args[i].type != FVAL_ARRAY) continue;
+        if (!shape_arg) {
+            shape_arg = &args[i];
+        } else if (args[i].v.arr.len != shape_arg->v.arr.len) {
+            ofort_error(I, "Elemental function array arguments must have the same size");
+        }
+    }
+    if (!shape_arg) return 0;
+
+    for (int elem = 0; elem < shape_arg->v.arr.len; elem++) {
+        OfortValue scalar_result;
+        push_scope(I);
+        OfortModule *mod = find_module(I, func->module_name);
+        if (mod) {
+            for (int i = 0; i < mod->n_vars; i++) {
+                declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+            }
+        }
+        for (int i = 0; i < fn->n_params; i++) {
+            if (i < nargs && args[i].type != FVAL_VOID) {
+                OfortValue actual = args[i].type == FVAL_ARRAY ?
+                    array_element_value(&args[i], elem) : copy_value(args[i]);
+                declare_var(I, fn->param_names[i], actual);
+            } else if (fn->param_optional[i]) {
+                declare_absent_optional_var(I, fn->param_names[i]);
+            } else {
+                ofort_error(I, "Missing required argument '%s' in call to '%s'",
+                            fn->param_names[i], fn->name);
+            }
+        }
+        restore_saved_vars(I, func);
+        const char *res_name = fn->result_name[0] ? fn->result_name : fn->name;
+        if (!procedure_body_declares_name(fn->children[0], res_name)) {
+            declare_var(I, res_name, default_value(fn->val_type, 1));
+        }
+
+        I->procedure_depth++;
+        exec_node(I, fn->children[0]);
+        I->procedure_depth--;
+        if (I->goto_active) {
+            ofort_error(I, "GOTO target label %d not found", I->goto_label);
+        }
+        I->returning = 0;
+
+        OfortVar *rv = find_var(I, res_name);
+        scalar_result = rv ? copy_value(rv->val) : make_void_val();
+        store_saved_vars(func, I->current_scope);
+        pop_scope(I);
+
+        if (elem == 0) {
+            result = make_array(scalar_result.type, shape_arg->v.arr.dims, shape_arg->v.arr.n_dims);
+        }
+        if (result.type == FVAL_ARRAY) {
+            OfortValue elem_value = coerce_assignment_value(I, call->name, result.v.arr.elem_type, scalar_result);
+            if (assign_packed_array_element(&result, elem, elem_value)) {
+                free_value(&elem_value);
+            } else if (result.v.arr.data && elem >= 0 && elem < result.v.arr.len) {
+                free_value(&result.v.arr.data[elem]);
+                result.v.arr.data[elem] = elem_value;
+            } else {
+                free_value(&elem_value);
+            }
+        } else {
+            free_value(&scalar_result);
+        }
+        if (I->stopping) break;
+    }
+
+    *result_out = result;
+    return 1;
+}
+
 static OfortVar *cached_ident_var(OfortInterpreter *I, OfortNode *owner, int slot, OfortNode *ident) {
     if (!I || !owner || !ident || ident->type != FND_IDENT || slot < 0 || slot > 6) return NULL;
     if (owner->fast_cache[7] != I->current_scope) {
@@ -7140,6 +7227,215 @@ static int fast_array_ref_index(OfortInterpreter *I, OfortNode *n, OfortVar **va
     if (index < 0 || index >= var->val.v.arr.len) return 0;
     *var_out = var;
     *index_out = index;
+    return 1;
+}
+
+static int fast_scalar_constant_value(OfortInterpreter *I, OfortNode *n, double *value) {
+    if (!I || !n || !value) return 0;
+    return fast_numeric_expr_value_node(I, n, value);
+}
+
+static int fast_array_expr_coeff(OfortInterpreter *I, OfortNode *n, OfortVar **source,
+                                 double *coef, double *constant) {
+    OfortVar *var;
+    double lc, lb, rc, rb, sv;
+
+    if (!I || !n || !source || !coef || !constant) return 0;
+    if (n->type == FND_IDENT) {
+        var = find_var(I, n->name);
+        if (var && var->val.type == FVAL_ARRAY && array_has_packed_numeric(&var->val)) {
+            if (*source && *source != var) return 0;
+            *source = var;
+            *coef = 1.0;
+            *constant = 0.0;
+            return 1;
+        }
+    }
+    if (fast_scalar_constant_value(I, n, constant)) {
+        *coef = 0.0;
+        return 1;
+    }
+    if (!n->children[0] || !n->children[1]) return 0;
+    switch (n->type) {
+    case FND_ADD:
+        if (!fast_array_expr_coeff(I, n->children[0], source, &lc, &lb) ||
+            !fast_array_expr_coeff(I, n->children[1], source, &rc, &rb))
+            return 0;
+        *coef = lc + rc;
+        *constant = lb + rb;
+        return 1;
+    case FND_SUB:
+        if (!fast_array_expr_coeff(I, n->children[0], source, &lc, &lb) ||
+            !fast_array_expr_coeff(I, n->children[1], source, &rc, &rb))
+            return 0;
+        *coef = lc - rc;
+        *constant = lb - rb;
+        return 1;
+    case FND_MUL:
+        if (fast_scalar_constant_value(I, n->children[0], &sv) &&
+            fast_array_expr_coeff(I, n->children[1], source, &rc, &rb)) {
+            *coef = sv * rc;
+            *constant = sv * rb;
+            return 1;
+        }
+        if (fast_scalar_constant_value(I, n->children[1], &sv) &&
+            fast_array_expr_coeff(I, n->children[0], source, &lc, &lb)) {
+            *coef = lc * sv;
+            *constant = lb * sv;
+            return 1;
+        }
+        return 0;
+    case FND_DIV:
+        if (fast_scalar_constant_value(I, n->children[1], &sv) && sv != 0.0 &&
+            fast_array_expr_coeff(I, n->children[0], source, &lc, &lb)) {
+            *coef = lc / sv;
+            *constant = lb / sv;
+            return 1;
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static int exec_fast_array_affine_assignment(OfortInterpreter *I, OfortNode *n) {
+    OfortNode *lhs;
+    OfortNode *rhs;
+    OfortVar *target;
+    OfortVar *source = NULL;
+    double coef = 0.0;
+    double constant = 0.0;
+    int len;
+
+    if (!I || !I->fast_mode || !n || n->type != FND_ASSIGN) return 0;
+    lhs = n->children[0];
+    rhs = n->children[1];
+    if (!lhs || lhs->type != FND_IDENT || !rhs) return 0;
+    target = cached_ident_var(I, n, 0, lhs);
+    if (!target || target->is_parameter || target->is_protected ||
+        target->val.type != FVAL_ARRAY || !array_has_packed_numeric(&target->val))
+        return 0;
+    if (!fast_array_expr_coeff(I, rhs, &source, &coef, &constant) || !source)
+        return 0;
+    if (source->val.type != FVAL_ARRAY || !array_has_packed_numeric(&source->val))
+        return 0;
+    if (target->val.v.arr.len != source->val.v.arr.len)
+        return 0;
+
+    len = target->val.v.arr.len;
+    for (int i = 0; i < len; i++) {
+        double x = source->val.v.arr.real_data ?
+                   source->val.v.arr.real_data[i] :
+                   (double)source->val.v.arr.int_data[i];
+        double y = coef * x + constant;
+        if (target->val.v.arr.real_data) target->val.v.arr.real_data[i] = y;
+        else target->val.v.arr.int_data[i] = (long long)y;
+    }
+    return 1;
+}
+
+static int fast_array_poly2_expr_coeff(OfortInterpreter *I, OfortNode *n, OfortVar **source,
+                                       double coeff[3]) {
+    OfortVar *var;
+    double left[3], right[3], sv;
+
+    if (!I || !n || !source || !coeff) return 0;
+    coeff[0] = coeff[1] = coeff[2] = 0.0;
+    if (n->type == FND_IDENT) {
+        var = find_var(I, n->name);
+        if (var && var->val.type == FVAL_ARRAY && array_has_packed_numeric(&var->val)) {
+            if (*source && *source != var) return 0;
+            *source = var;
+            coeff[1] = 1.0;
+            return 1;
+        }
+    }
+    if (fast_scalar_constant_value(I, n, &sv)) {
+        coeff[0] = sv;
+        return 1;
+    }
+    if (!n->children[0] || !n->children[1]) return 0;
+    switch (n->type) {
+    case FND_ADD:
+        if (!fast_array_poly2_expr_coeff(I, n->children[0], source, left) ||
+            !fast_array_poly2_expr_coeff(I, n->children[1], source, right))
+            return 0;
+        for (int i = 0; i < 3; i++) coeff[i] = left[i] + right[i];
+        return 1;
+    case FND_SUB:
+        if (!fast_array_poly2_expr_coeff(I, n->children[0], source, left) ||
+            !fast_array_poly2_expr_coeff(I, n->children[1], source, right))
+            return 0;
+        for (int i = 0; i < 3; i++) coeff[i] = left[i] - right[i];
+        return 1;
+    case FND_MUL:
+        if (!fast_array_poly2_expr_coeff(I, n->children[0], source, left) ||
+            !fast_array_poly2_expr_coeff(I, n->children[1], source, right))
+            return 0;
+        if ((left[2] != 0.0 && (right[1] != 0.0 || right[2] != 0.0)) ||
+            (right[2] != 0.0 && (left[1] != 0.0 || left[2] != 0.0)))
+            return 0;
+        coeff[0] = left[0] * right[0];
+        coeff[1] = left[0] * right[1] + left[1] * right[0];
+        coeff[2] = left[0] * right[2] + left[1] * right[1] + left[2] * right[0];
+        return 1;
+    case FND_DIV:
+        if (!fast_scalar_constant_value(I, n->children[1], &sv) || sv == 0.0)
+            return 0;
+        if (!fast_array_poly2_expr_coeff(I, n->children[0], source, left))
+            return 0;
+        for (int i = 0; i < 3; i++) coeff[i] = left[i] / sv;
+        return 1;
+    case FND_POWER:
+        if (!fast_scalar_constant_value(I, n->children[1], &sv))
+            return 0;
+        if (fabs(sv - 2.0) > 1.0e-12)
+            return 0;
+        if (!fast_array_poly2_expr_coeff(I, n->children[0], source, left))
+            return 0;
+        if (left[2] != 0.0)
+            return 0;
+        coeff[0] = left[0] * left[0];
+        coeff[1] = 2.0 * left[0] * left[1];
+        coeff[2] = left[1] * left[1];
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int exec_fast_array_poly2_assignment(OfortInterpreter *I, OfortNode *n) {
+    OfortNode *lhs;
+    OfortNode *rhs;
+    OfortVar *target;
+    OfortVar *source = NULL;
+    double coeff[3];
+    int len;
+
+    if (!I || !I->fast_mode || !n || n->type != FND_ASSIGN) return 0;
+    lhs = n->children[0];
+    rhs = n->children[1];
+    if (!lhs || lhs->type != FND_IDENT || !rhs) return 0;
+    target = cached_ident_var(I, n, 0, lhs);
+    if (!target || target->is_parameter || target->is_protected ||
+        target->val.type != FVAL_ARRAY || !array_has_packed_numeric(&target->val))
+        return 0;
+    if (!fast_array_poly2_expr_coeff(I, rhs, &source, coeff) || !source)
+        return 0;
+    if (source->val.type != FVAL_ARRAY || !array_has_packed_numeric(&source->val))
+        return 0;
+    if (target->val.v.arr.len != source->val.v.arr.len)
+        return 0;
+
+    len = target->val.v.arr.len;
+    for (int i = 0; i < len; i++) {
+        double x = source->val.v.arr.real_data ?
+                   source->val.v.arr.real_data[i] :
+                   (double)source->val.v.arr.int_data[i];
+        double y = (coeff[2] * x + coeff[1]) * x + coeff[0];
+        if (target->val.v.arr.real_data) target->val.v.arr.real_data[i] = y;
+        else target->val.v.arr.int_data[i] = (long long)y;
+    }
     return 1;
 }
 
@@ -7954,7 +8250,6 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int n_public_names = 0;
         int n_private_names = 0;
         copy_cstr(mod->name, sizeof(mod->name), n->name);
-        mod->n_funcs = 0;
         mod->n_vars = 0;
         mod->n_types = 0;
         mod->default_private = 0;
@@ -8335,6 +8630,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
     case FND_ASSIGN: {
         OfortNode *lhs = n->children[0];
+        if (exec_fast_array_poly2_assignment(I, n)) {
+            break;
+        }
+        if (exec_fast_array_affine_assignment(I, n)) {
+            break;
+        }
         if (exec_fast_scalar_numeric_assignment(I, n)) {
             break;
         }
