@@ -147,6 +147,7 @@ typedef enum {
     FND_CALL, FND_PRINT, FND_WRITE, FND_READ_STMT, FND_OPEN, FND_CLOSE, FND_REWIND, FND_INQUIRE,
     FND_ALLOCATE, FND_DEALLOCATE, FND_USE, FND_ACCESS, FND_INTERFACE,
     FND_EXPR_STMT,
+    FND_DATA,
     FND_STMT_FUNCTION,
     /* expressions */
     FND_ASSIGN,
@@ -198,6 +199,7 @@ typedef struct OfortNode {
     char param_names[OFORT_MAX_PARAMS][256];
     char binding_proc_names[OFORT_MAX_PARAMS][256];
     OfortValType param_types[OFORT_MAX_PARAMS];
+    char param_type_names[OFORT_MAX_PARAMS][64];
     int param_intents[OFORT_MAX_PARAMS];
     int param_optional[OFORT_MAX_PARAMS];
     int param_n_dims[OFORT_MAX_PARAMS];
@@ -208,6 +210,7 @@ typedef struct OfortNode {
     int has_lower_bound[7];
     int n_dims;
     struct OfortNode *char_len_expr;
+    struct OfortNode *kind_expr;
     void *fast_cache[8];
     /* source location */
     int line;
