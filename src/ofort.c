@@ -3035,6 +3035,10 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         } else if (check(I, FTOK_STAR)) {
             advance(I);
             char_len = OFORT_MAX_STRLEN - 1;
+        } else if (check(I, FTOK_COLON)) {
+            advance(I);
+            char_len = 0;
+            char_len_expr = NULL;
         } else if (check(I, FTOK_INT_LIT)) {
             char_len = (int)peek(I)->int_val;
             advance(I);
