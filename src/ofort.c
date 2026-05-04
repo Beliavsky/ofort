@@ -2040,6 +2040,9 @@ static int parse_operator_designator(OfortInterpreter *I, char *name, size_t nam
     } else if (check(I, FTOK_MINUS)) {
         advance(I);
         copy_cstr(name, name_size, "-");
+    } else if (check(I, FTOK_POWER)) {
+        advance(I);
+        copy_cstr(name, name_size, "**");
     } else if (check(I, FTOK_STAR)) {
         advance(I);
         copy_cstr(name, name_size, "*");
@@ -3226,16 +3229,20 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                     decl->stmts[decl->n_stmts++] = de;
                     if (check(I, FTOK_COLON)) {
                         advance(I);
-                        OfortNode *dh = parse_expr(I);
                         if (de->type == FND_INT_LIT) {
                             decl->lower_bounds[dim_index] = (int)de->int_val;
                             decl->has_lower_bound[dim_index] = 1;
                         }
-                        if (dh->type == FND_INT_LIT) {
-                            decl->dims[dim_index] = (int)dh->int_val;
-                        } else if (dim_index < decl->n_stmts) {
-                            decl->stmts[dim_index] = dh;
+                        if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
                             decl->dims[dim_index] = 0;
+                        } else {
+                            OfortNode *dh = parse_expr(I);
+                            if (dh->type == FND_INT_LIT) {
+                                decl->dims[dim_index] = (int)dh->int_val;
+                            } else if (dim_index < decl->n_stmts) {
+                                decl->stmts[dim_index] = dh;
+                                decl->dims[dim_index] = 0;
+                            }
                         }
                     }
                 }
@@ -4558,17 +4565,21 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
                     decl->stmts[decl->n_stmts++] = de;
                     if (check(I, FTOK_COLON)) {
                         advance(I);
-                        OfortNode *dh = parse_expr(I);
                         int dh_value = 0;
                         if (int_constant_node(de, &de_value)) {
                             decl->lower_bounds[dim_index] = de_value;
                             decl->has_lower_bound[dim_index] = 1;
                         }
-                        if (int_constant_node(dh, &dh_value)) {
-                            decl->dims[dim_index] = dh_value;
-                        } else if (dim_index < decl->n_stmts) {
-                            decl->stmts[dim_index] = dh;
+                        if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
                             decl->dims[dim_index] = 0;
+                        } else {
+                            OfortNode *dh = parse_expr(I);
+                            if (int_constant_node(dh, &dh_value)) {
+                                decl->dims[dim_index] = dh_value;
+                            } else if (dim_index < decl->n_stmts) {
+                                decl->stmts[dim_index] = dh;
+                                decl->dims[dim_index] = 0;
+                            }
                         }
                     }
                 }
@@ -7931,6 +7942,28 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
     case FND_ADD: case FND_SUB: case FND_MUL: case FND_DIV: case FND_POWER: {
         OfortValue left = eval_node(I, n->children[0]);
         OfortValue right = eval_node(I, n->children[1]);
+        if (left.type == FVAL_DERIVED || right.type == FVAL_DERIVED) {
+            const char *op_name = NULL;
+            OfortValue args[2];
+            OfortFunc *func;
+            switch (n->type) {
+                case FND_ADD: op_name = "+"; break;
+                case FND_SUB: op_name = "-"; break;
+                case FND_MUL: op_name = "*"; break;
+                case FND_DIV: op_name = "/"; break;
+                case FND_POWER: op_name = "**"; break;
+                default: break;
+            }
+            args[0] = left;
+            args[1] = right;
+            func = op_name ? find_matching_generic_func(I, op_name, args, 2) : NULL;
+            if (func) {
+                OfortValue result = execute_user_function_with_args(I, func, args, 2);
+                free_value(&left);
+                free_value(&right);
+                return result;
+            }
+        }
 
         /* Array operations: element-wise */
         if (left.type == FVAL_ARRAY || right.type == FVAL_ARRAY) {
