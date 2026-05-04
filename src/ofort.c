@@ -1077,6 +1077,15 @@ static OfortFunc *find_matching_generic_proc(OfortInterpreter *I, const char *na
                 match = 0;
                 break;
             }
+            if (fn->param_types[j] == FVAL_DERIVED && fn->param_type_names[j][0]) {
+                const char *actual_name = args[j].type == FVAL_ARRAY ?
+                    args[j].v.arr.elem_type_name : args[j].v.dt.type_name;
+                if (!actual_name || !actual_name[0] ||
+                    !str_eq_nocase(fn->param_type_names[j], actual_name)) {
+                    match = 0;
+                    break;
+                }
+            }
             if (fn->param_n_dims[j] != actual_rank &&
                 fn->param_n_dims[j] != -1 &&
                 !(fn->is_elemental && fn->param_n_dims[j] == 0 && actual_rank > 0) &&
@@ -1116,6 +1125,16 @@ static OfortFunc *find_matching_generic_proc(OfortInterpreter *I, const char *na
                   actual_rank == 0 && fn->param_n_dims[j] > 0)) {
                 ok = 0;
                 break;
+            }
+            if (fn->param_types[j] == FVAL_DERIVED && fn->param_type_names[j][0]) {
+                const char *actual_name = args[j].type == FVAL_ARRAY ?
+                    args[j].v.arr.elem_type_name : args[j].v.dt.type_name;
+                if (!actual_name || !actual_name[0] ||
+                    !str_eq_nocase(fn->param_type_names[j], actual_name)) {
+                    ok = 0;
+                    break;
+                }
+                continue;
             }
             if (fn->param_types[j] == FVAL_VOID || fn->param_types[j] == actual_type) continue;
             if (is_numeric_type(fn->param_types[j]) && is_numeric_type(actual_type)) {
@@ -2172,6 +2191,7 @@ static OfortNode *parse_statement_function(OfortInterpreter *I) {
         arg = expect(I, FTOK_IDENT);
         copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), arg->str_val);
         n->param_types[n->n_params] = FVAL_VOID;
+        n->param_type_names[n->n_params][0] = '\0';
         n->param_optional[n->n_params] = 0;
         n->n_params++;
         if (check(I, FTOK_COMMA)) {
@@ -2352,6 +2372,10 @@ static int check_end(OfortInterpreter *I, const char *what) {
             case FTOK_DO: strcpy(upper, "DO"); break;
             case FTOK_IF: strcpy(upper, "IF"); break;
             case FTOK_SELECT: strcpy(upper, "SELECT"); break;
+            case FTOK_IDENT:
+                if (token_ident_upper(next, "BLOCK")) strcpy(upper, "BLOCK");
+                else return 0;
+                break;
             case FTOK_SUBROUTINE: strcpy(upper, "SUBROUTINE"); break;
             case FTOK_FUNCTION: strcpy(upper, "FUNCTION"); break;
             case FTOK_MODULE: strcpy(upper, "MODULE"); break;
@@ -4141,6 +4165,21 @@ static OfortNode *parse_rewind_stmt(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_block_construct(OfortInterpreter *I) {
+    OfortToken *bt = advance(I); /* BLOCK */
+    OfortNode *n = alloc_node(I, FND_BLOCK_CONSTRUCT);
+    int prev_spec_section;
+    n->line = bt->line;
+    skip_newlines(I);
+    prev_spec_section = I->in_spec_section;
+    I->in_spec_section = 1;
+    n->children[0] = parse_block_until_end(I, "BLOCK");
+    I->in_spec_section = prev_spec_section;
+    n->n_children = 1;
+    consume_end(I, "BLOCK");
+    return n;
+}
+
 static OfortNode *parse_forall_stmt(OfortInterpreter *I) {
     OfortToken *ft = advance(I); /* FORALL */
     OfortNode *n = alloc_node(I, FND_FORALL);
@@ -4302,6 +4341,7 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
             OfortToken *param = expect(I, FTOK_IDENT);
             copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), param->str_val);
             n->param_types[n->n_params] = FVAL_VOID; /* resolved later */
+            n->param_type_names[n->n_params][0] = '\0';
             n->param_intents[n->n_params] = 0;
             n->param_optional[n->n_params] = 0;
             n->param_n_dims[n->n_params] = 0;
@@ -4340,6 +4380,7 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
             OfortToken *param = expect(I, FTOK_IDENT);
             copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), param->str_val);
             n->param_types[n->n_params] = FVAL_VOID;
+            n->param_type_names[n->n_params][0] = '\0';
             n->param_intents[n->n_params] = 0;
             n->param_optional[n->n_params] = 0;
             n->param_n_dims[n->n_params] = 0;
@@ -4470,6 +4511,7 @@ static OfortNode *parse_module_procedure_body(OfortInterpreter *I) {
         for (int i = 0; i < spec->n_params; i++) {
             copy_cstr(n->param_names[i], sizeof(n->param_names[i]), spec->param_names[i]);
             n->param_types[i] = spec->param_types[i];
+            copy_cstr(n->param_type_names[i], sizeof(n->param_type_names[i]), spec->param_type_names[i]);
             n->param_intents[i] = spec->param_intents[i];
             n->param_optional[i] = spec->param_optional[i];
             n->param_n_dims[i] = spec->param_n_dims[i];
@@ -5244,6 +5286,11 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return parse_subroutine(I);
     }
 
+    if (token_ident_upper(t, "BLOCK")) {
+        leave_spec_section(I);
+        return parse_block_construct(I);
+    }
+
     if (t->type == FTOK_INT_LIT) {
         stmt_label = t->int_val;
         advance(I);
@@ -5266,6 +5313,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         skip_newlines(I);
         t = peek(I);
         if (t->type == FTOK_EOF) return NULL;
+        if (token_ident_upper(t, "BLOCK")) {
+            leave_spec_section(I);
+            return parse_block_construct(I);
+        }
     }
 
     if (is_procedure_prefix_token(t)) {
@@ -8985,12 +9036,15 @@ static void annotate_procedure_params(OfortNode *n) {
                 continue;
             }
             for (int k = 0; k < n->n_params; k++) {
-                if (str_eq_nocase(d->name, n->param_names[k])) {
-                    n->param_intents[k] = d->intent;
-                    n->param_types[k] = d->val_type;
-                    n->param_optional[k] = d->is_optional;
-                    n->param_n_dims[k] = d->n_dims;
-                    break;
+            if (str_eq_nocase(d->name, n->param_names[k])) {
+                n->param_intents[k] = d->intent;
+                n->param_types[k] = d->val_type;
+                n->param_type_names[k][0] = '\0';
+                if (d->val_type == FVAL_DERIVED)
+                    copy_cstr(n->param_type_names[k], sizeof(n->param_type_names[k]), d->str_val);
+                n->param_optional[k] = d->is_optional;
+                n->param_n_dims[k] = d->n_dims;
+                break;
                 }
             }
         }
@@ -10850,6 +10904,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         break;
     }
 
+    case FND_BLOCK_CONSTRUCT: {
+        push_scope(I);
+        exec_node(I, n->children[0]);
+        pop_scope(I);
+        break;
+    }
+
     case FND_PROGRAM: {
         OfortNode *body = n->children[0];
         push_scope(I);
@@ -12576,6 +12637,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                                 if (strcmp(du, pu) == 0) {
                                     n->param_intents[k] = d->intent;
                                     n->param_types[k] = d->val_type;
+                                    n->param_type_names[k][0] = '\0';
+                                    if (d->val_type == FVAL_DERIVED)
+                                        copy_cstr(n->param_type_names[k], sizeof(n->param_type_names[k]), d->str_val);
                                     n->param_optional[k] = d->is_optional;
                                     n->param_n_dims[k] = d->n_dims;
                                     break;
@@ -12592,6 +12656,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         if (strcmp(du, pu) == 0) {
                             n->param_intents[k] = s->intent;
                             n->param_types[k] = s->val_type;
+                            n->param_type_names[k][0] = '\0';
+                            if (s->val_type == FVAL_DERIVED)
+                                copy_cstr(n->param_type_names[k], sizeof(n->param_type_names[k]), s->str_val);
                             n->param_optional[k] = s->is_optional;
                             n->param_n_dims[k] = s->n_dims;
                             break;
