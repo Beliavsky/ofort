@@ -5480,9 +5480,20 @@ static OfortNode *parse_implicit_stmt(OfortInterpreter *I) {
 
     while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
         OfortValType vtype;
-        if (!is_type_keyword(peek(I)->type))
-            ofort_error(I, "Expected type in IMPLICIT statement");
-        vtype = token_to_valtype(advance(I)->type);
+        if (peek(I)->type == FTOK_TYPE && peek_ahead(I, 1)->type == FTOK_LPAREN &&
+            is_type_keyword(peek_ahead(I, 2)->type)) {
+            advance(I); /* TYPE */
+            expect(I, FTOK_LPAREN);
+            vtype = token_to_valtype(advance(I)->type);
+            if (vtype == FVAL_DOUBLE && check(I, FTOK_IDENT) && check_ident_upper(I, "PRECISION")) {
+                advance(I);
+            }
+            expect(I, FTOK_RPAREN);
+        } else {
+            if (!is_type_keyword(peek(I)->type))
+                ofort_error(I, "Expected type in IMPLICIT statement");
+            vtype = token_to_valtype(advance(I)->type);
+        }
 
         if (check(I, FTOK_LPAREN) && vtype == FVAL_CHARACTER) {
             skip_balanced_parens(I);
