@@ -12679,10 +12679,31 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             int nargs = n->n_stmts + 1;
             if (nargs > OFORT_MAX_PARAMS) too_many_params_error(I, "type-bound subroutine arguments");
             OfortValue *args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
+            int actual_for_param[OFORT_MAX_PARAMS];
+            int next_positional_actual = 0;
             if (!args) ofort_error(I, "Out of memory");
             args[0] = make_void_val();
             for (int i = 0; i < n->n_stmts; i++) {
                 args[i + 1] = eval_node(I, n->stmts[i]);
+            }
+            for (int i = 0; i < OFORT_MAX_PARAMS; i++) actual_for_param[i] = -1;
+            for (int i = 1; i < fn->n_params; i++) {
+                for (int j = 0; j < n->n_stmts; j++) {
+                    if (n->param_names[j][0] &&
+                        str_eq_nocase(n->param_names[j], fn->param_names[i])) {
+                        actual_for_param[i] = j;
+                        break;
+                    }
+                }
+                if (actual_for_param[i] < 0) {
+                    while (next_positional_actual < n->n_stmts &&
+                           n->param_names[next_positional_actual][0]) {
+                        next_positional_actual++;
+                    }
+                    if (next_positional_actual < n->n_stmts) {
+                        actual_for_param[i] = next_positional_actual++;
+                    }
+                }
             }
             push_scope(I);
             {
@@ -12697,8 +12718,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 OfortVar *pv;
                 if (i == 0) {
                     pv = declare_alias_value_var(I, fn->param_names[i], receiver_target);
-                } else if (i < nargs && args[i].type != FVAL_VOID) {
-                    pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
+                } else if (actual_for_param[i] >= 0 &&
+                           args[actual_for_param[i] + 1].type != FVAL_VOID) {
+                    pv = declare_var(I, fn->param_names[i],
+                                     copy_value(args[actual_for_param[i] + 1]));
                 } else if (fn->param_optional[i]) {
                     pv = declare_absent_optional_var(I, fn->param_names[i]);
                 } else {
