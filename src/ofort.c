@@ -7537,6 +7537,11 @@ static void flush_stdout_for_read(OfortInterpreter *I) {
         return;
     }
     fputs(I->output, stdout);
+    if (I->out_len > 0 &&
+        I->output[I->out_len - 1] != '\n' &&
+        I->output[I->out_len - 1] != '\r') {
+        fputc('\n', stdout);
+    }
     fflush(stdout);
     I->out_len = 0;
     I->output[0] = '\0';
@@ -7547,6 +7552,11 @@ static int read_values_from_stdin(OfortInterpreter *I, OfortNode *n, int is_stre
     int status = 0;
 
     flush_stdout_for_read(I);
+
+    if (n->n_stmts == 0) {
+        if (!read_next_line_stdin(tok, sizeof(tok))) status = 1;
+        return status;
+    }
 
     if (format_is_character_line_read(n->format_str) && n->n_stmts > 0) {
         if (!read_next_line_stdin(tok, sizeof(tok))) {
@@ -7637,6 +7647,13 @@ static int read_values_from_file(OfortInterpreter *I, OfortUnitFile *entry, Ofor
     int status = 0;
     if (!fp) ofort_error(I, "Cannot open '%s' for reading", entry->path);
     fseek(fp, entry->stream_pos, SEEK_SET);
+
+    if (n->n_stmts == 0) {
+        if (!fgets(tok, sizeof(tok), fp)) status = 1;
+        entry->stream_pos = (int)ftell(fp);
+        fclose(fp);
+        return status;
+    }
 
     if (format_is_character_line_read(n->format_str) && n->n_stmts > 0) {
         char line[OFORT_MAX_STRLEN];
