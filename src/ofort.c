@@ -2019,7 +2019,7 @@ static int token_can_be_name(OfortToken *t) {
     return t && (t->type == FTOK_IDENT || t->type == FTOK_IN ||
                  t->type == FTOK_OUT || t->type == FTOK_INOUT ||
                  t->type == FTOK_CALL || t->type == FTOK_DEFAULT ||
-                 t->type == FTOK_SELECT);
+                 t->type == FTOK_SELECT || t->type == FTOK_DATA);
 }
 
 static const char *token_name_text(OfortToken *t) {
@@ -2030,6 +2030,7 @@ static const char *token_name_text(OfortToken *t) {
     if (t->type == FTOK_CALL) return "call";
     if (t->type == FTOK_DEFAULT) return "default";
     if (t->type == FTOK_SELECT) return "select";
+    if (t->type == FTOK_DATA) return "data";
     return t->str_val;
 }
 
