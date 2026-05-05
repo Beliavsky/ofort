@@ -125,6 +125,7 @@ struct OfortInterpreter {
     char warnings[4096];
     int warn_len;
     int warnings_enabled;
+    OfortStandardMode standard_mode;
     int fast_mode;
     int specialized_fast_paths;
     uint64_t fast_rng_state;
@@ -624,23 +625,40 @@ static void free_value(OfortValue *v) {
     }
 }
 
+static void free_call_args(OfortValue *args, int nargs) {
+    if (!args) return;
+    for (int i = 0; i < nargs; i++) free_value(&args[i]);
+    free(args);
+}
+
 static OfortValue copy_value(OfortValue v) {
     OfortValue r = v;
     if (v.type == FVAL_CHARACTER && v.v.s) {
         r.v.s = strdup(v.v.s);
     } else if (v.type == FVAL_ARRAY && v.v.arr.data) {
         int i;
+        r.v.arr.data = NULL;
+        r.v.arr.real_data = NULL;
+        r.v.arr.int_data = NULL;
         r.v.arr.data = (OfortValue *)malloc(sizeof(OfortValue) * v.v.arr.cap);
         for (i = 0; i < v.v.arr.len; i++)
             r.v.arr.data[i] = copy_value(v.v.arr.data[i]);
     } else if (v.type == FVAL_ARRAY && v.v.arr.real_data) {
+        r.v.arr.data = NULL;
+        r.v.arr.real_data = NULL;
+        r.v.arr.int_data = NULL;
         r.v.arr.real_data = (double *)malloc(sizeof(double) * v.v.arr.cap);
         if (r.v.arr.real_data) memcpy(r.v.arr.real_data, v.v.arr.real_data, sizeof(double) * v.v.arr.len);
     } else if (v.type == FVAL_ARRAY && v.v.arr.int_data) {
+        r.v.arr.data = NULL;
+        r.v.arr.real_data = NULL;
+        r.v.arr.int_data = NULL;
         r.v.arr.int_data = (long long *)malloc(sizeof(long long) * v.v.arr.cap);
         if (r.v.arr.int_data) memcpy(r.v.arr.int_data, v.v.arr.int_data, sizeof(long long) * v.v.arr.len);
     } else if (v.type == FVAL_DERIVED && v.v.dt.fields) {
         int i;
+        r.v.dt.fields = NULL;
+        r.v.dt.field_names = NULL;
         r.v.dt.fields = (OfortValue *)malloc(sizeof(OfortValue) * v.v.dt.n_fields);
         r.v.dt.field_names = (char(*)[64])malloc(sizeof(char[64]) * v.v.dt.n_fields);
         for (i = 0; i < v.v.dt.n_fields; i++) {
@@ -1037,6 +1055,27 @@ static OfortVar *declare_alias_var(OfortInterpreter *I, const char *name, OfortV
     v->pointer_has_slice = target->pointer_has_slice;
     v->pointer_slice_start = target->pointer_slice_start;
     v->pointer_slice_end = target->pointer_slice_end;
+    return v;
+}
+
+static OfortVar *declare_alias_value_var(OfortInterpreter *I, const char *name, OfortValue *target) {
+    OfortScope *s = I->current_scope;
+    OfortVar *v;
+    if (!target) return NULL;
+    if (s->n_vars >= OFORT_MAX_VARS) ofort_error(I, "Too many variables");
+    v = &s->vars[s->n_vars++];
+    memset(v, 0, sizeof(*v));
+    copy_cstr(v->name, sizeof(v->name), name);
+    v->val = *target;
+    v->intent = 0;
+    v->char_len = target->type == FVAL_CHARACTER && target->v.s ? (int)strlen(target->v.s) : 0;
+    v->present = 1;
+    v->declared_type = target->type;
+    v->declared_kind = target->kind;
+    if (target->type == FVAL_DERIVED) {
+        copy_cstr(v->declared_type_name, sizeof(v->declared_type_name), target->v.dt.type_name);
+    }
+    v->is_alias = 1;
     return v;
 }
 
@@ -3061,6 +3100,26 @@ static OfortValType token_to_valtype(OfortTokenType t) {
     }
 }
 
+static const char *valtype_standard_name(OfortValType type) {
+    switch (type) {
+        case FVAL_INTEGER: return "INTEGER";
+        case FVAL_REAL: return "REAL";
+        case FVAL_DOUBLE: return "DOUBLE PRECISION";
+        case FVAL_COMPLEX: return "COMPLEX";
+        case FVAL_CHARACTER: return "CHARACTER";
+        case FVAL_LOGICAL: return "LOGICAL";
+        default: return "TYPE";
+    }
+}
+
+static void reject_nonstandard_star_kind(OfortInterpreter *I, const char *type_name, long long size) {
+    if (I && I->standard_mode == OFORT_STD_F2023) {
+        ofort_error(I,
+                    "nonstandard %s*%lld declaration is not allowed with --std=f2023",
+                    type_name ? type_name : "TYPE", size);
+    }
+}
+
 static int parse_kind_selector_ex(OfortInterpreter *I, OfortNode **kind_expr_out) {
     int kind = 0;
     expect(I, FTOK_LPAREN);
@@ -3132,24 +3191,33 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     OfortNode *decl_dim_exprs[7] = {0};
     int n_decl_dims = 0;
 
-    if (vtype == FVAL_REAL && check(I, FTOK_STAR)) {
+    if ((vtype == FVAL_INTEGER || vtype == FVAL_REAL || vtype == FVAL_COMPLEX ||
+         vtype == FVAL_LOGICAL) && check(I, FTOK_STAR)) {
         OfortToken *kind_tok;
         advance(I);
         kind_tok = expect(I, FTOK_INT_LIT);
-        if (kind_tok->int_val == 8) {
-            vtype = FVAL_DOUBLE;
-        } else if (kind_tok->int_val == 4) {
-            vtype = FVAL_REAL;
-        } else {
-            ofort_warning(I, type_tok->line,
-                          "warning: nonstandard REAL*%lld treated as REAL*8 extension",
-                          kind_tok->int_val);
-            vtype = FVAL_DOUBLE;
+        reject_nonstandard_star_kind(I, token_type_name(type_tok->type), kind_tok->int_val);
+        decl_kind = (int)kind_tok->int_val;
+        if (vtype == FVAL_REAL) {
+            if (kind_tok->int_val == 8) {
+                vtype = FVAL_DOUBLE;
+            } else if (kind_tok->int_val == 4) {
+                vtype = FVAL_REAL;
+            } else {
+                ofort_warning(I, type_tok->line,
+                              "warning: nonstandard REAL*%lld treated as REAL*8 extension",
+                              kind_tok->int_val);
+                vtype = FVAL_DOUBLE;
+                decl_kind = 8;
+            }
         }
-        if (kind_tok->int_val == 4 || kind_tok->int_val == 8) {
+        if (kind_tok->int_val == 1 || kind_tok->int_val == 2 ||
+            kind_tok->int_val == 4 || kind_tok->int_val == 8 ||
+            kind_tok->int_val == 16) {
             ofort_warning(I, type_tok->line,
-                          "warning: nonstandard REAL*%lld treated as REAL(KIND=%lld) extension",
-                          kind_tok->int_val, kind_tok->int_val);
+                          "warning: nonstandard %s*%lld treated as %s(KIND=%lld) extension",
+                          token_type_name(type_tok->type), kind_tok->int_val,
+                          token_type_name(type_tok->type), kind_tok->int_val);
         }
     }
 
@@ -4954,18 +5022,24 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
                     }
                 }
                 has_type_spec = 1;
-                if (parsed_type == FVAL_REAL && check(I, FTOK_STAR)) {
+                if ((parsed_type == FVAL_INTEGER || parsed_type == FVAL_REAL ||
+                     parsed_type == FVAL_COMPLEX || parsed_type == FVAL_LOGICAL) &&
+                    check(I, FTOK_STAR)) {
                     OfortToken *kind_tok;
                     advance(I);
                     kind_tok = expect(I, FTOK_INT_LIT);
-                    if (kind_tok->int_val == 8) {
-                        parsed_type = FVAL_DOUBLE;
-                        kind = 8;
-                    } else if (kind_tok->int_val == 4) {
-                        parsed_type = FVAL_REAL;
-                        kind = 4;
-                    } else {
-                        kind = (int)kind_tok->int_val;
+                    reject_nonstandard_star_kind(I, valtype_standard_name(parsed_type), kind_tok->int_val);
+                    kind = (int)kind_tok->int_val;
+                    if (parsed_type == FVAL_REAL) {
+                        if (kind_tok->int_val == 8) {
+                            parsed_type = FVAL_DOUBLE;
+                            kind = 8;
+                        } else if (kind_tok->int_val == 4) {
+                            parsed_type = FVAL_REAL;
+                            kind = 4;
+                        } else {
+                            kind = (int)kind_tok->int_val;
+                        }
                     }
                 }
                 if (parsed_type == FVAL_CHARACTER && check(I, FTOK_STAR)) {
@@ -5577,6 +5651,8 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         }
         /* Distinguish between TYPE :: typename (definition) and TYPE(typename) :: var (declaration) */
         OfortToken *next = peek_ahead(I, 1);
+        if (next->type == FTOK_COMMA)
+            ofort_error(I, "Unsupported OOP feature at line %d: TYPE, EXTENDS(...) is not supported yet", t->line);
         if (next->type == FTOK_DCOLON || next->type == FTOK_IDENT) {
             return parse_type_def(I);
         }
@@ -5624,6 +5700,8 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     if (t->type == FTOK_SELECT) {
         leave_spec_section(I);
         if (token_ident_upper(peek_ahead(I, 1), "RANK")) return parse_select_rank(I);
+        if (peek_ahead(I, 1)->type == FTOK_TYPE || token_ident_upper(peek_ahead(I, 1), "TYPE"))
+            ofort_error(I, "Unsupported OOP feature at line %d: SELECT TYPE is not supported yet", t->line);
         return parse_select_case(I);
     }
 
@@ -5651,19 +5729,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         OfortNode *n = alloc_node(I, FND_CALL);
         copy_cstr(callee->name, sizeof(callee->name), base->str_val);
         callee->line = base->line;
-        while (check(I, FTOK_PERCENT)) {
-            OfortToken *mt;
-            OfortNode *mem;
-            advance(I);
-            if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
-            mt = advance(I);
-            mem = alloc_node(I, FND_MEMBER);
-            mem->children[0] = callee;
-            mem->n_children = 1;
-            copy_cstr(mem->name, sizeof(mem->name), token_name_text(mt));
-            mem->line = mt->line;
-            callee = mem;
-        }
+        callee = parse_component_target_postfix(I, callee);
         if (callee->type == FND_MEMBER) {
             copy_cstr(n->name, sizeof(n->name), callee->name);
             n->children[0] = callee->children[0];
@@ -8799,7 +8865,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         /* Evaluate arguments */
         int nargs = n->n_stmts;
         if (nargs > OFORT_MAX_PARAMS) too_many_params_error(I, "function arguments");
-        OfortValue args[OFORT_MAX_PARAMS];
+        OfortValue *args = NULL;
         char procedure_call_name[256];
         procedure_call_name[0] = '\0';
 
@@ -8911,11 +8977,13 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         }
 
         /* Evaluate all args */
+        args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
+        if (!args) ofort_error(I, "Out of memory");
         for (int i = 0; i < nargs; i++) args[i] = eval_node(I, n->stmts[i]);
 
         if (str_eq_nocase(n->name, ".IN.") && nargs == 2) {
             OfortValue result = eval_in_operator(I, args[0], args[1]);
-            for (int i = 0; i < nargs; i++) free_value(&args[i]);
+            free_call_args(args, nargs); args = NULL;
             return result;
         }
 
@@ -8927,7 +8995,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             if (fn && fn->type == FND_STMT_FUNCTION) {
                 OfortValue result;
                 if (nargs != fn->n_params) {
-                    for (int i = 0; i < nargs; i++) free_value(&args[i]);
+                    free_call_args(args, nargs); args = NULL;
                     ofort_error(I, "Wrong number of arguments in statement function '%s' (expected %d, got %d)",
                                 fn->name, fn->n_params, nargs);
                 }
@@ -8946,13 +9014,13 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 result = eval_node(I, fn->children[0]);
                 pop_scope(I);
-                for (int i = 0; i < nargs; i++) free_value(&args[i]);
+                free_call_args(args, nargs); args = NULL;
                 return result;
             }
             fn = func->node;
             OfortValue elemental_result;
             if (execute_elemental_function_call(I, n, func, fn, args, nargs, &elemental_result)) {
-                for (int i = 0; i < nargs; i++) free_value(&args[i]);
+                free_call_args(args, nargs); args = NULL;
                 return elemental_result;
             }
             push_scope(I);
@@ -9016,14 +9084,14 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 }
             }
 
-            for (int i = 0; i < nargs; i++) free_value(&args[i]);
+            free_call_args(args, nargs); args = NULL;
             return result;
         }
 
         /* Check for intrinsic after user/module procedures so names such as RANGE can be overridden. */
         if (is_intrinsic(n->name)) {
             OfortValue result = call_intrinsic(I, n->name, args, nargs, n->param_names);
-            for (int i = 0; i < nargs; i++) free_value(&args[i]);
+            free_call_args(args, nargs); args = NULL;
             return result;
         }
 
@@ -9031,7 +9099,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             OfortValue result;
             if (nargs < 1) ofort_error(I, "STORAGE_SIZE requires 1 argument");
             result = make_integer(storage_size_bits(&args[0]));
-            for (int i = 0; i < nargs; i++) free_value(&args[i]);
+            free_call_args(args, nargs); args = NULL;
             return result;
         }
 
@@ -9061,11 +9129,11 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     v.v.dt.fields[i] = default_value(td->field_types[i], td->field_char_lens[i]);
                 }
             }
-            for (int i = 0; i < nargs; i++) free_value(&args[i]);
+            free_call_args(args, nargs); args = NULL;
             return v;
         }
 
-        for (int i = 0; i < nargs; i++) free_value(&args[i]);
+        free_call_args(args, nargs); args = NULL;
         ofort_error(I, "Unknown function or array '%s' at line %d", n->name, n->line);
         return make_void_val();
     }
@@ -9134,8 +9202,9 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 if (proc_name) {
                     OfortFunc *func = find_func(I, proc_name);
                     if (n->n_stmts + 1 > OFORT_MAX_PARAMS) too_many_params_error(I, "type-bound call arguments");
-                    OfortValue args[OFORT_MAX_PARAMS];
+                    OfortValue *args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
                     int nargs = 1;
+                    if (!args) ofort_error(I, "Out of memory");
                     if (!func || !func->is_function)
                         ofort_error(I, "Type-bound function '%s' is not found", proc_name);
                     args[0] = receiver;
@@ -9144,6 +9213,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     }
                     OfortValue result = execute_user_function_with_args(I, func, args, nargs);
                     for (int i = 0; i < nargs; i++) free_value(&args[i]);
+                    free(args);
                     return result;
                 }
             }
@@ -12652,15 +12722,26 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
             int nargs = n->n_stmts + 1;
             if (nargs > OFORT_MAX_PARAMS) too_many_params_error(I, "type-bound subroutine arguments");
-            OfortValue args[OFORT_MAX_PARAMS];
-            args[0] = copy_value(*receiver_target);
+            OfortValue *args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
+            if (!args) ofort_error(I, "Out of memory");
+            args[0] = make_void_val();
             for (int i = 0; i < n->n_stmts; i++) {
                 args[i + 1] = eval_node(I, n->stmts[i]);
             }
             push_scope(I);
+            {
+                OfortModule *mod = find_module(I, func->module_name);
+                if (mod) {
+                    for (int i = 0; i < mod->n_vars; i++) {
+                        declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+                    }
+                }
+            }
             for (int i = 0; i < fn->n_params; i++) {
                 OfortVar *pv;
-                if (i < nargs && args[i].type != FVAL_VOID) {
+                if (i == 0) {
+                    pv = declare_alias_value_var(I, fn->param_names[i], receiver_target);
+                } else if (i < nargs && args[i].type != FVAL_VOID) {
                     pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
                 } else if (fn->param_optional[i]) {
                     pv = declare_absent_optional_var(I, fn->param_names[i]);
@@ -12675,16 +12756,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             exec_node(I, fn->children[0]);
             I->procedure_depth--;
             I->returning = 0;
-            {
-                OfortVar *self_var = find_var(I, fn->param_names[0]);
-                if (self_var && self_var->present) {
-                    free_value(receiver_target);
-                    *receiver_target = copy_value(self_var->val);
-                }
-            }
             store_saved_vars(func, I->current_scope);
             pop_scope(I);
             for (int i = 0; i < nargs; i++) free_value(&args[i]);
+            free(args);
             break;
         }
 
@@ -12695,7 +12770,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* (none currently — user subroutines only) */
 
         if (nargs > OFORT_MAX_PARAMS) too_many_params_error(I, "subroutine call arguments");
-        OfortValue args[OFORT_MAX_PARAMS];
+        OfortValue *args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
+        if (!args) ofort_error(I, "Out of memory");
         int arg_alias[OFORT_MAX_PARAMS] = {0};
         OfortVar *arg_alias_var[OFORT_MAX_PARAMS] = {0};
         OfortFunc *func = find_func(I, n->name);
@@ -12725,6 +12801,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (execute_elemental_subroutine_call(I, n, func, fn, args, nargs,
                                               arg_alias, arg_alias_var)) {
             for (int i = 0; i < nargs; i++) free_value(&args[i]);
+            free(args);
             break;
         }
         push_scope(I);
@@ -12781,6 +12858,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
         }
         for (int i = 0; i < nargs; i++) free_value(&args[i]);
+        free(args);
         break;
     }
 
@@ -15396,6 +15474,7 @@ OfortInterpreter *ofort_create(void) {
     I->node_pool_len = 0;
     I->node_pool_cap = 0;
     I->warnings_enabled = 1;
+    I->standard_mode = OFORT_STD_LEGACY;
     I->specialized_fast_paths = 1;
     return I;
 }
@@ -15575,6 +15654,12 @@ void ofort_set_suppress_output(OfortInterpreter *interp, int enabled) {
 void ofort_set_live_stdout(OfortInterpreter *interp, int enabled) {
     if (interp) {
         interp->live_stdout = enabled ? 1 : 0;
+    }
+}
+
+void ofort_set_standard_mode(OfortInterpreter *interp, OfortStandardMode mode) {
+    if (interp) {
+        interp->standard_mode = mode;
     }
 }
 
@@ -16231,4 +16316,5 @@ void ofort_reset(OfortInterpreter *interp) {
     clear_timing(interp);
     clear_line_profile(interp);
 }
+
 
