@@ -3897,6 +3897,17 @@ static OfortNode *parse_io_item(OfortInterpreter *I) {
     if (check(I, FTOK_LPAREN)) {
         OfortToken *t = advance(I);
         OfortNode *inner = parse_expr(I);
+        if (check(I, FTOK_COMMA)) {
+            OfortNode *n;
+            advance(I);
+            n = alloc_node(I, FND_COMPLEX_LIT);
+            n->children[0] = inner;
+            n->children[1] = parse_expr(I);
+            n->n_children = 2;
+            n->line = t->line;
+            expect(I, FTOK_RPAREN);
+            return n;
+        }
         expect(I, FTOK_RPAREN);
         if (check(I, FTOK_POWER)) {
             advance(I);
@@ -7895,20 +7906,31 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
 }
 
 static void append_flattened_output_value(OfortInterpreter *I, OfortValue value,
-                                          OfortValue **flat, int *count, int *cap) {
+                                          OfortValue **flat, int *count, int *cap,
+                                          int split_complex) {
     (void)I;
     if (value.type == FVAL_ARRAY) {
         for (int i = 0; i < value.v.arr.len; i++) {
             OfortValue elem = array_element_value(&value, i);
-            append_flattened_output_value(I, elem, flat, count, cap);
+            append_flattened_output_value(I, elem, flat, count, cap, split_complex);
             free_value(&elem);
         }
         return;
     }
     if (value.type == FVAL_DERIVED && value.v.dt.fields) {
         for (int i = 0; i < value.v.dt.n_fields; i++) {
-            append_flattened_output_value(I, value.v.dt.fields[i], flat, count, cap);
+            append_flattened_output_value(I, value.v.dt.fields[i], flat, count, cap, split_complex);
         }
+        return;
+    }
+    if (split_complex && value.type == FVAL_COMPLEX) {
+        if (*count + 2 > *cap) {
+            while (*count + 2 > *cap) *cap = *cap ? *cap * 2 : 8;
+            *flat = (OfortValue *)realloc(*flat, sizeof(OfortValue) * (size_t)*cap);
+            if (!*flat) ofort_error(I, "Out of memory flattening output list");
+        }
+        (*flat)[(*count)++] = make_real(value.v.cx.re);
+        (*flat)[(*count)++] = make_real(value.v.cx.im);
         return;
     }
     if (*count >= *cap) {
@@ -7922,8 +7944,10 @@ static void append_flattened_output_value(OfortInterpreter *I, OfortValue value,
 /* Format output using Fortran format descriptors */
 static void format_output(OfortInterpreter *I, const char *fmt, OfortValue *vals, int nvals) {
     int needs_flatten = 0;
+    int split_complex = fmt && fmt[0];
     for (int i = 0; i < nvals; i++) {
-        if (vals[i].type == FVAL_ARRAY || vals[i].type == FVAL_DERIVED) {
+        if (vals[i].type == FVAL_ARRAY || vals[i].type == FVAL_DERIVED ||
+            (split_complex && vals[i].type == FVAL_COMPLEX)) {
             needs_flatten = 1;
         }
     }
@@ -7932,7 +7956,7 @@ static void format_output(OfortInterpreter *I, const char *fmt, OfortValue *vals
         int flattened_count = 0;
         int flat_cap = 0;
         for (int i = 0; i < nvals; i++) {
-            append_flattened_output_value(I, vals[i], &flat, &flattened_count, &flat_cap);
+            append_flattened_output_value(I, vals[i], &flat, &flattened_count, &flat_cap, split_complex);
         }
         if (!flat) flat = (OfortValue *)calloc(1, sizeof(OfortValue));
         if (!flat) ofort_error(I, "Out of memory flattening output list");
@@ -8093,6 +8117,23 @@ static OfortValue *eval_io_list(OfortInterpreter *I, OfortNode *n, int *nvals_ou
 
 static void collect_constructor_values(OfortInterpreter *I, OfortNode *node,
                                        OfortValue **vals, int *nvals, int *cap) {
+    if (node->type == FND_MUL && node->children[0] && node->children[1]) {
+        OfortValue repeat_v = eval_node(I, node->children[0]);
+        if (repeat_v.type == FVAL_INTEGER) {
+            long long repeat = val_to_int(repeat_v);
+            OfortValue val;
+            free_value(&repeat_v);
+            if (repeat < 0) ofort_error(I, "DATA repeat count cannot be negative");
+            val = eval_node(I, node->children[1]);
+            for (long long i = 0; i < repeat; i++) {
+                append_io_value(I, vals, nvals, cap, copy_value(val));
+            }
+            free_value(&val);
+            return;
+        }
+        free_value(&repeat_v);
+    }
+
     if (node->type == FND_IMPLIED_DO) {
         OfortValue start_v = eval_node(I, node->children[0]);
         OfortValue end_v = eval_node(I, node->children[1]);
