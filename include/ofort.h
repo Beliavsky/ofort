@@ -11,6 +11,11 @@
 
 #include <stddef.h>
 
+#define OFORT_VERSION "0.1.0"
+#ifndef OFORT_BUILD_FLAGS
+#define OFORT_BUILD_FLAGS "-O2"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -24,9 +29,14 @@ extern "C" {
 #define OFORT_MAX_ARRAY     10000
 #define OFORT_MAX_TOKENS    32768
 #define OFORT_MAX_CHILDREN  16
-#define OFORT_MAX_PARAMS    32
+#define OFORT_MAX_PARAMS    256
 #define OFORT_MAX_MODULES   32
 #define OFORT_MAX_FIELDS    32
+
+typedef enum {
+    OFORT_STD_LEGACY = 0,
+    OFORT_STD_F2023 = 2023
+} OfortStandardMode;
 
 /* ── Token types ────────────────────────────── */
 typedef enum {
@@ -108,8 +118,10 @@ typedef enum {
 typedef struct OfortValue {
     OfortValType type;
     int kind;
+    char int_repr[64];  /* Optional exact decimal text for INTEGER values outside long long. */
     union {
         long long       i;       /* INTEGER */
+        __int128        i128;    /* INTEGER(16) */
         double          r;       /* REAL / DOUBLE PRECISION */
         struct { double re, im; } cx; /* COMPLEX */
         char           *s;       /* CHARACTER */
@@ -138,16 +150,17 @@ typedef struct OfortValue {
 
 /* ── AST node types ──────────────────────────── */
 typedef enum {
-    FND_PROGRAM, FND_BLOCK, FND_IMPLICIT_NONE,
+    FND_PROGRAM, FND_BLOCK, FND_BLOCK_CONSTRUCT, FND_ASSOCIATE, FND_IMPLICIT_NONE,
     FND_VARDECL, FND_PARAMDECL,
     FND_SUBROUTINE, FND_FUNCTION, FND_MODULE,
     FND_TYPE_DEF,
-    FND_IF, FND_DO_LOOP, FND_DO_WHILE, FND_DO_FOREVER, FND_FORALL, FND_SELECT_CASE, FND_SELECT_RANK, FND_CASE_BLOCK,
+    FND_IF, FND_DO_LOOP, FND_DO_WHILE, FND_DO_FOREVER, FND_DO_CONCURRENT, FND_FORALL, FND_SELECT_CASE, FND_SELECT_RANK, FND_CASE_BLOCK,
     FND_RETURN, FND_EXIT, FND_CYCLE, FND_STOP, FND_GOTO, FND_CONTINUE,
     FND_CALL, FND_PRINT, FND_WRITE, FND_READ_STMT, FND_OPEN, FND_CLOSE, FND_REWIND, FND_INQUIRE,
     FND_ALLOCATE, FND_DEALLOCATE, FND_USE, FND_ACCESS, FND_INTERFACE,
     FND_EXPR_STMT,
     FND_DATA,
+    FND_FORMAT,
     FND_STMT_FUNCTION,
     /* expressions */
     FND_ASSIGN,
@@ -187,6 +200,7 @@ typedef struct OfortNode {
     int is_parameter;
     int is_optional;
     int is_elemental;
+    int no_advance;         /* WRITE(..., ADVANCE='NO') */
     char result_name[256];  /* for FUNCTION ... RESULT(name) */
     char format_str[512];   /* for WRITE format */
     /* children */
@@ -204,13 +218,18 @@ typedef struct OfortNode {
     int param_optional[OFORT_MAX_PARAMS];
     int param_n_dims[OFORT_MAX_PARAMS];
     int n_params;
+    char type_param_names[OFORT_MAX_PARAMS][64];
+    int n_type_params;
     /* array dimensions in declarations */
     int dims[7];
     int lower_bounds[7];
     int has_lower_bound[7];
+    struct OfortNode *lower_bound_exprs[7];
     int n_dims;
     struct OfortNode *char_len_expr;
     struct OfortNode *kind_expr;
+    struct OfortNode *type_param_exprs[OFORT_MAX_PARAMS];
+    int n_type_param_exprs;
     void *fast_cache[8];
     /* source location */
     int line;
@@ -267,6 +286,9 @@ void ofort_set_line_profile_enabled(OfortInterpreter *interp, int enabled);
 
 /* If enabled, PRINT/WRITE output to unit 6 is emitted as it is produced. */
 void ofort_set_live_stdout(OfortInterpreter *interp, int enabled);
+
+/* Set parser standard mode. Default is OFORT_STD_LEGACY. */
+void ofort_set_standard_mode(OfortInterpreter *interp, OfortStandardMode mode);
 
 /* Set command-line arguments visible to COMMAND_ARGUMENT_COUNT/GET_COMMAND_ARGUMENT. */
 void ofort_set_command_args(OfortInterpreter *interp, int argc, const char *const *argv);

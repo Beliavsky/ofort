@@ -5844,7 +5844,28 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         copy_cstr(n->name, sizeof(n->name), mn->str_val);
         n->line = t->line;
         while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
-            advance(I);
+            if (check(I, FTOK_COMMA)) {
+                advance(I);
+            } else if (token_ident_upper(peek(I), "ONLY")) {
+                advance(I);
+                if (check(I, FTOK_COLON)) advance(I);
+            } else if (token_can_be_name(peek(I))) {
+                OfortToken *first = advance(I);
+                const char *local_name = token_name_text(first);
+                const char *use_name = local_name;
+                if (check(I, FTOK_POINTER_ASSIGN)) {
+                    advance(I);
+                    if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+                    OfortToken *remote = advance(I);
+                    use_name = token_name_text(remote);
+                }
+                if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "USE ONLY names");
+                copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[0]), local_name);
+                copy_cstr(n->binding_proc_names[n->n_params], sizeof(n->binding_proc_names[0]), use_name);
+                n->n_params++;
+            } else {
+                advance(I);
+            }
         }
         return n;
     }
@@ -12082,11 +12103,25 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         if (!mod) {
             if (strcmp(upper, "ISO_FORTRAN_ENV") == 0) {
-                declare_var(I, "output_unit", make_integer(6));
-                declare_var(I, "input_unit", make_integer(5));
-                declare_var(I, "error_unit", make_integer(0));
-                declare_var(I, "real64", make_integer(8));
-                declare_var(I, "int64", make_integer(8));
+                if (n->n_params > 0) {
+                    for (int i = 0; i < n->n_params; i++) {
+                        const char *local = n->param_names[i];
+                        const char *remote = n->binding_proc_names[i][0] ? n->binding_proc_names[i] : local;
+                        char ru[256];
+                        str_upper(ru, remote, sizeof(ru));
+                        if (strcmp(ru, "OUTPUT_UNIT") == 0) declare_var(I, local, make_integer(6));
+                        else if (strcmp(ru, "INPUT_UNIT") == 0) declare_var(I, local, make_integer(5));
+                        else if (strcmp(ru, "ERROR_UNIT") == 0) declare_var(I, local, make_integer(0));
+                        else if (strcmp(ru, "REAL64") == 0) declare_var(I, local, make_integer(8));
+                        else if (strcmp(ru, "INT64") == 0) declare_var(I, local, make_integer(8));
+                    }
+                } else {
+                    declare_var(I, "output_unit", make_integer(6));
+                    declare_var(I, "input_unit", make_integer(5));
+                    declare_var(I, "error_unit", make_integer(0));
+                    declare_var(I, "real64", make_integer(8));
+                    declare_var(I, "int64", make_integer(8));
+                }
                 break;
             }
             if (strcmp(upper, "IEEE_ARITHMETIC") == 0) {

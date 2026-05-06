@@ -1424,6 +1424,7 @@ static int g_time_detail = 0;
 static int g_fast_mode = 0;
 static int g_specialized_fast_paths = 1;
 static int g_line_profile = 0;
+static OfortStandardMode g_standard_mode = OFORT_STD_LEGACY;
 
 static OfortInterpreter *create_ofort_interpreter(void) {
     OfortInterpreter *interp = ofort_create();
@@ -1433,6 +1434,7 @@ static OfortInterpreter *create_ofort_interpreter(void) {
         ofort_set_fast_mode(interp, g_fast_mode);
         ofort_set_specialized_fast_paths(interp, g_specialized_fast_paths);
         ofort_set_line_profile_enabled(interp, g_line_profile);
+        ofort_set_standard_mode(interp, g_standard_mode);
     }
     return interp;
 }
@@ -1648,18 +1650,25 @@ static int check_ofort_file(const char *source_path, int quiet, int label_failur
     return rc == 0 ? 0 : 1;
 }
 
-static int run_each_file(const char *const *paths, int npaths, int syntax_check,
+static int run_each_file(const char *const *paths, int npaths, int limit, int syntax_check,
                          int command_argc, char **command_args, int time_operation,
                          int quiet) {
     int failures = 0;
-    const char **failed_paths = (const char **)calloc((size_t)npaths, sizeof(*failed_paths));
+    int checked = npaths;
+    const char **failed_paths;
+
+    if (limit >= 0 && limit < checked) {
+        checked = limit;
+    }
+
+    failed_paths = (const char **)calloc((size_t)(checked > 0 ? checked : 1), sizeof(*failed_paths));
 
     if (!failed_paths) {
         fprintf(stderr, "out of memory\n");
         return 2;
     }
 
-    for (int i = 0; i < npaths; i++) {
+    for (int i = 0; i < checked; i++) {
         int rc;
         double start = monotonic_seconds();
         if (!quiet && i > 0) {
@@ -1693,7 +1702,7 @@ static int run_each_file(const char *const *paths, int npaths, int syntax_check,
     if (!quiet || failures > 0) {
         printf("\n");
     }
-    printf("checked %d files: %d passed, %d failed\n", npaths, npaths - failures, failures);
+    printf("checked %d files: %d passed, %d failed\n", checked, checked - failures, failures);
     if (failures > 0) {
         printf("\nfailing files:\n");
         for (int i = 0; i < failures; i++) {
@@ -3279,8 +3288,8 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--version] [-w] [--quiet] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
-    fprintf(stderr, "       %s --each [--check] [--quiet] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "       %s --each [--check] [--quiet] [--limit n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --check file.f90\n", program);
@@ -3289,12 +3298,14 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --version prints the ofort version\n");
     fprintf(stderr, "       -w suppresses warnings\n");
     fprintf(stderr, "       --quiet suppresses success/progress output but not diagnostics\n");
+    fprintf(stderr, "       --std=f2023 rejects known nonstandard extensions; --std=legacy is the default\n");
     fprintf(stderr, "       --fast enables safe interpreter fast paths and suppresses warnings\n");
     fprintf(stderr, "       --no-specialize disables specialized pattern/program fast paths\n");
     fprintf(stderr, "       --time prints elapsed time for the requested operation\n");
     fprintf(stderr, "       --time-detail prints setup, lex, parse, register, execute, and total times\n");
     fprintf(stderr, "       --profile-lines prints elapsed execution time by source line\n");
     fprintf(stderr, "       --each treats each file or Windows glob match as a separate program\n");
+    fprintf(stderr, "       --limit n checks at most n files in --each mode\n");
     fprintf(stderr, "       @file reads source file names from a manifest, one path per line\n");
     fprintf(stderr, "       --implicit-typing, --legacy-implicit uses I-N integer/rest real implicit typing (default)\n");
     fprintf(stderr, "       --no-implicit-typing rejects undeclared variables unless declared or covered by IMPLICIT\n");
@@ -3364,6 +3375,7 @@ int main(int argc, char **argv) {
     int time_operation = 0;
     int each_mode = 0;
     int each_check = 0;
+    int each_limit = -1;
     int quiet = 0;
     double setup_start = 0.0;
     int i;
@@ -3395,6 +3407,16 @@ int main(int argc, char **argv) {
             g_warnings_enabled = 0;
         } else if (strcmp(argv[i], "--quiet") == 0) {
             quiet = 1;
+        } else if (strcmp(argv[i], "--std=f2023") == 0 || strcmp(argv[i], "-std=f2023") == 0 ||
+                   strcmp(argv[i], "--std=f2018") == 0 || strcmp(argv[i], "-std=f2018") == 0) {
+            g_standard_mode = OFORT_STD_F2023;
+        } else if (strcmp(argv[i], "--std=legacy") == 0 || strcmp(argv[i], "-std=legacy") == 0) {
+            g_standard_mode = OFORT_STD_LEGACY;
+        } else if (strncmp(argv[i], "--std=", 6) == 0 || strncmp(argv[i], "-std=", 5) == 0) {
+            fprintf(stderr, "unsupported standard mode '%s'\n", argv[i]);
+            print_usage(argv[0]);
+            path_list_free(&source_paths);
+            return 2;
         } else if (strcmp(argv[i], "--fast") == 0) {
             g_fast_mode = 1;
             g_warnings_enabled = 0;
@@ -3409,6 +3431,22 @@ int main(int argc, char **argv) {
             g_line_profile = 1;
         } else if (strcmp(argv[i], "--each") == 0) {
             each_mode = 1;
+        } else if (strcmp(argv[i], "--limit") == 0) {
+            char *endptr;
+            long parsed_limit;
+            if (++i >= argc) {
+                fprintf(stderr, "--limit requires a non-negative integer\n");
+                path_list_free(&source_paths);
+                return 2;
+            }
+            parsed_limit = strtol(argv[i], &endptr, 10);
+            if (endptr == argv[i] || *endptr != '\0' ||
+                parsed_limit < 0 || parsed_limit > 2147483647L) {
+                fprintf(stderr, "--limit requires a non-negative integer\n");
+                path_list_free(&source_paths);
+                return 2;
+            }
+            each_limit = (int)parsed_limit;
         } else if (strcmp(argv[i], "--") == 0) {
             program_args = &argv[i + 1];
             program_argc = argc - i - 1;
@@ -3467,6 +3505,12 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (!each_mode && each_limit >= 0) {
+        fprintf(stderr, "--limit is only valid with --each\n");
+        path_list_free(&source_paths);
+        return 2;
+    }
+
     if (check_path) {
         double start = monotonic_seconds();
         int rc = check_with_gfortran(check_path);
@@ -3498,7 +3542,7 @@ int main(int argc, char **argv) {
             path_list_free(&source_paths);
             return 2;
         }
-        rc = run_each_file(source_paths.items, source_paths.count, each_check,
+        rc = run_each_file(source_paths.items, source_paths.count, each_limit, each_check,
                            program_argc, program_args, time_operation, quiet);
         path_list_free(&source_paths);
         return rc;

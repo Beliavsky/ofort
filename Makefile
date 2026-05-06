@@ -5,8 +5,8 @@ LDLIBS ?= -lm
 
 TARGET = ofort.exe
 BUILD_INFO = ofort.build
-SOURCES = src/main.c src/ofort.c
-HEADERS = include/ofort.h
+SOURCES = src/main.c src/ofort.c src/ofort_values.c
+HEADERS = include/ofort.h src/ofort_internal.h
 
 .PHONY: all clean test gcc clang
 
