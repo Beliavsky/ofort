@@ -5820,9 +5820,22 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
     if (check(I, FTOK_LPAREN)) {
         advance(I);
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            OfortNode *param_expr;
             if (n_type_param_exprs >= OFORT_MAX_PARAMS)
                 too_many_params_error(I, "parameterized derived type actual parameters");
-            type_param_exprs[n_type_param_exprs++] = parse_expr(I);
+            if (token_can_be_name(peek(I)) && peek_ahead(I, 1)->type == FTOK_ASSIGN) {
+                advance(I);
+                advance(I);
+            }
+            if (check(I, FTOK_COLON)) {
+                advance(I);
+                param_expr = alloc_node(I, FND_INT_LIT);
+                param_expr->int_val = 0;
+                param_expr->line = type_tok->line;
+            } else {
+                param_expr = parse_expr(I);
+            }
+            type_param_exprs[n_type_param_exprs++] = param_expr;
             if (check(I, FTOK_COMMA)) advance(I);
             else break;
         }
