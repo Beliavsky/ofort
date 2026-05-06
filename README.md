@@ -34,9 +34,10 @@ artifacts and should not be committed.
 
 ## Current Status
 
-The interpreter currently supports a growing practical Fortran subset. The core
-is Fortran 90/95-like, but `ofort` also implements selected later features where
-they are useful for real test programs:
+The interpreter currently supports a growing practical Fortran subset. It
+includes the expected core scalar, array, procedure, module, control-flow, and
+I/O features, plus selected post-Fortran-95 features where they are useful for
+real test programs:
 
 - scalar `INTEGER`, `REAL`, `DOUBLE PRECISION`, `COMPLEX`, `LOGICAL`, and
   `CHARACTER`
