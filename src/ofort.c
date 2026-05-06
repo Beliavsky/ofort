@@ -6762,6 +6762,22 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
             leave_spec_section(I);
             return parse_block_construct(I);
         }
+        if (token_ident_upper(t, "ASSOCIATE")) {
+            leave_spec_section(I);
+            return parse_associate_construct(I);
+        }
+        if (token_ident_upper(t, "FORALL")) {
+            leave_spec_section(I);
+            return parse_forall_stmt(I);
+        }
+        if (t->type == FTOK_DO) {
+            leave_spec_section(I);
+            return parse_do(I);
+        }
+        if (t->type == FTOK_IF) {
+            leave_spec_section(I);
+            return parse_if(I);
+        }
     }
 
     if (is_procedure_prefix_token(t)) {
