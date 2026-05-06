@@ -1649,6 +1649,38 @@ static void tokenize(OfortInterpreter *I, const char *src) {
             int is_double_lit = 0;
             int literal_kind = 0;
             while (isdigit((unsigned char)*p)) p++;
+            if (*p == '_' && (p[1] == '\'' || p[1] == '"')) {
+                char kindbuf[32];
+                int kind_len = (int)(p - start);
+                int slen = 0;
+                char quote;
+                if (kind_len > 0 && kind_len < (int)sizeof(kindbuf)) {
+                    memcpy(kindbuf, start, (size_t)kind_len);
+                    kindbuf[kind_len] = '\0';
+                    literal_kind = atoi(kindbuf);
+                }
+                p++; /* underscore */
+                quote = *p;
+                p++; /* opening quote */
+                while (*p && !(*p == quote && *(p+1) != quote)) {
+                    if (*p == quote && *(p+1) == quote) {
+                        t->str_val[slen++] = quote;
+                        p += 2;
+                    } else {
+                        if (*p == '\n') line++;
+                        t->str_val[slen++] = *p;
+                        p++;
+                    }
+                    if (slen >= OFORT_MAX_STRLEN - 1) break;
+                }
+                t->str_val[slen] = '\0';
+                if (*p == quote) p++;
+                t->type = FTOK_STRING_LIT;
+                t->kind = literal_kind ? literal_kind : 1;
+                t->length = (int)(p - start);
+                I->n_tokens++;
+                continue;
+            }
             if (*p == '.' && *(p+1) != '.') { /* avoid confusing with .. if ever */
                 int dot_begins_exponent = (p[1] == 'e' || p[1] == 'E' ||
                                            p[1] == 'd' || p[1] == 'D') &&
@@ -3270,7 +3302,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                 expect(I, FTOK_ASSIGN);
             }
 
-            if (!is_kind && selector_pos == 0) {
+            if (is_len || (!is_kind && selector_pos == 0)) {
                 if (check(I, FTOK_STAR)) {
                     advance(I);
                     char_len = OFORT_MAX_STRLEN - 1;
@@ -3557,6 +3589,10 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             if (!decl->is_save && decl->type == FND_VARDECL) {
                 decl->is_implicit_save = 1;
             }
+        } else if (check(I, FTOK_POINTER_ASSIGN)) {
+            advance(I);
+            decl->children[0] = parse_expr(I);
+            decl->n_children = 1;
         }
 
         if (block->n_stmts >= cap) {
@@ -12602,12 +12638,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         infer_decl_dims_from_initializer(I, n);
         if (n->is_pointer && n->n_dims > 0) {
-            val.type = FVAL_ARRAY;
-            memset(&val.v.arr, 0, sizeof(val.v.arr));
-            val.v.arr.elem_type = n->val_type;
-            if (n->val_type == FVAL_DERIVED)
-                copy_cstr(val.v.arr.elem_type_name, sizeof(val.v.arr.elem_type_name), n->str_val);
-            val.v.arr.allocated = 0;
+            if (n->n_children > 0 && n->children[0]) {
+                val = eval_node(I, n->children[0]);
+            } else {
+                val.type = FVAL_ARRAY;
+                memset(&val.v.arr, 0, sizeof(val.v.arr));
+                val.v.arr.elem_type = n->val_type;
+                if (n->val_type == FVAL_DERIVED)
+                    copy_cstr(val.v.arr.elem_type_name, sizeof(val.v.arr.elem_type_name), n->str_val);
+                val.v.arr.allocated = 0;
+            }
         } else if (n->n_dims > 0 && !n->is_allocatable) {
             /* Array declaration */
             if (n->val_type == FVAL_DERIVED) {
@@ -12646,6 +12686,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (n->val_type == FVAL_CHARACTER)
             val = resize_character_value(val, decl_char_len);
 
+        if (n->is_pointer && n->val_type == FVAL_CHARACTER && n->n_dims > 0 &&
+            decl_char_len == 0 && val.type == FVAL_ARRAY &&
+            val.v.arr.elem_type == FVAL_CHARACTER && val.v.arr.data) {
+            for (int pi = 0; pi < val.v.arr.len; pi++) {
+                free_value(&val.v.arr.data[pi]);
+                val.v.arr.data[pi] = make_character("");
+            }
+        }
+
         if (n->kind > 0) {
             val.kind = n->kind;
             if (val.type == FVAL_ARRAY && val.v.arr.data) {
@@ -12656,7 +12705,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
 
         /* If there's an initializer and it's an array, set elements */
-        if (n->n_dims > 0 && !n->is_allocatable && n->n_children > 0 && n->children[0]) {
+        if (n->n_dims > 0 && !n->is_allocatable && !n->is_pointer &&
+            n->n_children > 0 && n->children[0]) {
             OfortValue init = eval_node(I, n->children[0]);
             if (init.type == FVAL_ARRAY) {
                 /* copy elements */
@@ -12703,8 +12753,29 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         v->pointer_has_slice = 0;
         v->pointer_slice_start = 0;
         v->pointer_slice_end = 0;
+        if (n->is_pointer && n->n_children > 0 && n->children[0]) {
+            char target_name[256];
+            int has_slice = 0, slice_start = 0, slice_end = 0;
+            v->pointer_associated = 1;
+            if (pointer_target_descriptor(I, n->children[0], target_name, sizeof(target_name),
+                                          &has_slice, &slice_start, &slice_end)) {
+                copy_cstr(v->pointer_target, sizeof(v->pointer_target), target_name);
+                v->pointer_has_slice = has_slice;
+                v->pointer_slice_start = slice_start;
+                v->pointer_slice_end = slice_end;
+            }
+            if (v->val.type == FVAL_CHARACTER && v->val.v.s) {
+                v->char_len = (int)strlen(v->val.v.s);
+            } else if (v->val.type == FVAL_ARRAY && v->val.v.arr.elem_type == FVAL_CHARACTER &&
+                       v->val.v.arr.len > 0 && v->val.v.arr.data &&
+                       v->val.v.arr.data[0].type == FVAL_CHARACTER &&
+                       v->val.v.arr.data[0].v.s) {
+                v->char_len = (int)strlen(v->val.v.arr.data[0].v.s);
+            }
+        }
         v->intent = n->intent;
-        v->char_len = decl_char_len;
+        if (!(n->is_pointer && n->n_children > 0 && n->children[0]))
+            v->char_len = decl_char_len;
         break;
     }
 
