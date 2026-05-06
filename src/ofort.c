@@ -4541,6 +4541,99 @@ static OfortNode *parse_block_construct(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_block_data(OfortInterpreter *I) {
+    OfortToken *bt = advance(I); /* BLOCK */
+    OfortNode *n = alloc_node(I, FND_BLOCK_DATA);
+    int prev_spec_section;
+    n->line = bt->line;
+    expect(I, FTOK_DATA);
+    if (token_can_be_name(peek(I))) {
+        OfortToken *name = advance(I);
+        copy_cstr(n->name, sizeof(n->name), token_name_text(name));
+    }
+    skip_newlines(I);
+    prev_spec_section = I->in_spec_section;
+    I->in_spec_section = 1;
+    n->children[0] = parse_block_until_end(I, "BLOCK");
+    I->in_spec_section = prev_spec_section;
+    n->n_children = 1;
+    if (check(I, FTOK_END) || check_end(I, "BLOCK")) {
+        skip_to_next_line(I);
+    }
+    return n;
+}
+
+static OfortNode *parse_common_statement(OfortInterpreter *I) {
+    OfortToken *ct = advance(I); /* COMMON */
+    OfortNode *block = alloc_node(I, FND_BLOCK);
+    int cap = 0;
+    block->line = ct->line;
+
+    while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+            continue;
+        }
+        if (check(I, FTOK_SLASH)) {
+            advance(I);
+            while (!check(I, FTOK_SLASH) && !check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+                advance(I);
+            }
+            if (check(I, FTOK_SLASH)) advance(I);
+            continue;
+        }
+        if (token_can_be_name(peek(I))) {
+            OfortToken *name = advance(I);
+            OfortNode *decl = alloc_node(I, FND_VARDECL);
+            int has_type = 0;
+            OfortValType type;
+            copy_cstr(decl->name, sizeof(decl->name), token_name_text(name));
+            type = implicit_type_for_name(I, decl->name, &has_type);
+            decl->val_type = has_type ? type : FVAL_REAL;
+            decl->bool_val = 1; /* COMMON compatibility declaration */
+            decl->line = name->line;
+
+            if (check(I, FTOK_LPAREN)) {
+                advance(I);
+                while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                    if (decl->n_dims >= 7) ofort_error(I, "Too many COMMON dimensions");
+                    if (check(I, FTOK_STAR) || check(I, FTOK_COLON)) {
+                        advance(I);
+                        decl->dims[decl->n_dims++] = 0;
+                    } else {
+                        OfortNode *dim = parse_dimension_bound_expr(I);
+                        if (dim->type == FND_INT_LIT) {
+                            decl->dims[decl->n_dims] = (int)dim->int_val;
+                        } else {
+                            decl->dims[decl->n_dims] = 0;
+                        }
+                        if (!decl->stmts) {
+                            decl->stmts = (OfortNode **)calloc(7, sizeof(OfortNode *));
+                            if (!decl->stmts) ofort_error(I, "Out of memory");
+                        }
+                        decl->stmts[decl->n_dims] = dim;
+                        decl->n_stmts = decl->n_dims + 1;
+                        decl->n_dims++;
+                    }
+                    if (check(I, FTOK_COMMA)) advance(I);
+                    else break;
+                }
+                expect(I, FTOK_RPAREN);
+            }
+
+            if (block->n_stmts >= cap) {
+                cap = cap ? cap * 2 : 4;
+                block->stmts = (OfortNode **)realloc(block->stmts, sizeof(OfortNode *) * (size_t)cap);
+                if (!block->stmts) ofort_error(I, "Out of memory parsing COMMON");
+            }
+            block->stmts[block->n_stmts++] = decl;
+            continue;
+        }
+        advance(I);
+    }
+    return block;
+}
+
 static OfortNode *parse_associate_construct(OfortInterpreter *I) {
     OfortToken *at = advance(I); /* ASSOCIATE */
     OfortNode *n = alloc_node(I, FND_ASSOCIATE);
@@ -5738,6 +5831,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return parse_subroutine(I);
     }
 
+    if (token_ident_upper(t, "BLOCK") && peek_ahead(I, 1)->type == FTOK_DATA) {
+        return parse_block_data(I);
+    }
+
     if (token_ident_upper(t, "BLOCK")) {
         leave_spec_section(I);
         return parse_block_construct(I);
@@ -5777,6 +5874,9 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         skip_newlines(I);
         t = peek(I);
         if (t->type == FTOK_EOF) return NULL;
+        if (token_ident_upper(t, "BLOCK") && peek_ahead(I, 1)->type == FTOK_DATA) {
+            return parse_block_data(I);
+        }
         if (token_ident_upper(t, "BLOCK")) {
             leave_spec_section(I);
             return parse_block_construct(I);
@@ -6182,6 +6282,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
 
     /* DEALLOCATE */
     if (t->type == FTOK_DEALLOCATE) { leave_spec_section(I); return parse_deallocate(I); }
+
+    if (token_ident_upper(t, "COMMON")) {
+        return parse_common_statement(I);
+    }
 
     /* END (bare) — shouldn't be reached normally */
     if (t->type == FTOK_END) {
@@ -12028,6 +12132,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         break;
     }
 
+    case FND_BLOCK_DATA: {
+        OfortNode *body = n->children[0];
+        if (body && body->type == FND_BLOCK) {
+            for (int i = 0; i < body->n_stmts; i++) {
+                exec_node(I, body->stmts[i]);
+            }
+        }
+        break;
+    }
+
     case FND_MODULE: {
         /* Register module: execute declarations, collect functions */
         if (I->n_modules >= OFORT_MAX_MODULES) ofort_error(I, "Too many modules");
@@ -12394,6 +12508,31 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             free_value(&existing->val);
             existing->val = val;
             existing->is_parameter = 1;
+            break;
+        }
+        if (existing && existing == existing_current && n->bool_val) {
+            OfortScope *outer = I->current_scope ? I->current_scope->parent : NULL;
+            while (outer) {
+                OfortVar *common_var = NULL;
+                for (int ci = 0; ci < outer->n_vars; ci++) {
+                    if (str_eq_nocase(outer->vars[ci].name, n->name)) {
+                        common_var = &outer->vars[ci];
+                        break;
+                    }
+                }
+                if (common_var && common_var->val.type != FVAL_VOID) {
+                    free_value(&existing->val);
+                    existing->val = copy_value(common_var->val);
+                    existing->char_len = common_var->char_len;
+                    existing->declared_type = common_var->declared_type;
+                    existing->declared_kind = common_var->declared_kind;
+                    copy_cstr(existing->declared_type_name,
+                              sizeof(existing->declared_type_name),
+                              common_var->declared_type_name);
+                    break;
+                }
+                outer = outer->parent;
+            }
             break;
         }
         infer_decl_dims_from_initializer(I, n);
@@ -16725,7 +16864,8 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
             OfortNode *s = interp->ast->stmts[i];
             if (!s) continue;
             if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
-                s->type == FND_STMT_FUNCTION || s->type == FND_MODULE) {
+                s->type == FND_STMT_FUNCTION || s->type == FND_MODULE ||
+                s->type == FND_BLOCK_DATA) {
                 exec_node(interp, s);
             }
         }
@@ -16739,7 +16879,8 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
             OfortNode *s = interp->ast->stmts[i];
             if (!s) continue;
             if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
-                s->type == FND_STMT_FUNCTION || s->type == FND_MODULE)
+                s->type == FND_STMT_FUNCTION || s->type == FND_MODULE ||
+                s->type == FND_BLOCK_DATA)
                 continue; /* already registered */
             exec_node(interp, s);
             if (interp->goto_active) {
