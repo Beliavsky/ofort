@@ -3554,29 +3554,37 @@ static OfortValType token_to_valtype(OfortTokenType t) {
 
 static int normalize_intrinsic_type_wrapper_declaration(OfortInterpreter *I) {
     int pos = I->tok_pos;
-    OfortToken *type_tok;
-    OfortToken *intrinsic_tok;
+    int depth = 0;
+    int outer_rparen = -1;
+    int keep_count;
 
     if (pos + 3 >= I->n_tokens) return 0;
     if (I->tokens[pos].type != FTOK_TYPE ||
         I->tokens[pos + 1].type != FTOK_LPAREN ||
-        !is_type_keyword(I->tokens[pos + 2].type) ||
-        I->tokens[pos + 3].type != FTOK_RPAREN) {
+        !is_type_keyword(I->tokens[pos + 2].type)) {
         return 0;
     }
 
-    type_tok = &I->tokens[pos];
-    intrinsic_tok = &I->tokens[pos + 2];
-    type_tok->type = intrinsic_tok->type;
-    type_tok->start = intrinsic_tok->start;
-    type_tok->length = intrinsic_tok->length;
-    type_tok->num_val = intrinsic_tok->num_val;
-    type_tok->int_val = intrinsic_tok->int_val;
-    type_tok->kind = intrinsic_tok->kind;
-    copy_cstr(type_tok->str_val, sizeof(type_tok->str_val), intrinsic_tok->str_val);
+    for (int p = pos + 1; p < I->n_tokens; p++) {
+        if (I->tokens[p].type == FTOK_LPAREN) {
+            depth++;
+        } else if (I->tokens[p].type == FTOK_RPAREN) {
+            depth--;
+            if (depth == 0) {
+                outer_rparen = p;
+                break;
+            }
+        } else if (I->tokens[p].type == FTOK_NEWLINE || I->tokens[p].type == FTOK_EOF) {
+            return 0;
+        }
+    }
+    if (outer_rparen < 0) return 0;
 
-    memmove(&I->tokens[pos + 1], &I->tokens[pos + 4],
-            (size_t)(I->n_tokens - (pos + 4)) * sizeof(I->tokens[0]));
+    keep_count = outer_rparen - (pos + 2);
+    memmove(&I->tokens[pos], &I->tokens[pos + 2],
+            (size_t)keep_count * sizeof(I->tokens[0]));
+    memmove(&I->tokens[pos + keep_count], &I->tokens[outer_rparen + 1],
+            (size_t)(I->n_tokens - (outer_rparen + 1)) * sizeof(I->tokens[0]));
     I->n_tokens -= 3;
     return 1;
 }
