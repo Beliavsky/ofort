@@ -5799,7 +5799,8 @@ static OfortNode *parse_type_def(OfortInterpreter *I) {
     OfortToken *tt = advance(I); /* TYPE */
     /* TYPE :: name */
     if (check(I, FTOK_DCOLON)) advance(I);
-    OfortToken *name = expect(I, FTOK_IDENT);
+    if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+    OfortToken *name = advance(I);
 
     OfortNode *n = alloc_node(I, FND_TYPE_DEF);
     copy_cstr(n->name, sizeof(n->name), name->str_val);
@@ -5915,7 +5916,8 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
     int cap = 0;
 
     expect(I, FTOK_LPAREN);
-    type_name = expect(I, FTOK_IDENT);
+    if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+    type_name = advance(I);
     if (check(I, FTOK_LPAREN)) {
         advance(I);
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
@@ -7050,7 +7052,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         OfortToken *next = peek_ahead(I, 1);
         if (next->type == FTOK_COMMA)
             ofort_error(I, "Unsupported OOP feature at line %d: TYPE, EXTENDS(...) is not supported yet", t->line);
-        if (next->type == FTOK_DCOLON || next->type == FTOK_IDENT) {
+        if (next->type == FTOK_DCOLON || token_can_be_name(next)) {
             return parse_type_def(I);
         }
         if (next->type == FTOK_LPAREN) {
