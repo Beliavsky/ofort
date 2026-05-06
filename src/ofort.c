@@ -4153,6 +4153,12 @@ static OfortNode *parse_do(OfortInterpreter *I) {
     OfortToken *dot = advance(I); /* consume DO */
     long long terminal_label = 0;
 
+    if (check(I, FTOK_INT_LIT)) {
+        terminal_label = peek(I)->int_val;
+        advance(I);
+        if (check(I, FTOK_COMMA)) advance(I);
+    }
+
     /* DO CONCURRENT, executed serially by ofort */
     if (token_ident_upper(peek(I), "CONCURRENT")) {
         OfortNode *n = alloc_node(I, FND_DO_CONCURRENT);
@@ -4233,20 +4239,17 @@ static OfortNode *parse_do(OfortInterpreter *I) {
         }
         skip_newlines(I);
 
-        OfortNode *body = parse_block_until_end(I, "DO");
+        OfortNode *body = terminal_label ?
+            parse_block_until_label(I, terminal_label) :
+            parse_block_until_end(I, "DO");
         n->n_stmts = body->n_stmts;
         if (n->n_stmts > 0) {
             n->stmts = (OfortNode **)calloc((size_t)n->n_stmts, sizeof(OfortNode *));
             if (!n->stmts) ofort_error(I, "Out of memory");
             for (int i = 0; i < n->n_stmts; i++) n->stmts[i] = body->stmts[i];
         }
-        consume_end(I, "DO");
+        if (!terminal_label) consume_end(I, "DO");
         return n;
-    }
-
-    if (check(I, FTOK_INT_LIT)) {
-        terminal_label = peek(I)->int_val;
-        advance(I);
     }
 
     /* DO WHILE */
