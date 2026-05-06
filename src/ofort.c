@@ -4366,7 +4366,12 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
 
     /* variable list */
     while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
-        OfortNode *item = parse_expr(I);
+        OfortNode *item;
+        if (check(I, FTOK_LPAREN) && paren_item_is_implied_do(I)) {
+            item = parse_implied_do(I);
+        } else {
+            item = parse_expr(I);
+        }
         if (n->n_stmts >= cap) {
             cap = cap ? cap * 2 : 8;
             n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
@@ -4632,8 +4637,9 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
         advance(I);
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
             if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "subroutine parameters");
-            OfortToken *param = expect(I, FTOK_IDENT);
-            copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), param->str_val);
+            if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+            OfortToken *param = advance(I);
+            copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), token_name_text(param));
             n->param_types[n->n_params] = FVAL_VOID; /* resolved later */
             n->param_type_names[n->n_params][0] = '\0';
             n->param_intents[n->n_params] = 0;
@@ -4672,8 +4678,9 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
         advance(I);
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
             if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "function parameters");
-            OfortToken *param = expect(I, FTOK_IDENT);
-            copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), param->str_val);
+            if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+            OfortToken *param = advance(I);
+            copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), token_name_text(param));
             n->param_types[n->n_params] = FVAL_VOID;
             n->param_type_names[n->n_params][0] = '\0';
             n->param_intents[n->n_params] = 0;
@@ -5736,11 +5743,40 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         (token_ident_upper(t, "GO") && token_ident_upper(peek_ahead(I, 1), "TO"))) {
         OfortToken *gt = advance(I);
         if (token_ident_upper(gt, "GO")) advance(I); /* TO */
-        OfortToken *target = expect(I, FTOK_INT_LIT);
         leave_spec_section(I);
         OfortNode *n = alloc_node(I, FND_GOTO);
-        n->int_val = target->int_val;
         n->line = gt->line;
+        if (check(I, FTOK_LPAREN)) {
+            int cap = 0;
+            ofort_warning(I, gt->line, "warning: computed GOTO is obsolescent");
+            advance(I);
+            while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                OfortToken *label_tok;
+                OfortNode *label;
+                if (check(I, FTOK_COMMA)) {
+                    advance(I);
+                    continue;
+                }
+                label_tok = expect(I, FTOK_INT_LIT);
+                label = alloc_node(I, FND_INT_LIT);
+                label->int_val = label_tok->int_val;
+                label->line = label_tok->line;
+                if (n->n_stmts >= cap) {
+                    cap = cap ? cap * 2 : 8;
+                    n->stmts = (OfortNode **)realloc(n->stmts, sizeof(OfortNode *) * cap);
+                    if (!n->stmts) ofort_error(I, "Out of memory");
+                }
+                n->stmts[n->n_stmts++] = label;
+                if (check(I, FTOK_COMMA)) advance(I);
+            }
+            expect(I, FTOK_RPAREN);
+            if (check(I, FTOK_COMMA)) advance(I);
+            n->children[0] = parse_expr(I);
+            n->n_children = 1;
+        } else {
+            OfortToken *target = expect(I, FTOK_INT_LIT);
+            n->int_val = target->int_val;
+        }
         return n;
     }
 
@@ -6014,7 +6050,8 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     }
 
     /* DATA statement: DATA var /value/ — simplified */
-    if (t->type == FTOK_DATA) {
+    if (t->type == FTOK_DATA && peek_ahead(I, 1)->type != FTOK_ASSIGN &&
+        peek_ahead(I, 1)->type != FTOK_LPAREN) {
         return parse_data_statement(I);
     }
 
@@ -6287,7 +6324,7 @@ typedef struct {
     int count;
 } OfortSubscriptSpec;
 
-static int eval_subscript_range(OfortInterpreter *I, OfortNode *sub, int dim_extent,
+static int eval_subscript_range(OfortInterpreter *I, OfortNode *sub, int lower_bound, int dim_extent,
                                 OfortSubscriptRange *range);
 static int section_linear_index(OfortValue *arr, int *subscripts, int nsubs);
 static OfortValue array_element_value(const OfortValue *arr, int index);
@@ -6319,7 +6356,8 @@ static OfortValue *member_lvalue(OfortInterpreter *I, OfortNode *n) {
         if (!var || var->val.type != FVAL_ARRAY) return NULL;
         for (int i = 0; i < n->n_stmts; i++) {
             int extent = i < var->val.v.arr.n_dims ? var->val.v.arr.dims[i] : var->val.v.arr.len;
-            if (eval_subscript_range(I, n->stmts[i], extent, &ranges[i])) has_slice = 1;
+            int lower = i < var->val.v.arr.n_dims ? var->val.v.arr.lower_bounds[i] : 1;
+            if (eval_subscript_range(I, n->stmts[i], lower, extent, &ranges[i])) has_slice = 1;
         }
         if (has_slice) return NULL;
         for (int i = 0; i < n->n_stmts; i++) subscripts[i] = ranges[i].start;
@@ -6352,7 +6390,8 @@ static OfortValue *member_lvalue(OfortInterpreter *I, OfortNode *n) {
         if (!arr || arr->type != FVAL_ARRAY) ofort_error(I, "Array reference target is not an array");
         for (int i = 0; i < n->n_stmts; i++) {
             int extent = i < arr->v.arr.n_dims ? arr->v.arr.dims[i] : arr->v.arr.len;
-            if (eval_subscript_range(I, n->stmts[i], extent, &ranges[i])) has_slice = 1;
+            int lower = i < arr->v.arr.n_dims ? arr->v.arr.lower_bounds[i] : 1;
+            if (eval_subscript_range(I, n->stmts[i], lower, extent, &ranges[i])) has_slice = 1;
         }
         if (has_slice) return NULL;
         for (int i = 0; i < n->n_stmts; i++) subscripts[i] = ranges[i].start;
@@ -6691,10 +6730,10 @@ static OfortValue fast_reusable_local_array_value(OfortInterpreter *I, OfortNode
     return *cached;
 }
 
-static int eval_subscript_range(OfortInterpreter *I, OfortNode *sub, int dim_extent,
+static int eval_subscript_range(OfortInterpreter *I, OfortNode *sub, int lower_bound, int dim_extent,
                                 OfortSubscriptRange *range) {
-    range->start = 1;
-    range->end = dim_extent;
+    range->start = lower_bound;
+    range->end = lower_bound + dim_extent - 1;
     range->step = 1;
     range->is_slice = 0;
     range->count = 1;
@@ -6750,7 +6789,7 @@ static void free_subscript_specs(OfortSubscriptSpec *specs, int nargs) {
     }
 }
 
-static int eval_subscript_spec(OfortInterpreter *I, OfortNode *sub, int extent,
+static int eval_subscript_spec(OfortInterpreter *I, OfortNode *sub, int lower_bound, int extent,
                                OfortSubscriptSpec *spec) {
     memset(spec, 0, sizeof(*spec));
     if (sub->type != FND_SLICE) {
@@ -6773,7 +6812,7 @@ static int eval_subscript_spec(OfortInterpreter *I, OfortNode *sub, int extent,
         free_value(&v);
         return 0;
     }
-    if (eval_subscript_range(I, sub, extent, &spec->range)) {
+    if (eval_subscript_range(I, sub, lower_bound, extent, &spec->range)) {
         spec->count = spec->range.count;
         return 1;
     }
@@ -6820,7 +6859,8 @@ static OfortValue eval_subscripted_array(OfortInterpreter *I, OfortValue *array,
 
     for (int i = 0; i < nargs; i++) {
         int extent = i < array->v.arr.n_dims ? array->v.arr.dims[i] : array->v.arr.len;
-        if (eval_subscript_spec(I, n->stmts[i], extent, &specs[i])) {
+        int lower = i < array->v.arr.n_dims ? array->v.arr.lower_bounds[i] : 1;
+        if (eval_subscript_spec(I, n->stmts[i], lower, extent, &specs[i])) {
             has_section = 1;
             result_dims[n_result_dims++] = specs[i].count;
         }
@@ -6855,7 +6895,7 @@ static OfortValue eval_array_section_value(OfortInterpreter *I, OfortValue *arra
         char *buf;
         int out = 0;
         if (nargs != 1) ofort_error(I, "Character substring requires one subscript range");
-        eval_subscript_range(I, n->stmts[0], len, &range);
+        eval_subscript_range(I, n->stmts[0], 1, len, &range);
         if (range.start < 1 || range.end > len ||
             (range.step > 0 ? range.start > range.end + 1 : range.start < range.end - 1)) {
             ofort_error(I, "Character substring bounds out of range");
@@ -6890,7 +6930,7 @@ static void assign_character_substring(OfortInterpreter *I, OfortVar *var, Ofort
         ofort_error(I, "Character substring assignment requires one subscript range");
 
     len = (int)strlen(var->val.v.s);
-    eval_subscript_range(I, lhs->stmts[0], len, &range);
+        eval_subscript_range(I, lhs->stmts[0], 1, len, &range);
     if (range.step != 1)
         ofort_error(I, "Character substring assignment does not support strided ranges");
     if (range.start < 1 || range.end > len || range.start > range.end + 1)
@@ -6917,7 +6957,7 @@ static int pointer_target_descriptor(OfortInterpreter *I, OfortNode *node,
         OfortVar *var = find_var(I, node->name);
         OfortSubscriptRange range;
         if (!var || var->val.type != FVAL_ARRAY) return 0;
-        eval_subscript_range(I, node->stmts[0], var->val.v.arr.len, &range);
+        eval_subscript_range(I, node->stmts[0], var->val.v.arr.lower_bounds[0], var->val.v.arr.len, &range);
         if (!range.is_slice) return 0;
         copy_cstr(name, name_size, node->name);
         *has_slice = 1;
@@ -6996,7 +7036,8 @@ static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs,
 
     for (int i = 0; i < nargs; i++) {
         int extent = i < var->val.v.arr.n_dims ? var->val.v.arr.dims[i] : var->val.v.arr.len;
-        if (eval_subscript_spec(I, lhs->stmts[i], extent, &specs[i])) has_section = 1;
+        int lower = i < var->val.v.arr.n_dims ? var->val.v.arr.lower_bounds[i] : 1;
+        if (eval_subscript_spec(I, lhs->stmts[i], lower, extent, &specs[i])) has_section = 1;
     }
 
     if (!has_section) {
@@ -7964,6 +8005,44 @@ static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, c
     return 0;
 }
 
+static void read_string_target(OfortInterpreter *I, const char **p, OfortNode *target, char *tok, int tok_size) {
+    if (target->type == FND_IMPLIED_DO) {
+        OfortValue start_v = eval_node(I, target->children[0]);
+        OfortValue end_v = eval_node(I, target->children[1]);
+        OfortValue step_v = eval_node(I, target->children[2]);
+        long long start = val_to_int(start_v);
+        long long end = val_to_int(end_v);
+        long long step = val_to_int(step_v);
+        free_value(&start_v);
+        free_value(&end_v);
+        free_value(&step_v);
+        if (step == 0) ofort_error(I, "Implied DO step cannot be zero");
+        for (long long iter = start; step > 0 ? iter <= end : iter >= end; iter += step) {
+            set_var(I, target->name, make_integer(iter));
+            for (int i = 0; i < target->n_stmts; i++) {
+                read_string_target(I, p, target->stmts[i], tok, tok_size);
+            }
+        }
+        return;
+    }
+
+    if (target->type == FND_IDENT) {
+        OfortVar *v = find_var(I, target->name);
+        if (!v) ofort_error(I, "Undefined variable '%s'", target->name);
+        if (v->val.type == FVAL_ARRAY) {
+            for (int j = 0; j < v->val.v.arr.len; j++) {
+                if (!read_next_string_token(p, tok, tok_size)) return;
+                assign_token_to_value(&v->val.v.arr.data[j], tok);
+            }
+            return;
+        }
+    }
+
+    if (read_next_string_token(p, tok, tok_size)) {
+        assign_token_to_read_target(I, target, tok);
+    }
+}
+
 static int read_values_from_file(OfortInterpreter *I, OfortUnitFile *entry, OfortNode *n) {
     FILE *fp = fopen(entry->path, "r");
     char tok[1024];
@@ -8037,20 +8116,7 @@ static void read_values_from_string(OfortInterpreter *I, const char *text, Ofort
     }
 
     for (int i = 0; i < n->n_stmts; i++) {
-        if (n->stmts[i]->type == FND_IDENT) {
-            OfortVar *v = find_var(I, n->stmts[i]->name);
-            if (!v) ofort_error(I, "Undefined variable '%s'", n->stmts[i]->name);
-            if (v->val.type == FVAL_ARRAY) {
-                for (int j = 0; j < v->val.v.arr.len; j++) {
-                    if (!read_next_string_token(&p, tok, sizeof(tok))) break;
-                    assign_token_to_value(&v->val.v.arr.data[j], tok);
-                }
-                continue;
-            }
-        }
-        if (read_next_string_token(&p, tok, sizeof(tok))) {
-            assign_token_to_read_target(I, n->stmts[i], tok);
-        }
+        read_string_target(I, &p, n->stmts[i], tok, sizeof(tok));
     }
 }
 
@@ -13149,6 +13215,78 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             break;
         }
+        if (strcmp(call_upper, "MOVE_ALLOC") == 0) {
+            OfortVar *from_var;
+            OfortVar *to_var;
+            OfortValue moved;
+            OfortValue from_placeholder;
+            if (n->n_stmts != 2 || n->stmts[0]->type != FND_IDENT || n->stmts[1]->type != FND_IDENT)
+                ofort_error(I, "MOVE_ALLOC requires two variable arguments");
+            from_var = find_var(I, n->stmts[0]->name);
+            to_var = find_var(I, n->stmts[1]->name);
+            if (!from_var)
+                ofort_error(I, "Undefined variable '%s' in MOVE_ALLOC", n->stmts[0]->name);
+            if (!to_var)
+                ofort_error(I, "Undefined variable '%s' in MOVE_ALLOC", n->stmts[1]->name);
+            if (!from_var->is_allocatable || !to_var->is_allocatable)
+                ofort_error(I, "MOVE_ALLOC arguments must be allocatable");
+
+            if (from_var->val.type == FVAL_ARRAY) {
+                int was_allocated = from_var->val.v.arr.allocated;
+                OfortValType elem_type = from_var->val.v.arr.elem_type;
+                int n_dims = from_var->val.v.arr.n_dims;
+                char elem_type_name[64];
+                int lower_bounds[7];
+                int dims[7];
+                copy_cstr(elem_type_name, sizeof(elem_type_name), from_var->val.v.arr.elem_type_name);
+                for (int i = 0; i < 7; i++) {
+                    lower_bounds[i] = from_var->val.v.arr.lower_bounds[i];
+                    dims[i] = 0;
+                }
+                moved = from_var->val;
+                free_value(&to_var->val);
+                if (was_allocated) {
+                    to_var->val = moved;
+                    to_var->scalar_allocated = 0;
+                } else {
+                    to_var->val.type = FVAL_ARRAY;
+                    memset(&to_var->val.v.arr, 0, sizeof(to_var->val.v.arr));
+                    to_var->val.v.arr.elem_type = elem_type;
+                    to_var->val.v.arr.n_dims = n_dims;
+                    to_var->val.v.arr.allocated = 0;
+                    copy_cstr(to_var->val.v.arr.elem_type_name, sizeof(to_var->val.v.arr.elem_type_name), elem_type_name);
+                    for (int i = 0; i < n_dims && i < 7; i++) to_var->val.v.arr.lower_bounds[i] = lower_bounds[i] ? lower_bounds[i] : 1;
+                    to_var->scalar_allocated = 0;
+                }
+                from_placeholder.type = FVAL_ARRAY;
+                memset(&from_placeholder.v.arr, 0, sizeof(from_placeholder.v.arr));
+                from_placeholder.v.arr.elem_type = elem_type;
+                from_placeholder.v.arr.n_dims = n_dims;
+                from_placeholder.v.arr.allocated = 0;
+                copy_cstr(from_placeholder.v.arr.elem_type_name, sizeof(from_placeholder.v.arr.elem_type_name), elem_type_name);
+                for (int i = 0; i < n_dims && i < 7; i++) {
+                    from_placeholder.v.arr.dims[i] = dims[i];
+                    from_placeholder.v.arr.lower_bounds[i] = lower_bounds[i] ? lower_bounds[i] : 1;
+                }
+                from_var->val = from_placeholder;
+                from_var->scalar_allocated = 0;
+            } else {
+                int was_allocated = from_var->scalar_allocated;
+                moved = from_var->val;
+                free_value(&to_var->val);
+                if (was_allocated) {
+                    to_var->val = moved;
+                    to_var->scalar_allocated = 1;
+                } else {
+                    to_var->val = make_void_val();
+                    to_var->scalar_allocated = 0;
+                    free_value(&moved);
+                }
+                from_var->val = make_void_val();
+                from_var->scalar_allocated = 0;
+            }
+            break;
+        }
         if (strcmp(call_upper, "SYSTEM_CLOCK") == 0) {
             long long now = (long long)time(NULL);
             for (int i = 0; i < n->n_stmts; i++) {
@@ -13981,8 +14119,18 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         break;
 
     case FND_GOTO:
-        I->goto_active = 1;
-        I->goto_label = (int)n->int_val;
+        if (n->n_stmts > 0 && n->children[0]) {
+            OfortValue selector = eval_node(I, n->children[0]);
+            long long choice = val_to_int(selector);
+            free_value(&selector);
+            if (choice >= 1 && choice <= n->n_stmts) {
+                I->goto_active = 1;
+                I->goto_label = (int)n->stmts[choice - 1]->int_val;
+            }
+        } else {
+            I->goto_active = 1;
+            I->goto_label = (int)n->int_val;
+        }
         break;
 
     case FND_CONTINUE:
