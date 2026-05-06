@@ -6275,6 +6275,31 @@ static void skip_balanced_parens(OfortInterpreter *I) {
     }
 }
 
+static int implicit_letter_list_follows(OfortInterpreter *I) {
+    int pos;
+    if (!check(I, FTOK_LPAREN)) return 0;
+    pos = I->tok_pos + 1;
+    while (pos < I->n_tokens) {
+        OfortToken *t = &I->tokens[pos];
+        int letter = token_letter_index(t);
+        if (t->type == FTOK_RPAREN) return 1;
+        if (t->type == FTOK_NEWLINE || t->type == FTOK_EOF) return 0;
+        if (letter < 0) return 0;
+        pos++;
+        if (I->tokens[pos].type == FTOK_MINUS) {
+            pos++;
+            if (token_letter_index(&I->tokens[pos]) < 0) return 0;
+            pos++;
+        }
+        if (I->tokens[pos].type == FTOK_COMMA) {
+            pos++;
+            continue;
+        }
+        return I->tokens[pos].type == FTOK_RPAREN;
+    }
+    return 0;
+}
+
 static OfortNode *parse_implicit_stmt(OfortInterpreter *I) {
     OfortToken *t = advance(I); /* IMPLICIT */
     OfortNode *n = alloc_node(I, FND_IMPLICIT_NONE);
@@ -6303,8 +6328,29 @@ static OfortNode *parse_implicit_stmt(OfortInterpreter *I) {
             vtype = token_to_valtype(advance(I)->type);
         }
 
-        int implicit_char_len = 0;
-        if (check(I, FTOK_LPAREN) && vtype == FVAL_CHARACTER) {
+        int implicit_char_len = vtype == FVAL_CHARACTER ? 1 : 0;
+        if (check(I, FTOK_STAR) && vtype == FVAL_CHARACTER) {
+            advance(I);
+            if (check(I, FTOK_LPAREN)) {
+                advance(I);
+                if (check(I, FTOK_STAR)) {
+                    advance(I);
+                    implicit_char_len = OFORT_MAX_STRLEN - 1;
+                } else if (!check(I, FTOK_RPAREN)) {
+                    OfortNode *len_expr = parse_expr(I);
+                    if (len_expr && len_expr->type == FND_INT_LIT)
+                        implicit_char_len = (int)len_expr->int_val;
+                }
+                expect(I, FTOK_RPAREN);
+            } else if (check(I, FTOK_STAR)) {
+                advance(I);
+                implicit_char_len = OFORT_MAX_STRLEN - 1;
+            } else {
+                OfortToken *len_tok = expect(I, FTOK_INT_LIT);
+                implicit_char_len = (int)len_tok->int_val;
+            }
+        }
+        if (check(I, FTOK_LPAREN) && vtype == FVAL_CHARACTER && !implicit_letter_list_follows(I)) {
             advance(I);
             if (check(I, FTOK_STAR)) {
                 advance(I);
@@ -6321,8 +6367,7 @@ static OfortNode *parse_implicit_stmt(OfortInterpreter *I) {
             expect(I, FTOK_RPAREN);
         } else if (check(I, FTOK_LPAREN) &&
                    (vtype == FVAL_INTEGER || vtype == FVAL_REAL || vtype == FVAL_DOUBLE)) {
-            OfortToken *after_lparen = peek_ahead(I, 1);
-            if (!(after_lparen->type == FTOK_IDENT || after_lparen->type == FTOK_IN || after_lparen->type == FTOK_OUT)) {
+            if (!implicit_letter_list_follows(I)) {
                 skip_balanced_parens(I);
             }
         }
@@ -10461,6 +10506,16 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             var = find_var(I, n->stmts[0]->name);
             present = var && var->present;
             return make_logical(present);
+        }
+
+        if (str_eq_nocase(n->name, "len") && nargs == 1 &&
+            n->stmts[0]->type == FND_IDENT && !find_var(I, n->stmts[0]->name)) {
+            int has_type = 0;
+            OfortValType implicit_type = implicit_type_for_name(I, n->stmts[0]->name, &has_type);
+            if (has_type && implicit_type == FVAL_CHARACTER) {
+                int char_len = implicit_char_len_for_name(I, n->stmts[0]->name);
+                return make_integer(char_len > 0 ? char_len : 1);
+            }
         }
 
         /* Evaluate all args */
