@@ -9,9 +9,34 @@ standalone command-line interpreter.
 `ofort` is intended for experimentation, small examples, tests, and interpreter
 development. It is not a production Fortran compiler.
 
+## Project Layout
+
+- `include/ofort.h` contains the public interpreter declarations shared by the
+  C translation units.
+- `src/main.c` contains command-line handling, the REPL, and user-facing
+  diagnostics.
+- `src/ofort.c` contains most of the parser, evaluator, runtime, and intrinsic
+  implementation.
+- `src/ofort_internal.h` contains internal declarations shared inside `src`.
+- `src/ofort_values.c` contains value helper routines split out from the main
+  interpreter implementation.
+- `tests/test_ofort.py` contains the main pytest suite.
+- `tests/cases` contains focused Fortran regression programs. Most stdout
+  regression cases use a `name.f90` source file plus a sibling `name.out`
+  expected-output file.
+- `scripts/xofort.py` is a batch runner for trying many source files one at a
+  time.
+- `examples` contains small demonstration programs when present.
+
+Generated files such as `ofort.exe`, `ofort.build`, `main*.f90`, compiler
+objects, module files, and temporary `gfortran` executables are local build/run
+artifacts and should not be committed.
+
 ## Current Status
 
-The interpreter currently supports a growing Fortran 90/95-style subset:
+The interpreter currently supports a growing practical Fortran subset. The core
+is Fortran 90/95-like, but `ofort` also implements selected later features where
+they are useful for real test programs:
 
 - scalar `INTEGER`, `REAL`, `DOUBLE PRECISION`, `COMPLEX`, `LOGICAL`, and
   `CHARACTER`
@@ -20,14 +45,32 @@ The interpreter currently supports a growing Fortran 90/95-style subset:
 - modules, `use` imports, derived types, functions, subroutines, generic
   interfaces, optional arguments, `intent`, `pure` procedures, and elemental
   functions/subroutines
+- `class` declarations, polymorphic-style dummy arguments, type-bound
+  procedures, and basic dispatch for supported cases
+- selected parameterized derived-type syntax and derived-type parameter
+  handling used by the regression tests
+- selected `iso_fortran_env` named constants such as `real64`, including
+  `only` renaming
 - `implicit none`, configurable implicit typing, declaration reordering in the
   REPL, assignment type checks, and diagnostics that include source lines
-- `if`, `select case`, `do`, `do while`, labeled `do`, `exit`, `cycle`, `goto`,
-  `forall`, `stop`, and `return`
-- formatted `print`/`write`, `read`, `open`, `close`, `rewind`, internal I/O,
-  simple external files, and simple unformatted stream I/O
+- `if`, `select case`, `do`, `do while`, labeled `do`, numbered `do`,
+  numbered `do while`, `exit`, `cycle`, `goto`, computed `goto`, `forall`,
+  `stop`, and `return`
+- `format` statements, formatted `print`/`write`, `read`, `open`, `close`,
+  `rewind`, internal I/O, simple external files, and simple unformatted stream
+  I/O
 - command-line arguments via `command_argument_count`, `get_command_argument`,
   and the nonstandard `getarg`
+- allocatable utilities such as `allocated`, `allocate`, `deallocate`, and
+  `move_alloc`
+
+Support for modern Fortran features is intentionally incremental rather than
+complete. A feature being accepted in one tested form does not imply full
+standard coverage for every edge case.
+
+Some old Fortran features are accepted for compatibility but reported as
+obsolescent or nonstandard where appropriate. Examples include computed `goto`,
+old alternate returns, and selected extension-style calls.
 
 `REAL` and `DOUBLE PRECISION` are distinguished by type tag and kind, but both
 are stored internally as C `double`.
@@ -68,6 +111,9 @@ make clang
 ```
 
 The generated executable is `ofort.exe` on Windows.
+
+`make` writes a small `ofort.build` file describing the compiler used for the
+last build. That file is generated and should not be committed.
 
 ## Run
 
@@ -237,6 +283,9 @@ When an interactive session exits with a non-empty source buffer, the buffer is
 saved automatically as `main.f90`, or `main1.f90`, `main2.f90`, and so on if
 earlier names already exist.
 
+Those `main*.f90` files are autosave artifacts. Move or delete them when no
+longer needed; they are not intended to be committed.
+
 ## Test
 
 ```powershell
@@ -246,3 +295,31 @@ pytest -q
 The test suite is intentionally small-program oriented. New language features
 are usually added by creating a focused `tests/cases/x*.f90` source and a
 matching `.out` file.
+
+Only `tests/cases/*.f90` files with a sibling UTF-8 text `.out` file are
+collected as simple stdout regression cases. Files without an expected-output
+file may still be used by targeted tests in `tests/test_ofort.py`.
+
+Some tests compare behavior with `gfortran` or exercise local files. The core
+test suite should pass with:
+
+```powershell
+make
+pytest -q
+```
+
+## Local Check Helpers
+
+`github_check.bat` is a Windows helper that clones the GitHub repository into
+`C:\github\ofort` by default, or into the directory supplied as its first
+argument, then runs `make gcc` and `pytest -q` there.
+
+```cmd
+github_check.bat
+github_check.bat C:\github\ofort_temp
+```
+
+`gitcheck.bat` is a local Windows `cmd.exe` sanity check for this working copy.
+It clones the committed `HEAD` into `ofort_build_check`, builds it, and runs the
+tests. It is useful for catching files that were edited locally but not
+committed. It is not required for portable builds.
