@@ -3889,6 +3889,9 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         } else if (check(I, FTOK_SAVE)) {
             advance(I);
             is_save = 1;
+        } else if (token_ident_upper(peek(I), "BIND")) {
+            advance(I);
+            if (check(I, FTOK_LPAREN)) skip_balanced_parens(I);
         } else {
             /* unknown attribute, skip */
             advance(I);
