@@ -2486,7 +2486,7 @@ static int token_can_be_name(OfortToken *t) {
                  t->type == FTOK_READ || t->type == FTOK_WRITE ||
                  t->type == FTOK_OPEN || t->type == FTOK_CLOSE ||
                  t->type == FTOK_REWIND || t->type == FTOK_INQUIRE ||
-                 t->type == FTOK_STOP || t->type == FTOK_RETURN ||
+                 t->type == FTOK_END || t->type == FTOK_STOP || t->type == FTOK_RETURN ||
                  t->type == FTOK_EXIT || t->type == FTOK_CYCLE ||
                  t->type == FTOK_ENTRY);
 }
@@ -2528,6 +2528,7 @@ static const char *token_name_text(OfortToken *t) {
     if (t->type == FTOK_CLOSE) return "close";
     if (t->type == FTOK_REWIND) return "rewind";
     if (t->type == FTOK_INQUIRE) return "inquire";
+    if (t->type == FTOK_END) return "end";
     if (t->type == FTOK_STOP) return "stop";
     if (t->type == FTOK_RETURN) return "return";
     if (t->type == FTOK_EXIT) return "exit";
