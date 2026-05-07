@@ -2938,10 +2938,6 @@ static int check_end(OfortInterpreter *I, const char *what) {
             case FTOK_DO: strcpy(upper, "DO"); break;
             case FTOK_IF: strcpy(upper, "IF"); break;
             case FTOK_SELECT: strcpy(upper, "SELECT"); break;
-            case FTOK_IDENT:
-                if (token_ident_upper(next, "BLOCK")) strcpy(upper, "BLOCK");
-                else return 0;
-                break;
             case FTOK_SUBROUTINE: strcpy(upper, "SUBROUTINE"); break;
             case FTOK_FUNCTION: strcpy(upper, "FUNCTION"); break;
             case FTOK_MODULE: strcpy(upper, "MODULE"); break;
@@ -7077,6 +7073,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         if (token_ident_upper(t, "FORALL")) {
             leave_spec_section(I);
             return parse_forall_stmt(I);
+        }
+        if (token_ident_upper(t, "WHERE")) {
+            leave_spec_section(I);
+            return parse_where_statement(I);
         }
         if (t->type == FTOK_DO) {
             leave_spec_section(I);
