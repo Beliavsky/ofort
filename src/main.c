@@ -31,6 +31,8 @@ static int starts_with_word_nocase(const char *line, const char *word);
 static int identifier_char(int c);
 static int line_is_terminal_end(const char *start, const char *end);
 static int add_repl_line_to_buffer(char **buf, size_t *len, size_t *cap, const char *line);
+static int source_defines_name(const char *source, const char *name);
+static int replace_source_line(char **buf, size_t *len, size_t *cap, int line_no, const char *text);
 
 typedef struct {
     const char **items;
@@ -1118,6 +1120,9 @@ static int insert_text_at(char **buf, size_t *len, size_t *cap, size_t pos, cons
         *buf = new_buf;
         *cap = new_cap;
     }
+    if (*len == 0) {
+        (*buf)[0] = '\0';
+    }
     memmove(*buf + pos + n, *buf + pos, *len - pos + 1);
     memcpy(*buf + pos, text, n);
     *len += n;
@@ -1308,6 +1313,242 @@ static int validate_repl_line_before_append(const char *source, const char *line
         return 0;
     }
 
+    return 1;
+}
+
+static int copy_repl_shortcut_identifier(const char **p_in, char *name, size_t name_size) {
+    const char *p = *p_in;
+    const char *start;
+    size_t len;
+
+    if (!(isalpha((unsigned char)*p) || *p == '_')) return 0;
+    start = p;
+    p++;
+    while (identifier_char((unsigned char)*p)) p++;
+    len = (size_t)(p - start);
+    if (len == 0 || len >= name_size) return 0;
+    memcpy(name, start, len);
+    name[len] = '\0';
+    *p_in = p;
+    return 1;
+}
+
+static int character_literal_length(const char *rhs) {
+    const char *p = skip_space(rhs);
+    char quote;
+    int len = 0;
+
+    if (*p != '"' && *p != '\'') return -1;
+    quote = *p++;
+    while (*p) {
+        if (*p == quote) {
+            if (p[1] == quote) {
+                len++;
+                p += 2;
+                continue;
+            }
+            return len;
+        }
+        if (*p == '\r' || *p == '\n') return -1;
+        len++;
+        p++;
+    }
+    return -1;
+}
+
+static int repl_shortcut_decl_type(const char *rhs, char *decl, size_t decl_size) {
+    ReplType type = literal_rhs_type(rhs);
+    const char *p = skip_space(rhs);
+
+    switch (type) {
+        case REPL_TYPE_INTEGER:
+            snprintf(decl, decl_size, "integer");
+            return 1;
+        case REPL_TYPE_REAL:
+            snprintf(decl, decl_size, "real");
+            return 1;
+        case REPL_TYPE_DOUBLE:
+            snprintf(decl, decl_size, "double precision");
+            return 1;
+        case REPL_TYPE_LOGICAL:
+            snprintf(decl, decl_size, "logical");
+            return 1;
+        case REPL_TYPE_CHARACTER: {
+            int len = character_literal_length(rhs);
+            if (len < 0) return 0;
+            snprintf(decl, decl_size, "character(len=%d)", len);
+            return 1;
+        }
+        default:
+            break;
+    }
+
+    if (starts_with_word_nocase(p, "kind")) {
+        const char *q = p + 4;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q == '(') {
+            snprintf(decl, decl_size, "integer");
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int line_is_parameter_declaration_for_name(const char *line, const char *name) {
+    const char *p = skip_space(line);
+    const char *dc;
+    const char *q;
+
+    if (!(starts_with_word_nocase(p, "integer") ||
+          starts_with_word_nocase(p, "real") ||
+          starts_with_word_nocase(p, "double") ||
+          starts_with_word_nocase(p, "character") ||
+          starts_with_word_nocase(p, "logical") ||
+          starts_with_word_nocase(p, "complex"))) {
+        return 0;
+    }
+    dc = strstr(p, "::");
+    if (!dc || !declaration_line_has_name(p, name)) return 0;
+    q = p;
+    while (q < dc) {
+        if (starts_with_word_nocase(q, "parameter")) return 1;
+        q++;
+    }
+    return 0;
+}
+
+static int source_parameter_line_number(const char *source, const char *name) {
+    const char *line = source;
+    int line_no = 1;
+
+    while (line && *line) {
+        const char *end = strchr(line, '\n');
+        char local[4096];
+        size_t len = end ? (size_t)(end - line) : strlen(line);
+        if (len >= sizeof(local)) len = sizeof(local) - 1;
+        memcpy(local, line, len);
+        local[len] = '\0';
+        if (line_is_parameter_declaration_for_name(local, name)) return line_no;
+        line = end ? end + 1 : NULL;
+        line_no++;
+    }
+    return 0;
+}
+
+static int parse_repl_decl_shortcut(const char *line, const char **keyword_out,
+                                    char *name, size_t name_size, const char **rhs_out) {
+    const char *p;
+    const char *keyword = NULL;
+
+    if (!line) return 0;
+
+    p = line;
+    while (*p == ' ' || *p == '\t') p++;
+
+    if (starts_with_word_nocase(p, "let")) keyword = "let";
+    else if (starts_with_word_nocase(p, "const")) keyword = "const";
+    else if (starts_with_word_nocase(p, "reconst")) keyword = "reconst";
+    else return 0;
+
+    p += strlen(keyword);
+    if (*p != ' ' && *p != '\t') return 0;
+    while (*p == ' ' || *p == '\t') p++;
+    if (!copy_repl_shortcut_identifier(&p, name, name_size)) return 0;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '=' || p[1] == '=') return 0;
+    *keyword_out = keyword;
+    *rhs_out = p + 1;
+    return 1;
+}
+
+static void build_repl_decl_shortcut_line(char *out, size_t out_size, const char *keyword,
+                                          const char *name, const char *decl,
+                                          const char *rhs, const char *leading, size_t leading_len) {
+    int is_const = strcmp(keyword, "const") == 0 || strcmp(keyword, "reconst") == 0;
+
+    if (leading_len >= out_size) {
+        if (out_size > 0) out[0] = '\0';
+        return;
+    }
+    memcpy(out, leading, leading_len);
+    if (is_const) {
+        snprintf(out + leading_len, out_size - leading_len,
+                 "%s, parameter :: %s = %s", decl, name, skip_space(rhs));
+    } else {
+        snprintf(out + leading_len, out_size - leading_len,
+                 "%s :: %s\n%.*s%s = %s", decl, name, (int)leading_len, leading, name, skip_space(rhs));
+    }
+    out[out_size - 1] = '\0';
+}
+
+static int rewrite_repl_let_const_shortcut(char *line, size_t line_size, const char *source) {
+    const char *p;
+    const char *rhs;
+    const char *keyword = NULL;
+    char name[256];
+    char decl[256];
+    char rewritten[4096];
+    size_t leading_len;
+
+    if (!line || line_size == 0) return 0;
+
+    p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    leading_len = (size_t)(p - line);
+
+    if (!parse_repl_decl_shortcut(line, &keyword, name, sizeof(name), &rhs)) return 0;
+    if (strcmp(keyword, "reconst") == 0) return 0;
+
+    if (source_defines_name(source ? source : "", name)) {
+        if (strcmp(keyword, "const") == 0) {
+            fprintf(stderr, "CONST name '%s' already exists; use reconst %s = ... to replace a parameter\n",
+                    name, name);
+        } else {
+            fprintf(stderr, "LET variable '%s' already exists; use assignment: %s = ...\n",
+                    name, name);
+        }
+        return -1;
+    }
+
+    if (!repl_shortcut_decl_type(rhs, decl, sizeof(decl))) {
+        fprintf(stderr, "cannot infer type for %s; use an explicit declaration\n", keyword);
+        return -1;
+    }
+
+    build_repl_decl_shortcut_line(rewritten, sizeof(rewritten), keyword, name, decl,
+                                  rhs, line, leading_len);
+    snprintf(line, line_size, "%s", rewritten);
+    return 1;
+}
+
+static int apply_repl_reconst_shortcut(char **buf, size_t *len, size_t *cap, const char *line) {
+    const char *rhs;
+    const char *keyword = NULL;
+    char name[256];
+    char decl[256];
+    char rewritten[4096];
+    int line_no;
+
+    if (!parse_repl_decl_shortcut(line, &keyword, name, sizeof(name), &rhs)) return 0;
+    if (strcmp(keyword, "reconst") != 0) return 0;
+
+    if (!repl_shortcut_decl_type(rhs, decl, sizeof(decl))) {
+        fprintf(stderr, "cannot infer type for reconst; use an explicit PARAMETER declaration\n");
+        return -1;
+    }
+    line_no = source_parameter_line_number(*buf ? *buf : "", name);
+    if (line_no <= 0) {
+        if (source_defines_name(*buf ? *buf : "", name)) {
+            fprintf(stderr, "RECONST name '%s' exists but is not a PARAMETER\n", name);
+        } else {
+            fprintf(stderr, "RECONST name '%s' is not an existing PARAMETER\n", name);
+        }
+        return -1;
+    }
+    build_repl_decl_shortcut_line(rewritten, sizeof(rewritten), keyword, name, decl,
+                                  rhs, line, (size_t)(skip_space(line) - line));
+    if (!replace_source_line(buf, len, cap, line_no, rewritten)) return -1;
     return 1;
 }
 
@@ -3205,6 +3446,35 @@ static int run_interactive(const char *load_path, int run_after_load) {
             continue;
         }
 
+        {
+            int reconst_rc = apply_repl_reconst_shortcut(&buf, &len, &cap, line);
+            if (reconst_rc != 0) {
+                if (reconst_rc > 0) {
+                    executed_len = 0;
+                    ofort_destroy(repl_interp);
+                    repl_interp = create_repl_interpreter();
+                    if (!repl_interp) {
+                        fprintf(stderr, "failed to create Fortran interpreter\n");
+                        free(buf);
+                        free(footer);
+                        return 2;
+                    }
+                    last_rc = repl_preflight_check_source(buf ? buf : "", footer,
+                                                         source_line_count(buf ? buf : ""));
+                } else {
+                    last_rc = 1;
+                }
+                continue;
+            }
+        }
+
+        {
+            int shortcut_rc = rewrite_repl_let_const_shortcut(line, sizeof(line), buf ? buf : "");
+            if (shortcut_rc < 0) {
+                last_rc = 1;
+                continue;
+            }
+        }
         rewrite_repl_print_shortcut(line, sizeof(line));
 
         if (!validate_repl_line_before_append(buf ? buf : "", line)) {
