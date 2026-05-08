@@ -3523,6 +3523,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         advance(I);
         OfortNode *n = alloc_node(I, FND_STRING_LIT);
         copy_cstr(n->str_val, sizeof(n->str_val), t->str_val);
+        n->kind = t->kind;
         n->line = t->line;
         while (check(I, FTOK_LPAREN)) {
             n = parse_array_ref_postfix(I, n);
@@ -3647,6 +3648,26 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         return parse_primary(I);
     }
     /* identifier — could be variable, function call, or array ref */
+    if (t->type == FTOK_IDENT && peek_ahead(I, 1)->type == FTOK_STRING_LIT) {
+        size_t idlen = strlen(t->str_val);
+        if (idlen > 1 && t->str_val[idlen - 1] == '_') {
+            OfortToken *lit = peek_ahead(I, 1);
+            OfortNode *n = alloc_node(I, FND_STRING_LIT);
+            OfortNode *ke = alloc_node(I, FND_IDENT);
+            copy_cstr(n->str_val, sizeof(n->str_val), lit->str_val);
+            copy_cstr(ke->name, sizeof(ke->name), t->str_val);
+            ke->name[idlen - 1] = '\0';
+            ke->line = t->line;
+            n->kind_expr = ke;
+            n->line = t->line;
+            advance(I);
+            advance(I);
+            while (check(I, FTOK_LPAREN)) {
+                n = parse_array_ref_postfix(I, n);
+            }
+            return n;
+        }
+    }
     /* BOZ literal constants: B'1010', O'17', Z'ff'. The lexer leaves these
        as an identifier prefix followed by a string literal. */
     if (t->type == FTOK_IDENT && peek_ahead(I, 1)->type == FTOK_STRING_LIT &&
@@ -11503,7 +11524,18 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         return make_real(n->num_val);
 
     case FND_STRING_LIT:
-        return make_character(n->str_val);
+        {
+            OfortValue r = make_character(n->str_val);
+            if (n->kind_expr) {
+                OfortValue kv = eval_node(I, n->kind_expr);
+                int runtime_kind = (int)val_to_int(kv);
+                free_value(&kv);
+                r.kind = runtime_kind > 0 ? runtime_kind : 4;
+            } else {
+                r.kind = n->kind > 0 ? n->kind : 1;
+            }
+            return r;
+        }
 
     case FND_LOGICAL_LIT:
         if (n->kind_expr) {
@@ -19695,6 +19727,76 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
     return 0;
 }
 
+static OfortValue minmaxval_dim_result(OfortInterpreter *I, OfortValue *array, int dim, int want_max) {
+    int rank = array->v.arr.n_dims;
+    int result_dims[7];
+    int result_rank = 0;
+    int dim_extent, stride;
+    if (dim < 1 || dim > rank) ofort_error(I, "%s DIM is out of range", want_max ? "MAXVAL" : "MINVAL");
+    for (int i = 0; i < rank; i++) {
+        if (i != dim - 1) result_dims[result_rank++] = array->v.arr.dims[i];
+    }
+    dim_extent = array->v.arr.dims[dim - 1];
+    stride = 1;
+    for (int i = 0; i < dim - 1; i++) stride *= array->v.arr.dims[i];
+
+    if (result_rank == 0) {
+        OfortValue best = make_void_val();
+        int found = 0;
+        for (int k = 0; k < dim_extent; k++) {
+            OfortValue elem = array_element_value(array, k * stride);
+            if (!found || (want_max ? values_compare_fortran(I, elem, best) > 0
+                                    : values_compare_fortran(I, elem, best) < 0)) {
+                free_value(&best);
+                best = copy_value(elem);
+                found = 1;
+            }
+            free_value(&elem);
+        }
+        if (!found) {
+            best = default_value(array->v.arr.elem_type, 1);
+            best.kind = array->kind ? array->kind : 4;
+        }
+        return best;
+    }
+
+    OfortValue result = make_array(array->v.arr.elem_type, result_dims, result_rank);
+    result.kind = array->kind;
+    for (int ri = 0; ri < result.v.arr.len; ri++) {
+        int rem = ri;
+        int base = 0;
+        int out_axis = 0;
+        int found = 0;
+        OfortValue best = make_void_val();
+        for (int axis = 0; axis < rank; axis++) {
+            if (axis == dim - 1) continue;
+            int coord = rem % result_dims[out_axis];
+            int axis_stride = 1;
+            rem /= result_dims[out_axis];
+            for (int si = 0; si < axis; si++) axis_stride *= array->v.arr.dims[si];
+            base += coord * axis_stride;
+            out_axis++;
+        }
+        for (int k = 0; k < dim_extent; k++) {
+            OfortValue elem = array_element_value(array, base + k * stride);
+            if (!found || (want_max ? values_compare_fortran(I, elem, best) > 0
+                                    : values_compare_fortran(I, elem, best) < 0)) {
+                free_value(&best);
+                best = copy_value(elem);
+                found = 1;
+            }
+            free_value(&elem);
+        }
+        if (!found) {
+            best = default_value(array->v.arr.elem_type, 1);
+            best.kind = array->kind ? array->kind : 4;
+        }
+        free_value(&result.v.arr.data[ri]);
+        result.v.arr.data[ri] = best;
+    }
+    return result;
+}
+
 static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs,
                                 char arg_names[OFORT_MAX_PARAMS][256]) {
     char upper[256];
@@ -20287,6 +20389,16 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     }
     if (strcmp(upper, "MAX") == 0) {
         if (nargs < 2) ofort_error(I, "MAX requires at least 2 arguments");
+        if (args[0].type == FVAL_CHARACTER) {
+            OfortValue result = copy_value(args[0]);
+            for (int i = 1; i < nargs; i++) {
+                if (values_compare_fortran(I, args[i], result) > 0) {
+                    free_value(&result);
+                    result = copy_value(args[i]);
+                }
+            }
+            return result;
+        }
         double result = val_to_real(args[0]);
         for (int i = 1; i < nargs; i++) {
             double v = val_to_real(args[i]);
@@ -20297,6 +20409,16 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     }
     if (strcmp(upper, "MIN") == 0) {
         if (nargs < 2) ofort_error(I, "MIN requires at least 2 arguments");
+        if (args[0].type == FVAL_CHARACTER) {
+            OfortValue result = copy_value(args[0]);
+            for (int i = 1; i < nargs; i++) {
+                if (values_compare_fortran(I, args[i], result) < 0) {
+                    free_value(&result);
+                    result = copy_value(args[i]);
+                }
+            }
+            return result;
+        }
         double result = val_to_real(args[0]);
         for (int i = 1; i < nargs; i++) {
             double v = val_to_real(args[i]);
@@ -21243,51 +21365,87 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         }
     }
     if (strcmp(upper, "MAXVAL") == 0) {
-        if (args[0].type != FVAL_ARRAY || args[0].v.arr.len == 0)
+        int array_idx = intrinsic_arg_index(arg_names, nargs, "array");
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        if (array_idx < 0) array_idx = 0;
+        if (dim_idx < 0 && nargs > 1) dim_idx = array_idx == 0 ? 1 : 0;
+        if (array_idx >= nargs || args[array_idx].type != FVAL_ARRAY)
             ofort_error(I, "MAXVAL requires a non-empty array");
-        if (args[0].v.arr.int_data && args[0].v.arr.elem_type == FVAL_INTEGER) {
-            long long mx = args[0].v.arr.int_data[0];
-            for (int i = 1; i < args[0].v.arr.len; i++)
-                if (args[0].v.arr.int_data[i] > mx) mx = args[0].v.arr.int_data[i];
+        if (dim_idx >= 0 && dim_idx < nargs)
+            return minmaxval_dim_result(I, &args[array_idx], (int)val_to_int(args[dim_idx]), 1);
+        if (args[array_idx].v.arr.len == 0)
+            ofort_error(I, "MAXVAL requires a non-empty array");
+        if (args[array_idx].v.arr.int_data && args[array_idx].v.arr.elem_type == FVAL_INTEGER) {
+            long long mx = args[array_idx].v.arr.int_data[0];
+            for (int i = 1; i < args[array_idx].v.arr.len; i++)
+                if (args[array_idx].v.arr.int_data[i] > mx) mx = args[array_idx].v.arr.int_data[i];
             return make_integer(mx);
         }
-        if (args[0].v.arr.real_data &&
-            (args[0].v.arr.elem_type == FVAL_REAL || args[0].v.arr.elem_type == FVAL_DOUBLE)) {
-            double mx = args[0].v.arr.real_data[0];
-            for (int i = 1; i < args[0].v.arr.len; i++)
-                if (args[0].v.arr.real_data[i] > mx) mx = args[0].v.arr.real_data[i];
+        if (args[array_idx].v.arr.real_data &&
+            (args[array_idx].v.arr.elem_type == FVAL_REAL || args[array_idx].v.arr.elem_type == FVAL_DOUBLE)) {
+            double mx = args[array_idx].v.arr.real_data[0];
+            for (int i = 1; i < args[array_idx].v.arr.len; i++)
+                if (args[array_idx].v.arr.real_data[i] > mx) mx = args[array_idx].v.arr.real_data[i];
             return make_real(mx);
         }
-        double mx = val_to_real(args[0].v.arr.data[0]);
-        for (int i = 1; i < args[0].v.arr.len; i++) {
-            double v = val_to_real(args[0].v.arr.data[i]);
+        if (args[array_idx].v.arr.elem_type == FVAL_CHARACTER) {
+            OfortValue best = copy_value(args[array_idx].v.arr.data[0]);
+            for (int i = 1; i < args[array_idx].v.arr.len; i++) {
+                if (values_compare_fortran(I, args[array_idx].v.arr.data[i], best) > 0) {
+                    free_value(&best);
+                    best = copy_value(args[array_idx].v.arr.data[i]);
+                }
+            }
+            return best;
+        }
+        double mx = val_to_real(args[array_idx].v.arr.data[0]);
+        for (int i = 1; i < args[array_idx].v.arr.len; i++) {
+            double v = val_to_real(args[array_idx].v.arr.data[i]);
             if (v > mx) mx = v;
         }
-        if (args[0].v.arr.elem_type == FVAL_INTEGER) return make_integer((long long)mx);
+        if (args[array_idx].v.arr.elem_type == FVAL_INTEGER) return make_integer((long long)mx);
         return make_real(mx);
     }
     if (strcmp(upper, "MINVAL") == 0) {
-        if (args[0].type != FVAL_ARRAY || args[0].v.arr.len == 0)
+        int array_idx = intrinsic_arg_index(arg_names, nargs, "array");
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        if (array_idx < 0) array_idx = 0;
+        if (dim_idx < 0 && nargs > 1) dim_idx = array_idx == 0 ? 1 : 0;
+        if (array_idx >= nargs || args[array_idx].type != FVAL_ARRAY)
             ofort_error(I, "MINVAL requires a non-empty array");
-        if (args[0].v.arr.int_data && args[0].v.arr.elem_type == FVAL_INTEGER) {
-            long long mn = args[0].v.arr.int_data[0];
-            for (int i = 1; i < args[0].v.arr.len; i++)
-                if (args[0].v.arr.int_data[i] < mn) mn = args[0].v.arr.int_data[i];
+        if (dim_idx >= 0 && dim_idx < nargs)
+            return minmaxval_dim_result(I, &args[array_idx], (int)val_to_int(args[dim_idx]), 0);
+        if (args[array_idx].v.arr.len == 0)
+            ofort_error(I, "MINVAL requires a non-empty array");
+        if (args[array_idx].v.arr.int_data && args[array_idx].v.arr.elem_type == FVAL_INTEGER) {
+            long long mn = args[array_idx].v.arr.int_data[0];
+            for (int i = 1; i < args[array_idx].v.arr.len; i++)
+                if (args[array_idx].v.arr.int_data[i] < mn) mn = args[array_idx].v.arr.int_data[i];
             return make_integer(mn);
         }
-        if (args[0].v.arr.real_data &&
-            (args[0].v.arr.elem_type == FVAL_REAL || args[0].v.arr.elem_type == FVAL_DOUBLE)) {
-            double mn = args[0].v.arr.real_data[0];
-            for (int i = 1; i < args[0].v.arr.len; i++)
-                if (args[0].v.arr.real_data[i] < mn) mn = args[0].v.arr.real_data[i];
+        if (args[array_idx].v.arr.real_data &&
+            (args[array_idx].v.arr.elem_type == FVAL_REAL || args[array_idx].v.arr.elem_type == FVAL_DOUBLE)) {
+            double mn = args[array_idx].v.arr.real_data[0];
+            for (int i = 1; i < args[array_idx].v.arr.len; i++)
+                if (args[array_idx].v.arr.real_data[i] < mn) mn = args[array_idx].v.arr.real_data[i];
             return make_real(mn);
         }
-        double mn = val_to_real(args[0].v.arr.data[0]);
-        for (int i = 1; i < args[0].v.arr.len; i++) {
-            double v = val_to_real(args[0].v.arr.data[i]);
+        if (args[array_idx].v.arr.elem_type == FVAL_CHARACTER) {
+            OfortValue best = copy_value(args[array_idx].v.arr.data[0]);
+            for (int i = 1; i < args[array_idx].v.arr.len; i++) {
+                if (values_compare_fortran(I, args[array_idx].v.arr.data[i], best) < 0) {
+                    free_value(&best);
+                    best = copy_value(args[array_idx].v.arr.data[i]);
+                }
+            }
+            return best;
+        }
+        double mn = val_to_real(args[array_idx].v.arr.data[0]);
+        for (int i = 1; i < args[array_idx].v.arr.len; i++) {
+            double v = val_to_real(args[array_idx].v.arr.data[i]);
             if (v < mn) mn = v;
         }
-        if (args[0].v.arr.elem_type == FVAL_INTEGER) return make_integer((long long)mn);
+        if (args[array_idx].v.arr.elem_type == FVAL_INTEGER) return make_integer((long long)mn);
         return make_real(mn);
     }
     if (strcmp(upper, "FINDLOC") == 0) {
