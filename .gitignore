@@ -1,9 +1,14 @@
+/*.f90
+!/tests/cases/*.f90
+
 # Build products
 ofort.exe
+ofort.build
 *.o
 *.obj
 *.exe
 *.out
+!tests/cases/*.out
 *.dll
 *.so
 *.dylib
@@ -14,6 +19,11 @@ ofort.exe
 __pycache__/
 .pytest_cache/
 *.py[cod]
+/gpass_ofail/
+/gpass_ofail_next*/
+
+# Benchmark output
+benchmarks/benchmark_results.csv
 
 # Local helper scripts
 gpush.bat
