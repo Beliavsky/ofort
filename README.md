@@ -69,6 +69,9 @@ rather than standard-complete.
   `rewind`, internal I/O, simple external files, and simple unformatted stream
   I/O
 - simple preprocessing support for `#define` macro substitution in source files
+- explicitly imported `ofort` extension modules, currently including
+  `ofort_random_mod`, `ofort_la_mod`, `ofort_io_mod`, and
+  `ofort_statistics_mod`
 - command-line arguments via `command_argument_count`, `get_command_argument`,
   and the nonstandard `getarg`
 - allocatable utilities such as `allocated`, `allocate`, `deallocate`, and
@@ -77,6 +80,23 @@ rather than standard-complete.
 Support for modern Fortran features is intentionally incremental rather than
 complete. A feature being accepted in one tested form does not imply full
 standard coverage for every edge case.
+
+## ofort Extension Modules
+
+`ofort` has optional nonstandard extension modules for interpreted workflows.
+They are not required to run ordinary Fortran programs, and their procedure
+names are not global intrinsics. Import them explicitly with `use` when needed.
+
+Current extension modules:
+
+- `ofort_random_mod`: normal random variates
+- `ofort_la_mod`: dense linear algebra helpers
+- `ofort_io_mod`: simple numeric text readers
+- `ofort_statistics_mod`: vector, matrix, and column statistics
+
+See [docs/extension_modules.md](docs/extension_modules.md) for the full module
+reference, including procedure lists, arguments, examples, and current
+limitations.
 
 Some old Fortran features are accepted for compatibility but reported as
 obsolescent or nonstandard where appropriate. Examples include computed `goto`,
