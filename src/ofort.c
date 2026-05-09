@@ -3430,6 +3430,7 @@ static int source_ends_with_bare_end(OfortInterpreter *I) {
 static void consume_end(OfortInterpreter *I, const char *what) {
     if (what && check_end(I, what) && peek(I)->type == FTOK_IDENT) {
         advance(I);
+        if (token_can_be_name(peek(I))) advance(I);
         return;
     }
     if (what && I->consumed_bare_end) {
@@ -6885,8 +6886,13 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
     int cap = 0;
 
     expect(I, FTOK_LPAREN);
-    if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
-    type_name = advance(I);
+    if (check(I, FTOK_STAR)) {
+        type_name = advance(I);
+        copy_cstr(type_name->str_val, sizeof(type_name->str_val), "*");
+    } else {
+        if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+        type_name = advance(I);
+    }
     if (check(I, FTOK_LPAREN)) {
         advance(I);
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
@@ -7594,17 +7600,34 @@ static OfortNode *parse_implicit_stmt(OfortInterpreter *I) {
                 advance(I);
             }
             expect(I, FTOK_RPAREN);
-        } else if (peek(I)->type == FTOK_TYPE && peek_ahead(I, 1)->type == FTOK_LPAREN &&
-                   peek_ahead(I, 2)->type == FTOK_IDENT &&
-                   peek_ahead(I, 3)->type == FTOK_RPAREN) {
+        } else if (((peek(I)->type == FTOK_TYPE) ||
+                    (peek(I)->type == FTOK_IDENT && check_ident_upper(I, "CLASS"))) &&
+                   peek_ahead(I, 1)->type == FTOK_LPAREN &&
+                   (peek_ahead(I, 2)->type == FTOK_IDENT || peek_ahead(I, 2)->type == FTOK_STAR)) {
             advance(I); /* TYPE */
             expect(I, FTOK_LPAREN);
-            OfortToken *type_tok = expect(I, FTOK_IDENT);
-            copy_cstr(implicit_type_name, sizeof(implicit_type_name), type_tok->str_val);
+            OfortToken *type_tok = NULL;
+            if (check(I, FTOK_STAR)) {
+                advance(I);
+                copy_cstr(implicit_type_name, sizeof(implicit_type_name), "*");
+            } else {
+                type_tok = expect(I, FTOK_IDENT);
+                copy_cstr(implicit_type_name, sizeof(implicit_type_name), type_tok->str_val);
+                if (check(I, FTOK_LPAREN)) {
+                    int depth = 0;
+                    do {
+                        if (check(I, FTOK_LPAREN)) depth++;
+                        else if (check(I, FTOK_RPAREN)) depth--;
+                        advance(I);
+                    } while (depth > 0 && !check(I, FTOK_EOF));
+                }
+            }
             expect(I, FTOK_RPAREN);
             vtype = FVAL_DERIVED;
-            ofort_warning(I, type_tok->line,
-                          "warning: derived-type implicit typing is legal but discouraged; prefer explicit declarations");
+            if (type_tok) {
+                ofort_warning(I, type_tok->line,
+                              "warning: derived-type implicit typing is legal but discouraged; prefer explicit declarations");
+            }
         } else {
             if (!is_type_keyword(peek(I)->type))
                 ofort_error(I, "Expected type in IMPLICIT statement");
