@@ -4245,6 +4245,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     int is_parameter = 0;
     int is_optional = 0;
     int is_external = 0;
+    int access_attr = 0;
     int intent = 0;
     int decl_dims[7] = {0};
     int decl_lower_bounds[7] = {0};
@@ -4458,6 +4459,12 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "external")) {
             advance(I);
             is_external = 1;
+        } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "public")) {
+            advance(I);
+            access_attr = 1;
+        } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "private")) {
+            advance(I);
+            access_attr = 2;
         } else if (check(I, FTOK_INTENT)) {
             advance(I);
             expect(I, FTOK_LPAREN);
@@ -4509,6 +4516,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         decl->is_implicit_save = is_implicit_save;
         decl->is_parameter = is_parameter;
         decl->is_optional = is_optional;
+        decl->access_attr = access_attr;
         decl->intent = intent;
         decl->line = name_tok->line;
         if (is_external) {
@@ -14937,6 +14945,21 @@ static void import_namelist(OfortInterpreter *I, const char *local_name,
     }
 }
 
+static int declaration_access_attr_for_name(OfortNode *node, const char *name) {
+    if (!node || !name || !name[0]) return 0;
+    if ((node->type == FND_VARDECL || node->type == FND_PARAMDECL) &&
+        str_eq_nocase(node->name, name)) {
+        return node->access_attr;
+    }
+    if (node->type == FND_BLOCK && node->stmts) {
+        for (int i = 0; i < node->n_stmts; i++) {
+            int access = declaration_access_attr_for_name(node->stmts[i], name);
+            if (access) return access;
+        }
+    }
+    return 0;
+}
+
 static int check_semantics_is_spec_node(OfortNode *n) {
     if (!n) return 0;
     switch (n->type) {
@@ -14954,6 +14977,7 @@ static int check_semantics_is_spec_node(OfortNode *n) {
         case FND_BLOCK_DATA:
         case FND_FORMAT:
         case FND_DATA:
+        case FND_NAMELIST:
             return 1;
         default:
             return 0;
@@ -15078,6 +15102,7 @@ static void check_semantics_identifier(OfortInterpreter *I, OfortNode *n) {
     if (!I || !n || !n->name[0]) return;
     if (find_var(I, n->name) || find_func(I, n->name) || find_generic(I, n->name)) return;
     if (find_namelist(I, n->name)) return;
+    if (is_intrinsic(n->name)) return;
     if (!current_scope_has_implicit_none(I)) {
         (void)implicit_type_for_name(I, n->name, &has_implicit_type);
         if (has_implicit_type) return;
@@ -15186,6 +15211,61 @@ static const char *resolve_imported_extension_intrinsic(OfortInterpreter *I, con
         }
     }
     return NULL;
+}
+
+static void declare_iso_c_binding_name(OfortInterpreter *I, const char *local, const char *remote) {
+    char ru[256];
+    char ch[2] = {0, 0};
+    if (!local || !local[0] || !remote || !remote[0]) return;
+    str_upper(ru, remote, sizeof(ru));
+
+    if (strcmp(ru, "C_INT") == 0) declare_var(I, local, make_integer(4));
+    else if (strcmp(ru, "C_SHORT") == 0) declare_var(I, local, make_integer(2));
+    else if (strcmp(ru, "C_LONG") == 0) declare_var(I, local, make_integer(4));
+    else if (strcmp(ru, "C_LONG_LONG") == 0) declare_var(I, local, make_integer(8));
+    else if (strcmp(ru, "C_SIGNED_CHAR") == 0) declare_var(I, local, make_integer(1));
+    else if (strcmp(ru, "C_SIZE_T") == 0) declare_var(I, local, make_integer(8));
+    else if (strcmp(ru, "C_INT8_T") == 0 || strcmp(ru, "C_INT_LEAST8_T") == 0 ||
+             strcmp(ru, "C_INT_FAST8_T") == 0) declare_var(I, local, make_integer(1));
+    else if (strcmp(ru, "C_INT16_T") == 0 || strcmp(ru, "C_INT_LEAST16_T") == 0)
+        declare_var(I, local, make_integer(2));
+    else if (strcmp(ru, "C_INT32_T") == 0 || strcmp(ru, "C_INT_LEAST32_T") == 0 ||
+             strcmp(ru, "C_INT_FAST16_T") == 0 || strcmp(ru, "C_INT_FAST32_T") == 0 ||
+             strcmp(ru, "C_INTPTR_T") == 0) declare_var(I, local, make_integer(4));
+    else if (strcmp(ru, "C_INT64_T") == 0 || strcmp(ru, "C_INT_LEAST64_T") == 0 ||
+             strcmp(ru, "C_INT_FAST64_T") == 0 || strcmp(ru, "C_INTMAX_T") == 0)
+        declare_var(I, local, make_integer(8));
+    else if (strcmp(ru, "C_DOUBLE") == 0) declare_var(I, local, make_integer(8));
+    else if (strcmp(ru, "C_FLOAT") == 0) declare_var(I, local, make_integer(4));
+    else if (strcmp(ru, "C_LONG_DOUBLE") == 0) declare_var(I, local, make_integer(16));
+    else if (strcmp(ru, "C_FLOAT_COMPLEX") == 0) declare_var(I, local, make_integer(4));
+    else if (strcmp(ru, "C_DOUBLE_COMPLEX") == 0) declare_var(I, local, make_integer(8));
+    else if (strcmp(ru, "C_LONG_DOUBLE_COMPLEX") == 0) declare_var(I, local, make_integer(16));
+    else if (strcmp(ru, "C_BOOL") == 0) declare_var(I, local, make_integer(1));
+    else if (strcmp(ru, "C_CHAR") == 0) declare_var(I, local, make_integer(1));
+    else if (strcmp(ru, "C_NULL_CHAR") == 0) declare_var(I, local, make_character(""));
+    else if (strcmp(ru, "C_ALERT") == 0) { ch[0] = '\a'; declare_var(I, local, make_character(ch)); }
+    else if (strcmp(ru, "C_BACKSPACE") == 0) { ch[0] = '\b'; declare_var(I, local, make_character(ch)); }
+    else if (strcmp(ru, "C_FORM_FEED") == 0) { ch[0] = '\f'; declare_var(I, local, make_character(ch)); }
+    else if (strcmp(ru, "C_NEW_LINE") == 0) { ch[0] = '\n'; declare_var(I, local, make_character(ch)); }
+    else if (strcmp(ru, "C_CARRIAGE_RETURN") == 0) { ch[0] = '\r'; declare_var(I, local, make_character(ch)); }
+    else if (strcmp(ru, "C_HORIZONTAL_TAB") == 0) { ch[0] = '\t'; declare_var(I, local, make_character(ch)); }
+    else if (strcmp(ru, "C_VERTICAL_TAB") == 0) { ch[0] = '\v'; declare_var(I, local, make_character(ch)); }
+}
+
+static void declare_default_iso_c_binding_names(OfortInterpreter *I) {
+    static const char *names[] = {
+        "c_int", "c_short", "c_long", "c_long_long", "c_signed_char", "c_size_t",
+        "c_int8_t", "c_int16_t", "c_int32_t", "c_int64_t",
+        "c_int_least8_t", "c_int_least16_t", "c_int_least32_t", "c_int_least64_t",
+        "c_int_fast8_t", "c_int_fast16_t", "c_int_fast32_t", "c_int_fast64_t",
+        "c_intmax_t", "c_intptr_t", "c_float", "c_double", "c_long_double",
+        "c_float_complex", "c_double_complex", "c_long_double_complex",
+        "c_bool", "c_char", "c_null_char", "c_alert", "c_backspace",
+        "c_form_feed", "c_new_line", "c_carriage_return", "c_horizontal_tab",
+        "c_vertical_tab", NULL
+    };
+    for (int i = 0; names[i]; i++) declare_iso_c_binding_name(I, names[i], names[i]);
 }
 
 static int static_expr_type(OfortInterpreter *I, OfortNode *n, OfortValType *type_out) {
@@ -15790,6 +15870,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             OfortScope *ms = I->current_scope;
             for (int i = 0; i < ms->n_vars && i < OFORT_MAX_MODULE_VARS; i++) {
                 int is_public = mod->default_private ? 0 : 1;
+                int decl_access = declaration_access_attr_for_name(body, ms->vars[i].name);
+                if (decl_access == 1) is_public = 1;
+                if (decl_access == 2) is_public = 0;
                 if (name_in_list_nocase(ms->vars[i].name, public_names, n_public_names)) is_public = 1;
                 if (name_in_list_nocase(ms->vars[i].name, private_names, n_private_names)) is_public = 0;
                 mod->var_public[mod->n_vars] = is_public;
@@ -15961,20 +16044,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     for (int i = 0; i < n->n_params; i++) {
                         const char *local = n->param_names[i];
                         const char *remote = n->binding_proc_names[i][0] ? n->binding_proc_names[i] : local;
-                        char ru[256];
-                        str_upper(ru, remote, sizeof(ru));
-                        if (strcmp(ru, "C_INT") == 0) declare_var(I, local, make_integer(4));
-                        else if (strcmp(ru, "C_SIZE_T") == 0) declare_var(I, local, make_integer(8));
-                        else if (strcmp(ru, "C_DOUBLE") == 0) declare_var(I, local, make_integer(8));
-                        else if (strcmp(ru, "C_FLOAT") == 0) declare_var(I, local, make_integer(4));
-                        else if (strcmp(ru, "C_BOOL") == 0) declare_var(I, local, make_integer(1));
+                        declare_iso_c_binding_name(I, local, remote);
                     }
                 } else {
-                    declare_var(I, "c_int", make_integer(4));
-                    declare_var(I, "c_size_t", make_integer(8));
-                    declare_var(I, "c_double", make_integer(8));
-                    declare_var(I, "c_float", make_integer(4));
-                    declare_var(I, "c_bool", make_integer(1));
+                    declare_default_iso_c_binding_names(I);
                 }
                 break;
             }
@@ -16594,12 +16667,31 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (n->val_type == FVAL_CHARACTER) existing->char_len = decl_char_len;
             break;
         }
-        if (existing && n->type == FND_PARAMDECL && n->n_children > 0 && n->children[0]) {
+        if (existing && existing == existing_current &&
+            n->type == FND_PARAMDECL && n->n_children > 0 && n->children[0]) {
             val = eval_decl_initializer(I, n, n->children[0]);
-            val = coerce_assignment_value(I, n->name, existing->val.type, val);
-            val = resize_character_value(val, existing->char_len);
-            free_value(&existing->val);
-            existing->val = val;
+            if (existing->val.type == FVAL_ARRAY && val.type != FVAL_ARRAY) {
+                for (int i = 0; i < existing->val.v.arr.len; i++) {
+                    OfortValue elem = copy_value(val);
+                    elem = coerce_assignment_value(I, n->name, existing->val.v.arr.elem_type, elem);
+                    if (existing->val.v.arr.elem_type == FVAL_CHARACTER)
+                        elem = resize_character_value(elem, existing->char_len);
+                    if (assign_packed_array_element(&existing->val, i, elem)) {
+                        free_value(&elem);
+                    } else if (existing->val.v.arr.data) {
+                        free_value(&existing->val.v.arr.data[i]);
+                        existing->val.v.arr.data[i] = elem;
+                    } else {
+                        free_value(&elem);
+                    }
+                }
+                free_value(&val);
+            } else {
+                val = coerce_assignment_value(I, n->name, existing->val.type, val);
+                val = resize_character_value(val, existing->char_len);
+                free_value(&existing->val);
+                existing->val = val;
+            }
             existing->is_parameter = 1;
             break;
         }
@@ -19068,7 +19160,9 @@ static const char *intrinsic_names[] = {
     /* Type conversion */
     "FLOAT", "DFLOAT", "SNGL", "LOGICAL",
     /* Command line */
-    "COMMAND_ARGUMENT_COUNT", "C_SIZEOF", "IS_IOSTAT_END", "IS_IOSTAT_EOR",
+    "COMMAND_ARGUMENT_COUNT", "COMPILER_VERSION", "COMPILER_OPTIONS",
+    "C_SIZEOF", "C_LOC", "C_FUNLOC", "C_ASSOCIATED", "C_F_POINTER", "C_F_PROCPOINTER",
+    "IS_IOSTAT_END", "IS_IOSTAT_EOR",
     NULL
 };
 
@@ -21780,6 +21874,18 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         bytes = storage_size_bits(&args[0]) / 8;
         if (args[0].type == FVAL_ARRAY) bytes *= args[0].v.arr.len;
         return make_integer_kind(bytes, 8);
+    }
+    if (strcmp(upper, "C_LOC") == 0 || strcmp(upper, "C_FUNLOC") == 0) {
+        return make_integer_kind(0, 8);
+    }
+    if (strcmp(upper, "C_ASSOCIATED") == 0) {
+        return make_logical(nargs > 0 && val_to_int(args[0]) != 0);
+    }
+    if (strcmp(upper, "COMPILER_VERSION") == 0) {
+        return make_character("j");
+    }
+    if (strcmp(upper, "COMPILER_OPTIONS") == 0) {
+        return make_character("-");
     }
     if (strcmp(upper, "CHARACTER_KINDS") == 0 ||
         strcmp(upper, "INTEGER_KINDS") == 0 ||
