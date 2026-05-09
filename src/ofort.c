@@ -210,6 +210,7 @@ struct OfortInterpreter {
     int command_argc;
     char command_args[OFORT_MAX_PARAMS][OFORT_MAX_STRLEN];
     int procedure_depth;
+    int check_mode;
     int consumed_bare_end;
     int in_spec_section;
     int stop_expr_at_slash;
@@ -2052,6 +2053,11 @@ static char *preprocess_source(OfortInterpreter *I, const char *source) {
                         n_macros--;
                     }
                 }
+                append_char_text(&out, &out_len, &out_cap, '\n');
+            } else if ((size_t)(line_end - q) >= 4 && strncmp(q, "line", 4) == 0 &&
+                       (q + 4 == line_end || isspace((unsigned char)q[4]))) {
+                append_char_text(&out, &out_len, &out_cap, '\n');
+            } else if (q < line_end && isdigit((unsigned char)*q)) {
                 append_char_text(&out, &out_len, &out_cap, '\n');
             } else if (q >= line_end) {
                 append_char_text(&out, &out_len, &out_cap, '\n');
@@ -4772,8 +4778,10 @@ static OfortNode *parse_do(OfortInterpreter *I) {
     n->line = dot->line;
 
     /* loop variable */
-    OfortToken *var_tok = expect(I, FTOK_IDENT);
-    copy_cstr(n->name, sizeof(n->name), var_tok->str_val);
+    OfortToken *var_tok;
+    if (!(token_can_be_name(peek(I)) || peek(I)->type == FTOK_CALL)) expect(I, FTOK_IDENT);
+    var_tok = advance(I);
+    copy_cstr(n->name, sizeof(n->name), token_name_text(var_tok));
     expect(I, FTOK_ASSIGN);
     n->children[0] = parse_expr(I); /* start */
     expect(I, FTOK_COMMA);
@@ -6529,6 +6537,14 @@ static OfortNode *parse_type_def(OfortInterpreter *I) {
                 if (check_end(I, "TYPE")) break;
                 if (token_ident_upper(peek(I), "PROCEDURE")) {
                     advance(I);
+                    if (check(I, FTOK_LPAREN)) {
+                        int depth = 0;
+                        do {
+                            if (check(I, FTOK_LPAREN)) depth++;
+                            else if (check(I, FTOK_RPAREN)) depth--;
+                            advance(I);
+                        } while (depth > 0 && !check(I, FTOK_EOF));
+                    }
                     while (check(I, FTOK_COMMA)) {
                         advance(I);
                         if (check(I, FTOK_IDENT)) advance(I);
@@ -7826,6 +7842,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     if (token_ident_upper(t, "EXTERNAL") || token_ident_upper(t, "INTRINSIC") ||
         token_ident_upper(t, "TARGET") || token_ident_upper(t, "PROTECTED") ||
         token_ident_upper(t, "VOLATILE") || token_ident_upper(t, "ASYNCHRONOUS") ||
+        token_ident_upper(t, "CONTIGUOUS") ||
         token_ident_upper(t, "VALUE") || t->type == FTOK_ALLOCATABLE) {
         return parse_attribute_name_list_statement(I);
     }
@@ -9167,6 +9184,7 @@ static OfortValue eval_array_section_value(OfortInterpreter *I, OfortValue *arra
         eval_subscript_range(I, n->stmts[0], 1, len, &range);
         if (range.start < 1 || range.end > len ||
             (range.step > 0 ? range.start > range.end + 1 : range.start < range.end - 1)) {
+            if (I->check_mode) return make_character("");
             ofort_error(I, "Character substring bounds out of range");
         }
         buf = (char *)malloc((size_t)range.count + 1);
@@ -9202,8 +9220,10 @@ static void assign_character_substring(OfortInterpreter *I, OfortVar *var, Ofort
         eval_subscript_range(I, lhs->stmts[0], 1, len, &range);
     if (range.step != 1)
         ofort_error(I, "Character substring assignment does not support strided ranges");
-    if (range.start < 1 || range.end > len || range.start > range.end + 1)
+    if (range.start < 1 || range.end > len || range.start > range.end + 1) {
+        if (I->check_mode) return;
         ofort_error(I, "Character substring bounds out of range");
+    }
 
     value_to_string(I, *rhs, rbuf, sizeof(rbuf));
     src_len = (int)strlen(rbuf);
@@ -9473,6 +9493,16 @@ static int data_target_count_node(OfortInterpreter *I, OfortNode *target) {
             }
         }
         return count;
+    }
+
+    if (target->type == FND_ARRAY_REF &&
+        target->children[0] && target->children[0]->type == FND_ARRAY_REF) {
+        OfortValue base = eval_node(I, target->children[0]);
+        if (base.type == FVAL_CHARACTER) {
+            free_value(&base);
+            return 1;
+        }
+        free_value(&base);
     }
 
     {
@@ -14691,10 +14721,26 @@ static void check_semantics_node(OfortInterpreter *I, OfortNode *n) {
             check_semantics_node(I, n->children[0]);
             pop_scope(I);
             return;
+        case FND_ASSOCIATE: {
+            int n_assoc = n->n_params;
+            push_scope(I);
+            for (int i = 0; i < n_assoc; i++) {
+                declare_var(I, n->param_names[i], make_void_val());
+            }
+            check_semantics_node(I, n->children[0]);
+            pop_scope(I);
+            return;
+        }
         case FND_IDENT:
             check_semantics_identifier(I, n);
             return;
         case FND_FUNC_CALL:
+            if (str_eq_nocase(n->name, "nullify")) {
+                for (int i = 0; i < n->n_stmts; i++) {
+                    check_semantics_node(I, n->stmts[i]);
+                }
+                return;
+            }
             if (!find_var(I, n->name) && !find_func(I, n->name) &&
                 !find_generic(I, n->name) && !is_intrinsic(n->name) &&
                 !find_imported_extension_intrinsic(I, n->name) &&
@@ -14736,6 +14782,17 @@ static void check_semantics_node(OfortInterpreter *I, OfortNode *n) {
                 check_semantics_node(I, n->stmts[i]);
             }
             return;
+        case FND_EXPR_STMT:
+            if (n->children[0] && n->children[0]->type == FND_ARRAY_REF &&
+                n->children[0]->children[0] &&
+                n->children[0]->children[0]->type == FND_IDENT &&
+                str_eq_nocase(n->children[0]->children[0]->name, "nullify")) {
+                for (int i = 0; i < n->children[0]->n_stmts; i++) {
+                    check_semantics_node(I, n->children[0]->stmts[i]);
+                }
+                return;
+            }
+            break;
         default:
             break;
     }
@@ -15288,6 +15345,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (strcmp(upper, "IEEE_ARITHMETIC") == 0) {
                 break;
             }
+            if (strcmp(upper, "IEEE_EXCEPTIONS") == 0 || strcmp(upper, "IEEE_FEATURES") == 0) {
+                break;
+            }
             if (strcmp(upper, "ISO_C_BINDING") == 0) {
                 if (n->n_params > 0) {
                     for (int i = 0; i < n->n_params; i++) {
@@ -15587,6 +15647,45 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int decl_char_len = n->val_type == FVAL_CHARACTER ? eval_character_length(I, n) : 0;
         OfortVar *existing = find_var(I, n->name);
         OfortVar *existing_current = find_var_in_current_scope(I, n->name);
+        if (existing && existing == existing_current &&
+            existing->val.type == FVAL_ARRAY && n->n_dims == 0 &&
+            n->val_type != FVAL_VOID && n->type != FND_PARAMDECL &&
+            n->n_children == 0) {
+            existing->intent = n->intent;
+            existing->is_pointer = n->is_pointer;
+            existing->is_allocatable = n->is_allocatable;
+            existing->is_target = n->is_target;
+            existing->is_protected = n->is_protected;
+            existing->declared_type = n->val_type;
+            existing->declared_kind = n->kind;
+            existing->declared_type_name[0] = '\0';
+            if (n->val_type == FVAL_DERIVED)
+                copy_cstr(existing->declared_type_name,
+                          sizeof(existing->declared_type_name), n->str_val);
+            {
+                int dims[7] = {0};
+                int lows[7] = {0};
+                int rank = existing->val.v.arr.n_dims;
+                OfortValue new_arr;
+                for (int i = 0; i < rank && i < 7; i++) {
+                    dims[i] = existing->val.v.arr.dims[i];
+                    lows[i] = existing->val.v.arr.lower_bounds[i];
+                }
+                new_arr = make_array_with_char_len(n->val_type, dims, rank, decl_char_len);
+                for (int i = 0; i < rank && i < 7; i++) {
+                    new_arr.v.arr.lower_bounds[i] = lows[i];
+                }
+                free_value(&existing->val);
+                existing->val = new_arr;
+            }
+            if (n->val_type == FVAL_DERIVED)
+                copy_cstr(existing->val.v.arr.elem_type_name,
+                          sizeof(existing->val.v.arr.elem_type_name), n->str_val);
+            if (n->val_type == FVAL_CHARACTER) {
+                existing->char_len = decl_char_len;
+            }
+            break;
+        }
         if (n->val_type == FVAL_VOID && n->n_dims > 0) {
             if (existing && existing == existing_current) {
                 int has_assumed_shape = 0;
@@ -15607,7 +15706,42 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (existing->declared_type_name[0])
                     copy_cstr(n->str_val, sizeof(n->str_val), existing->declared_type_name);
                 for (int i = 0; i < n->n_dims; i++) {
-                    if (n->dims[i] == 0) { has_assumed_shape = 1; break; }
+                    if (n->dims[i] == 0 &&
+                        !(n->stmts && i < n->n_stmts && n->stmts[i])) {
+                        has_assumed_shape = 1;
+                        break;
+                    }
+                }
+                if ((existing->is_alias || I->procedure_depth > 0) && existing->val.type == FVAL_ARRAY) {
+                    int total = 1;
+                    existing->declared_type = elem_type;
+                    existing->declared_kind = n->kind;
+                    if (n->str_val[0])
+                        copy_cstr(existing->declared_type_name,
+                                  sizeof(existing->declared_type_name), n->str_val);
+                    existing->val.v.arr.elem_type = elem_type;
+                    existing->val.v.arr.n_dims = n->n_dims;
+                    for (int i = 0; i < n->n_dims && i < 7; i++) {
+                        int lower = n->has_lower_bound[i] ? n->lower_bounds[i] : 1;
+                        int extent = n->dims[i];
+                        if (n->has_lower_bound[i] && n->lower_bound_exprs[i]) {
+                            OfortValue lv = eval_node(I, n->lower_bound_exprs[i]);
+                            lower = (int)val_to_int(lv);
+                            free_value(&lv);
+                        }
+                        if (extent <= 0 && n->stmts && i < n->n_stmts && n->stmts[i]) {
+                            OfortValue dv = eval_node(I, n->stmts[i]);
+                            extent = (int)val_to_int(dv);
+                            free_value(&dv);
+                        }
+                        if (n->has_lower_bound[i]) extent = extent - lower + 1;
+                        if (extent < 0) extent = 0;
+                        existing->val.v.arr.dims[i] = extent;
+                        existing->val.v.arr.lower_bounds[i] = lower;
+                        total *= extent;
+                    }
+                    if (total > 0 && total <= existing->val.v.arr.cap) existing->val.v.arr.len = total;
+                    break;
                 }
                 existing->declared_type = elem_type;
                 existing->declared_kind = n->kind;
@@ -15626,9 +15760,22 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                                   sizeof(existing->val.v.arr.elem_type_name), n->str_val);
                     existing->val.v.arr.n_dims = n->n_dims;
                     for (int i = 0; i < n->n_dims && i < 7; i++) {
-                        existing->val.v.arr.dims[i] = 0;
-                        existing->val.v.arr.lower_bounds[i] =
-                            n->has_lower_bound[i] ? n->lower_bounds[i] : 1;
+                        int lower = n->has_lower_bound[i] ? n->lower_bounds[i] : 1;
+                        int extent = n->dims[i];
+                        if (n->has_lower_bound[i] && n->lower_bound_exprs[i]) {
+                            OfortValue lv = eval_node(I, n->lower_bound_exprs[i]);
+                            lower = (int)val_to_int(lv);
+                            free_value(&lv);
+                        }
+                        if (extent <= 0 && n->stmts && i < n->n_stmts && n->stmts[i]) {
+                            OfortValue dv = eval_node(I, n->stmts[i]);
+                            extent = (int)val_to_int(dv);
+                            free_value(&dv);
+                        }
+                        if (n->has_lower_bound[i]) extent = extent - lower + 1;
+                        if (extent < 0) extent = 0;
+                        existing->val.v.arr.dims[i] = extent;
+                        existing->val.v.arr.lower_bounds[i] = lower;
                     }
                     existing->val.v.arr.allocated = 0;
                 } else {
@@ -16251,10 +16398,37 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 int needed = target_list[ti].count;
                 if (needed <= 0) needed = 1;
                 if (value_pos + needed > n_vals) {
+                    if (I->check_mode) {
+                        value_pos = n_vals;
+                        break;
+                    }
                     free(target_list);
                     for (int i = 0; i < n_vals; i++) free_value(&vals[i]);
                     free(vals);
                     ofort_error(I, "DATA list has fewer values than targets");
+                }
+                if (target_list[ti].target &&
+                    target_list[ti].target->type == FND_IDENT &&
+                    needed > 1) {
+                    OfortVar *dv = find_var(I, target_list[ti].target->name);
+                    if (dv && dv->val.type == FVAL_ARRAY && dv->val.v.arr.len >= needed) {
+                        for (int di = 0; di < needed; di++) {
+                            OfortValue elem = copy_value(vals[value_pos + di]);
+                            elem = coerce_assignment_value(I, dv->name, dv->val.v.arr.elem_type, elem);
+                            if (dv->val.v.arr.elem_type == FVAL_CHARACTER)
+                                elem = resize_character_value(elem, dv->char_len);
+                            if (assign_packed_array_element(&dv->val, di, elem)) {
+                                free_value(&elem);
+                            } else if (dv->val.v.arr.data) {
+                                free_value(&dv->val.v.arr.data[di]);
+                                dv->val.v.arr.data[di] = elem;
+                            } else {
+                                free_value(&elem);
+                            }
+                        }
+                        value_pos += needed;
+                        continue;
+                    }
                 }
                 OfortNode *assign = alloc_node(I, FND_ASSIGN);
                 OfortNode *rhs = data_node_from_values(I, vals, value_pos, needed);
@@ -16266,7 +16440,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 exec_node(I, assign);
             }
 
-            if (value_pos != n_vals) {
+            if (value_pos != n_vals && !I->check_mode) {
                 for (int i = 0; i < n_vals; i++) free_value(&vals[i]);
                 free(vals);
                 free(target_list);
@@ -18027,6 +18201,26 @@ unresolved_external_call_done:
             }
             break;
         }
+        if (n->children[0] && n->children[0]->type == FND_ARRAY_REF &&
+            n->children[0]->children[0] &&
+            n->children[0]->children[0]->type == FND_IDENT &&
+            str_eq_nocase(n->children[0]->children[0]->name, "nullify")) {
+            OfortNode *call = n->children[0];
+            for (int i = 0; i < call->n_stmts; i++) {
+                OfortVar *v;
+                if (call->stmts[i]->type != FND_IDENT)
+                    ofort_error(I, "NULLIFY requires pointer variable arguments");
+                v = find_var(I, call->stmts[i]->name);
+                if (!v || !v->is_pointer)
+                    ofort_error(I, "NULLIFY argument is not a pointer");
+                v->pointer_associated = 0;
+                v->pointer_target[0] = '\0';
+                v->pointer_has_slice = 0;
+                v->pointer_slice_start = 0;
+                v->pointer_slice_end = 0;
+            }
+            break;
+        }
         OfortValue v = eval_node(I, n->children[0]);
         if (I->print_expr_statements && v.type != FVAL_VOID) {
             char buf[1024];
@@ -18055,22 +18249,25 @@ static const char *intrinsic_names[] = {
     "ABS", "SQRT", "HYPOT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
     "SIND", "COSD", "TAND", "ASIND", "ACOSD", "ATAND", "ATAN2D",
     "BESSEL_J0", "BESSEL_J1", "BESSEL_Y0", "BESSEL_Y1", "BESSEL_JN", "BESSEL_YN",
-    "SINH", "COSH", "TANH",
-    "EXP", "LOG", "LOG10", "GAMMA", "LOG_GAMMA", "MOD", "MODULO", "DIM", "MAX", "MIN", "FLOOR", "CEILING", "AINT", "NINT",
+    "SINH", "COSH", "TANH", "ASINH", "ACOSH", "ATANH",
+    "EXP", "LOG", "LOG10", "GAMMA", "LOG_GAMMA", "ERFC_SCALED", "MOD", "AMOD", "MODULO", "DIM", "MAX", "MIN", "MIN1", "AMIN0", "FLOOR", "CEILING", "AINT", "ANINT", "NINT",
+    "DACOS", "DASIN",
+    "CSQRT", "CEXP", "CSIN", "CCOS", "CABS",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "TRANSFER",
-    "BIT_SIZE", "STORAGE_SIZE", "BTEST", "IAND", "IEOR", "IOR", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC", "DSHIFTL", "DSHIFTR", "MASKL", "MASKR",
+    "BIT_SIZE", "STORAGE_SIZE", "BTEST", "POPCNT", "POPPAR", "LEADZ", "TRAILZ", "IAND", "IEOR", "IOR", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC", "SHIFTA", "SHIFTL", "SHIFTR", "DSHIFTL", "DSHIFTR", "MASKL", "MASKR",
     "MERGE_BITS", "BGE", "BGT", "BLE", "BLT",
     "LGE", "LGT", "LLE", "LLT",
     "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
     "SET_EXPONENT",
-    "SELECTED_INT_KIND", "SELECTED_REAL_KIND",
+    "SELECTED_INT_KIND", "SELECTED_REAL_KIND", "IEEE_SELECTED_REAL_KIND", "SELECTED_CHAR_KIND",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "NEW_LINE", "ADJUSTL", "ADJUSTR", "INDEX", "SCAN", "VERIFY",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
     /* Array */
     "SIZE", "SHAPE", "RANK", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "REDUCE", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC", "FINDLOC",
     "DOT_PRODUCT", "MATMUL", "NORM2", "TRANSPOSE", "RESHAPE", "SPREAD", "EOSHIFT", "CSHIFT",
-    "COUNT", "ANY", "ALL", "PARITY", "ALLOCATED", "ASSOCIATED", "NULL", "LBOUND", "UBOUND",
+    "COUNT", "ANY", "ALL", "PARITY", "ALLOCATED", "ASSOCIATED", "NULL", "LBOUND", "UBOUND", "IS_CONTIGUOUS", "SAME_TYPE_AS", "EXTENDS_TYPE_OF",
+    "CHARACTER_KINDS", "INTEGER_KINDS", "REAL_KINDS",
     /* Type conversion */
     "FLOAT", "DFLOAT", "SNGL", "LOGICAL",
     /* Command line */
@@ -18107,10 +18304,16 @@ static int is_elemental_unary_intrinsic(const char *upper) {
            strcmp(upper, "SINH") == 0 ||
            strcmp(upper, "COSH") == 0 ||
            strcmp(upper, "TANH") == 0 ||
+           strcmp(upper, "ASINH") == 0 ||
+           strcmp(upper, "ACOSH") == 0 ||
+           strcmp(upper, "ATANH") == 0 ||
            strcmp(upper, "ASIN") == 0 ||
            strcmp(upper, "ACOS") == 0 ||
+           strcmp(upper, "DACOS") == 0 ||
+           strcmp(upper, "DASIN") == 0 ||
            strcmp(upper, "ATAN") == 0 ||
            strcmp(upper, "EXP") == 0 ||
+           strcmp(upper, "ERFC_SCALED") == 0 ||
            strcmp(upper, "LOG") == 0 ||
            strcmp(upper, "LOG10") == 0 ||
            strcmp(upper, "GAMMA") == 0 ||
@@ -18121,7 +18324,12 @@ static int is_elemental_unary_intrinsic(const char *upper) {
            strcmp(upper, "FLOOR") == 0 ||
            strcmp(upper, "CEILING") == 0 ||
            strcmp(upper, "AINT") == 0 ||
+           strcmp(upper, "ANINT") == 0 ||
            strcmp(upper, "NINT") == 0 ||
+           strcmp(upper, "POPCNT") == 0 ||
+           strcmp(upper, "POPPAR") == 0 ||
+           strcmp(upper, "LEADZ") == 0 ||
+           strcmp(upper, "TRAILZ") == 0 ||
            strcmp(upper, "REAL") == 0 ||
            strcmp(upper, "FLOAT") == 0 ||
            strcmp(upper, "SNGL") == 0 ||
@@ -18129,6 +18337,11 @@ static int is_elemental_unary_intrinsic(const char *upper) {
            strcmp(upper, "DBLE") == 0 ||
            strcmp(upper, "DFLOAT") == 0 ||
            strcmp(upper, "AIMAG") == 0 ||
+           strcmp(upper, "CABS") == 0 ||
+           strcmp(upper, "CSQRT") == 0 ||
+           strcmp(upper, "CEXP") == 0 ||
+           strcmp(upper, "CSIN") == 0 ||
+           strcmp(upper, "CCOS") == 0 ||
            strcmp(upper, "CONJG") == 0 ||
            strcmp(upper, "LOGICAL") == 0;
 }
@@ -18156,9 +18369,17 @@ static OfortValType elemental_result_type(const char *upper, OfortValType input_
     if (strcmp(upper, "FLOOR") == 0 ||
         strcmp(upper, "CEILING") == 0 ||
         strcmp(upper, "NINT") == 0 ||
+        strcmp(upper, "POPCNT") == 0 ||
+        strcmp(upper, "POPPAR") == 0 ||
+        strcmp(upper, "LEADZ") == 0 ||
+        strcmp(upper, "TRAILZ") == 0 ||
         strcmp(upper, "INT") == 0) return FVAL_INTEGER;
     if (strcmp(upper, "DBLE") == 0 || strcmp(upper, "DFLOAT") == 0) return FVAL_DOUBLE;
-    if (strcmp(upper, "CONJG") == 0) return FVAL_COMPLEX;
+    if (strcmp(upper, "CONJG") == 0 ||
+        strcmp(upper, "CSQRT") == 0 ||
+        strcmp(upper, "CEXP") == 0 ||
+        strcmp(upper, "CSIN") == 0 ||
+        strcmp(upper, "CCOS") == 0) return FVAL_COMPLEX;
     if (strcmp(upper, "LOGICAL") == 0) return FVAL_LOGICAL;
     return FVAL_REAL;
 }
@@ -18168,6 +18389,39 @@ static int integer_kind_bits(int kind) {
     if (kind == 2) return 16;
     if (kind == 8) return 64;
     return 32;
+}
+
+static int count_bits_unsigned(unsigned long long x) {
+    int n = 0;
+    while (x) {
+        n += (int)(x & 1ULL);
+        x >>= 1;
+    }
+    return n;
+}
+
+static OfortValue bit_count_intrinsic_value(const char *upper, OfortValue arg) {
+    int kind = arg.kind ? arg.kind : 4;
+    int bits = integer_kind_bits(kind);
+    unsigned long long mask = bits >= 64 ? ~0ULL : ((1ULL << (unsigned int)bits) - 1ULL);
+    unsigned long long x = arg.type == FVAL_INTEGER ? (((unsigned long long)arg.v.i) & mask) : 0ULL;
+    if (strcmp(upper, "POPCNT") == 0) return make_integer(count_bits_unsigned(x));
+    if (strcmp(upper, "POPPAR") == 0) return make_integer(count_bits_unsigned(x) & 1);
+    if (strcmp(upper, "TRAILZ") == 0) {
+        int n = 0;
+        if (x == 0) return make_integer(bits);
+        while (((x >> (unsigned int)n) & 1ULL) == 0ULL && n < bits) n++;
+        return make_integer(n);
+    }
+    if (x == 0) return make_integer(bits);
+    {
+        int n = 0;
+        for (int b = bits - 1; b >= 0; b--) {
+            if ((x >> (unsigned int)b) & 1ULL) break;
+            n++;
+        }
+        return make_integer(n);
+    }
 }
 
 static int storage_size_bits(OfortValue *v) {
@@ -19727,11 +19981,67 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
     return 0;
 }
 
-static OfortValue minmaxval_dim_result(OfortInterpreter *I, OfortValue *array, int dim, int want_max) {
+static int reduction_mask_takes(OfortInterpreter *I, OfortValue *mask, int index, int total_len) {
+    int take;
+    OfortValue mv;
+    if (!mask) return 1;
+    if (mask->type != FVAL_ARRAY) return val_to_logical(*mask);
+    if (mask->v.arr.len != total_len)
+        ofort_error(I, "MASK must be scalar or conform to ARRAY");
+    mv = array_element_value(mask, index);
+    take = val_to_logical(mv);
+    free_value(&mv);
+    return take;
+}
+
+static OfortValue shift_scalar_value(const char *upper, OfortValue value_arg, OfortValue shift_arg) {
+    int kind, bits;
+    long long shift;
+    unsigned long long value, mask;
+    if (value_arg.type != FVAL_INTEGER || shift_arg.type != FVAL_INTEGER)
+        return make_integer(0);
+    kind = value_arg.kind ? value_arg.kind : 4;
+    bits = integer_kind_bits(kind);
+    shift = shift_arg.v.i;
+    if (shift < 0) shift = 0;
+    if (shift >= bits) return make_integer_kind(0, kind);
+    value = (unsigned long long)value_arg.v.i;
+    mask = bits == 64 ? ~0ULL : ((1ULL << (unsigned int)bits) - 1ULL);
+    value &= mask;
+    if (strcmp(upper, "SHIFTL") == 0) {
+        value = (value << (unsigned int)shift) & mask;
+        return make_integer_kind((long long)value, kind);
+    }
+    if (strcmp(upper, "SHIFTR") == 0) {
+        value >>= (unsigned int)shift;
+        return make_integer_kind((long long)value, kind);
+    }
+    if (shift == 0) return make_integer_kind(value_arg.v.i, kind);
+    return make_integer_kind(value_arg.v.i >> (unsigned int)shift, kind);
+}
+
+static OfortValue shift_array_result(OfortInterpreter *I, const char *upper, OfortValue *value_arg, OfortValue *shift_arg) {
+    OfortValue result = make_array(FVAL_INTEGER, value_arg->v.arr.dims, value_arg->v.arr.n_dims);
+    for (int i = 0; i < value_arg->v.arr.len; i++) {
+        OfortValue xv = array_element_value(value_arg, i);
+        OfortValue sv = shift_arg->type == FVAL_ARRAY ? array_element_value(shift_arg, i) : copy_value(*shift_arg);
+        OfortValue rv = shift_scalar_value(upper, xv, sv);
+        free_value(&result.v.arr.data[i]);
+        result.v.arr.data[i] = rv;
+        free_value(&xv);
+        free_value(&sv);
+    }
+    (void)I;
+    return result;
+}
+
+static OfortValue minmaxval_dim_result(OfortInterpreter *I, OfortValue *array, int dim, int want_max, OfortValue *mask) {
     int rank = array->v.arr.n_dims;
     int result_dims[7];
     int result_rank = 0;
     int dim_extent, stride;
+    if (mask && mask->type == FVAL_ARRAY && mask->v.arr.len != array->v.arr.len)
+        ofort_error(I, "MASK must be scalar or conform to ARRAY");
     if (dim < 1 || dim > rank) ofort_error(I, "%s DIM is out of range", want_max ? "MAXVAL" : "MINVAL");
     for (int i = 0; i < rank; i++) {
         if (i != dim - 1) result_dims[result_rank++] = array->v.arr.dims[i];
@@ -19744,7 +20054,10 @@ static OfortValue minmaxval_dim_result(OfortInterpreter *I, OfortValue *array, i
         OfortValue best = make_void_val();
         int found = 0;
         for (int k = 0; k < dim_extent; k++) {
-            OfortValue elem = array_element_value(array, k * stride);
+            int flat = k * stride;
+            OfortValue elem;
+            if (!reduction_mask_takes(I, mask, flat, array->v.arr.len)) continue;
+            elem = array_element_value(array, flat);
             if (!found || (want_max ? values_compare_fortran(I, elem, best) > 0
                                     : values_compare_fortran(I, elem, best) < 0)) {
                 free_value(&best);
@@ -19778,7 +20091,10 @@ static OfortValue minmaxval_dim_result(OfortInterpreter *I, OfortValue *array, i
             out_axis++;
         }
         for (int k = 0; k < dim_extent; k++) {
-            OfortValue elem = array_element_value(array, base + k * stride);
+            int flat = base + k * stride;
+            OfortValue elem;
+            if (!reduction_mask_takes(I, mask, flat, array->v.arr.len)) continue;
+            elem = array_element_value(array, flat);
             if (!found || (want_max ? values_compare_fortran(I, elem, best) > 0
                                     : values_compare_fortran(I, elem, best) < 0)) {
                 free_value(&best);
@@ -19805,6 +20121,16 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "NULL") == 0) {
         if (nargs > 1) ofort_error(I, "NULL accepts at most one MOLD argument");
         return make_void_val();
+    }
+    if (strcmp(upper, "IS_CONTIGUOUS") == 0) {
+        if (nargs < 1) ofort_error(I, "IS_CONTIGUOUS requires 1 argument");
+        return make_logical(1);
+    }
+    if (strcmp(upper, "SAME_TYPE_AS") == 0 || strcmp(upper, "EXTENDS_TYPE_OF") == 0) {
+        if (nargs < 2) ofort_error(I, "%s requires 2 arguments", upper);
+        if (args[0].type == FVAL_DERIVED && args[1].type == FVAL_DERIVED)
+            return make_logical(str_eq_nocase(args[0].v.dt.type_name, args[1].v.dt.type_name));
+        return make_logical(args[0].type == args[1].type);
     }
 
     if (strcmp(upper, "DSHIFTL") == 0 || strcmp(upper, "DSHIFTR") == 0) {
@@ -20064,7 +20390,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         return result;
     }
 
-    if ((strcmp(upper, "MOD") == 0 || strcmp(upper, "MODULO") == 0 ||
+    if ((strcmp(upper, "MOD") == 0 || strcmp(upper, "AMOD") == 0 || strcmp(upper, "MODULO") == 0 ||
          strcmp(upper, "HYPOT") == 0 ||
          strcmp(upper, "DIM") == 0 || strcmp(upper, "SIGN") == 0 ||
          strcmp(upper, "NEAREST") == 0 || strcmp(upper, "SCALE") == 0 ||
@@ -20073,7 +20399,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         OfortValue *shape_arg = args[0].type == FVAL_ARRAY ? &args[0] : &args[1];
         OfortValType result_type = FVAL_REAL;
         OfortValue result;
-        if ((strcmp(upper, "MOD") == 0 || strcmp(upper, "MODULO") == 0 || strcmp(upper, "DIM") == 0) &&
+        if ((strcmp(upper, "MOD") == 0 || strcmp(upper, "AMOD") == 0 || strcmp(upper, "MODULO") == 0 || strcmp(upper, "DIM") == 0) &&
             ((args[0].type == FVAL_ARRAY ? args[0].v.arr.elem_type : args[0].type) == FVAL_INTEGER) &&
             ((args[1].type == FVAL_ARRAY ? args[1].v.arr.elem_type : args[1].type) == FVAL_INTEGER)) {
             result_type = FVAL_INTEGER;
@@ -20154,6 +20480,14 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (nargs < 1) ofort_error(I, "SQRT requires 1 argument");
         return make_real(sqrt(val_to_real(args[0])));
     }
+    if (strcmp(upper, "CSQRT") == 0) {
+        double a = args[0].type == FVAL_COMPLEX ? args[0].v.cx.re : val_to_real(args[0]);
+        double b = args[0].type == FVAL_COMPLEX ? args[0].v.cx.im : 0.0;
+        double r = hypot(a, b);
+        double re = sqrt((r + a) / 2.0);
+        double im = b < 0 ? -sqrt((r - a) / 2.0) : sqrt((r - a) / 2.0);
+        return make_complex(re, im);
+    }
     if (strcmp(upper, "HYPOT") == 0) {
         if (nargs < 2) ofort_error(I, "HYPOT requires 2 arguments");
         return make_real(hypot(val_to_real(args[0]), val_to_real(args[1])));
@@ -20162,9 +20496,19 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (nargs < 1) ofort_error(I, "SIN requires 1 argument");
         return make_real(sin(val_to_real(args[0])));
     }
+    if (strcmp(upper, "CSIN") == 0) {
+        double a = args[0].type == FVAL_COMPLEX ? args[0].v.cx.re : val_to_real(args[0]);
+        double b = args[0].type == FVAL_COMPLEX ? args[0].v.cx.im : 0.0;
+        return make_complex(sin(a) * cosh(b), cos(a) * sinh(b));
+    }
     if (strcmp(upper, "COS") == 0) {
         if (nargs < 1) ofort_error(I, "COS requires 1 argument");
         return make_real(cos(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "CCOS") == 0) {
+        double a = args[0].type == FVAL_COMPLEX ? args[0].v.cx.re : val_to_real(args[0]);
+        double b = args[0].type == FVAL_COMPLEX ? args[0].v.cx.im : 0.0;
+        return make_complex(cos(a) * cosh(b), -sin(a) * sinh(b));
     }
     if (strcmp(upper, "TAN") == 0) {
         return make_real(tan(val_to_real(args[0])));
@@ -20178,11 +20522,26 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "TANH") == 0) {
         return make_real(tanh(val_to_real(args[0])));
     }
+    if (strcmp(upper, "ASINH") == 0) {
+        return make_real(asinh(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "ACOSH") == 0) {
+        return make_real(acosh(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "ATANH") == 0) {
+        return make_real(atanh(val_to_real(args[0])));
+    }
     if (strcmp(upper, "ASIN") == 0) {
         return make_real(asin(val_to_real(args[0])));
     }
+    if (strcmp(upper, "DASIN") == 0) {
+        return make_double(asin(val_to_real(args[0])));
+    }
     if (strcmp(upper, "ACOS") == 0) {
         return make_real(acos(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "DACOS") == 0) {
+        return make_double(acos(val_to_real(args[0])));
     }
     if (strcmp(upper, "ATAN") == 0) {
         return make_real(atan(val_to_real(args[0])));
@@ -20339,6 +20698,12 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "EXP") == 0) {
         return make_real(exp(val_to_real(args[0])));
     }
+    if (strcmp(upper, "CEXP") == 0) {
+        double a = args[0].type == FVAL_COMPLEX ? args[0].v.cx.re : val_to_real(args[0]);
+        double b = args[0].type == FVAL_COMPLEX ? args[0].v.cx.im : 0.0;
+        double ea = exp(a);
+        return make_complex(ea * cos(b), ea * sin(b));
+    }
     if (strcmp(upper, "LOG") == 0) {
         return make_real(log(val_to_real(args[0])));
     }
@@ -20353,9 +20718,13 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (nargs < 1) ofort_error(I, "LOG_GAMMA requires 1 argument");
         return make_real(lgamma(val_to_real(args[0])));
     }
-    if (strcmp(upper, "MOD") == 0) {
+    if (strcmp(upper, "ERFC_SCALED") == 0) {
+        double x = val_to_real(args[0]);
+        return make_real(exp(x * x) * erfc(x));
+    }
+    if (strcmp(upper, "MOD") == 0 || strcmp(upper, "AMOD") == 0) {
         if (nargs < 2) ofort_error(I, "MOD requires 2 arguments");
-        if (args[0].type == FVAL_INTEGER && args[1].type == FVAL_INTEGER) {
+        if (strcmp(upper, "MOD") == 0 && args[0].type == FVAL_INTEGER && args[1].type == FVAL_INTEGER) {
             long long b = val_to_int(args[1]);
             if (b == 0) ofort_error(I, "MOD: division by zero");
             return make_integer(val_to_int(args[0]) % b);
@@ -20407,7 +20776,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (args[0].type == FVAL_INTEGER) return make_integer((long long)result);
         return make_real(result);
     }
-    if (strcmp(upper, "MIN") == 0) {
+    if (strcmp(upper, "MIN") == 0 || strcmp(upper, "MIN1") == 0 || strcmp(upper, "AMIN0") == 0) {
         if (nargs < 2) ofort_error(I, "MIN requires at least 2 arguments");
         if (args[0].type == FVAL_CHARACTER) {
             OfortValue result = copy_value(args[0]);
@@ -20424,7 +20793,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             double v = val_to_real(args[i]);
             if (v < result) result = v;
         }
-        if (args[0].type == FVAL_INTEGER) return make_integer((long long)result);
+        if (strcmp(upper, "MIN1") == 0 || args[0].type == FVAL_INTEGER) return make_integer((long long)result);
         return make_real(result);
     }
     if (strcmp(upper, "FLOOR") == 0) {
@@ -20436,8 +20805,15 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "AINT") == 0) {
         return make_real(trunc(val_to_real(args[0])));
     }
+    if (strcmp(upper, "ANINT") == 0) {
+        return make_real(round(val_to_real(args[0])));
+    }
     if (strcmp(upper, "NINT") == 0) {
         return make_integer((long long)round(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "CABS") == 0) {
+        if (args[0].type == FVAL_COMPLEX) return make_real(hypot(args[0].v.cx.re, args[0].v.cx.im));
+        return make_real(fabs(val_to_real(args[0])));
     }
     if (strcmp(upper, "SIGN") == 0) {
         if (nargs < 2) ofort_error(I, "SIGN requires 2 arguments");
@@ -20481,11 +20857,70 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (args[0].type == FVAL_ARRAY) bytes *= args[0].v.arr.len;
         return make_integer_kind(bytes, 8);
     }
+    if (strcmp(upper, "CHARACTER_KINDS") == 0 ||
+        strcmp(upper, "INTEGER_KINDS") == 0 ||
+        strcmp(upper, "REAL_KINDS") == 0) {
+        int dims[1] = {strcmp(upper, "CHARACTER_KINDS") == 0 ? 2 : 4};
+        OfortValue result = make_array(FVAL_INTEGER, dims, 1);
+        int values[4] = {1, 2, 4, 8};
+        if (strcmp(upper, "CHARACTER_KINDS") == 0) values[1] = 4;
+        if (result.v.arr.int_data) {
+            for (int i = 0; i < dims[0]; i++) result.v.arr.int_data[i] = values[i];
+        } else if (result.v.arr.data) {
+            for (int i = 0; i < dims[0]; i++) result.v.arr.data[i] = make_integer(values[i]);
+        }
+        if (nargs >= 1) {
+            long long idx = val_to_int(args[0]);
+            OfortValue out = make_integer(values[idx <= 1 ? 0 : idx > dims[0] ? dims[0] - 1 : (int)idx - 1]);
+            free_value(&result);
+            return out;
+        }
+        return result;
+    }
+    if (strcmp(upper, "SELECTED_CHAR_KIND") == 0) {
+        if (nargs < 1) ofort_error(I, "SELECTED_CHAR_KIND requires NAME argument");
+        if (args[0].type == FVAL_CHARACTER && args[0].v.s) {
+            if (str_eq_nocase(args[0].v.s, "ascii") ||
+                str_eq_nocase(args[0].v.s, "default")) return make_integer(1);
+            if (str_eq_nocase(args[0].v.s, "iso_10646")) return make_integer(4);
+        }
+        return make_integer(-1);
+    }
+    if (strcmp(upper, "POPCNT") == 0 || strcmp(upper, "POPPAR") == 0 ||
+        strcmp(upper, "LEADZ") == 0 || strcmp(upper, "TRAILZ") == 0) {
+        if (nargs < 1) ofort_error(I, "%s requires 1 argument", upper);
+        if (args[0].type != FVAL_INTEGER) ofort_error(I, "%s requires integer argument", upper);
+        return bit_count_intrinsic_value(upper, args[0]);
+    }
     if (strcmp(upper, "BTEST") == 0) {
         int kind, bits;
         long long pos;
         unsigned long long value;
         if (nargs < 2) ofort_error(I, "BTEST requires 2 arguments");
+        if (args[0].type == FVAL_ARRAY) {
+            OfortValue result = make_array(FVAL_LOGICAL, args[0].v.arr.dims, args[0].v.arr.n_dims);
+            if (args[1].type == FVAL_ARRAY && args[1].v.arr.len != args[0].v.arr.len)
+                ofort_error(I, "BTEST arguments must conform");
+            for (int i = 0; i < args[0].v.arr.len; i++) {
+                OfortValue xv = array_element_value(&args[0], i);
+                OfortValue pv = args[1].type == FVAL_ARRAY ? array_element_value(&args[1], i) : copy_value(args[1]);
+                OfortValue rv;
+                if (xv.type != FVAL_INTEGER || pv.type != FVAL_INTEGER) {
+                    rv = make_logical(0);
+                } else {
+                    int k = xv.kind ? xv.kind : 4;
+                    int b = integer_kind_bits(k);
+                    long long p = pv.v.i;
+                    unsigned long long u = (unsigned long long)xv.v.i;
+                    rv = make_logical(p >= 0 && p < b && (((u >> (unsigned int)p) & 1ULL) != 0));
+                }
+                free_value(&result.v.arr.data[i]);
+                result.v.arr.data[i] = rv;
+                free_value(&xv);
+                free_value(&pv);
+            }
+            return result;
+        }
         if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER)
             ofort_error(I, "BTEST requires integer arguments");
         kind = args[0].kind ? args[0].kind : 4;
@@ -20582,6 +21017,15 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (shift > 0) value <<= (unsigned int)shift;
         else if (shift < 0) value >>= (unsigned int)(-shift);
         return make_integer_kind((long long)value, kind);
+    }
+    if (strcmp(upper, "SHIFTA") == 0 || strcmp(upper, "SHIFTL") == 0 || strcmp(upper, "SHIFTR") == 0) {
+        if (nargs < 2) ofort_error(I, "%s requires 2 arguments", upper);
+        if (args[0].type == FVAL_ARRAY) {
+            if (args[1].type == FVAL_ARRAY && args[1].v.arr.len != args[0].v.arr.len)
+                ofort_error(I, "%s arguments must conform", upper);
+            return shift_array_result(I, upper, &args[0], &args[1]);
+        }
+        return shift_scalar_value(upper, args[0], args[1]);
     }
     if (strcmp(upper, "ISHFTC") == 0) {
         int kind, bits, size;
@@ -20810,14 +21254,16 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (r <= 18) return make_integer(8);
         return make_integer(-1);
     }
-    if (strcmp(upper, "SELECTED_REAL_KIND") == 0) {
+    if (strcmp(upper, "SELECTED_REAL_KIND") == 0 || strcmp(upper, "IEEE_SELECTED_REAL_KIND") == 0) {
         int p_idx = intrinsic_arg_index(arg_names, nargs, "p");
         int r_idx = intrinsic_arg_index(arg_names, nargs, "r");
+        int radix_idx = intrinsic_arg_index(arg_names, nargs, "radix");
         long long p = 0, r = 0;
         int p_bad, r_bad;
         if (p_idx < 0 && nargs >= 1 && (!arg_names || arg_names[0][0] == '\0')) p_idx = 0;
         if (r_idx < 0 && nargs >= 2 && (!arg_names || arg_names[1][0] == '\0')) r_idx = 1;
-        if (p_idx < 0 && r_idx < 0) ofort_error(I, "SELECTED_REAL_KIND requires P or R");
+        if (radix_idx < 0 && nargs >= 3 && (!arg_names || arg_names[2][0] == '\0')) radix_idx = 2;
+        if (p_idx < 0 && r_idx < 0 && radix_idx < 0) ofort_error(I, "SELECTED_REAL_KIND requires P or R");
         if (p_idx >= 0) {
             if (args[p_idx].type != FVAL_INTEGER)
                 ofort_error(I, "SELECTED_REAL_KIND P must be integer");
@@ -20828,6 +21274,8 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                 ofort_error(I, "SELECTED_REAL_KIND R must be integer");
             r = args[r_idx].v.i;
         }
+        if (radix_idx >= 0 && args[radix_idx].type == FVAL_INTEGER && args[radix_idx].v.i != 2)
+            return make_integer(-5);
         p_bad = p > 15;
         r_bad = r > 307;
         if (p_bad && r_bad) return make_integer(-3);
@@ -20928,7 +21376,6 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     }
     if (strcmp(upper, "NEW_LINE") == 0) {
         if (nargs < 1) ofort_error(I, "NEW_LINE requires 1 argument");
-        if (args[0].type != FVAL_CHARACTER) ofort_error(I, "NEW_LINE requires a character argument");
         return make_character("\n");
     }
     if (strcmp(upper, "ADJUSTL") == 0) {
@@ -21367,14 +21814,53 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "MAXVAL") == 0) {
         int array_idx = intrinsic_arg_index(arg_names, nargs, "array");
         int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        int mask_idx = intrinsic_arg_index(arg_names, nargs, "mask");
         if (array_idx < 0) array_idx = 0;
-        if (dim_idx < 0 && nargs > 1) dim_idx = array_idx == 0 ? 1 : 0;
+        if (dim_idx < 0) {
+            for (int i = 0; i < nargs; i++) {
+                if (i != array_idx && i != mask_idx && arg_names[i][0] == '\0') {
+                    dim_idx = i;
+                    break;
+                }
+            }
+        }
+        if (mask_idx < 0 && dim_idx >= 0) {
+            for (int i = 0; i < nargs; i++) {
+                if (i != array_idx && i != dim_idx && arg_names[i][0] == '\0') {
+                    mask_idx = i;
+                    break;
+                }
+            }
+        }
         if (array_idx >= nargs || args[array_idx].type != FVAL_ARRAY)
             ofort_error(I, "MAXVAL requires a non-empty array");
         if (dim_idx >= 0 && dim_idx < nargs)
-            return minmaxval_dim_result(I, &args[array_idx], (int)val_to_int(args[dim_idx]), 1);
+            return minmaxval_dim_result(I, &args[array_idx], (int)val_to_int(args[dim_idx]), 1,
+                                        (mask_idx >= 0 && mask_idx < nargs) ? &args[mask_idx] : NULL);
         if (args[array_idx].v.arr.len == 0)
             ofort_error(I, "MAXVAL requires a non-empty array");
+        if (mask_idx >= 0 && mask_idx < nargs) {
+            OfortValue best = make_void_val();
+            int found = 0;
+            if (args[mask_idx].type == FVAL_ARRAY && args[mask_idx].v.arr.len != args[array_idx].v.arr.len)
+                ofort_error(I, "MASK must be scalar or conform to ARRAY");
+            for (int i = 0; i < args[array_idx].v.arr.len; i++) {
+                OfortValue elem;
+                if (!reduction_mask_takes(I, &args[mask_idx], i, args[array_idx].v.arr.len)) continue;
+                elem = array_element_value(&args[array_idx], i);
+                if (!found || values_compare_fortran(I, elem, best) > 0) {
+                    free_value(&best);
+                    best = copy_value(elem);
+                    found = 1;
+                }
+                free_value(&elem);
+            }
+            if (!found) {
+                best = default_value(args[array_idx].v.arr.elem_type, 1);
+                best.kind = args[array_idx].kind ? args[array_idx].kind : 4;
+            }
+            return best;
+        }
         if (args[array_idx].v.arr.int_data && args[array_idx].v.arr.elem_type == FVAL_INTEGER) {
             long long mx = args[array_idx].v.arr.int_data[0];
             for (int i = 1; i < args[array_idx].v.arr.len; i++)
@@ -21409,14 +21895,53 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "MINVAL") == 0) {
         int array_idx = intrinsic_arg_index(arg_names, nargs, "array");
         int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        int mask_idx = intrinsic_arg_index(arg_names, nargs, "mask");
         if (array_idx < 0) array_idx = 0;
-        if (dim_idx < 0 && nargs > 1) dim_idx = array_idx == 0 ? 1 : 0;
+        if (dim_idx < 0) {
+            for (int i = 0; i < nargs; i++) {
+                if (i != array_idx && i != mask_idx && arg_names[i][0] == '\0') {
+                    dim_idx = i;
+                    break;
+                }
+            }
+        }
+        if (mask_idx < 0 && dim_idx >= 0) {
+            for (int i = 0; i < nargs; i++) {
+                if (i != array_idx && i != dim_idx && arg_names[i][0] == '\0') {
+                    mask_idx = i;
+                    break;
+                }
+            }
+        }
         if (array_idx >= nargs || args[array_idx].type != FVAL_ARRAY)
             ofort_error(I, "MINVAL requires a non-empty array");
         if (dim_idx >= 0 && dim_idx < nargs)
-            return minmaxval_dim_result(I, &args[array_idx], (int)val_to_int(args[dim_idx]), 0);
+            return minmaxval_dim_result(I, &args[array_idx], (int)val_to_int(args[dim_idx]), 0,
+                                        (mask_idx >= 0 && mask_idx < nargs) ? &args[mask_idx] : NULL);
         if (args[array_idx].v.arr.len == 0)
             ofort_error(I, "MINVAL requires a non-empty array");
+        if (mask_idx >= 0 && mask_idx < nargs) {
+            OfortValue best = make_void_val();
+            int found = 0;
+            if (args[mask_idx].type == FVAL_ARRAY && args[mask_idx].v.arr.len != args[array_idx].v.arr.len)
+                ofort_error(I, "MASK must be scalar or conform to ARRAY");
+            for (int i = 0; i < args[array_idx].v.arr.len; i++) {
+                OfortValue elem;
+                if (!reduction_mask_takes(I, &args[mask_idx], i, args[array_idx].v.arr.len)) continue;
+                elem = array_element_value(&args[array_idx], i);
+                if (!found || values_compare_fortran(I, elem, best) < 0) {
+                    free_value(&best);
+                    best = copy_value(elem);
+                    found = 1;
+                }
+                free_value(&elem);
+            }
+            if (!found) {
+                best = default_value(args[array_idx].v.arr.elem_type, 1);
+                best.kind = args[array_idx].kind ? args[array_idx].kind : 4;
+            }
+            return best;
+        }
         if (args[array_idx].v.arr.int_data && args[array_idx].v.arr.elem_type == FVAL_INTEGER) {
             long long mn = args[array_idx].v.arr.int_data[0];
             for (int i = 1; i < args[array_idx].v.arr.len; i++)
@@ -22485,6 +23010,7 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     clear_timing(interp);
     interp->source = source;
     interp->has_error = 0;
+    interp->check_mode = 0;
     interp->returning = 0;
     interp->exiting = 0;
     interp->cycling = 0;
@@ -22583,6 +23109,7 @@ int ofort_check(OfortInterpreter *interp, const char *source) {
     clear_timing(interp);
     interp->source = source;
     interp->has_error = 0;
+    interp->check_mode = 1;
     interp->returning = 0;
     interp->exiting = 0;
     interp->cycling = 0;
@@ -23309,6 +23836,7 @@ int ofort_call_real1(OfortInterpreter *interp, const char *name, double x, doubl
     if (!interp || !name || !result) return -1;
     interp->error[0] = '\0';
     interp->has_error = 0;
+    interp->check_mode = 0;
     interp->returning = 0;
     interp->exiting = 0;
     interp->cycling = 0;
