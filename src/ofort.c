@@ -24,10 +24,14 @@
 #include <stdint.h>
 #include <time.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #define OFORT_ALLOC_TARGET_CHILD (OFORT_MAX_CHILDREN - 1)
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>
 #endif
 
 /* ══════════════════════════════════════════════
@@ -363,6 +367,7 @@ static int node_is_profiled_statement(const OfortNode *n) {
     case FND_CLOSE:
     case FND_REWIND:
     case FND_BACKSPACE:
+    case FND_ENDFILE:
     case FND_INQUIRE:
     case FND_SELECT_RANK:
     case FND_ALLOCATE:
@@ -2175,6 +2180,7 @@ static const KeywordEntry fortran_keywords[] = {
     {"PRINT", FTOK_PRINT}, {"WRITE", FTOK_WRITE}, {"READ", FTOK_READ},
     {"OPEN", FTOK_OPEN}, {"CLOSE", FTOK_CLOSE}, {"REWIND", FTOK_REWIND},
     {"BACKSPACE", FTOK_BACKSPACE},
+    {"ENDFILE", FTOK_ENDFILE},
     {"INQUIRE", FTOK_INQUIRE},
     {NULL, FTOK_EOF}
 };
@@ -2772,6 +2778,7 @@ static const char *token_type_name(OfortTokenType type) {
         case FTOK_CLOSE: return "CLOSE";
         case FTOK_REWIND: return "REWIND";
         case FTOK_BACKSPACE: return "BACKSPACE";
+        case FTOK_ENDFILE: return "ENDFILE";
         case FTOK_INQUIRE: return "INQUIRE";
         case FTOK_TRUE: return ".TRUE.";
         case FTOK_FALSE: return ".FALSE.";
@@ -2875,7 +2882,8 @@ static int token_can_be_name(OfortToken *t) {
                  t->type == FTOK_SUBROUTINE || t->type == FTOK_USE ||
                  t->type == FTOK_READ || t->type == FTOK_WRITE ||
                  t->type == FTOK_OPEN || t->type == FTOK_CLOSE ||
-                 t->type == FTOK_REWIND || t->type == FTOK_BACKSPACE || t->type == FTOK_INQUIRE ||
+                 t->type == FTOK_REWIND || t->type == FTOK_BACKSPACE ||
+                 t->type == FTOK_ENDFILE || t->type == FTOK_INQUIRE ||
                  t->type == FTOK_END || t->type == FTOK_STOP || t->type == FTOK_RETURN ||
                  t->type == FTOK_EXIT || t->type == FTOK_CYCLE ||
                  t->type == FTOK_ENTRY);
@@ -2927,6 +2935,7 @@ static const char *token_name_text(OfortToken *t) {
     if (t->type == FTOK_CLOSE) return "close";
     if (t->type == FTOK_REWIND) return "rewind";
     if (t->type == FTOK_BACKSPACE) return "backspace";
+    if (t->type == FTOK_ENDFILE) return "endfile";
     if (t->type == FTOK_INQUIRE) return "inquire";
     if (t->type == FTOK_END) return "end";
     if (t->type == FTOK_STOP) return "stop";
@@ -2962,6 +2971,7 @@ static const char *token_arg_name(OfortToken *t) {
     if (t->type == FTOK_CLOSE) return "close";
     if (t->type == FTOK_REWIND) return "rewind";
     if (t->type == FTOK_BACKSPACE) return "backspace";
+    if (t->type == FTOK_ENDFILE) return "endfile";
     if (t->type == FTOK_INQUIRE) return "inquire";
     if (t->type == FTOK_IN) return "in";
     if (t->type == FTOK_OUT) return "out";
@@ -5671,6 +5681,42 @@ static OfortNode *parse_backspace_stmt(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_endfile_stmt(OfortInterpreter *I) {
+    OfortToken *et = advance(I); /* ENDFILE */
+    OfortNode *n = alloc_node(I, FND_ENDFILE);
+    n->line = et->line;
+
+    if (check(I, FTOK_LPAREN)) {
+        advance(I);
+        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+            if (check_keyword_arg(I)) {
+                const char *name = token_arg_name(advance(I));
+                advance(I); /* = */
+                if (str_eq_nocase(name, "unit")) {
+                    n->children[0] = parse_expr(I);
+                    n->n_children = 1;
+                } else {
+                    parse_expr(I);
+                }
+            } else if (!n->children[0]) {
+                n->children[0] = parse_expr(I);
+                n->n_children = 1;
+            } else {
+                parse_expr(I);
+            }
+            if (check(I, FTOK_COMMA)) advance(I);
+            else break;
+        }
+        expect(I, FTOK_RPAREN);
+    } else {
+        n->children[0] = parse_expr(I);
+        n->n_children = 1;
+    }
+
+    if (!n->children[0]) ofort_error(I, "ENDFILE requires UNIT");
+    return n;
+}
+
 static OfortNode *parse_block_construct(OfortInterpreter *I) {
     OfortToken *bt = advance(I); /* BLOCK */
     OfortNode *n = alloc_node(I, FND_BLOCK_CONSTRUCT);
@@ -8067,6 +8113,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     if (t->type == FTOK_CLOSE) { leave_spec_section(I); return parse_close_stmt(I); }
     if (t->type == FTOK_REWIND) { leave_spec_section(I); return parse_rewind_stmt(I); }
     if (t->type == FTOK_BACKSPACE) { leave_spec_section(I); return parse_backspace_stmt(I); }
+    if (t->type == FTOK_ENDFILE) { leave_spec_section(I); return parse_endfile_stmt(I); }
     if (t->type == FTOK_INQUIRE) { leave_spec_section(I); return parse_inquire_stmt(I); }
 
     /* CALL */
@@ -10215,6 +10262,23 @@ static int previous_sequential_record_pos(const char *path, int current_pos) {
     return this_start > 0 ? this_start : prev_start;
 }
 
+static int truncate_file_at_pos(const char *path, int pos) {
+    FILE *fp;
+    int fd;
+    int ok;
+    if (!path || !*path || pos < 0) return 0;
+    fp = fopen(path, "r+b");
+    if (!fp) return 0;
+    fd = fileno(fp);
+#ifdef _WIN32
+    ok = _chsize_s(fd, (long long)pos) == 0;
+#else
+    ok = ftruncate(fd, (off_t)pos) == 0;
+#endif
+    fclose(fp);
+    return ok;
+}
+
 static OfortUnitFile *find_unit_by_file(OfortInterpreter *I, const char *path) {
     char trimmed[512];
     size_t len = path ? strlen(path) : 0;
@@ -10705,6 +10769,45 @@ static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, c
     return 0;
 }
 
+static int read_file_target(OfortInterpreter *I, FILE *fp, OfortNode *target, char *tok, int tok_size) {
+    int status = 0;
+    if (target->type == FND_IMPLIED_DO) {
+        OfortValue start_v = eval_node(I, target->children[0]);
+        OfortValue end_v = eval_node(I, target->children[1]);
+        OfortValue step_v = eval_node(I, target->children[2]);
+        long long start = val_to_int(start_v);
+        long long end = val_to_int(end_v);
+        long long step = val_to_int(step_v);
+        free_value(&start_v);
+        free_value(&end_v);
+        free_value(&step_v);
+        if (step == 0) ofort_error(I, "Implied DO step cannot be zero");
+        for (long long iter = start; step > 0 ? iter <= end : iter >= end; iter += step) {
+            set_var(I, target->name, make_integer(iter));
+            for (int i = 0; i < target->n_stmts; i++) {
+                if (read_file_target(I, fp, target->stmts[i], tok, tok_size) != 0) status = 1;
+            }
+            if (status) break;
+        }
+        return status;
+    }
+
+    if (target->type == FND_IDENT) {
+        OfortVar *v = find_var(I, target->name);
+        if (v && v->val.type == FVAL_ARRAY) {
+            for (int j = 0; j < v->val.v.arr.len; j++) {
+                if (!read_next_token(fp, tok, tok_size)) return 1;
+                assign_token_to_value(&v->val.v.arr.data[j], tok);
+            }
+            return 0;
+        }
+    }
+
+    if (!read_next_token(fp, tok, tok_size)) return 1;
+    assign_token_to_read_target(I, target, tok);
+    return 0;
+}
+
 static void read_string_target(OfortInterpreter *I, const char **p, OfortNode *target, char *tok, int tok_size) {
     if (target->type == FND_IMPLIED_DO) {
         OfortValue start_v = eval_node(I, target->children[0]);
@@ -10771,24 +10874,10 @@ static int read_values_from_file(OfortInterpreter *I, OfortUnitFile *entry, Ofor
     }
 
     for (int i = 0; i < n->n_stmts; i++) {
-        if (n->stmts[i]->type == FND_IDENT) {
-            OfortVar *v = find_var(I, n->stmts[i]->name);
-            if (v && v->val.type == FVAL_ARRAY) {
-                for (int j = 0; j < v->val.v.arr.len; j++) {
-                    if (!read_next_token(fp, tok, sizeof(tok))) {
-                        status = 1;
-                        break;
-                    }
-                    assign_token_to_value(&v->val.v.arr.data[j], tok);
-                }
-                continue;
-            }
-        }
-        if (!read_next_token(fp, tok, sizeof(tok))) {
+        if (read_file_target(I, fp, n->stmts[i], tok, sizeof(tok)) != 0) {
             status = 1;
             break;
         }
-        assign_token_to_read_target(I, n->stmts[i], tok);
     }
     entry->stream_pos = (int)ftell(fp);
     fclose(fp);
@@ -14614,6 +14703,7 @@ static const char *io_statement_name(OfortNodeType type) {
         case FND_CLOSE: return "CLOSE";
         case FND_REWIND: return "REWIND";
         case FND_BACKSPACE: return "BACKSPACE";
+        case FND_ENDFILE: return "ENDFILE";
         case FND_INQUIRE: return "INQUIRE";
         default: return NULL;
     }
@@ -17367,6 +17457,22 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             ofort_error(I, "BACKSPACE requires a sequential file");
         }
         entry->stream_pos = previous_sequential_record_pos(entry->path, entry->stream_pos);
+        break;
+    }
+
+    case FND_ENDFILE: {
+        OfortValue uv = eval_node(I, n->children[0]);
+        int unit = (int)val_to_int(uv);
+        OfortUnitFile *entry = find_unit_file(I, unit);
+        free_value(&uv);
+        if (!entry) entry = ensure_unit_file(I, unit, 1);
+        if (!entry) ofort_error(I, "Unit %d is not open", unit);
+        if (entry->is_direct || strcmp(entry->access, "stream") == 0) {
+            ofort_error(I, "ENDFILE requires a sequential file");
+        }
+        if (!truncate_file_at_pos(entry->path, entry->stream_pos)) {
+            ofort_error(I, "Failed to write ENDFILE on unit %d", unit);
+        }
         break;
     }
 
