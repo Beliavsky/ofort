@@ -123,6 +123,11 @@ typedef struct {
     OfortVar vars[OFORT_MAX_MODULE_VARS];
     int var_public[OFORT_MAX_MODULE_VARS];
     int n_vars;
+    char namelist_names[32][256];
+    char namelist_var_names[32][OFORT_MAX_PARAMS][256];
+    int namelist_n_vars[32];
+    int namelist_public[32];
+    int n_namelists;
     OfortTypeDef types[32];
     int n_types;
     int default_private;
@@ -11741,6 +11746,9 @@ static void format_output(OfortInterpreter *I, const char *fmt, OfortValue *vals
 static const char *write_format_string(OfortInterpreter *I, OfortNode *n,
                                        char *buf, int bufsize) {
     if (n->children[1]) {
+        if (n->children[1]->type == FND_IDENT && find_namelist(I, n->children[1]->name)) {
+            return n->format_str;
+        }
         OfortValue fmt_val = eval_node(I, n->children[1]);
         value_to_string(I, fmt_val, buf, bufsize);
         free_value(&fmt_val);
@@ -14911,6 +14919,24 @@ static void register_namelist(OfortInterpreter *I, OfortNode *n) {
     }
 }
 
+static void import_namelist(OfortInterpreter *I, const char *local_name,
+                            const char var_names[][256], int n_vars) {
+    OfortNamelist *nl;
+    if (!local_name || !local_name[0]) return;
+    nl = find_namelist(I, local_name);
+    if (!nl) {
+        if (I->n_namelists >= (int)(sizeof(I->namelists) / sizeof(I->namelists[0])))
+            ofort_error(I, "Too many NAMELIST groups");
+        nl = &I->namelists[I->n_namelists++];
+        memset(nl, 0, sizeof(*nl));
+        copy_cstr(nl->name, sizeof(nl->name), local_name);
+    }
+    nl->n_vars = 0;
+    for (int i = 0; i < n_vars && i < OFORT_MAX_PARAMS; i++) {
+        copy_cstr(nl->var_names[nl->n_vars++], sizeof(nl->var_names[0]), var_names[i]);
+    }
+}
+
 static int check_semantics_is_spec_node(OfortNode *n) {
     if (!n) return 0;
     switch (n->type) {
@@ -15051,6 +15077,7 @@ static void check_semantics_identifier(OfortInterpreter *I, OfortNode *n) {
 
     if (!I || !n || !n->name[0]) return;
     if (find_var(I, n->name) || find_func(I, n->name) || find_generic(I, n->name)) return;
+    if (find_namelist(I, n->name)) return;
     if (!current_scope_has_implicit_none(I)) {
         (void)implicit_type_for_name(I, n->name, &has_implicit_type);
         if (has_implicit_type) return;
@@ -15714,12 +15741,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (!public_names || !private_names) ofort_error(I, "Out of memory");
         copy_cstr(mod->name, sizeof(mod->name), n->name);
         mod->n_vars = 0;
+        mod->n_namelists = 0;
         mod->n_types = 0;
         mod->default_private = 0;
 
         /* Execute the module body to register functions and declarations */
         push_scope(I);
         OfortNode *body = n->children[0];
+        int namelist_start = I->n_namelists;
         if (body) {
             for (int i = 0; i < body->n_stmts; i++) {
                 OfortNode *s = body->stmts[i];
@@ -15767,6 +15796,21 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 mod->vars[mod->n_vars++] = ms->vars[i];
                 ms->vars[i].val = make_void_val(); /* prevent double-free */
             }
+            for (int i = namelist_start; i < I->n_namelists && mod->n_namelists < 32; i++) {
+                OfortNamelist *nl = &I->namelists[i];
+                int is_public = mod->default_private ? 0 : 1;
+                int target = mod->n_namelists++;
+                if (name_in_list_nocase(nl->name, public_names, n_public_names)) is_public = 1;
+                if (name_in_list_nocase(nl->name, private_names, n_private_names)) is_public = 0;
+                copy_cstr(mod->namelist_names[target], sizeof(mod->namelist_names[target]), nl->name);
+                mod->namelist_n_vars[target] = nl->n_vars;
+                mod->namelist_public[target] = is_public;
+                for (int j = 0; j < nl->n_vars && j < OFORT_MAX_PARAMS; j++) {
+                    copy_cstr(mod->namelist_var_names[target][j],
+                              sizeof(mod->namelist_var_names[target][j]), nl->var_names[j]);
+                }
+            }
+            I->n_namelists = namelist_start;
         }
         pop_scope(I);
         free(public_names);
@@ -15940,6 +15984,23 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (n->int_val && n->n_params == 0) {
             /* USE module, ONLY: imports no variables. */
         } else if (n->n_params > 0) {
+            if (!n->int_val) {
+                for (int i = 0; i < mod->n_vars; i++) {
+                    int renamed = 0;
+                    if (!mod->var_public[i]) continue;
+                    for (int pi = 0; pi < n->n_params; pi++) {
+                        const char *remote = n->binding_proc_names[pi][0] ? n->binding_proc_names[pi] : n->param_names[pi];
+                        if (str_eq_nocase(mod->vars[i].name, remote)) {
+                            renamed = 1;
+                            break;
+                        }
+                    }
+                    if (!renamed) {
+                        OfortVar *v = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
+                        copy_imported_var_attrs(v, &mod->vars[i]);
+                    }
+                }
+            }
             for (int pi = 0; pi < n->n_params; pi++) {
                 const char *local = n->param_names[pi];
                 const char *remote = n->binding_proc_names[pi][0] ? n->binding_proc_names[pi] : local;
@@ -15956,6 +16017,44 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (!mod->var_public[i]) continue;
                 OfortVar *v = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
                 copy_imported_var_attrs(v, &mod->vars[i]);
+            }
+        }
+        /* import NAMELIST groups */
+        if (n->int_val && n->n_params == 0) {
+            /* USE module, ONLY: imports no namelists. */
+        } else if (n->n_params > 0) {
+            if (!n->int_val) {
+                for (int i = 0; i < mod->n_namelists; i++) {
+                    int renamed = 0;
+                    if (!mod->namelist_public[i]) continue;
+                    for (int pi = 0; pi < n->n_params; pi++) {
+                        const char *remote = n->binding_proc_names[pi][0] ? n->binding_proc_names[pi] : n->param_names[pi];
+                        if (str_eq_nocase(mod->namelist_names[i], remote)) {
+                            renamed = 1;
+                            break;
+                        }
+                    }
+                    if (!renamed) {
+                        import_namelist(I, mod->namelist_names[i],
+                                        mod->namelist_var_names[i], mod->namelist_n_vars[i]);
+                    }
+                }
+            }
+            for (int pi = 0; pi < n->n_params; pi++) {
+                const char *local = n->param_names[pi];
+                const char *remote = n->binding_proc_names[pi][0] ? n->binding_proc_names[pi] : local;
+                for (int i = 0; i < mod->n_namelists; i++) {
+                    if (!mod->namelist_public[i]) continue;
+                    if (!str_eq_nocase(mod->namelist_names[i], remote)) continue;
+                    import_namelist(I, local, mod->namelist_var_names[i], mod->namelist_n_vars[i]);
+                    break;
+                }
+            }
+        } else {
+            for (int i = 0; i < mod->n_namelists; i++) {
+                if (!mod->namelist_public[i]) continue;
+                import_namelist(I, mod->namelist_names[i],
+                                mod->namelist_var_names[i], mod->namelist_n_vars[i]);
             }
         }
         for (int i = 0; i < n->n_params; i++) {
@@ -17307,19 +17406,25 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortValue *vals = eval_io_list(I, n, &nvals);
         char fmt_buf[OFORT_MAX_STRLEN];
         const char *fmt = write_format_string(I, n, fmt_buf, sizeof(fmt_buf));
+        const char *nml_name = n->name;
         int wrote_stdout = 0;
         int status = 0;
         int rec_no = 0;
         int has_rec = 0;
 
-        if (n->name[0]) {
+        if (!nml_name[0] && n->children[1] && n->children[1]->type == FND_IDENT &&
+            find_namelist(I, n->children[1]->name)) {
+            nml_name = n->children[1]->name;
+        }
+
+        if (nml_name[0]) {
             if (n->children[0]) {
                 OfortValue uv = eval_node(I, n->children[0]);
                 int unit = (int)val_to_int(uv);
                 OfortUnitFile *entry = find_unit_file(I, unit);
                 free_value(&uv);
                 if (!entry && unit == 6) {
-                    write_namelist_to_stream(I, n->name, NULL);
+                    write_namelist_to_stream(I, nml_name, NULL);
                     wrote_stdout = 1;
                     status = 0;
                 } else {
@@ -17328,12 +17433,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     if (!entry) ofort_error(I, "Unit %d is not open", unit);
                     fp = fopen(entry->path, "ab");
                     if (!fp) ofort_error(I, "Cannot open '%s' for namelist writing", entry->path);
-                    write_namelist_to_stream(I, n->name, fp);
+                    write_namelist_to_stream(I, nml_name, fp);
                     fclose(fp);
                     status = 0;
                 }
             } else {
-                write_namelist_to_stream(I, n->name, NULL);
+                write_namelist_to_stream(I, nml_name, NULL);
                 wrote_stdout = 1;
                 status = 0;
             }
@@ -17444,12 +17549,18 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_READ_STMT:
-        if (n->name[0]) {
+        {
+        const char *nml_name = n->name;
+        if (!nml_name[0] && n->children[1] && n->children[1]->type == FND_IDENT &&
+            find_namelist(I, n->children[1]->name)) {
+            nml_name = n->children[1]->name;
+        }
+        if (nml_name[0]) {
             int status = 0;
             if (n->children[0]) {
                 OfortValue uv = eval_node(I, n->children[0]);
                 if (uv.type == FVAL_CHARACTER) {
-                    status = read_namelist_from_text(I, n->name, uv.v.s ? uv.v.s : "");
+                    status = read_namelist_from_text(I, nml_name, uv.v.s ? uv.v.s : "");
                     free_value(&uv);
                 } else {
                     int unit = (int)val_to_int(uv);
@@ -17457,7 +17568,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     free_value(&uv);
                     if (!entry) entry = ensure_unit_file(I, unit, 0);
                     if (!entry) ofort_error(I, "Unit %d is not open", unit);
-                    status = read_namelist_from_file(I, entry, n->name);
+                    status = read_namelist_from_file(I, entry, nml_name);
                 }
             } else {
                 status = 1;
@@ -17466,6 +17577,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 set_var(I, n->children[4]->name, make_integer(status));
             }
             break;
+        }
         }
         if (n->children[0]) {
             OfortValue uv = eval_node(I, n->children[0]);
