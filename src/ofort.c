@@ -20263,6 +20263,76 @@ static OfortValue minmaxval_dim_result(OfortInterpreter *I, OfortValue *array, i
     return result;
 }
 
+static OfortValue sum_product_dim_result(OfortInterpreter *I, OfortValue *array, int dim, int want_product) {
+    int rank = array->v.arr.n_dims;
+    int result_dims[7];
+    int result_rank = 0;
+    int dim_extent, stride;
+    OfortValType result_type = array->v.arr.elem_type == FVAL_INTEGER ? FVAL_INTEGER : FVAL_REAL;
+    if (dim < 1 || dim > rank) ofort_error(I, "%s DIM is out of range", want_product ? "PRODUCT" : "SUM");
+    for (int i = 0; i < rank; i++) {
+        if (i != dim - 1) result_dims[result_rank++] = array->v.arr.dims[i];
+    }
+    dim_extent = array->v.arr.dims[dim - 1];
+    stride = 1;
+    for (int i = 0; i < dim - 1; i++) stride *= array->v.arr.dims[i];
+
+    if (result_rank == 0) {
+        long long isum = want_product ? 1 : 0;
+        double rsum = want_product ? 1.0 : 0.0;
+        for (int k = 0; k < dim_extent; k++) {
+            OfortValue elem = array_element_value(array, k * stride);
+            if (result_type == FVAL_INTEGER) {
+                long long v = val_to_int(elem);
+                if (want_product) isum *= v;
+                else isum += v;
+            } else {
+                double v = val_to_real(elem);
+                if (want_product) rsum *= v;
+                else rsum += v;
+            }
+            free_value(&elem);
+        }
+        return result_type == FVAL_INTEGER ? make_integer(isum) : make_real(rsum);
+    }
+
+    OfortValue result = make_array(result_type, result_dims, result_rank);
+    result.kind = array->kind;
+    for (int ri = 0; ri < result.v.arr.len; ri++) {
+        int rem = ri;
+        int base = 0;
+        int out_axis = 0;
+        long long isum = want_product ? 1 : 0;
+        double rsum = want_product ? 1.0 : 0.0;
+        for (int axis = 0; axis < rank; axis++) {
+            if (axis == dim - 1) continue;
+            int coord = rem % result_dims[out_axis];
+            int axis_stride = 1;
+            rem /= result_dims[out_axis];
+            for (int si = 0; si < axis; si++) axis_stride *= array->v.arr.dims[si];
+            base += coord * axis_stride;
+            out_axis++;
+        }
+        for (int k = 0; k < dim_extent; k++) {
+            int flat = base + k * stride;
+            OfortValue elem = array_element_value(array, flat);
+            if (result_type == FVAL_INTEGER) {
+                long long v = val_to_int(elem);
+                if (want_product) isum *= v;
+                else isum += v;
+            } else {
+                double v = val_to_real(elem);
+                if (want_product) rsum *= v;
+                else rsum += v;
+            }
+            free_value(&elem);
+        }
+        free_value(&result.v.arr.data[ri]);
+        result.v.arr.data[ri] = result_type == FVAL_INTEGER ? make_integer(isum) : make_real(rsum);
+    }
+    return result;
+}
+
 static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs,
                                 char arg_names[OFORT_MAX_PARAMS][256]) {
     char upper[256];
@@ -21772,6 +21842,9 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
         if (dim_idx < 0 && nargs >= 2 && (!arg_names || arg_names[1][0] == '\0')) dim_idx = 1;
         if (args[0].type != FVAL_ARRAY) return copy_value(args[0]);
+        if (dim_idx >= 0) {
+            return sum_product_dim_result(I, &args[0], (int)val_to_int(args[dim_idx]), 0);
+        }
         if (dim_idx >= 0 && args[0].v.arr.n_dims == 2) {
             int dim = (int)val_to_int(args[dim_idx]);
             int n1 = args[0].v.arr.dims[0];
@@ -21837,7 +21910,12 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         return make_real(sum);
     }
     if (strcmp(upper, "PRODUCT") == 0) {
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        if (dim_idx < 0 && nargs >= 2 && (!arg_names || arg_names[1][0] == '\0')) dim_idx = 1;
         if (args[0].type != FVAL_ARRAY) return copy_value(args[0]);
+        if (dim_idx >= 0) {
+            return sum_product_dim_result(I, &args[0], (int)val_to_int(args[dim_idx]), 1);
+        }
         double prod = 1;
         if (args[0].v.arr.int_data && args[0].v.arr.elem_type == FVAL_INTEGER) {
             long long iprod = 1;
@@ -22913,7 +22991,60 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         ofort_error(I, "CSHIFT is only implemented for rank 1 or 2 arrays");
     }
     if (strcmp(upper, "COUNT") == 0) {
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        if (dim_idx < 0 && nargs > 1 && (!arg_names || arg_names[1][0] == '\0')) dim_idx = 1;
         if (args[0].type != FVAL_ARRAY) return make_integer(val_to_logical(args[0]) ? 1 : 0);
+        if (dim_idx >= 0) {
+            OfortValue *array = &args[0];
+            int dim = (int)val_to_int(args[dim_idx]);
+            int rank = array->v.arr.n_dims;
+            int reduce_dim;
+            int result_rank = rank - 1;
+            int result_dims[7] = {0};
+            int result_len = 1;
+            int strides[7] = {0};
+            if (dim < 1 || dim > rank) ofort_error(I, "COUNT DIM is out of range");
+            reduce_dim = dim - 1;
+            for (int d = 0; d < rank; d++) {
+                if (d != reduce_dim) {
+                    result_dims[d < reduce_dim ? d : d - 1] = array->v.arr.dims[d];
+                    result_len *= array->v.arr.dims[d];
+                }
+            }
+            strides[0] = 1;
+            for (int d = 1; d < rank; d++) strides[d] = strides[d - 1] * array->v.arr.dims[d - 1];
+            if (result_rank == 0) {
+                int count = 0;
+                for (int k = 0; k < array->v.arr.dims[reduce_dim]; k++) {
+                    OfortValue elem = array_element_value(array, k * strides[reduce_dim]);
+                    if (val_to_logical(elem)) count++;
+                    free_value(&elem);
+                }
+                return make_integer(count);
+            } else {
+                OfortValue result = make_array(FVAL_INTEGER, result_dims, result_rank);
+                for (int out = 0; out < result_len; out++) {
+                    int rem = out;
+                    int full_subs[7] = {0};
+                    int base_index = 0;
+                    int count = 0;
+                    for (int rd = 0; rd < result_rank; rd++) {
+                        int sub = result_dims[rd] ? rem % result_dims[rd] : 0;
+                        if (result_dims[rd]) rem /= result_dims[rd];
+                        full_subs[rd < reduce_dim ? rd : rd + 1] = sub;
+                    }
+                    for (int d = 0; d < rank; d++) base_index += full_subs[d] * strides[d];
+                    for (int k = 0; k < array->v.arr.dims[reduce_dim]; k++) {
+                        OfortValue elem = array_element_value(array, base_index + k * strides[reduce_dim]);
+                        if (val_to_logical(elem)) count++;
+                        free_value(&elem);
+                    }
+                    free_value(&result.v.arr.data[out]);
+                    result.v.arr.data[out] = make_integer(count);
+                }
+                return result;
+            }
+        }
         int count = 0;
         for (int i = 0; i < args[0].v.arr.len; i++) {
             if (val_to_logical(args[0].v.arr.data[i])) count++;
@@ -22921,14 +23052,124 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         return make_integer(count);
     }
     if (strcmp(upper, "ANY") == 0) {
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        if (dim_idx < 0 && nargs > 1 && (!arg_names || arg_names[1][0] == '\0')) dim_idx = 1;
         if (args[0].type != FVAL_ARRAY) return make_logical(val_to_logical(args[0]));
+        if (dim_idx >= 0) {
+            OfortValue *array = &args[0];
+            int dim = (int)val_to_int(args[dim_idx]);
+            int rank = array->v.arr.n_dims;
+            int reduce_dim;
+            int result_rank = rank - 1;
+            int result_dims[7] = {0};
+            int result_len = 1;
+            int strides[7] = {0};
+            if (dim < 1 || dim > rank) ofort_error(I, "ANY DIM is out of range");
+            reduce_dim = dim - 1;
+            for (int d = 0; d < rank; d++) {
+                if (d != reduce_dim) {
+                    result_dims[d < reduce_dim ? d : d - 1] = array->v.arr.dims[d];
+                    result_len *= array->v.arr.dims[d];
+                }
+            }
+            strides[0] = 1;
+            for (int d = 1; d < rank; d++) strides[d] = strides[d - 1] * array->v.arr.dims[d - 1];
+            if (result_rank == 0) {
+                int any = 0;
+                for (int k = 0; k < array->v.arr.dims[reduce_dim]; k++) {
+                    OfortValue elem = array_element_value(array, k * strides[reduce_dim]);
+                    if (val_to_logical(elem)) any = 1;
+                    free_value(&elem);
+                    if (any) break;
+                }
+                return make_logical(any);
+            } else {
+                OfortValue result = make_array(FVAL_LOGICAL, result_dims, result_rank);
+                for (int out = 0; out < result_len; out++) {
+                    int rem = out;
+                    int full_subs[7] = {0};
+                    int base_index = 0;
+                    int any = 0;
+                    for (int rd = 0; rd < result_rank; rd++) {
+                        int sub = result_dims[rd] ? rem % result_dims[rd] : 0;
+                        if (result_dims[rd]) rem /= result_dims[rd];
+                        full_subs[rd < reduce_dim ? rd : rd + 1] = sub;
+                    }
+                    for (int d = 0; d < rank; d++) base_index += full_subs[d] * strides[d];
+                    for (int k = 0; k < array->v.arr.dims[reduce_dim]; k++) {
+                        OfortValue elem = array_element_value(array, base_index + k * strides[reduce_dim]);
+                        if (val_to_logical(elem)) any = 1;
+                        free_value(&elem);
+                        if (any) break;
+                    }
+                    free_value(&result.v.arr.data[out]);
+                    result.v.arr.data[out] = make_logical(any);
+                }
+                return result;
+            }
+        }
         for (int i = 0; i < args[0].v.arr.len; i++) {
             if (val_to_logical(args[0].v.arr.data[i])) return make_logical(1);
         }
         return make_logical(0);
     }
     if (strcmp(upper, "ALL") == 0) {
+        int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
+        if (dim_idx < 0 && nargs > 1 && (!arg_names || arg_names[1][0] == '\0')) dim_idx = 1;
         if (args[0].type != FVAL_ARRAY) return make_logical(val_to_logical(args[0]));
+        if (dim_idx >= 0) {
+            OfortValue *array = &args[0];
+            int dim = (int)val_to_int(args[dim_idx]);
+            int rank = array->v.arr.n_dims;
+            int reduce_dim;
+            int result_rank = rank - 1;
+            int result_dims[7] = {0};
+            int result_len = 1;
+            int strides[7] = {0};
+            if (dim < 1 || dim > rank) ofort_error(I, "ALL DIM is out of range");
+            reduce_dim = dim - 1;
+            for (int d = 0; d < rank; d++) {
+                if (d != reduce_dim) {
+                    result_dims[d < reduce_dim ? d : d - 1] = array->v.arr.dims[d];
+                    result_len *= array->v.arr.dims[d];
+                }
+            }
+            strides[0] = 1;
+            for (int d = 1; d < rank; d++) strides[d] = strides[d - 1] * array->v.arr.dims[d - 1];
+            if (result_rank == 0) {
+                int all = 1;
+                for (int k = 0; k < array->v.arr.dims[reduce_dim]; k++) {
+                    OfortValue elem = array_element_value(array, k * strides[reduce_dim]);
+                    if (!val_to_logical(elem)) all = 0;
+                    free_value(&elem);
+                    if (!all) break;
+                }
+                return make_logical(all);
+            } else {
+                OfortValue result = make_array(FVAL_LOGICAL, result_dims, result_rank);
+                for (int out = 0; out < result_len; out++) {
+                    int rem = out;
+                    int full_subs[7] = {0};
+                    int base_index = 0;
+                    int all = 1;
+                    for (int rd = 0; rd < result_rank; rd++) {
+                        int sub = result_dims[rd] ? rem % result_dims[rd] : 0;
+                        if (result_dims[rd]) rem /= result_dims[rd];
+                        full_subs[rd < reduce_dim ? rd : rd + 1] = sub;
+                    }
+                    for (int d = 0; d < rank; d++) base_index += full_subs[d] * strides[d];
+                    for (int k = 0; k < array->v.arr.dims[reduce_dim]; k++) {
+                        OfortValue elem = array_element_value(array, base_index + k * strides[reduce_dim]);
+                        if (!val_to_logical(elem)) all = 0;
+                        free_value(&elem);
+                        if (!all) break;
+                    }
+                    free_value(&result.v.arr.data[out]);
+                    result.v.arr.data[out] = make_logical(all);
+                }
+                return result;
+            }
+        }
         for (int i = 0; i < args[0].v.arr.len; i++) {
             if (!val_to_logical(args[0].v.arr.data[i])) return make_logical(0);
         }
