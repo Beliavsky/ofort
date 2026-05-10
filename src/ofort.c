@@ -238,6 +238,7 @@ struct OfortInterpreter {
     int check_mode;
     int consumed_bare_end;
     int in_spec_section;
+    char pending_construct_name[256];
     int stop_expr_at_slash;
     int stop_expr_at_colon;
     OfortValue *where_mask;
@@ -3428,8 +3429,8 @@ static int check_end(OfortInterpreter *I, const char *what) {
     OfortToken *next = peek_ahead(I, 1);
     if (next->type == FTOK_NEWLINE || next->type == FTOK_EOF) return 1;
     char upper[256];
-    if (next->type == FTOK_IDENT) {
-        str_upper(upper, next->str_val, 256);
+    if (token_can_be_name(next)) {
+        str_upper(upper, token_name_text(next), 256);
     } else {
         /* map token type to string */
         switch (next->type) {
@@ -3541,6 +3542,14 @@ static void consume_end_named(OfortInterpreter *I, const char *what, const char 
 
 static void consume_end(OfortInterpreter *I, const char *what) {
     consume_end_named(I, what, NULL);
+}
+
+static void apply_pending_construct_name(OfortInterpreter *I, OfortNode *n) {
+    if (!n) return;
+    if (I->pending_construct_name[0]) {
+        copy_cstr(n->name, sizeof(n->name), I->pending_construct_name);
+        I->pending_construct_name[0] = '\0';
+    }
 }
 
 /* ── Expression parsing (precedence climbing) ── */
@@ -4821,6 +4830,7 @@ static OfortNode *parse_if(OfortInterpreter *I) {
     OfortNode *n = alloc_node(I, FND_IF);
     n->line = ift->line;
     n->children[0] = cond;
+    apply_pending_construct_name(I, n);
 
     /* check for single-line IF (no THEN) */
     if (!check(I, FTOK_THEN)) {
@@ -4883,7 +4893,7 @@ static OfortNode *parse_if(OfortInterpreter *I) {
     }
 
     if (check_end(I, "IF")) {
-        consume_end(I, "IF");
+        consume_end_named(I, "IF", n->name);
     } else if (check(I, FTOK_EOF)) {
         ofort_error(I, "Unexpected end of file: missing END IF");
     }
@@ -4907,6 +4917,7 @@ static OfortNode *parse_do(OfortInterpreter *I) {
     if (token_ident_upper(peek(I), "CONCURRENT")) {
         OfortNode *n = alloc_node(I, FND_DO_CONCURRENT);
         n->line = dot->line;
+        apply_pending_construct_name(I, n);
         advance(I); /* CONCURRENT */
         expect(I, FTOK_LPAREN);
         while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
@@ -4992,7 +5003,7 @@ static OfortNode *parse_do(OfortInterpreter *I) {
             if (!n->stmts) ofort_error(I, "Out of memory");
             for (int i = 0; i < n->n_stmts; i++) n->stmts[i] = body->stmts[i];
         }
-        if (!terminal_label) consume_end(I, "DO");
+        if (!terminal_label) consume_end_named(I, "DO", n->name);
         return n;
     }
 
@@ -5007,13 +5018,14 @@ static OfortNode *parse_do(OfortInterpreter *I) {
         OfortNode *n = alloc_node(I, FND_DO_WHILE);
         n->children[0] = cond;
         n->line = dot->line;
+        apply_pending_construct_name(I, n);
 
         OfortNode *body = terminal_label ?
             parse_block_until_label(I, terminal_label) :
             parse_block_until_end(I, "DO");
         n->children[1] = body;
         n->n_children = 2;
-        if (!terminal_label) consume_end(I, "DO");
+        if (!terminal_label) consume_end_named(I, "DO", n->name);
         return n;
     }
 
@@ -5021,17 +5033,22 @@ static OfortNode *parse_do(OfortInterpreter *I) {
     if (check(I, FTOK_NEWLINE) || check(I, FTOK_SEMICOLON)) {
         OfortNode *n = alloc_node(I, FND_DO_FOREVER);
         n->line = dot->line;
+        apply_pending_construct_name(I, n);
         skip_newlines(I);
         OfortNode *body = parse_block_until_end(I, "DO");
         n->children[0] = body;
         n->n_children = 1;
-        consume_end(I, "DO");
+        consume_end_named(I, "DO", n->name);
         return n;
     }
 
     /* DO [label] i = start, end [, step] */
     OfortNode *n = alloc_node(I, FND_DO_LOOP);
     n->line = dot->line;
+    if (I->pending_construct_name[0]) {
+        copy_cstr(n->str_val, sizeof(n->str_val), I->pending_construct_name);
+        I->pending_construct_name[0] = '\0';
+    }
 
     /* loop variable */
     OfortToken *var_tok;
@@ -5059,7 +5076,7 @@ static OfortNode *parse_do(OfortInterpreter *I) {
         parse_block_until_end(I, "DO");
     n->children[3] = body;
     n->n_children = 4;
-    if (!terminal_label) consume_end(I, "DO");
+    if (!terminal_label) consume_end_named(I, "DO", n->str_val);
     return n;
 }
 
@@ -5109,6 +5126,7 @@ static OfortNode *parse_select_case(OfortInterpreter *I) {
     n->children[0] = expr;
     n->n_children = 1;
     n->line = st->line;
+    apply_pending_construct_name(I, n);
     n->stmts = NULL;
     n->n_stmts = 0;
     int cap = 0;
@@ -5176,7 +5194,7 @@ static OfortNode *parse_select_case(OfortInterpreter *I) {
             advance(I); /* skip unexpected tokens */
         }
     }
-    consume_end(I, "SELECT");
+    consume_end_named(I, "SELECT", n->name);
     /* skip optional CASE after END SELECT (i.e. END SELECT) -- already consumed */
     return n;
 }
@@ -5195,6 +5213,7 @@ static OfortNode *parse_select_rank(OfortInterpreter *I) {
     n->children[0] = expr;
     n->n_children = 1;
     n->line = st->line;
+    apply_pending_construct_name(I, n);
 
     while (!check_end(I, "SELECT") && !check(I, FTOK_EOF)) {
         skip_newlines(I);
@@ -5242,7 +5261,7 @@ static OfortNode *parse_select_rank(OfortInterpreter *I) {
             advance(I);
         }
     }
-    consume_end(I, "SELECT");
+    consume_end_named(I, "SELECT", n->name);
     return n;
 }
 
@@ -5984,13 +6003,14 @@ static OfortNode *parse_block_construct(OfortInterpreter *I) {
     OfortNode *n = alloc_node(I, FND_BLOCK_CONSTRUCT);
     int prev_spec_section;
     n->line = bt->line;
+    apply_pending_construct_name(I, n);
     skip_newlines(I);
     prev_spec_section = I->in_spec_section;
     I->in_spec_section = 1;
     n->children[0] = parse_block_until_end(I, "BLOCK");
     I->in_spec_section = prev_spec_section;
     n->n_children = 1;
-    consume_end(I, "BLOCK");
+    consume_end_named(I, "BLOCK", n->name);
     return n;
 }
 
@@ -6423,6 +6443,7 @@ static OfortNode *parse_associate_construct(OfortInterpreter *I) {
     OfortNode *n = alloc_node(I, FND_ASSOCIATE);
     int cap = 0;
     n->line = at->line;
+    apply_pending_construct_name(I, n);
     expect(I, FTOK_LPAREN);
     while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
         if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
@@ -6443,7 +6464,7 @@ static OfortNode *parse_associate_construct(OfortInterpreter *I) {
     skip_newlines(I);
     n->children[0] = parse_block_until_end(I, "ASSOCIATE");
     n->n_children = 1;
-    consume_end(I, "ASSOCIATE");
+    consume_end_named(I, "ASSOCIATE", n->name);
     return n;
 }
 
@@ -6451,6 +6472,7 @@ static OfortNode *parse_forall_stmt(OfortInterpreter *I) {
     OfortToken *ft = advance(I); /* FORALL */
     OfortNode *n = alloc_node(I, FND_FORALL);
     n->line = ft->line;
+    apply_pending_construct_name(I, n);
     expect(I, FTOK_LPAREN);
     while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
         OfortToken *name;
@@ -6501,7 +6523,7 @@ static OfortNode *parse_forall_stmt(OfortInterpreter *I) {
             if (!n->stmts) ofort_error(I, "Out of memory");
             for (int i = 0; i < n->n_stmts; i++) n->stmts[i] = body->stmts[i];
         }
-        consume_end(I, "FORALL");
+        consume_end_named(I, "FORALL", n->name);
     } else {
         OfortNode *body_stmt = parse_statement(I);
         if (body_stmt) {
@@ -6511,7 +6533,7 @@ static OfortNode *parse_forall_stmt(OfortInterpreter *I) {
             n->n_stmts = 1;
         }
         if (!body_stmt && check_end(I, "FORALL")) {
-            consume_end(I, "FORALL");
+            consume_end_named(I, "FORALL", n->name);
         }
     }
     return n;
@@ -6785,7 +6807,7 @@ static OfortNode *parse_submodule(OfortInterpreter *I) {
         n->children[0] = parse_block_until_end(I, "SUBMODULE");
         I->in_spec_section = prev_spec_section;
         n->n_children = 1;
-        consume_end(I, "SUBMODULE");
+        consume_end_named(I, "SUBMODULE", n->name);
     }
     return n;
 }
@@ -6846,7 +6868,7 @@ static OfortNode *parse_module_procedure_body(OfortInterpreter *I) {
             n->children[0] = impl_body;
         }
         n->n_children = 1;
-        consume_end(I, "PROCEDURE");
+        consume_end_named(I, "PROCEDURE", n->name);
     }
     return n;
 }
@@ -7987,6 +8009,8 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
 
     /* Statement label/name prefix, e.g. "outer: do ..." */
     if (t->type == FTOK_IDENT && peek_ahead(I, 1)->type == FTOK_COLON) {
+        char construct_name[256];
+        copy_cstr(construct_name, sizeof(construct_name), token_name_text(t));
         advance(I);
         advance(I);
         skip_newlines(I);
@@ -7997,27 +8021,39 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         }
         if (token_ident_upper(t, "BLOCK")) {
             leave_spec_section(I);
+            copy_cstr(I->pending_construct_name, sizeof(I->pending_construct_name), construct_name);
             return parse_block_construct(I);
         }
         if (token_ident_upper(t, "ASSOCIATE")) {
             leave_spec_section(I);
+            copy_cstr(I->pending_construct_name, sizeof(I->pending_construct_name), construct_name);
             return parse_associate_construct(I);
         }
         if (token_ident_upper(t, "FORALL")) {
             leave_spec_section(I);
+            copy_cstr(I->pending_construct_name, sizeof(I->pending_construct_name), construct_name);
             return parse_forall_stmt(I);
         }
         if (token_ident_upper(t, "WHERE")) {
             leave_spec_section(I);
+            copy_cstr(I->pending_construct_name, sizeof(I->pending_construct_name), construct_name);
             return parse_where_statement(I);
         }
         if (t->type == FTOK_DO) {
             leave_spec_section(I);
+            copy_cstr(I->pending_construct_name, sizeof(I->pending_construct_name), construct_name);
             return parse_do(I);
         }
         if (t->type == FTOK_IF) {
             leave_spec_section(I);
+            copy_cstr(I->pending_construct_name, sizeof(I->pending_construct_name), construct_name);
             return parse_if(I);
+        }
+        if (t->type == FTOK_SELECT) {
+            leave_spec_section(I);
+            copy_cstr(I->pending_construct_name, sizeof(I->pending_construct_name), construct_name);
+            if (token_ident_upper(peek_ahead(I, 1), "RANK")) return parse_select_rank(I);
+            return parse_select_case(I);
         }
     }
 
@@ -8721,6 +8757,7 @@ static OfortNode *parse_where_statement(OfortInterpreter *I) {
     OfortToken *wt = advance(I); /* WHERE */
     OfortNode *n = alloc_node(I, FND_WHERE);
     n->line = wt->line;
+    apply_pending_construct_name(I, n);
     expect(I, FTOK_LPAREN);
     n->children[0] = parse_expr(I);
     expect(I, FTOK_RPAREN);
@@ -8749,7 +8786,7 @@ static OfortNode *parse_where_statement(OfortInterpreter *I) {
             parse_block_until_where_part(I);
         }
     }
-    consume_end(I, "WHERE");
+    consume_end_named(I, "WHERE", n->name);
     return n;
 }
 
