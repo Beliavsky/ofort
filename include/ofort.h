@@ -204,8 +204,10 @@ typedef struct OfortNode {
     int is_implicit_save;
     int is_parameter;
     int is_optional;
+    int is_value;
     int is_elemental;
     int is_pure;
+    int has_explicit_result_type;
     int access_attr;        /* 0=none, 1=PUBLIC, 2=PRIVATE */
     int no_advance;         /* WRITE(..., ADVANCE='NO') */
     char result_name[256];  /* for FUNCTION ... RESULT(name) */
@@ -224,6 +226,7 @@ typedef struct OfortNode {
     char param_type_names[OFORT_MAX_PARAMS][64];
     int param_intents[OFORT_MAX_PARAMS];
     int param_optional[OFORT_MAX_PARAMS];
+    int param_values[OFORT_MAX_PARAMS];
     int param_n_dims[OFORT_MAX_PARAMS];
     int n_params;
     char type_param_names[OFORT_MAX_PARAMS][64];
