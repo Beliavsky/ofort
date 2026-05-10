@@ -37,6 +37,8 @@ static int add_repl_line_to_buffer(char **buf, size_t *len, size_t *cap, const c
 static int source_defines_name(const char *source, const char *name);
 static int replace_source_line(char **buf, size_t *len, size_t *cap, int line_no, const char *text);
 
+static char g_repl_prompt[128] = "ofort> ";
+
 typedef struct {
     const char **items;
     int count;
@@ -273,6 +275,30 @@ static int command_starts_with(const char *line, const char *command) {
 
     return strncmp(line, command, n) == 0 &&
            (line[n] == '\0' || line[n] == '\n' || line[n] == '\r' || isspace((unsigned char)line[n]));
+}
+
+static int set_repl_prompt_from_command(const char *line) {
+    const char *p;
+    const char *end;
+    size_t len;
+    if (!command_starts_with(line, ".prompt")) return 0;
+    p = line + strlen(".prompt");
+    while (*p && isspace((unsigned char)*p)) p++;
+    end = p + strlen(p);
+    while (end > p && (end[-1] == '\n' || end[-1] == '\r' || isspace((unsigned char)end[-1]))) end--;
+    if (end == p) {
+        snprintf(g_repl_prompt, sizeof(g_repl_prompt), "%s", "ofort> ");
+        return 1;
+    }
+    if (end - p >= 2 && ((*p == '"' && end[-1] == '"') || (*p == '\'' && end[-1] == '\''))) {
+        p++;
+        end--;
+    }
+    len = (size_t)(end - p);
+    if (len >= sizeof(g_repl_prompt)) len = sizeof(g_repl_prompt) - 1;
+    memcpy(g_repl_prompt, p, len);
+    g_repl_prompt[len] = '\0';
+    return 1;
 }
 
 static void free_split_args(char **args, int nargs) {
@@ -715,21 +741,18 @@ static char *make_save_source(const char *source, const char *footer) {
     return effective;
 }
 
-static int save_interactive_source(const char *source, const char *footer) {
-    char path[64];
+static int save_interactive_source_to_path(const char *source, const char *footer,
+                                           const char *path, int overwrite) {
     char *effective;
     FILE *fp;
-    int i;
 
     if (!source || source[0] == '\0') {
         return 0;
     }
-
-    strcpy(path, "main.f90");
-    for (i = 1; file_exists(path); i++) {
-        snprintf(path, sizeof(path), "main%d.f90", i);
+    if (!overwrite && file_exists(path)) {
+        fprintf(stderr, "%s already exists; use --overwrite to replace it\n", path);
+        return 1;
     }
-
     fp = fopen(path, "wb");
     if (!fp) {
         fprintf(stderr, "failed to save %s\n", path);
@@ -746,6 +769,20 @@ static int save_interactive_source(const char *source, const char *footer) {
     fclose(fp);
     printf("Saved %s\n", path);
     return 0;
+}
+
+static int save_interactive_source(const char *source, const char *footer) {
+    char path[64];
+    int i;
+
+    if (!source || source[0] == '\0') {
+        return 0;
+    }
+    strcpy(path, "main.f90");
+    for (i = 1; file_exists(path); i++) {
+        snprintf(path, sizeof(path), "main%d.f90", i);
+    }
+    return save_interactive_source_to_path(source, footer, path, 0);
 }
 
 static const char *skip_space(const char *line) {
@@ -1237,6 +1274,13 @@ static ReplType source_declared_type(const char *source, const char *name) {
 static ReplType literal_rhs_type(const char *rhs) {
     const char *p = skip_space(rhs);
 
+    if (*p == '[') {
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+    } else if (*p == '(' && p[1] == '/') {
+        p += 2;
+        while (*p == ' ' || *p == '\t') p++;
+    }
     if (*p == '"' || *p == '\'') {
         return REPL_TYPE_CHARACTER;
     }
@@ -1327,6 +1371,40 @@ static int validate_repl_line_before_append(const char *source, const char *line
     }
 
     return 1;
+}
+
+static int parse_save_command(const char *line, const char *command,
+                              char *path, size_t path_size, int *has_path,
+                              int *overwrite) {
+    char *args[OFORT_MAX_PARAMS];
+    int nargs = 0;
+    const char *p;
+    int ok = 1;
+
+    if (!command_starts_with(line, command)) return 0;
+    p = skip_space(line + strlen(command));
+    *has_path = 0;
+    *overwrite = 0;
+    if (!split_command_args(p, args, &nargs)) return -1;
+    if (nargs == 0) return 1;
+    if (nargs == 1) {
+        if (strcmp(args[0], "--overwrite") == 0) {
+            fprintf(stderr, "%s --overwrite requires a filename\n", command);
+            ok = 0;
+        } else {
+            snprintf(path, path_size, "%s", args[0]);
+            *has_path = 1;
+        }
+    } else if (nargs == 2 && strcmp(args[1], "--overwrite") == 0) {
+        snprintf(path, path_size, "%s", args[0]);
+        *has_path = 1;
+        *overwrite = 1;
+    } else {
+        fprintf(stderr, "usage: %s [file] [--overwrite]\n", command);
+        ok = 0;
+    }
+    free_split_args(args, nargs);
+    return ok ? 1 : -1;
 }
 
 static int copy_repl_shortcut_identifier(const char **p_in, char *name, size_t name_size) {
@@ -1449,8 +1527,40 @@ static int source_parameter_line_number(const char *source, const char *name) {
     return 0;
 }
 
+static int copy_repl_shortcut_shape(const char **p_in, char *shape, size_t shape_size) {
+    const char *p = *p_in;
+    const char *start;
+    int depth = 0;
+    size_t len;
+
+    if (shape_size > 0) shape[0] = '\0';
+    if (*p != '(') return 1;
+    start = p;
+    while (*p) {
+        if (*p == '(') depth++;
+        else if (*p == ')') {
+            depth--;
+            if (depth == 0) {
+                p++;
+                len = (size_t)(p - start);
+                if (len >= shape_size) return 0;
+                memcpy(shape, start, len);
+                shape[len] = '\0';
+                *p_in = p;
+                return 1;
+            }
+        } else if (*p == '\r' || *p == '\n') {
+            return 0;
+        }
+        p++;
+    }
+    return 0;
+}
+
 static int parse_repl_decl_shortcut(const char *line, const char **keyword_out,
-                                    char *name, size_t name_size, const char **rhs_out) {
+                                    char *name, size_t name_size,
+                                    char *shape, size_t shape_size,
+                                    const char **rhs_out) {
     const char *p;
     const char *keyword = NULL;
 
@@ -1468,6 +1578,7 @@ static int parse_repl_decl_shortcut(const char *line, const char **keyword_out,
     if (*p != ' ' && *p != '\t') return 0;
     while (*p == ' ' || *p == '\t') p++;
     if (!copy_repl_shortcut_identifier(&p, name, name_size)) return 0;
+    if (!copy_repl_shortcut_shape(&p, shape, shape_size)) return 0;
     while (*p == ' ' || *p == '\t') p++;
     if (*p != '=' || p[1] == '=') return 0;
     *keyword_out = keyword;
@@ -1477,7 +1588,8 @@ static int parse_repl_decl_shortcut(const char *line, const char **keyword_out,
 
 static void build_repl_decl_shortcut_line(char *out, size_t out_size, const char *keyword,
                                           const char *name, const char *decl,
-                                          const char *rhs, const char *leading, size_t leading_len) {
+                                          const char *shape, const char *rhs,
+                                          const char *leading, size_t leading_len) {
     int is_const = strcmp(keyword, "const") == 0 || strcmp(keyword, "reconst") == 0;
 
     if (leading_len >= out_size) {
@@ -1487,8 +1599,15 @@ static void build_repl_decl_shortcut_line(char *out, size_t out_size, const char
     memcpy(out, leading, leading_len);
     if (is_const) {
         snprintf(out + leading_len, out_size - leading_len,
-                 "%s, parameter :: %s = %s", decl, name, skip_space(rhs));
+                 "%s, parameter :: %s%s = %s", decl, name, shape ? shape : "", skip_space(rhs));
     } else {
+        if (shape && shape[0]) {
+            snprintf(out + leading_len, out_size - leading_len,
+                     "%s :: %s%s\n%.*s%s = %s", decl, name, shape,
+                     (int)leading_len, leading, name, skip_space(rhs));
+            out[out_size - 1] = '\0';
+            return;
+        }
         snprintf(out + leading_len, out_size - leading_len,
                  "%s :: %s\n%.*s%s = %s", decl, name, (int)leading_len, leading, name, skip_space(rhs));
     }
@@ -1500,6 +1619,7 @@ static int rewrite_repl_let_const_shortcut(char *line, size_t line_size, const c
     const char *rhs;
     const char *keyword = NULL;
     char name[256];
+    char shape[256];
     char decl[256];
     char rewritten[4096];
     size_t leading_len;
@@ -1510,7 +1630,7 @@ static int rewrite_repl_let_const_shortcut(char *line, size_t line_size, const c
     while (*p == ' ' || *p == '\t') p++;
     leading_len = (size_t)(p - line);
 
-    if (!parse_repl_decl_shortcut(line, &keyword, name, sizeof(name), &rhs)) return 0;
+    if (!parse_repl_decl_shortcut(line, &keyword, name, sizeof(name), shape, sizeof(shape), &rhs)) return 0;
     if (strcmp(keyword, "reconst") == 0) return 0;
 
     if (source_defines_name(source ? source : "", name)) {
@@ -1529,7 +1649,7 @@ static int rewrite_repl_let_const_shortcut(char *line, size_t line_size, const c
         return -1;
     }
 
-    build_repl_decl_shortcut_line(rewritten, sizeof(rewritten), keyword, name, decl,
+    build_repl_decl_shortcut_line(rewritten, sizeof(rewritten), keyword, name, decl, shape,
                                   rhs, line, leading_len);
     snprintf(line, line_size, "%s", rewritten);
     return 1;
@@ -1539,11 +1659,12 @@ static int apply_repl_reconst_shortcut(char **buf, size_t *len, size_t *cap, con
     const char *rhs;
     const char *keyword = NULL;
     char name[256];
+    char shape[256];
     char decl[256];
     char rewritten[4096];
     int line_no;
 
-    if (!parse_repl_decl_shortcut(line, &keyword, name, sizeof(name), &rhs)) return 0;
+    if (!parse_repl_decl_shortcut(line, &keyword, name, sizeof(name), shape, sizeof(shape), &rhs)) return 0;
     if (strcmp(keyword, "reconst") != 0) return 0;
 
     if (!repl_shortcut_decl_type(rhs, decl, sizeof(decl))) {
@@ -1559,7 +1680,7 @@ static int apply_repl_reconst_shortcut(char **buf, size_t *len, size_t *cap, con
         }
         return -1;
     }
-    build_repl_decl_shortcut_line(rewritten, sizeof(rewritten), keyword, name, decl,
+    build_repl_decl_shortcut_line(rewritten, sizeof(rewritten), keyword, name, decl, shape,
                                   rhs, line, (size_t)(skip_space(line) - line));
     if (!replace_source_line(buf, len, cap, line_no, rewritten)) return -1;
     return 1;
@@ -1729,6 +1850,14 @@ static int g_fast_mode = 0;
 static int g_specialized_fast_paths = 1;
 static int g_line_profile = 0;
 static int g_trace_assign = 0;
+static int g_check_uninitialized = 0;
+static int g_no_logo = 0;
+static int g_init_integer_enabled = 0;
+static long long g_init_integer_value = 0;
+static int g_init_real_enabled = 0;
+static double g_init_real_value = 0.0;
+static int g_init_character_enabled = 0;
+static char g_init_character_value[OFORT_MAX_STRLEN] = "";
 static OfortStandardMode g_standard_mode = OFORT_STD_LEGACY;
 
 static OfortInterpreter *create_ofort_interpreter(void) {
@@ -1740,6 +1869,10 @@ static OfortInterpreter *create_ofort_interpreter(void) {
         ofort_set_specialized_fast_paths(interp, g_specialized_fast_paths);
         ofort_set_line_profile_enabled(interp, g_line_profile);
         ofort_set_trace_assign(interp, g_trace_assign);
+        ofort_set_strict_uninitialized(interp, g_check_uninitialized);
+        ofort_set_init_integer(interp, g_init_integer_enabled, g_init_integer_value);
+        ofort_set_init_real(interp, g_init_real_enabled, g_init_real_value);
+        ofort_set_init_character(interp, g_init_character_enabled, g_init_character_value);
         ofort_set_standard_mode(interp, g_standard_mode);
     }
     return interp;
@@ -1749,6 +1882,7 @@ static OfortInterpreter *create_repl_interpreter(void) {
     OfortInterpreter *interp = create_ofort_interpreter();
     if (interp) {
         ofort_set_live_stdout(interp, 1);
+        ofort_set_strict_uninitialized(interp, 1);
     }
     return interp;
 }
@@ -3017,8 +3151,10 @@ static int run_interactive(const char *load_path, int run_after_load) {
     size_t executed_len = 0;
     int last_rc = 0;
 
-    printf("Enter Fortran source.\n");
-    printf("Commands: . runs, .run [n] [-- args] repeats, .time [n] [-- args] times, .runq [n] [-- args] runs and quits, .quit quits, .clear clears, .del n[:m] deletes lines, .ins n text inserts, .rep n text replaces, .rename old new renames, .list lists, .decl lists declarations, .vars [names] lists values, .info [names] lists details, .shapes [names] lists array shapes, .sizes [names] lists array sizes, .stats [names] lists array stats, .load file loads, .load-run file loads/runs. With --trace-assign, top-level assignments run immediately.\n");
+    if (!g_no_logo) {
+        printf("Enter Fortran source.\n");
+        printf("Commands: . runs, .run [n] [-- args] repeats, .time [n] [-- args] times, .runq [n] [-- args] runs and quits, .quit quits and saves, .quit! quits without saving, .save [file] saves, .saveq [file] saves and quits, .clear clears, .prompt text changes the prompt, .del n[:m] deletes lines, .ins n text inserts, .rep n text replaces, .rename old new renames, .list lists, .decl lists declarations, .vars [names] lists values, .info [names] lists details, .shapes [names] lists array shapes, .sizes [names] lists array sizes, .stats [names] lists array stats, .load file loads, .load-run file loads/runs. With --trace-assign, top-level assignments run immediately.\n");
+    }
 
     repl_interp = create_repl_interpreter();
     if (!repl_interp) {
@@ -3050,7 +3186,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
     for (;;) {
         int prompt_indent = source_indent_level(buf ? buf : "");
 
-        fputs("ofort> ", stdout);
+        fputs(g_repl_prompt, stdout);
         for (int i = 0; i < prompt_indent * 2; i++) {
             fputc(' ', stdout);
         }
@@ -3173,6 +3309,59 @@ static int run_interactive(const char *load_path, int run_after_load) {
                 free(footer);
                 ofort_destroy(repl_interp);
                 return last_rc;
+            }
+        }
+
+        if (set_repl_prompt_from_command(line)) {
+            continue;
+        }
+
+        if (is_command(line, ".quit!")) {
+            free(buf);
+            free(footer);
+            ofort_destroy(repl_interp);
+            return last_rc;
+        }
+
+        {
+            char save_path[1024];
+            int has_path = 0;
+            int overwrite = 0;
+            int parsed = parse_save_command(line, ".save", save_path, sizeof(save_path),
+                                            &has_path, &overwrite);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    last_rc = has_path ?
+                              save_interactive_source_to_path(buf ? buf : "", footer, save_path, overwrite) :
+                              save_interactive_source(buf ? buf : "", footer);
+                } else {
+                    last_rc = 1;
+                }
+                continue;
+            }
+        }
+
+        {
+            char save_path[1024];
+            int has_path = 0;
+            int overwrite = 0;
+            int parsed = parse_save_command(line, ".saveq", save_path, sizeof(save_path),
+                                            &has_path, &overwrite);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    last_rc = has_path ?
+                              save_interactive_source_to_path(buf ? buf : "", footer, save_path, overwrite) :
+                              save_interactive_source(buf ? buf : "", footer);
+                    if (last_rc == 0) {
+                        free(buf);
+                        free(footer);
+                        ofort_destroy(repl_interp);
+                        return 0;
+                    }
+                } else {
+                    last_rc = 1;
+                }
+                continue;
             }
         }
 
@@ -3590,7 +3779,9 @@ static int run_interactive(const char *load_path, int run_after_load) {
 
         {
             int line_indent = source_indent_level(buf ? buf : "");
-            int trace_immediate = (g_trace_assign && line_indent == 0 && is_trace_assign_immediate_line(line));
+            int assignment_immediate = (line_indent == 0 && is_trace_assign_immediate_line(line));
+            int print_immediate = (line_indent == 0 && starts_with_word_nocase(skip_space(line), "print"));
+            int immediate_execute = assignment_immediate || print_immediate;
             int declaration_after_execution = (executed_len > 0 && is_repl_declaration_line(line));
             size_t old_len = len;
             size_t old_executed_len = executed_len;
@@ -3622,7 +3813,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
                     return 2;
                 }
             }
-            if (trace_immediate) {
+            if (immediate_execute) {
                 if (executed_len == 0 && old_len > 0) {
                     last_rc = execute_repl_source_prefix(repl_interp, buf ? buf : "", old_len,
                                                         &executed_len, 0);
@@ -3875,6 +4066,16 @@ static int starts_with_keyword(const char *s, const char *kw) {
     return s[i] == '\0' || isspace((unsigned char)s[i]);
 }
 
+static int string_eq_nocase(const char *a, const char *b) {
+    size_t i = 0;
+    if (!a || !b) return 0;
+    while (a[i] && b[i]) {
+        if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return 0;
+        i++;
+    }
+    return a[i] == '\0' && b[i] == '\0';
+}
+
 static int has_program_unit_header(const char *source) {
     const char *p = source;
 
@@ -3943,7 +4144,7 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--version] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--time|--time-detail] [--profile-lines] [--trace-assign] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [--nologo] [--prompt text] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--time|--time-detail] [--profile-lines] [--trace-assign] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
     fprintf(stderr, "       %s --each [--check] [--quiet] [--limit n] [--max-fail n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
@@ -3951,6 +4152,8 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       %s --check-gfortran file.f90\n", program);
     fprintf(stderr, "       %s < file.f90\n", program);
     fprintf(stderr, "       --version prints the ofort version\n");
+    fprintf(stderr, "       --nologo suppresses the interactive startup banner\n");
+    fprintf(stderr, "       --prompt text sets the interactive prompt text\n");
     fprintf(stderr, "       -w suppresses warnings\n");
     fprintf(stderr, "       --quiet suppresses success/progress output but not diagnostics\n");
     fprintf(stderr, "       --std=f2023 rejects known nonstandard extensions; --std=legacy is the default\n");
@@ -3960,6 +4163,10 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --time-detail prints setup, lex, parse, register, execute, and total times\n");
     fprintf(stderr, "       --profile-lines prints elapsed execution time by source line\n");
     fprintf(stderr, "       --trace-assign prints assignment trace diagnostics\n");
+    fprintf(stderr, "       --check-uninitialized, --check-uninit rejects reads of declared variables before assignment\n");
+    fprintf(stderr, "       --init-int value initializes otherwise uninitialized INTEGER variables to value\n");
+    fprintf(stderr, "       --init-real value|nan initializes otherwise uninitialized REAL/DOUBLE variables to value or NaN\n");
+    fprintf(stderr, "       --init-char text initializes otherwise uninitialized CHARACTER variables with repeated/truncated text\n");
     fprintf(stderr, "       --fixed-form treats input as fixed source form; --free-form forces free source form\n");
     fprintf(stderr, "       --save-free saves converted fixed-form input beside the source as .f90\n");
     fprintf(stderr, "       --each treats each file or Windows glob match as a separate program\n");
@@ -4068,6 +4275,15 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--quiet") == 0) {
             quiet = 1;
             g_quiet = 1;
+        } else if (strcmp(argv[i], "--nologo") == 0) {
+            g_no_logo = 1;
+        } else if (strcmp(argv[i], "--prompt") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "--prompt requires text\n");
+                path_list_free(&source_paths);
+                return 2;
+            }
+            snprintf(g_repl_prompt, sizeof(g_repl_prompt), "%s", argv[i]);
         } else if (strcmp(argv[i], "--std=f2023") == 0 || strcmp(argv[i], "-std=f2023") == 0 ||
                    strcmp(argv[i], "--std=f2018") == 0 || strcmp(argv[i], "-std=f2018") == 0) {
             g_standard_mode = OFORT_STD_F2023;
@@ -4093,6 +4309,53 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--trace-assign") == 0) {
             g_trace_assign = 1;
             g_specialized_fast_paths = 0;
+        } else if (strcmp(argv[i], "--check-uninitialized") == 0 ||
+                   strcmp(argv[i], "--check-uninit") == 0) {
+            g_check_uninitialized = 1;
+        } else if (strcmp(argv[i], "--init-int") == 0) {
+            char *endptr;
+            long long parsed;
+            if (++i >= argc) {
+                fprintf(stderr, "--init-int requires an integer value\n");
+                path_list_free(&source_paths);
+                return 2;
+            }
+            parsed = strtoll(argv[i], &endptr, 10);
+            if (endptr == argv[i] || *endptr != '\0') {
+                fprintf(stderr, "--init-int requires an integer value\n");
+                path_list_free(&source_paths);
+                return 2;
+            }
+            g_init_integer_enabled = 1;
+            g_init_integer_value = parsed;
+        } else if (strcmp(argv[i], "--init-real") == 0) {
+            char *endptr;
+            double parsed;
+            if (++i >= argc) {
+                fprintf(stderr, "--init-real requires a real value or nan\n");
+                path_list_free(&source_paths);
+                return 2;
+            }
+            if (string_eq_nocase(argv[i], "nan")) {
+                parsed = NAN;
+            } else {
+                parsed = strtod(argv[i], &endptr);
+                if (endptr == argv[i] || *endptr != '\0') {
+                    fprintf(stderr, "--init-real requires a real value or nan\n");
+                    path_list_free(&source_paths);
+                    return 2;
+                }
+            }
+            g_init_real_enabled = 1;
+            g_init_real_value = parsed;
+        } else if (strcmp(argv[i], "--init-char") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "--init-char requires text\n");
+                path_list_free(&source_paths);
+                return 2;
+            }
+            g_init_character_enabled = 1;
+            snprintf(g_init_character_value, sizeof(g_init_character_value), "%s", argv[i]);
         } else if (strcmp(argv[i], "--fixed-form") == 0) {
             g_source_form = SOURCE_FORM_FIXED;
         } else if (strcmp(argv[i], "--free-form") == 0) {
