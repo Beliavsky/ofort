@@ -44,6 +44,7 @@ typedef struct {
     OfortValue val;
     int is_parameter; /* PARAMETER = const */
     int intent;       /* 0=none,1=IN,2=OUT,3=INOUT */
+    int is_value;
     int char_len;     /* declared CHARACTER length, 0 if not CHARACTER */
     int present;      /* 0 for absent OPTIONAL dummy arguments */
     int is_allocatable;
@@ -877,6 +878,8 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
             if (s->vars[i].is_protected)
                 ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
+            if (s->vars[i].intent == 1)
+                ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", name);
             if (s->vars[i].is_alias && s->vars[i].pointer_target[0]) {
                 OfortVar *target = find_var(I, s->vars[i].pointer_target);
                 OfortValue alias_val = copy_value(val);
@@ -940,6 +943,8 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                     ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
                 if (ps->vars[i].is_protected)
                     ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
+                if (ps->vars[i].intent == 1)
+                    ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", name);
                 if (ps->vars[i].is_alias && ps->vars[i].pointer_target[0]) {
                     OfortVar *target = find_var(I, ps->vars[i].pointer_target);
                     OfortValue alias_val = copy_value(val);
@@ -1014,6 +1019,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->val = val;
     v->is_parameter = 0;
     v->intent = 0;
+    v->is_value = 0;
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     v->present = 1;
     v->is_allocatable = 0;
@@ -1068,6 +1074,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->val = val;
     v->is_parameter = 0;
     v->intent = 0;
+    v->is_value = 0;
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     v->present = val.type != FVAL_VOID;
     v->is_allocatable = 0;
@@ -1102,6 +1109,7 @@ static OfortVar *declare_alias_var(OfortInterpreter *I, const char *name, OfortV
     v->val = target->val;
     v->is_parameter = target->is_parameter;
     v->intent = target->intent;
+    v->is_value = target->is_value;
     v->char_len = target->char_len;
     v->present = target->present;
     v->is_allocatable = target->is_allocatable;
@@ -1530,6 +1538,7 @@ static void restore_saved_vars(OfortInterpreter *I, OfortFunc *func) {
         OfortVar *v = declare_var(I, func->saved_vars[i].name, copy_value(func->saved_vars[i].val));
         v->is_parameter = func->saved_vars[i].is_parameter;
         v->intent = func->saved_vars[i].intent;
+        v->is_value = func->saved_vars[i].is_value;
         v->char_len = func->saved_vars[i].char_len;
         v->present = func->saved_vars[i].present;
         v->is_allocatable = func->saved_vars[i].is_allocatable;
@@ -1568,6 +1577,7 @@ static void store_saved_vars(OfortFunc *func, OfortScope *scope) {
         dst->val = copy_value(src->val);
         dst->is_parameter = src->is_parameter;
         dst->intent = src->intent;
+        dst->is_value = src->is_value;
         dst->char_len = src->char_len;
         dst->present = src->present;
         dst->is_allocatable = src->is_allocatable;
@@ -1594,6 +1604,7 @@ static void copy_imported_var_attrs(OfortVar *dst, const OfortVar *src) {
     if (!dst || !src) return;
     dst->is_parameter = src->is_parameter;
     dst->intent = src->intent;
+    dst->is_value = src->is_value;
     dst->char_len = src->char_len;
     dst->present = src->present;
     dst->is_allocatable = src->is_allocatable;
@@ -4255,6 +4266,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     int is_implicit_save = 0;
     int is_parameter = 0;
     int is_optional = 0;
+    int is_value = 0;
     int is_external = 0;
     int access_attr = 0;
     int intent = 0;
@@ -4467,6 +4479,9 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "optional")) {
             advance(I);
             is_optional = 1;
+        } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "value")) {
+            advance(I);
+            is_value = 1;
         } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "external")) {
             advance(I);
             is_external = 1;
@@ -4527,6 +4542,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         decl->is_implicit_save = is_implicit_save;
         decl->is_parameter = is_parameter;
         decl->is_optional = is_optional;
+        decl->is_value = is_value;
         decl->access_attr = access_attr;
         decl->intent = intent;
         decl->line = name_tok->line;
@@ -6555,6 +6571,7 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
             n->param_type_names[n->n_params][0] = '\0';
             n->param_intents[n->n_params] = 0;
             n->param_optional[n->n_params] = 0;
+            n->param_values[n->n_params] = 0;
             n->param_n_dims[n->n_params] = 0;
             n->n_params++;
             if (check(I, FTOK_COMMA)) advance(I);
@@ -6572,7 +6589,8 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
     return n;
 }
 
-static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType result_type) {
+static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType result_type,
+                                           int has_explicit_result_type) {
     OfortToken *ft = advance(I); /* FUNCTION */
     if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
     OfortToken *name = advance(I);
@@ -6581,6 +6599,7 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
     copy_cstr(n->name, sizeof(n->name), token_name_text(name));
     n->line = ft->line;
     n->val_type = result_type;
+    n->has_explicit_result_type = has_explicit_result_type;
     n->n_params = 0;
     n->result_name[0] = '\0';
 
@@ -6596,6 +6615,7 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
             n->param_type_names[n->n_params][0] = '\0';
             n->param_intents[n->n_params] = 0;
             n->param_optional[n->n_params] = 0;
+            n->param_values[n->n_params] = 0;
             n->param_n_dims[n->n_params] = 0;
             n->n_params++;
             if (check(I, FTOK_COMMA)) advance(I);
@@ -6632,7 +6652,7 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
 }
 
 static OfortNode *parse_function(OfortInterpreter *I) {
-    return parse_function_with_type(I, FVAL_INTEGER);
+    return parse_function_with_type(I, FVAL_INTEGER, 0);
 }
 
 static OfortNode *parse_typed_function(OfortInterpreter *I) {
@@ -6656,7 +6676,7 @@ static OfortNode *parse_typed_function(OfortInterpreter *I) {
         } while (depth > 0 && !check(I, FTOK_EOF));
     }
 
-    OfortNode *fn = parse_function_with_type(I, result_type);
+    OfortNode *fn = parse_function_with_type(I, result_type, 1);
     if (derived_type_name[0]) copy_cstr(fn->str_val, sizeof(fn->str_val), derived_type_name);
     return fn;
 }
@@ -6724,6 +6744,7 @@ static OfortNode *parse_module_procedure_body(OfortInterpreter *I) {
         n->is_pure = spec->is_pure;
         n->is_elemental = spec->is_elemental;
         n->val_type = spec->val_type;
+        n->has_explicit_result_type = spec->has_explicit_result_type;
         copy_cstr(n->str_val, sizeof(n->str_val), spec->str_val);
         copy_cstr(n->result_name, sizeof(n->result_name), spec->result_name);
         n->n_params = spec->n_params;
@@ -6734,6 +6755,7 @@ static OfortNode *parse_module_procedure_body(OfortInterpreter *I) {
             copy_cstr(n->param_type_names[i], sizeof(n->param_type_names[i]), spec->param_type_names[i]);
             n->param_intents[i] = spec->param_intents[i];
             n->param_optional[i] = spec->param_optional[i];
+            n->param_values[i] = spec->param_values[i];
             n->param_n_dims[i] = spec->param_n_dims[i];
         }
     }
@@ -6941,6 +6963,7 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
     int is_save = 0;
     int is_parameter = 0;
     int is_optional = 0;
+    int is_value = 0;
     int intent = 0;
     int decl_dims[7] = {0};
     int decl_lower_bounds[7] = {0};
@@ -7059,6 +7082,9 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
         } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "optional")) {
             advance(I);
             is_optional = 1;
+        } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "value")) {
+            advance(I);
+            is_value = 1;
         } else if (check(I, FTOK_INTENT)) {
             advance(I);
             expect(I, FTOK_LPAREN);
@@ -7100,6 +7126,7 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
         decl->is_save = is_save;
         decl->is_parameter = is_parameter;
         decl->is_optional = is_optional;
+        decl->is_value = is_value;
         decl->intent = intent;
         decl->line = name_tok->line;
         decl->n_type_param_exprs = n_type_param_exprs;
@@ -13310,7 +13337,7 @@ static void annotate_procedure_params(OfortNode *n) {
         }
         for (int j = 0; j < n_decls; j++) {
             OfortNode *d = decls[j];
-            if (d->type != FND_VARDECL || (d->intent == 0 && !d->is_optional)) {
+            if (d->type != FND_VARDECL || (d->intent == 0 && !d->is_optional && !d->is_value)) {
                 continue;
             }
             for (int k = 0; k < n->n_params; k++) {
@@ -13321,6 +13348,7 @@ static void annotate_procedure_params(OfortNode *n) {
                 if (d->val_type == FVAL_DERIVED)
                     copy_cstr(n->param_type_names[k], sizeof(n->param_type_names[k]), d->str_val);
                 n->param_optional[k] = d->is_optional;
+                n->param_values[k] = d->is_value;
                 n->param_n_dims[k] = d->n_dims;
                 break;
                 }
@@ -13428,6 +13456,7 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
                             fn->param_names[i], fn->name);
             }
             pv->intent = fn->param_intents[i];
+            pv->is_value = fn->param_values[i];
         }
         restore_saved_vars(I, func);
         I->procedure_depth++;
@@ -15213,6 +15242,21 @@ static void validate_pure_procedure_node(OfortInterpreter *I, OfortNode *n) {
     int n_local_names = 0;
 
     if (!n || !n->is_pure) return;
+    if (n->type == FND_FUNCTION && !n->has_explicit_result_type &&
+        !procedure_body_declares_name(n->children[0], n->result_name[0] ? n->result_name : n->name)) {
+        ofort_append_error(I, n->line,
+                           "Function result '%s' in PURE function '%s' has no declared type",
+                           n->result_name[0] ? n->result_name : n->name, n->name);
+    }
+    if (n->type == FND_FUNCTION) {
+        for (int i = 0; i < n->n_params; i++) {
+            if (n->param_intents[i] != 1 && !n->param_values[i]) {
+                ofort_append_error(I, n->line,
+                                   "Argument '%s' of PURE function '%s' must be INTENT(IN) or VALUE",
+                                   n->param_names[i], n->name);
+            }
+        }
+    }
     local_names = (char (*)[256])calloc(OFORT_MAX_VARS, sizeof(*local_names));
     if (!local_names) ofort_error(I, "Out of memory");
     for (int i = 0; i < n->n_params; i++) {
@@ -15225,6 +15269,41 @@ static void validate_pure_procedure_node(OfortInterpreter *I, OfortNode *n) {
     collect_pure_local_names(n->children[0], local_names, &n_local_names);
     validate_pure_procedure_tree(I, n, n->children[0], local_names, n_local_names);
     free(local_names);
+}
+
+static int procedure_param_index(OfortNode *proc, const char *name) {
+    if (!proc || !name || !name[0]) return -1;
+    for (int i = 0; i < proc->n_params; i++) {
+        if (str_eq_nocase(proc->param_names[i], name)) return i;
+    }
+    return -1;
+}
+
+static void validate_intent_in_assignment_tree(OfortInterpreter *I, OfortNode *proc, OfortNode *n) {
+    const char *target_name;
+    int param_index;
+
+    if (!I || !proc || !n) return;
+    if (n->type == FND_ASSIGN || n->type == FND_POINTER_ASSIGN) {
+        target_name = extract_forall_lhs_name(n->children[0]);
+        param_index = procedure_param_index(proc, target_name);
+        if (param_index >= 0 && proc->param_intents[param_index] == 1) {
+            ofort_append_error(I, n->line > 0 ? n->line : proc->line,
+                               "Cannot assign to INTENT(IN) argument '%s' in procedure '%s'",
+                               proc->param_names[param_index], proc->name);
+        }
+    }
+    for (int i = 0; i < n->n_children; i++) {
+        validate_intent_in_assignment_tree(I, proc, n->children[i]);
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        validate_intent_in_assignment_tree(I, proc, n->stmts[i]);
+    }
+}
+
+static void validate_intent_in_assignments(OfortInterpreter *I, OfortNode *proc) {
+    if (!proc || !proc->children[0]) return;
+    validate_intent_in_assignment_tree(I, proc, proc->children[0]);
 }
 
 static void check_semantics_identifier(OfortInterpreter *I, OfortNode *n) {
@@ -15534,6 +15613,9 @@ static void check_semantics_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 if (v && v->is_protected) {
                     ofort_error(I, "Cannot assign to PROTECTED variable '%s'", n->children[0]->name);
+                }
+                if (v && v->intent == 1) {
+                    ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", n->children[0]->name);
                 }
                 if (v && v->val.type == FVAL_INTEGER && n->children[1]) {
                     OfortValType rhs_type;
@@ -15903,6 +15985,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                           s->type == FND_STMT_FUNCTION)) {
                     annotate_procedure_params(s);
                     validate_pure_procedure_node(I, s);
+                    validate_intent_in_assignments(I, s);
                     (void)register_func(I, s->name, s, s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
                 }
             }
@@ -15989,6 +16072,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     OfortFunc *func;
                     annotate_procedure_params(s);
                     validate_pure_procedure_node(I, s);
+                    validate_intent_in_assignments(I, s);
                     func = register_func(I, s->name, s, s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
                     copy_cstr(func->module_name, sizeof(func->module_name), mod->name);
                 } else if (s->type == FND_TYPE_DEF) {
@@ -16769,8 +16853,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 break;
             }
         }
-        if (existing && existing == existing_current && (n->intent != 0 || n->is_optional)) {
+        if (existing && existing == existing_current && (n->intent != 0 || n->is_optional || n->is_value)) {
             existing->intent = n->intent;
+            existing->is_value = n->is_value;
             existing->is_allocatable = n->is_allocatable;
             existing->is_pointer = n->is_pointer;
             existing->is_target = n->is_target;
@@ -16800,6 +16885,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         if (existing && existing == existing_current && I->procedure_depth > 0) {
             existing->intent = n->intent;
+            existing->is_value = n->is_value;
             existing->is_pointer = n->is_pointer;
             existing->is_allocatable = n->is_allocatable;
             existing->is_target = n->is_target;
@@ -16968,6 +17054,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortVar *v = declare_var(I, n->name, val);
         if (val_is_alias) v->is_alias = 1;
         if (n->is_parameter || n->type == FND_PARAMDECL) v->is_parameter = 1;
+        v->is_value = n->is_value;
         v->is_allocatable = n->is_allocatable;
         v->scalar_allocated = 0;
         v->declared_type = n->val_type;
@@ -17080,6 +17167,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
     case FND_ASSIGN: {
         OfortNode *lhs = n->children[0];
+        if (lhs && lhs->type == FND_IDENT) {
+            OfortVar *v = find_var(I, lhs->name);
+            if (v && v->intent == 1) ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", lhs->name);
+        }
         if (I->where_mask) I->where_mask_index = 0;
         if (!I->where_mask && exec_fast_array_poly2_assignment(I, n)) {
             break;
@@ -17097,6 +17188,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             OfortVar *v = find_var(I, lhs->name);
             if (v && v->is_parameter) ofort_error(I, "Cannot assign to PARAMETER '%s'", lhs->name);
             if (v && v->is_protected) ofort_error(I, "Cannot assign to PROTECTED variable '%s'", lhs->name);
+            if (v && v->intent == 1) ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", lhs->name);
             if (v && v->val.type == FVAL_ARRAY) {
                 if (rhs.type == FVAL_ARRAY) {
                     if (!v->val.v.arr.allocated || v->val.v.arr.len == 0 ||
@@ -18659,6 +18751,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                                 fn->param_names[i], fn->name);
                 }
                 pv->intent = fn->param_intents[i];
+                pv->is_value = fn->param_values[i];
             }
             restore_saved_vars(I, func);
             I->procedure_depth++;
@@ -18758,6 +18851,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             fn->param_names[i], fn->name);
             }
             pv->intent = fn->param_intents[i];
+            pv->is_value = fn->param_values[i];
         }
         restore_saved_vars(I, func);
 
@@ -18830,7 +18924,7 @@ unresolved_external_call_done:
                     /* declaration block */
                     for (int j = 0; j < s->n_stmts; j++) {
                         OfortNode *d = s->stmts[j];
-                        if (d->type == FND_VARDECL && (d->intent != 0 || d->is_optional)) {
+                        if (d->type == FND_VARDECL && (d->intent != 0 || d->is_optional || d->is_value)) {
                             /* Match parameter name */
                             char du[256];
                             str_upper(du, d->name, 256);
@@ -18844,13 +18938,14 @@ unresolved_external_call_done:
                                     if (d->val_type == FVAL_DERIVED)
                                         copy_cstr(n->param_type_names[k], sizeof(n->param_type_names[k]), d->str_val);
                                     n->param_optional[k] = d->is_optional;
+                                    n->param_values[k] = d->is_value;
                                     n->param_n_dims[k] = d->n_dims;
                                     break;
                                 }
                             }
                         }
                     }
-                } else if (s->type == FND_VARDECL && (s->intent != 0 || s->is_optional)) {
+                } else if (s->type == FND_VARDECL && (s->intent != 0 || s->is_optional || s->is_value)) {
                     char du[256];
                     str_upper(du, s->name, 256);
                     for (int k = 0; k < n->n_params; k++) {
@@ -18863,6 +18958,7 @@ unresolved_external_call_done:
                             if (s->val_type == FVAL_DERIVED)
                                 copy_cstr(n->param_type_names[k], sizeof(n->param_type_names[k]), s->str_val);
                             n->param_optional[k] = s->is_optional;
+                            n->param_values[k] = s->is_value;
                             n->param_n_dims[k] = s->n_dims;
                             break;
                         }
@@ -18871,6 +18967,7 @@ unresolved_external_call_done:
             }
         }
         validate_pure_procedure_node(I, n);
+        validate_intent_in_assignments(I, n);
         (void)register_func(I, n->name, n, n->type == FND_FUNCTION);
         break;
     }
