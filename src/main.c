@@ -4561,6 +4561,9 @@ static int run_interactive(const char *load_path, int run_after_load) {
     char auto_end_texts[128][128];
     int auto_end_depth = 0;
 
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     if (!g_no_logo) {
         printf("Enter Fortran source.\n");
         printf("Commands: . runs, .ofort/.gfortran/.ifx/.lfortran/.g95 [options] run with selected compiler (-c compiles only for external compilers), .timec [n] .ofort ; .gfortran [options] times compiler runs, .run [n] [-- args] repeats, .time [n] [-- args] times, .runq [n] [-- args] runs and quits, .quit quits and saves, .quit! quits without saving, .save [file] saves, .saveq [file] saves and quits, .clear clears, .prompt text changes the prompt, .del n[:m] deletes lines, .ins n text inserts, .rep n text replaces, .rename old new renames, .group-decl groups simple declarations, .unused lists unused simple declarations, .undecl names removes declarations, .drop-unused removes unused simple declarations, .list lists, .list -n lists without line numbers, .decl lists declarations, .vars [names] lists values, .info [names] lists details, .shapes [names] lists array shapes, .sizes [names] lists array sizes, .stats [names] lists array stats, .load file loads, .load-run file loads/runs. With --trace-assign, top-level assignments run immediately. With --auto-end, block openers insert matching END lines.\n");
@@ -5744,7 +5747,7 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--version] [--nologo] [--prompt text] [--auto-end] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--time|--time-detail] [--profile-lines] [--trace-assign] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--time|--time-detail] [--profile-lines] [--trace-assign] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
     fprintf(stderr, "       %s --each [--check] [--quiet] [--limit n] [--max-fail n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
@@ -5753,6 +5756,7 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       %s < file.f90\n", program);
     fprintf(stderr, "       --version prints the ofort version\n");
     fprintf(stderr, "       --nologo suppresses the interactive startup banner\n");
+    fprintf(stderr, "       --repl forces an interactive session, useful when stdin is a pipe\n");
     fprintf(stderr, "       --prompt text sets the interactive prompt text\n");
     fprintf(stderr, "       --auto-end makes the REPL insert matching END lines for block openers\n");
     fprintf(stderr, "       -w suppresses warnings\n");
@@ -5845,6 +5849,7 @@ int main(int argc, char **argv) {
     int each_limit = -1;
     int each_max_fail = 0;
     int quiet = 0;
+    int force_interactive = 0;
     double setup_start = 0.0;
     int i;
     if (ISATTY(FILENO(stdout))) {
@@ -5878,6 +5883,8 @@ int main(int argc, char **argv) {
             g_quiet = 1;
         } else if (strcmp(argv[i], "--nologo") == 0) {
             g_no_logo = 1;
+        } else if (strcmp(argv[i], "--repl") == 0 || strcmp(argv[i], "--interactive") == 0) {
+            force_interactive = 1;
         } else if (strcmp(argv[i], "--auto-end") == 0) {
             g_repl_auto_end = 1;
         } else if (strcmp(argv[i], "--prompt") == 0) {
@@ -6118,7 +6125,10 @@ int main(int argc, char **argv) {
         return rc;
     }
 
-    if (source_paths.count > 0) {
+    if (force_interactive) {
+        path_list_free(&source_paths);
+        return run_interactive(NULL, 0);
+    } else if (source_paths.count > 0) {
         setup_start = monotonic_seconds();
         source = read_files_concatenated(source_paths.items, source_paths.count, &source_map);
     } else if (ISATTY(FILENO(stdin))) {
