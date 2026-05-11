@@ -1268,6 +1268,81 @@ static int save_interactive_source(const char *source, const char *footer) {
     return save_interactive_source_to_path(source, footer, path, 0);
 }
 
+static int save_interactive_state_to_path(OfortInterpreter *interp, const char *source,
+                                          const char *footer, const char *path,
+                                          int overwrite) {
+    char *effective = NULL;
+    char *state_buf = NULL;
+    FILE *fp;
+    const char *line;
+
+    if (!overwrite && file_exists(path)) {
+        fprintf(stderr, "%s already exists; use --overwrite to replace it\n", path);
+        return 1;
+    }
+    effective = make_save_source(source ? source : "", footer);
+    if (!effective) {
+        fprintf(stderr, "out of memory\n");
+        return 1;
+    }
+    state_buf = (char *)calloc(1, OFORT_MAX_OUTPUT * 4);
+    if (!state_buf) {
+        free(effective);
+        fprintf(stderr, "out of memory\n");
+        return 1;
+    }
+    if (ofort_dump_state_initializers(interp, state_buf, OFORT_MAX_OUTPUT * 4) < 0) {
+        free(effective);
+        free(state_buf);
+        fprintf(stderr, "failed to serialize state\n");
+        return 1;
+    }
+    fp = fopen(path, "wb");
+    if (!fp) {
+        free(effective);
+        free(state_buf);
+        fprintf(stderr, "failed to save %s\n", path);
+        return 1;
+    }
+    fputs("! ofort state v1\n", fp);
+    fputs("! OFORT_SOURCE_BEGIN\n", fp);
+    line = effective;
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        fputs("!|", fp);
+        if (end) {
+            fwrite(line, 1, (size_t)(end - line + 1), fp);
+            line = end + 1;
+        } else {
+            fputs(line, fp);
+            fputc('\n', fp);
+            break;
+        }
+    }
+    fputs("! OFORT_SOURCE_END\n", fp);
+    fputs("! OFORT_STATE_BEGIN\n", fp);
+    fputs(state_buf, fp);
+    if (state_buf[0] && state_buf[strlen(state_buf) - 1] != '\n') fputc('\n', fp);
+    fputs("end\n", fp);
+    fputs("! OFORT_STATE_END\n", fp);
+    fclose(fp);
+    free(effective);
+    free(state_buf);
+    printf("Saved state %s\n", path);
+    return 0;
+}
+
+static int save_interactive_state(OfortInterpreter *interp, const char *source, const char *footer) {
+    char path[64];
+    int i;
+
+    strcpy(path, "ofort_state.f90");
+    for (i = 1; file_exists(path); i++) {
+        snprintf(path, sizeof(path), "ofort_state%d.f90", i);
+    }
+    return save_interactive_state_to_path(interp, source, footer, path, 0);
+}
+
 static const char *skip_space(const char *line) {
     while (*line == ' ' || *line == '\t') {
         line++;
@@ -4000,6 +4075,88 @@ static int load_interactive_file(const char *path, char **buf, size_t *len,
     return 1;
 }
 
+static int load_interactive_state_file(const char *path, char **buf, size_t *len,
+                                       size_t *cap, char **footer,
+                                       OfortInterpreter **interp,
+                                       size_t *executed_len) {
+    char *text = read_source_file(path);
+    char *source = NULL;
+    char *state = NULL;
+    size_t source_len = 0, source_cap = 0;
+    size_t state_len = 0, state_cap = 0;
+    int in_state = 0;
+
+    if (!text) return 0;
+    normalize_newlines(text);
+    for (char *line = text; *line; ) {
+        char *end = strchr(line, '\n');
+        char saved = '\0';
+        if (end) {
+            saved = end[1];
+            end[1] = '\0';
+        }
+        if (strncmp(line, "! OFORT_STATE_BEGIN", 19) == 0) {
+            in_state = 1;
+        } else if (strncmp(line, "! OFORT_STATE_END", 17) == 0) {
+            in_state = 0;
+        } else if (strncmp(line, "!|", 2) == 0) {
+            if (!append_text(&source, &source_len, &source_cap, line + 2)) {
+                free(text);
+                free(source);
+                free(state);
+                return 0;
+            }
+        } else if (in_state) {
+            if (!append_text(&state, &state_len, &state_cap, line)) {
+                free(text);
+                free(source);
+                free(state);
+                return 0;
+            }
+        }
+        if (!end) break;
+        end[1] = saved;
+        line = end + 1;
+    }
+    free(text);
+    if (!state || state[0] == '\0') {
+        free(source);
+        free(state);
+        fprintf(stderr, "%s is not an ofort state file\n", path);
+        return 0;
+    }
+    free(*buf);
+    free(*footer);
+    *buf = NULL;
+    *footer = NULL;
+    *len = 0;
+    *cap = 0;
+    *buf = source;
+    if (!*buf && !append_text(buf, len, cap, "")) {
+        free(state);
+        return 0;
+    }
+    normalize_newlines(*buf);
+    *footer = strip_terminal_end_line(*buf);
+    *len = strlen(*buf);
+    *cap = *len + 1;
+    ofort_destroy(*interp);
+    *interp = create_repl_interpreter();
+    if (!*interp) {
+        free(state);
+        fprintf(stderr, "failed to create Fortran interpreter\n");
+        return 0;
+    }
+    if (execute_source_text_on_interpreter(*interp, state, 1, 0, 1, NULL) != 0) {
+        free(state);
+        return 0;
+    }
+    free(state);
+    if (executed_len) *executed_len = *len;
+    printf("Loaded state %s\n", path);
+    return 1;
+}
+
 static const char *load_command_path(const char *line) {
     const char *p = skip_space(line);
 
@@ -4018,6 +4175,17 @@ static const char *load_run_command_path(const char *line) {
         return NULL;
     }
     p += 9;
+    p = skip_space(p);
+    return (*p == '\0' || *p == '\r' || *p == '\n') ? NULL : p;
+}
+
+static const char *load_state_command_path(const char *line) {
+    const char *p = skip_space(line);
+
+    if (strncmp(p, ".load-state", 11) != 0 || !isspace((unsigned char)p[11])) {
+        return NULL;
+    }
+    p += 11;
     p = skip_space(p);
     return (*p == '\0' || *p == '\r' || *p == '\n') ? NULL : p;
 }
@@ -4590,7 +4758,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
 
     if (!g_no_logo) {
         printf("Enter Fortran source.\n");
-        printf("Commands: . runs, .ofort/.gfortran/.ifx/.lfortran/.g95 [options] run with selected compiler (-c compiles only for external compilers), .timec [n] .ofort ; .gfortran [options] times compiler runs, .run [n] [-- args] repeats, .time [n] [-- args] times, .runq [n] [-- args] runs and quits, .quit quits and saves, .quit! quits without saving, .save [file] saves, .saveq [file] saves and quits, .clear clears, .prompt text changes the prompt, .del n[:m] deletes lines, .ins n text inserts, .rep n text replaces, .rename old new renames, .group-decl groups simple declarations, .unused lists unused simple declarations, .undecl names removes declarations, .drop-unused removes unused simple declarations, .list lists, .list -n lists without line numbers, .decl lists declarations, .vars [names] lists values, .info [names] lists details, .shapes [names] lists array shapes, .sizes [names] lists array sizes, .stats [names] lists array stats, .load file loads, .load-run file loads/runs. With --trace-assign, top-level assignments run immediately. With --auto-end, block openers insert matching END lines. With --defer-check, source lines are checked only when run. With --autorun, complete top-level executable lines run the current source.\n");
+        printf("Commands: . runs, .ofort/.gfortran/.ifx/.lfortran/.g95 [options] run with selected compiler (-c compiles only for external compilers), .timec [n] .ofort ; .gfortran [options] times compiler runs, .run [n] [-- args] repeats, .time [n] [-- args] times, .runq [n] [-- args] runs and quits, .quit quits and saves, .quit! quits without saving, .save [file] saves, .saveq [file] saves and quits, .save-state/.saveq-state save source plus simple variable state, .load-state restores it, .clear clears, .prompt text changes the prompt, .del n[:m] deletes lines, .ins n text inserts, .rep n text replaces, .rename old new renames, .group-decl groups simple declarations, .unused lists unused simple declarations, .undecl names removes declarations, .drop-unused removes unused simple declarations, .list lists, .list -n lists without line numbers, .decl lists declarations, .vars [names] lists values, .info [names] lists details, .shapes [names] lists array shapes, .sizes [names] lists array sizes, .stats [names] lists array stats, .load file loads, .load-run file loads/runs. With --trace-assign, top-level assignments run immediately. With --auto-end, block openers insert matching END lines. With --defer-check, source lines are checked only when run. With --autorun, complete top-level executable lines run the current source.\n");
     }
 
     repl_interp = create_repl_interpreter();
@@ -4780,6 +4948,56 @@ static int run_interactive(const char *load_path, int run_after_load) {
             free(footer);
             ofort_destroy(repl_interp);
             return last_rc;
+        }
+
+        {
+            char save_path[1024];
+            int has_path = 0;
+            int overwrite = 0;
+            int parsed = parse_save_command(line, ".save-state", save_path, sizeof(save_path),
+                                            &has_path, &overwrite);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    last_rc = execute_repl_pending_source(repl_interp, buf ? buf : "", &executed_len);
+                    if (last_rc == 0) {
+                        last_rc = has_path ?
+                                  save_interactive_state_to_path(repl_interp, buf ? buf : "", footer,
+                                                                 save_path, overwrite) :
+                                  save_interactive_state(repl_interp, buf ? buf : "", footer);
+                    }
+                } else {
+                    last_rc = 1;
+                }
+                continue;
+            }
+        }
+
+        {
+            char save_path[1024];
+            int has_path = 0;
+            int overwrite = 0;
+            int parsed = parse_save_command(line, ".saveq-state", save_path, sizeof(save_path),
+                                            &has_path, &overwrite);
+            if (parsed != 0) {
+                if (parsed > 0) {
+                    last_rc = execute_repl_pending_source(repl_interp, buf ? buf : "", &executed_len);
+                    if (last_rc == 0) {
+                        last_rc = has_path ?
+                                  save_interactive_state_to_path(repl_interp, buf ? buf : "", footer,
+                                                                 save_path, overwrite) :
+                                  save_interactive_state(repl_interp, buf ? buf : "", footer);
+                    }
+                    if (last_rc == 0) {
+                        free(buf);
+                        free(footer);
+                        ofort_destroy(repl_interp);
+                        return 0;
+                    }
+                } else {
+                    last_rc = 1;
+                }
+                continue;
+            }
         }
 
         {
@@ -5223,6 +5441,23 @@ static int run_interactive(const char *load_path, int run_after_load) {
                     free_split_args(var_names, n_var_names);
                 } else {
                     last_rc = 1;
+                }
+                continue;
+            }
+        }
+
+        {
+            const char *path = load_state_command_path(line);
+            if (path) {
+                char local_path[4096];
+                snprintf(local_path, sizeof(local_path), "%s", path);
+                trim_line_end(local_path);
+                if (!load_interactive_state_file(local_path, &buf, &len, &cap, &footer,
+                                                 &repl_interp, &executed_len)) {
+                    last_rc = 1;
+                } else {
+                    last_rc = 0;
+                    auto_end_depth = 0;
                 }
                 continue;
             }
