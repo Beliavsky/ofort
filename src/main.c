@@ -74,6 +74,7 @@ static SourceFormMode g_source_form = SOURCE_FORM_AUTO;
 static int g_save_free_form = 0;
 static int g_quiet = 0;
 static int g_repl_auto_end = 0;
+static int g_repl_defer_check = 0;
 
 static int append_text(char **buf, size_t *len, size_t *cap, const char *text) {
     size_t n = strlen(text);
@@ -4990,7 +4991,8 @@ static int run_interactive(const char *load_path, int run_after_load) {
                 free(footer);
                 return 2;
             }
-            last_rc = repl_preflight_check_source(buf ? buf : "", footer,
+            last_rc = g_repl_defer_check ? 0 :
+                      repl_preflight_check_source(buf ? buf : "", footer,
                                                  source_line_count(buf ? buf : ""));
             continue;
         }
@@ -5032,7 +5034,8 @@ static int run_interactive(const char *load_path, int run_after_load) {
                             free(footer);
                             return 2;
                         }
-                        last_rc = repl_preflight_check_source(buf ? buf : "", footer,
+                        last_rc = g_repl_defer_check ? 0 :
+                                  repl_preflight_check_source(buf ? buf : "", footer,
                                                              source_line_count(buf ? buf : ""));
                     }
                     free_split_args(undecl_args, n_undecl_args);
@@ -5058,7 +5061,8 @@ static int run_interactive(const char *load_path, int run_after_load) {
                 free(footer);
                 return 2;
             }
-            last_rc = repl_preflight_check_source(buf ? buf : "", footer,
+            last_rc = g_repl_defer_check ? 0 :
+                      repl_preflight_check_source(buf ? buf : "", footer,
                                                  source_line_count(buf ? buf : ""));
             continue;
         }
@@ -5274,7 +5278,8 @@ static int run_interactive(const char *load_path, int run_after_load) {
                         free(footer);
                         return 2;
                     }
-                    last_rc = repl_preflight_check_source(buf ? buf : "", footer,
+                    last_rc = g_repl_defer_check ? 0 :
+                              repl_preflight_check_source(buf ? buf : "", footer,
                                                          source_line_count(buf ? buf : ""));
                 } else {
                     last_rc = 1;
@@ -5301,7 +5306,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
             }
         }
 
-        if (!validate_repl_line_before_append(buf ? buf : "", line)) {
+        if (!g_repl_defer_check && !validate_repl_line_before_append(buf ? buf : "", line)) {
             last_rc = 1;
             continue;
         }
@@ -5387,9 +5392,10 @@ static int run_interactive(const char *load_path, int run_after_load) {
                          "%s", generated_end);
                 auto_end_depth++;
             }
-            last_rc = repl_preflight_check_source(buf ? buf : "", footer,
+            last_rc = g_repl_defer_check ? 0 :
+                      repl_preflight_check_source(buf ? buf : "", footer,
                                                  source_line_count(buf ? buf : ""));
-            if (last_rc != 0) {
+            if (!g_repl_defer_check && last_rc != 0) {
                 len = old_len;
                 if (buf) buf[len] = '\0';
                 executed_len = old_executed_len;
@@ -5747,7 +5753,7 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--time|--time-detail] [--profile-lines] [--trace-assign] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--time|--time-detail] [--profile-lines] [--trace-assign] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
     fprintf(stderr, "       %s --each [--check] [--quiet] [--limit n] [--max-fail n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
@@ -5759,6 +5765,7 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --repl forces an interactive session, useful when stdin is a pipe\n");
     fprintf(stderr, "       --prompt text sets the interactive prompt text\n");
     fprintf(stderr, "       --auto-end makes the REPL insert matching END lines for block openers\n");
+    fprintf(stderr, "       --defer-check makes the REPL check source lines only when run\n");
     fprintf(stderr, "       -w suppresses warnings\n");
     fprintf(stderr, "       --quiet suppresses success/progress output but not diagnostics\n");
     fprintf(stderr, "       --std=f2023 rejects known nonstandard extensions; --std=legacy is the default\n");
@@ -5887,6 +5894,8 @@ int main(int argc, char **argv) {
             force_interactive = 1;
         } else if (strcmp(argv[i], "--auto-end") == 0) {
             g_repl_auto_end = 1;
+        } else if (strcmp(argv[i], "--defer-check") == 0) {
+            g_repl_defer_check = 1;
         } else if (strcmp(argv[i], "--prompt") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "--prompt requires text\n");
