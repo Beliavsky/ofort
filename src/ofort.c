@@ -25989,8 +25989,57 @@ static int append_state_initializer_expr(OfortInterpreter *interp, const OfortVa
     return append_state_value_literal(interp, v, buf, buf_size, used);
 }
 
+static void state_fortran_path(const char *path, char *buf, size_t buf_size) {
+    size_t j = 0;
+    if (!buf || buf_size == 0) return;
+    if (path) {
+        for (size_t i = 0; path[i] && j + 1 < buf_size; i++) {
+            buf[j++] = path[i] == '\\' ? '/' : path[i];
+        }
+    }
+    buf[j] = '\0';
+}
+
+static int state_can_binary_array(const OfortVar *var, int threshold) {
+    int kind;
+    if (!var || var->is_parameter || var->val.type != FVAL_ARRAY) return 0;
+    if (threshold < 1) threshold = 1;
+    if (var->val.v.arr.len < threshold) return 0;
+    if (var->val.v.arr.elem_type != FVAL_REAL && var->val.v.arr.elem_type != FVAL_DOUBLE) return 0;
+    kind = var->declared_kind > 0 ? var->declared_kind : state_array_element_kind(&var->val);
+    return kind == 8 || var->val.v.arr.elem_type == FVAL_DOUBLE;
+}
+
+static int write_state_binary_real_array(const OfortVar *var, const char *binary_dir,
+                                         char *fortran_file, size_t fortran_file_size) {
+    char path[1024];
+    FILE *fp;
+    if (!var || !binary_dir || !fortran_file || fortran_file_size == 0) return 0;
+    snprintf(path, sizeof(path), "%s/%s.bin", binary_dir, var->name);
+    fp = fopen(path, "wb");
+    if (!fp) return 0;
+    for (int i = 0; i < var->val.v.arr.len; i++) {
+        double x;
+        if (var->val.v.arr.real_data) {
+            x = var->val.v.arr.real_data[i];
+        } else {
+            OfortValue elem = array_element_value(&var->val, i);
+            x = val_to_real(elem);
+            free_value(&elem);
+        }
+        if (fwrite(&x, sizeof(x), 1, fp) != 1) {
+            fclose(fp);
+            return 0;
+        }
+    }
+    if (fclose(fp) != 0) return 0;
+    state_fortran_path(path, fortran_file, fortran_file_size);
+    return 1;
+}
+
 static int append_state_var(OfortInterpreter *interp, const OfortVar *var,
-                            char *buf, size_t buf_size, size_t *used) {
+                            char *buf, size_t buf_size, size_t *used,
+                            const char *binary_dir, int binary_array_threshold) {
     char decl_type[128];
     const OfortValue *v;
     const char *parameter_attr;
@@ -26010,6 +26059,8 @@ static int append_state_var(OfortInterpreter *interp, const OfortVar *var,
     parameter_attr = var->is_parameter ? ", parameter" : "";
     if (v->type == FVAL_ARRAY) {
         char shape_buf[128];
+        int use_binary = state_can_binary_array(var, binary_array_threshold) && binary_dir && binary_dir[0];
+        char binary_file[1024];
         state_shape_string(interp, var, shape_buf, sizeof(shape_buf));
         if (v->v.arr.elem_type == FVAL_CHARACTER) {
             if (!append_state_printf(buf, buf_size, used, "character(len=%d)%s :: %s%s",
@@ -26024,6 +26075,18 @@ static int append_state_var(OfortInterpreter *interp, const OfortVar *var,
             return append_state_text(buf, buf_size, used, "\n");
         }
         if (!append_state_text(buf, buf_size, used, "\n")) return 0;
+        if (use_binary) {
+            if (!write_state_binary_real_array(var, binary_dir, binary_file, sizeof(binary_file))) {
+                return append_state_printf(buf, buf_size, used,
+                                           "! failed to write binary state for %s\n", var->name);
+            }
+            if (!append_state_printf(buf, buf_size, used,
+                                     "open(newunit=ofort_state_unit, file=\"%s\", access=\"stream\", form=\"unformatted\", status=\"old\")\n",
+                                     binary_file)) return 0;
+            if (!append_state_printf(buf, buf_size, used, "read(ofort_state_unit) %s\n", var->name)) return 0;
+            if (!append_state_text(buf, buf_size, used, "close(ofort_state_unit)\n")) return 0;
+            return 1;
+        }
         if (!append_state_printf(buf, buf_size, used, "%s = ", var->name)) return 0;
         if (!append_state_initializer_expr(interp, v, buf, buf_size, used)) return 0;
         if (!append_state_text(buf, buf_size, used, "\n")) return 0;
@@ -26046,13 +26109,17 @@ static int append_state_var(OfortInterpreter *interp, const OfortVar *var,
     return append_state_text(buf, buf_size, used, "\n");
 }
 
-int ofort_dump_state_initializers(OfortInterpreter *interp, char *buf, size_t buf_size) {
+int ofort_dump_state_initializers_binary(OfortInterpreter *interp, char *buf, size_t buf_size,
+                                         const char *binary_dir, int binary_array_threshold) {
     size_t used = 0;
     int count = 0;
 
     if (!interp || !buf || buf_size == 0) return -1;
     buf[0] = '\0';
     if (!append_state_text(buf, buf_size, &used, "implicit none\n")) return -1;
+    if (binary_dir && binary_dir[0]) {
+        if (!append_state_text(buf, buf_size, &used, "integer :: ofort_state_unit\n")) return -1;
+    }
     for (OfortScope *scope = interp->current_scope; scope; scope = scope->parent) {
         for (int i = 0; i < scope->n_vars; i++) {
             int duplicate = 0;
@@ -26066,11 +26133,16 @@ int ofort_dump_state_initializers(OfortInterpreter *interp, char *buf, size_t bu
                 if (duplicate) break;
             }
             if (duplicate) continue;
-            if (!append_state_var(interp, &scope->vars[i], buf, buf_size, &used)) return -1;
+            if (!append_state_var(interp, &scope->vars[i], buf, buf_size, &used,
+                                  binary_dir, binary_array_threshold)) return -1;
             count++;
         }
     }
     return count;
+}
+
+int ofort_dump_state_initializers(OfortInterpreter *interp, char *buf, size_t buf_size) {
+    return ofort_dump_state_initializers_binary(interp, buf, buf_size, NULL, 0);
 }
 
 const char *ofort_get_output(OfortInterpreter *interp) {
