@@ -25711,6 +25711,368 @@ int ofort_dump_variable_stats(OfortInterpreter *interp, const char *const *names
     return count;
 }
 
+static int append_state_text(char *buf, size_t buf_size, size_t *used, const char *text) {
+    size_t n;
+    if (!buf || !used || !text || *used >= buf_size) return 0;
+    n = strlen(text);
+    if (n >= buf_size - *used) {
+        buf[buf_size - 1] = '\0';
+        return 0;
+    }
+    memcpy(buf + *used, text, n);
+    *used += n;
+    buf[*used] = '\0';
+    return 1;
+}
+
+static int append_state_printf(char *buf, size_t buf_size, size_t *used, const char *fmt, ...) {
+    va_list ap;
+    int written;
+    if (!buf || !used || *used >= buf_size) return 0;
+    va_start(ap, fmt);
+    written = vsnprintf(buf + *used, buf_size - *used, fmt, ap);
+    va_end(ap);
+    if (written < 0) return 0;
+    if ((size_t)written >= buf_size - *used) {
+        buf[buf_size - 1] = '\0';
+        return 0;
+    }
+    *used += (size_t)written;
+    return 1;
+}
+
+static void state_escape_character(const char *s, char *buf, size_t buf_size) {
+    size_t used = 0;
+    if (!buf || buf_size == 0) return;
+    buf[used++] = '"';
+    if (s) {
+        for (const char *p = s; *p && used + 2 < buf_size; p++) {
+            if (*p == '"') {
+                buf[used++] = '"';
+                buf[used++] = '"';
+            } else {
+                buf[used++] = *p;
+            }
+        }
+    }
+    if (used + 1 < buf_size) buf[used++] = '"';
+    buf[used < buf_size ? used : buf_size - 1] = '\0';
+}
+
+static int state_value_supported(const OfortValue *v) {
+    if (!v) return 0;
+    switch (v->type) {
+        case FVAL_INTEGER:
+        case FVAL_REAL:
+        case FVAL_DOUBLE:
+        case FVAL_COMPLEX:
+        case FVAL_CHARACTER:
+        case FVAL_LOGICAL:
+            return 1;
+        case FVAL_ARRAY:
+            if (!v->v.arr.allocated || v->v.arr.len < 0) return 0;
+            for (int i = 0; i < v->v.arr.len; i++) {
+                OfortValue elem = array_element_value(v, i);
+                int ok = state_value_supported(&elem);
+                free_value(&elem);
+                if (!ok) return 0;
+            }
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static int state_character_len_value(const OfortValue *v) {
+    int max_len = 1;
+    if (!v) return max_len;
+    if (v->type == FVAL_CHARACTER) {
+        int len = v->v.s ? (int)strlen(v->v.s) : 0;
+        return len > 0 ? len : 1;
+    }
+    if (v->type == FVAL_ARRAY) {
+        for (int i = 0; i < v->v.arr.len; i++) {
+            OfortValue elem = array_element_value(v, i);
+            int len = state_character_len_value(&elem);
+            if (len > max_len) max_len = len;
+            free_value(&elem);
+        }
+    }
+    return max_len;
+}
+
+static int append_state_value_literal(OfortInterpreter *interp, const OfortValue *v,
+                                      char *buf, size_t buf_size, size_t *used) {
+    char tmp[OFORT_MAX_STRLEN];
+    (void)interp;
+    if (!v) return 0;
+    switch (v->type) {
+        case FVAL_INTEGER:
+            if (v->kind == 16) int128_to_string(v->v.i128, tmp, sizeof(tmp));
+            else if (v->int_repr[0]) snprintf(tmp, sizeof(tmp), "%s", v->int_repr);
+            else snprintf(tmp, sizeof(tmp), "%lld", v->v.i);
+            return append_state_text(buf, buf_size, used, tmp);
+        case FVAL_REAL:
+            snprintf(tmp, sizeof(tmp), v->kind == 8 ? "%.17g" : "%.9g", v->v.r);
+            return append_state_text(buf, buf_size, used, tmp);
+        case FVAL_DOUBLE:
+            snprintf(tmp, sizeof(tmp), "%.17g", v->v.r);
+            return append_state_text(buf, buf_size, used, tmp);
+        case FVAL_COMPLEX:
+            snprintf(tmp, sizeof(tmp), "(%.17g, %.17g)", v->v.cx.re, v->v.cx.im);
+            return append_state_text(buf, buf_size, used, tmp);
+        case FVAL_CHARACTER:
+            state_escape_character(v->v.s ? v->v.s : "", tmp, sizeof(tmp));
+            return append_state_text(buf, buf_size, used, tmp);
+        case FVAL_LOGICAL:
+            return append_state_text(buf, buf_size, used, v->v.b ? ".true." : ".false.");
+        default:
+            return 0;
+    }
+}
+
+static int append_state_array_constructor(OfortInterpreter *interp, const OfortValue *v,
+                                          char *buf, size_t buf_size, size_t *used) {
+    if (!v || v->type != FVAL_ARRAY) return 0;
+    if (v->v.arr.elem_type == FVAL_CHARACTER) {
+        if (!append_state_printf(buf, buf_size, used, "[character(len=%d) :: ",
+                                 state_character_len_value(v))) return 0;
+    } else if (!append_state_text(buf, buf_size, used, "[")) {
+        return 0;
+    }
+    for (int i = 0; i < v->v.arr.len; i++) {
+        OfortValue elem = array_element_value(v, i);
+        if (i > 0 && !append_state_text(buf, buf_size, used, ", ")) {
+            free_value(&elem);
+            return 0;
+        }
+        if (!append_state_value_literal(interp, &elem, buf, buf_size, used)) {
+            free_value(&elem);
+            return 0;
+        }
+        free_value(&elem);
+    }
+    return append_state_text(buf, buf_size, used, "]");
+}
+
+static int state_array_element_kind(const OfortValue *v) {
+    int kind = 0;
+    if (!v || v->type != FVAL_ARRAY) return 0;
+    kind = v->kind;
+    if (kind > 0) return kind;
+    if (v->v.arr.len > 0) {
+        OfortValue elem = array_element_value(v, 0);
+        kind = elem.kind;
+        free_value(&elem);
+    }
+    return kind;
+}
+
+static int state_find_integer_parameter_name(OfortInterpreter *interp, long long value,
+                                             const char *exclude_name,
+                                             char *out, size_t out_size) {
+    if (!interp || !out || out_size == 0) return 0;
+    out[0] = '\0';
+    for (OfortScope *scope = interp->current_scope; scope; scope = scope->parent) {
+        for (int i = 0; i < scope->n_vars; i++) {
+            const OfortVar *candidate = &scope->vars[i];
+            if (!candidate->is_parameter || candidate->val.type != FVAL_INTEGER) continue;
+            if (exclude_name && str_eq_nocase(candidate->name, exclude_name)) continue;
+            if (candidate->val.kind == 16) continue;
+            if (candidate->val.v.i != value) continue;
+            copy_cstr(out, out_size, candidate->name);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void state_decl_type(const OfortInterpreter *interp, const OfortVar *var,
+                            char *buf, size_t buf_size) {
+    OfortValType type;
+    int kind;
+    char kind_name[64];
+    if (!buf || buf_size == 0) return;
+    buf[0] = '\0';
+    if (!var) return;
+    type = var->declared_type != FVAL_VOID ? var->declared_type : variable_display_type(var);
+    kind = var->declared_kind > 0 ? var->declared_kind : var->val.kind;
+    if (var->val.type == FVAL_ARRAY) {
+        if (var->declared_type == FVAL_VOID) type = var->val.v.arr.elem_type;
+        if (kind <= 0) kind = state_array_element_kind(&var->val);
+    }
+    switch (type) {
+        case FVAL_INTEGER:
+            if (kind == 8 || kind == 16) {
+                snprintf(buf, buf_size, "integer(kind=%d)", kind);
+            } else {
+                copy_cstr(buf, buf_size, "integer");
+            }
+            return;
+        case FVAL_REAL:
+            if (kind == 8) {
+                if (state_find_integer_parameter_name((OfortInterpreter *)interp, kind, var->name,
+                                                      kind_name, sizeof(kind_name))) {
+                    snprintf(buf, buf_size, "real(kind=%s)", kind_name);
+                } else {
+                    copy_cstr(buf, buf_size, "real(kind=8)");
+                }
+            } else {
+                copy_cstr(buf, buf_size, "real");
+            }
+            return;
+        case FVAL_DOUBLE:
+            copy_cstr(buf, buf_size, "double precision");
+            return;
+        case FVAL_COMPLEX:
+            if (kind == 8) {
+                if (state_find_integer_parameter_name((OfortInterpreter *)interp, kind, var->name,
+                                                      kind_name, sizeof(kind_name))) {
+                    snprintf(buf, buf_size, "complex(kind=%s)", kind_name);
+                } else {
+                    copy_cstr(buf, buf_size, "complex(kind=8)");
+                }
+            } else {
+                copy_cstr(buf, buf_size, "complex");
+            }
+            return;
+        case FVAL_LOGICAL:
+            copy_cstr(buf, buf_size, "logical");
+            return;
+        case FVAL_CHARACTER:
+            copy_cstr(buf, buf_size, "character");
+            return;
+        default:
+            return;
+    }
+}
+
+static void state_shape_string(const OfortInterpreter *interp, const OfortVar *var,
+                               char *buf, size_t buf_size) {
+    const OfortValue *v;
+    char name[64];
+    size_t used = 0;
+
+    if (!buf || buf_size == 0) return;
+    buf[0] = '\0';
+    if (!var || var->val.type != FVAL_ARRAY) return;
+    v = &var->val;
+    append_state_text(buf, buf_size, &used, "(");
+    for (int d = 0; d < v->v.arr.n_dims; d++) {
+        if (d > 0) append_state_text(buf, buf_size, &used, ",");
+        if (state_find_integer_parameter_name((OfortInterpreter *)interp, v->v.arr.dims[d],
+                                              var->name, name, sizeof(name))) {
+            append_state_text(buf, buf_size, &used, name);
+        } else {
+            append_state_printf(buf, buf_size, &used, "%d", v->v.arr.dims[d]);
+        }
+    }
+    append_state_text(buf, buf_size, &used, ")");
+}
+
+static int append_state_initializer_expr(OfortInterpreter *interp, const OfortValue *v,
+                                         char *buf, size_t buf_size, size_t *used) {
+    if (!v) return 0;
+    if (v->type == FVAL_ARRAY) {
+        if (v->v.arr.n_dims > 1) {
+            if (!append_state_text(buf, buf_size, used, "reshape(")) return 0;
+            if (!append_state_array_constructor(interp, v, buf, buf_size, used)) return 0;
+            if (!append_state_text(buf, buf_size, used, ", [")) return 0;
+            for (int d = 0; d < v->v.arr.n_dims; d++) {
+                if (!append_state_printf(buf, buf_size, used, "%s%d",
+                                         d > 0 ? ", " : "", v->v.arr.dims[d])) return 0;
+            }
+            return append_state_text(buf, buf_size, used, "])");
+        }
+        return append_state_array_constructor(interp, v, buf, buf_size, used);
+    }
+    return append_state_value_literal(interp, v, buf, buf_size, used);
+}
+
+static int append_state_var(OfortInterpreter *interp, const OfortVar *var,
+                            char *buf, size_t buf_size, size_t *used) {
+    char decl_type[128];
+    const OfortValue *v;
+    const char *parameter_attr;
+
+    if (!var || var->name[0] == '\0') return 1;
+    if (var->is_alias || var->is_pointer || var->val.type == FVAL_VOID) return 1;
+    v = &var->val;
+    if (!state_value_supported(v)) {
+        return append_state_printf(buf, buf_size, used,
+                                   "! skipped unsupported state variable %s\n", var->name);
+    }
+    state_decl_type(interp, var, decl_type, sizeof(decl_type));
+    if (decl_type[0] == '\0') {
+        return append_state_printf(buf, buf_size, used,
+                                   "! skipped unsupported state variable %s\n", var->name);
+    }
+    parameter_attr = var->is_parameter ? ", parameter" : "";
+    if (v->type == FVAL_ARRAY) {
+        char shape_buf[128];
+        state_shape_string(interp, var, shape_buf, sizeof(shape_buf));
+        if (v->v.arr.elem_type == FVAL_CHARACTER) {
+            if (!append_state_printf(buf, buf_size, used, "character(len=%d)%s :: %s%s",
+                                     state_character_len_value(v), parameter_attr, var->name, shape_buf)) return 0;
+        } else if (!append_state_printf(buf, buf_size, used, "%s%s :: %s%s",
+                                        decl_type, parameter_attr, var->name, shape_buf)) {
+            return 0;
+        }
+        if (var->is_parameter) {
+            if (!append_state_text(buf, buf_size, used, " = ")) return 0;
+            if (!append_state_initializer_expr(interp, v, buf, buf_size, used)) return 0;
+            return append_state_text(buf, buf_size, used, "\n");
+        }
+        if (!append_state_text(buf, buf_size, used, "\n")) return 0;
+        if (!append_state_printf(buf, buf_size, used, "%s = ", var->name)) return 0;
+        if (!append_state_initializer_expr(interp, v, buf, buf_size, used)) return 0;
+        if (!append_state_text(buf, buf_size, used, "\n")) return 0;
+        return 1;
+    }
+    if (v->type == FVAL_CHARACTER) {
+        int char_len = var->char_len > 0 ? var->char_len : state_character_len_value(v);
+        if (!append_state_printf(buf, buf_size, used, "character(len=%d)%s :: %s", char_len, parameter_attr, var->name)) return 0;
+    } else if (!append_state_printf(buf, buf_size, used, "%s%s :: %s", decl_type, parameter_attr, var->name)) {
+        return 0;
+    }
+    if (var->is_parameter) {
+        if (!append_state_text(buf, buf_size, used, " = ")) return 0;
+        if (!append_state_initializer_expr(interp, v, buf, buf_size, used)) return 0;
+        return append_state_text(buf, buf_size, used, "\n");
+    }
+    if (!append_state_text(buf, buf_size, used, "\n")) return 0;
+    if (!append_state_printf(buf, buf_size, used, "%s = ", var->name)) return 0;
+    if (!append_state_initializer_expr(interp, v, buf, buf_size, used)) return 0;
+    return append_state_text(buf, buf_size, used, "\n");
+}
+
+int ofort_dump_state_initializers(OfortInterpreter *interp, char *buf, size_t buf_size) {
+    size_t used = 0;
+    int count = 0;
+
+    if (!interp || !buf || buf_size == 0) return -1;
+    buf[0] = '\0';
+    if (!append_state_text(buf, buf_size, &used, "implicit none\n")) return -1;
+    for (OfortScope *scope = interp->current_scope; scope; scope = scope->parent) {
+        for (int i = 0; i < scope->n_vars; i++) {
+            int duplicate = 0;
+            for (OfortScope *inner = interp->current_scope; inner && inner != scope; inner = inner->parent) {
+                for (int j = 0; j < inner->n_vars; j++) {
+                    if (str_eq_nocase(inner->vars[j].name, scope->vars[i].name)) {
+                        duplicate = 1;
+                        break;
+                    }
+                }
+                if (duplicate) break;
+            }
+            if (duplicate) continue;
+            if (!append_state_var(interp, &scope->vars[i], buf, buf_size, &used)) return -1;
+            count++;
+        }
+    }
+    return count;
+}
+
 const char *ofort_get_output(OfortInterpreter *interp) {
     return interp ? interp->output : "";
 }
