@@ -254,11 +254,15 @@ struct OfortInterpreter {
     OfortNode **node_pool;
     int node_pool_len;
     int node_pool_cap;
+    char *cached_source_text;
+    char *cached_processed_source;
+    OfortNode *cached_ast;
 };
 
 /* ── Forward declarations ────────────────────── */
 static char fast_local_array_cache_tag;
 static char fast_numeric_loop_plan_tag;
+static char fast_array_expr_program_tag;
 
 typedef struct {
     int kind; /* 1=assignment, 2=counted DO */
@@ -269,6 +273,18 @@ typedef struct {
     int n_items;
     FastNumericLoopItem *items;
 } FastNumericLoopPlan;
+
+typedef struct {
+    int op;
+    double number;
+    OfortVar *var;
+} FastArrayExprInstr;
+
+typedef struct {
+    int n_instr;
+    int cap_instr;
+    FastArrayExprInstr *instr;
+} FastArrayExprProgram;
 
 static void ofort_error(OfortInterpreter *I, const char *fmt, ...);
 static OfortNamelist *find_namelist(OfortInterpreter *I, const char *name);
@@ -300,7 +316,9 @@ static OfortValue call_ofort_stats_matrix_cov_cor(OfortInterpreter *I, const cha
 static OfortValue call_ofort_la_intrinsic(OfortInterpreter *I, const char *name,
                                           OfortValue *args, int nargs);
 static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char *name,
-                                                 OfortValue *args, int nargs);
+                                                 OfortValue *args, int nargs,
+                                                 char arg_names[OFORT_MAX_PARAMS][256]);
+static void ofort_assign_real_array_element(OfortValue *target, int index, double value);
 static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n);
 static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bufsize);
 static OfortValue array_element_value(const OfortValue *arr, int index);
@@ -343,6 +361,17 @@ static double ofort_monotonic_seconds(void) {
 
 static void clear_timing(OfortInterpreter *I) {
     if (I) memset(&I->timing, 0, sizeof(I->timing));
+}
+
+static char *ofort_strdup_local(const char *text) {
+    size_t len;
+    char *copy;
+    if (!text) return NULL;
+    len = strlen(text);
+    copy = (char *)malloc(len + 1);
+    if (!copy) return NULL;
+    memcpy(copy, text, len + 1);
+    return copy;
 }
 
 static int count_source_lines_text(const char *source) {
@@ -12546,7 +12575,21 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_IDENT: {
-        OfortVar *v = find_var(I, n->name);
+        OfortVar *v = NULL;
+        if (I->procedure_depth == 0 && I->current_scope == I->global_scope) {
+            if (n->fast_cache[0] == I->global_scope) {
+                v = (OfortVar *)n->fast_cache[1];
+            } else {
+                n->fast_cache[0] = I->global_scope;
+                n->fast_cache[1] = NULL;
+            }
+        }
+        if (!v) {
+            v = find_var(I, n->name);
+            if (v && I->procedure_depth == 0 && I->current_scope == I->global_scope) {
+                n->fast_cache[1] = v;
+            }
+        }
         if (!v) {
             OfortFunc *func = find_func(I, n->name);
             char ref[320];
@@ -13443,7 +13486,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         if (find_imported_extension_intrinsic(I, n->name)) {
             const char *extension_name = resolve_imported_extension_intrinsic(I, n->name);
             OfortValue result = call_ofort_extension_intrinsic(I, extension_name ? extension_name : n->name,
-                                                              args, nargs);
+                                                              args, nargs, n->param_names);
             free_call_args(args, nargs); args = NULL;
             return result;
         }
@@ -14020,6 +14063,36 @@ static int fast_numeric_expr_value_node(OfortInterpreter *I, OfortNode *n, doubl
         if (str_eq_nocase(n->name, "REAL") && n->n_stmts >= 1) {
             return fast_numeric_expr_value_node(I, n->stmts[0], value);
         }
+        if (str_eq_nocase(n->name, "INT") && n->n_stmts >= 1) {
+            if (!fast_numeric_expr_value_node(I, n->stmts[0], value)) return 0;
+            *value = trunc(*value);
+            return 1;
+        }
+        if (str_eq_nocase(n->name, "MOD") && n->n_stmts == 2) {
+            if (!fast_numeric_expr_value_node(I, n->stmts[0], &left) ||
+                !fast_numeric_expr_value_node(I, n->stmts[1], &right) ||
+                right == 0.0) {
+                return 0;
+            }
+            *value = left - trunc(left / right) * right;
+            return 1;
+        }
+        if (str_eq_nocase(n->name, "MIN") && n->n_stmts >= 1) {
+            if (!fast_numeric_expr_value_node(I, n->stmts[0], value)) return 0;
+            for (int i = 1; i < n->n_stmts; i++) {
+                if (!fast_numeric_expr_value_node(I, n->stmts[i], &right)) return 0;
+                if (right < *value) *value = right;
+            }
+            return 1;
+        }
+        if (str_eq_nocase(n->name, "MAX") && n->n_stmts >= 1) {
+            if (!fast_numeric_expr_value_node(I, n->stmts[0], value)) return 0;
+            for (int i = 1; i < n->n_stmts; i++) {
+                if (!fast_numeric_expr_value_node(I, n->stmts[i], &right)) return 0;
+                if (right > *value) *value = right;
+            }
+            return 1;
+        }
         if (str_eq_nocase(n->name, "SQRT") && n->n_stmts == 1) {
             if (!fast_numeric_expr_value_node(I, n->stmts[0], value) || *value < 0.0) return 0;
             *value = sqrt(*value);
@@ -14422,6 +14495,8 @@ static FastNumericLoopPlan *get_fast_numeric_loop_plan(OfortNode *n) {
 }
 
 static int exec_fast_numeric_loop_plan(OfortInterpreter *I, FastNumericLoopPlan *plan);
+static int exec_fast_array_expr_accum_loop(OfortInterpreter *I, OfortNode *n,
+                                           long long s, long long e, long long st);
 
 static int exec_fast_numeric_do_loop(OfortInterpreter *I, OfortNode *n) {
     OfortValue start;
@@ -14445,6 +14520,10 @@ static int exec_fast_numeric_do_loop(OfortInterpreter *I, OfortNode *n) {
     free_value(&end);
     free_value(&step);
     if (st == 0) ofort_error(I, "DO loop step cannot be zero");
+
+    if (I->specialized_fast_paths && exec_fast_array_expr_accum_loop(I, n, s, e, st)) {
+        return 1;
+    }
 
     set_var(I, n->name, make_integer(s));
     loop_var = find_var(I, n->name);
@@ -14738,6 +14817,319 @@ static int exec_fast_scalar_affine_recurrence_loop(OfortInterpreter *I, OfortNod
         iter += st;
     }
     target->val.v.r = value;
+    loop_var->val.v.i = iter;
+    if (I->line_profile_enabled && n->line > 0) {
+        add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
+    }
+    return 1;
+}
+
+static int expr_loop_array_ref_name(OfortNode *n, const char *loop_name,
+                                    char *array_name, size_t array_name_size,
+                                    int *refs) {
+    if (!n || !loop_name || !array_name || !refs) return 0;
+    if (n->type == FND_FUNC_CALL && n->n_stmts == 1 &&
+        n->stmts[0] && n->stmts[0]->type == FND_IDENT &&
+        str_eq_nocase(n->stmts[0]->name, loop_name)) {
+        OfortVar *v = NULL;
+        if (n->name[0]) v = NULL;
+        if (!array_name[0]) {
+            copy_cstr(array_name, array_name_size, n->name);
+        } else if (!str_eq_nocase(array_name, n->name)) {
+            return 0;
+        }
+        (void)v;
+        (*refs)++;
+        return 1;
+    }
+    for (int i = 0; i < n->n_children; i++) {
+        if (!expr_loop_array_ref_name(n->children[i], loop_name, array_name, array_name_size, refs)) return 0;
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        if (!expr_loop_array_ref_name(n->stmts[i], loop_name, array_name, array_name_size, refs)) return 0;
+    }
+    return 1;
+}
+
+enum {
+    FAST_EXPR_PUSH_CONST = 1,
+    FAST_EXPR_PUSH_ARRAY_VALUE,
+    FAST_EXPR_PUSH_VAR,
+    FAST_EXPR_NEG,
+    FAST_EXPR_ADD,
+    FAST_EXPR_SUB,
+    FAST_EXPR_MUL,
+    FAST_EXPR_DIV,
+    FAST_EXPR_POWER,
+    FAST_EXPR_INT,
+    FAST_EXPR_REAL,
+    FAST_EXPR_SQRT,
+    FAST_EXPR_MOD
+};
+
+static void free_fast_array_expr_program(FastArrayExprProgram *program) {
+    if (!program) return;
+    free(program->instr);
+    free(program);
+}
+
+static int fast_array_expr_emit(FastArrayExprProgram *program, int op, double number, OfortVar *var) {
+    FastArrayExprInstr *new_instr;
+    if (!program) return 0;
+    if (program->n_instr >= program->cap_instr) {
+        int new_cap = program->cap_instr ? program->cap_instr * 2 : 32;
+        new_instr = (FastArrayExprInstr *)realloc(program->instr, (size_t)new_cap * sizeof(*new_instr));
+        if (!new_instr) return 0;
+        program->instr = new_instr;
+        program->cap_instr = new_cap;
+    }
+    program->instr[program->n_instr].op = op;
+    program->instr[program->n_instr].number = number;
+    program->instr[program->n_instr].var = var;
+    program->n_instr++;
+    return 1;
+}
+
+static int compile_fast_array_expr_node(OfortInterpreter *I, FastArrayExprProgram *program,
+                                        OfortNode *n, const char *array_name,
+                                        const char *loop_name) {
+    OfortVar *v;
+    if (!I || !program || !n || !array_name || !loop_name) return 0;
+    if (n->type == FND_FUNC_CALL && str_eq_nocase(n->name, array_name) &&
+        n->n_stmts == 1 && n->stmts[0] && n->stmts[0]->type == FND_IDENT &&
+        str_eq_nocase(n->stmts[0]->name, loop_name)) {
+        return fast_array_expr_emit(program, FAST_EXPR_PUSH_ARRAY_VALUE, 0.0, NULL);
+    }
+    switch (n->type) {
+    case FND_INT_LIT:
+        return fast_array_expr_emit(program, FAST_EXPR_PUSH_CONST, (double)n->int_val, NULL);
+    case FND_REAL_LIT:
+        return fast_array_expr_emit(program, FAST_EXPR_PUSH_CONST, n->num_val, NULL);
+    case FND_IDENT:
+        v = cached_node_var(I, n, n->name);
+        if (!v) return 0;
+        if (v->val.type != FVAL_INTEGER && v->val.type != FVAL_REAL && v->val.type != FVAL_DOUBLE) return 0;
+        return fast_array_expr_emit(program, FAST_EXPR_PUSH_VAR, 0.0, v);
+    case FND_NEGATE:
+        return compile_fast_array_expr_node(I, program, n->children[0], array_name, loop_name) &&
+               fast_array_expr_emit(program, FAST_EXPR_NEG, 0.0, NULL);
+    case FND_ADD:
+    case FND_SUB:
+    case FND_MUL:
+    case FND_DIV:
+    case FND_POWER:
+        if (!compile_fast_array_expr_node(I, program, n->children[0], array_name, loop_name) ||
+            !compile_fast_array_expr_node(I, program, n->children[1], array_name, loop_name)) {
+            return 0;
+        }
+        switch (n->type) {
+        case FND_ADD: return fast_array_expr_emit(program, FAST_EXPR_ADD, 0.0, NULL);
+        case FND_SUB: return fast_array_expr_emit(program, FAST_EXPR_SUB, 0.0, NULL);
+        case FND_MUL: return fast_array_expr_emit(program, FAST_EXPR_MUL, 0.0, NULL);
+        case FND_DIV: return fast_array_expr_emit(program, FAST_EXPR_DIV, 0.0, NULL);
+        case FND_POWER: return fast_array_expr_emit(program, FAST_EXPR_POWER, 0.0, NULL);
+        default: return 0;
+        }
+    case FND_FUNC_CALL:
+        if (str_eq_nocase(n->name, "REAL") && n->n_stmts >= 1) {
+            return compile_fast_array_expr_node(I, program, n->stmts[0], array_name, loop_name) &&
+                   fast_array_expr_emit(program, FAST_EXPR_REAL, 0.0, NULL);
+        }
+        if (str_eq_nocase(n->name, "INT") && n->n_stmts >= 1) {
+            return compile_fast_array_expr_node(I, program, n->stmts[0], array_name, loop_name) &&
+                   fast_array_expr_emit(program, FAST_EXPR_INT, 0.0, NULL);
+        }
+        if (str_eq_nocase(n->name, "SQRT") && n->n_stmts == 1) {
+            return compile_fast_array_expr_node(I, program, n->stmts[0], array_name, loop_name) &&
+                   fast_array_expr_emit(program, FAST_EXPR_SQRT, 0.0, NULL);
+        }
+        if (str_eq_nocase(n->name, "MOD") && n->n_stmts == 2) {
+            return compile_fast_array_expr_node(I, program, n->stmts[0], array_name, loop_name) &&
+                   compile_fast_array_expr_node(I, program, n->stmts[1], array_name, loop_name) &&
+                   fast_array_expr_emit(program, FAST_EXPR_MOD, 0.0, NULL);
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+static FastArrayExprProgram *get_fast_array_expr_program(OfortInterpreter *I, OfortNode *term,
+                                                         const char *array_name,
+                                                         const char *loop_name) {
+    FastArrayExprProgram *program;
+    if (!I || !term || !array_name || !loop_name) return NULL;
+    if (term->fast_cache[4] == &fast_array_expr_program_tag) {
+        return (FastArrayExprProgram *)term->fast_cache[5];
+    }
+    program = (FastArrayExprProgram *)calloc(1, sizeof(*program));
+    if (!program) return NULL;
+    if (!compile_fast_array_expr_node(I, program, term, array_name, loop_name) || program->n_instr == 0) {
+        free_fast_array_expr_program(program);
+        program = NULL;
+    }
+    term->fast_cache[4] = &fast_array_expr_program_tag;
+    term->fast_cache[5] = program;
+    return program;
+}
+
+static int eval_fast_array_expr_program(FastArrayExprProgram *program,
+                                        double array_value, double *value) {
+    double stack[128];
+    int sp = 0;
+    if (!program || !value || program->n_instr >= (int)(sizeof(stack) / sizeof(stack[0]))) return 0;
+    for (int i = 0; i < program->n_instr; i++) {
+        FastArrayExprInstr *ins = &program->instr[i];
+        double a;
+        double b;
+        switch (ins->op) {
+        case FAST_EXPR_PUSH_CONST:
+            stack[sp++] = ins->number;
+            break;
+        case FAST_EXPR_PUSH_ARRAY_VALUE:
+            stack[sp++] = array_value;
+            break;
+        case FAST_EXPR_PUSH_VAR:
+            if (!ins->var || (ins->var->val.type != FVAL_INTEGER &&
+                              ins->var->val.type != FVAL_REAL &&
+                              ins->var->val.type != FVAL_DOUBLE)) return 0;
+            stack[sp++] = val_to_real(ins->var->val);
+            break;
+        case FAST_EXPR_NEG:
+            if (sp < 1) return 0;
+            stack[sp - 1] = -stack[sp - 1];
+            break;
+        case FAST_EXPR_INT:
+            if (sp < 1) return 0;
+            stack[sp - 1] = trunc(stack[sp - 1]);
+            break;
+        case FAST_EXPR_REAL:
+            if (sp < 1) return 0;
+            break;
+        case FAST_EXPR_SQRT:
+            if (sp < 1 || stack[sp - 1] < 0.0) return 0;
+            stack[sp - 1] = sqrt(stack[sp - 1]);
+            break;
+        case FAST_EXPR_ADD:
+        case FAST_EXPR_SUB:
+        case FAST_EXPR_MUL:
+        case FAST_EXPR_DIV:
+        case FAST_EXPR_POWER:
+        case FAST_EXPR_MOD:
+            if (sp < 2) return 0;
+            b = stack[--sp];
+            a = stack[--sp];
+            switch (ins->op) {
+            case FAST_EXPR_ADD: stack[sp++] = a + b; break;
+            case FAST_EXPR_SUB: stack[sp++] = a - b; break;
+            case FAST_EXPR_MUL: stack[sp++] = a * b; break;
+            case FAST_EXPR_DIV:
+                if (b == 0.0) return 0;
+                stack[sp++] = a / b;
+                break;
+            case FAST_EXPR_POWER: stack[sp++] = pow(a, b); break;
+            case FAST_EXPR_MOD:
+                if (b == 0.0) return 0;
+                stack[sp++] = a - trunc(a / b) * b;
+                break;
+            default: return 0;
+            }
+            break;
+        default:
+            return 0;
+        }
+        if (sp >= (int)(sizeof(stack) / sizeof(stack[0]))) return 0;
+    }
+    if (sp != 1) return 0;
+    *value = stack[0];
+    return 1;
+}
+
+static int exec_fast_array_expr_accum_loop(OfortInterpreter *I, OfortNode *n,
+                                           long long s, long long e, long long st) {
+    OfortNode *body;
+    OfortNode *assign;
+    OfortNode *lhs;
+    OfortNode *rhs;
+    OfortNode *term = NULL;
+    OfortVar *array_var;
+    OfortVar *sum_var;
+    OfortVar *loop_var;
+    FastArrayExprProgram *program;
+    char array_name[128];
+    int refs = 0;
+    long long iter;
+    int lower;
+    int len;
+    double sum;
+    double profile_start = 0.0;
+
+    if (!I || !I->fast_mode || !n || n->type != FND_DO_LOOP || st == 0) return 0;
+    body = n->children[3];
+    if (!body || body->type != FND_BLOCK || body->n_stmts != 1) return 0;
+    assign = body->stmts[0];
+    if (!assign || assign->type != FND_ASSIGN) return 0;
+    lhs = assign->children[0];
+    rhs = assign->children[1];
+    if (!lhs || lhs->type != FND_IDENT || !rhs || rhs->type != FND_ADD) return 0;
+    if (rhs->children[0] && rhs->children[0]->type == FND_IDENT &&
+        str_eq_nocase(rhs->children[0]->name, lhs->name)) {
+        term = rhs->children[1];
+    } else if (rhs->children[1] && rhs->children[1]->type == FND_IDENT &&
+               str_eq_nocase(rhs->children[1]->name, lhs->name)) {
+        term = rhs->children[0];
+    } else {
+        return 0;
+    }
+    if (!term) return 0;
+
+    array_name[0] = '\0';
+    if (!expr_loop_array_ref_name(term, n->name, array_name, sizeof(array_name), &refs) ||
+        refs <= 0 || !array_name[0]) {
+        return 0;
+    }
+
+    array_var = find_var(I, array_name);
+    sum_var = cached_node_var(I, lhs, lhs->name);
+    loop_var = find_var(I, n->name);
+    if (!array_var || !sum_var || !loop_var ||
+        array_var->val.type != FVAL_ARRAY ||
+        sum_var->is_parameter || sum_var->is_protected ||
+        loop_var->is_parameter || loop_var->is_protected) {
+        return 0;
+    }
+    if (array_var->val.v.arr.n_dims != 1 ||
+        (sum_var->val.type != FVAL_REAL && sum_var->val.type != FVAL_DOUBLE) ||
+        loop_var->val.type != FVAL_INTEGER) {
+        return 0;
+    }
+    if (!array_var->val.v.arr.real_data && !array_var->val.v.arr.int_data && !array_var->val.v.arr.data) return 0;
+    program = get_fast_array_expr_program(I, term, array_name, n->name);
+    if (!program) return 0;
+
+    lower = array_var->val.v.arr.lower_bounds[0];
+    len = array_var->val.v.arr.dims[0];
+    sum = sum_var->val.v.r;
+    iter = s;
+    if (I->line_profile_enabled && n->line > 0) profile_start = ofort_monotonic_seconds();
+    while (st > 0 ? iter <= e : iter >= e) {
+        int index = (int)(iter - lower);
+        double array_value;
+        double term_value;
+        if (index < 0 || index >= len) return 0;
+        if (array_var->val.v.arr.real_data) {
+            array_value = array_var->val.v.arr.real_data[index];
+        } else if (array_var->val.v.arr.int_data) {
+            array_value = (double)array_var->val.v.arr.int_data[index];
+        } else {
+            array_value = val_to_real(array_var->val.v.arr.data[index]);
+        }
+        if (!eval_fast_array_expr_program(program, array_value, &term_value)) return 0;
+        sum += term_value;
+        iter += st;
+    }
+    sum_var->val.v.r = sum;
+    sum_var->is_initialized = 1;
     loop_var->val.v.i = iter;
     if (I->line_profile_enabled && n->line > 0) {
         add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
@@ -15705,7 +16097,9 @@ static int ofort_extension_module_exists(const char *module_name) {
            str_eq_nocase(module_name, "ofort_la_mod") ||
            str_eq_nocase(module_name, "ofort_io_mod") ||
            str_eq_nocase(module_name, "ofort_statistics_mod") ||
-           str_eq_nocase(module_name, "ofort_stats_mod");
+           str_eq_nocase(module_name, "ofort_stats_mod") ||
+           str_eq_nocase(module_name, "stdlib_stats") ||
+           str_eq_nocase(module_name, "stdlib_stats_distribution_normal");
 }
 
 static int ofort_extension_module_exports(const char *module_name, const char *name) {
@@ -15726,6 +16120,22 @@ static int ofort_extension_module_exports(const char *module_name, const char *n
         return str_eq_nocase(name, "read_matrix") ||
                str_eq_nocase(name, "read_vector");
     }
+    if (str_eq_nocase(module_name, "stdlib_stats_distribution_normal")) {
+        return str_eq_nocase(name, "rvs_normal") ||
+               str_eq_nocase(name, "pdf_normal") ||
+               str_eq_nocase(name, "cdf_normal");
+    }
+    if (str_eq_nocase(module_name, "stdlib_stats")) {
+        return str_eq_nocase(name, "mean") ||
+               str_eq_nocase(name, "var") ||
+               str_eq_nocase(name, "cov") ||
+               str_eq_nocase(name, "corr") ||
+               str_eq_nocase(name, "median") ||
+               str_eq_nocase(name, "moment") ||
+               str_eq_nocase(name, "pca") ||
+               str_eq_nocase(name, "pca_transform") ||
+               str_eq_nocase(name, "pca_inverse_transform");
+    }
     if (str_eq_nocase(module_name, "ofort_statistics_mod") ||
         str_eq_nocase(module_name, "ofort_stats_mod")) {
         return str_eq_nocase(name, "mean") ||
@@ -15735,6 +16145,11 @@ static int ofort_extension_module_exports(const char *module_name, const char *n
                str_eq_nocase(name, "cor") ||
                str_eq_nocase(name, "variance_given_mean") ||
                str_eq_nocase(name, "sd_given_mean") ||
+               str_eq_nocase(name, "median") ||
+               str_eq_nocase(name, "moment") ||
+               str_eq_nocase(name, "pca") ||
+               str_eq_nocase(name, "pca_transform") ||
+               str_eq_nocase(name, "pca_inverse_transform") ||
                str_eq_nocase(name, "calc_stats") ||
                str_eq_nocase(name, "calc_col_stats");
     }
@@ -16599,6 +17014,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     } else if (str_eq_nocase(n->name, "ofort_io_mod")) {
                         import_ofort_extension_intrinsic(I, "read_matrix", "read_matrix");
                         import_ofort_extension_intrinsic(I, "read_vector", "read_vector");
+                    } else if (str_eq_nocase(n->name, "stdlib_stats_distribution_normal")) {
+                        import_ofort_extension_intrinsic(I, "rvs_normal", "rvs_normal");
+                        import_ofort_extension_intrinsic(I, "pdf_normal", "pdf_normal");
+                        import_ofort_extension_intrinsic(I, "cdf_normal", "cdf_normal");
+                    } else if (str_eq_nocase(n->name, "stdlib_stats")) {
+                        import_ofort_extension_intrinsic(I, "mean", "mean");
+                        import_ofort_extension_intrinsic(I, "var", "var");
+                        import_ofort_extension_intrinsic(I, "cov", "cov");
+                        import_ofort_extension_intrinsic(I, "corr", "corr");
+                        import_ofort_extension_intrinsic(I, "median", "median");
+                        import_ofort_extension_intrinsic(I, "moment", "moment");
+                        import_ofort_extension_intrinsic(I, "pca", "pca");
+                        import_ofort_extension_intrinsic(I, "pca_transform", "pca_transform");
+                        import_ofort_extension_intrinsic(I, "pca_inverse_transform", "pca_inverse_transform");
                     } else {
                         import_ofort_extension_intrinsic(I, "mean", "mean");
                         import_ofort_extension_intrinsic(I, "variance", "variance");
@@ -16607,6 +17036,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         import_ofort_extension_intrinsic(I, "cor", "cor");
                         import_ofort_extension_intrinsic(I, "variance_given_mean", "variance_given_mean");
                         import_ofort_extension_intrinsic(I, "sd_given_mean", "sd_given_mean");
+                        import_ofort_extension_intrinsic(I, "median", "median");
+                        import_ofort_extension_intrinsic(I, "moment", "moment");
+                        import_ofort_extension_intrinsic(I, "pca", "pca");
+                        import_ofort_extension_intrinsic(I, "pca_transform", "pca_transform");
+                        import_ofort_extension_intrinsic(I, "pca_inverse_transform", "pca_inverse_transform");
                         import_ofort_extension_intrinsic(I, "calc_stats", "calc_stats");
                         import_ofort_extension_intrinsic(I, "calc_col_stats", "calc_col_stats");
                     }
@@ -17963,6 +18397,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             (exec_fast_affine_subroutine_loop(I, n, s, e, st) ||
              exec_fast_scalar_poly_accum_loop(I, n, s, e, st) ||
              exec_fast_scalar_affine_recurrence_loop(I, n, s, e, st) ||
+             exec_fast_array_expr_accum_loop(I, n, s, e, st) ||
              exec_fast_array_affine_loop(I, n, s, e, st) ||
              exec_fast_random_dot_loop(I, n, s, e, st) ||
              exec_fast_random_sum_loop(I, n, s, e, st))) {
@@ -20275,10 +20710,12 @@ static OfortValue call_ofort_stats_unary(OfortInterpreter *I, const char *name,
     borrowed_x = x == args[0].v.arr.real_data;
     if (str_eq_nocase(name, "mean")) {
         result = ofort_stats_mean_r8(x, n);
-    } else if (str_eq_nocase(name, "variance")) {
+    } else if (str_eq_nocase(name, "variance") || str_eq_nocase(name, "var")) {
         result = ofort_stats_variance_r8(x, n);
     } else if (str_eq_nocase(name, "sd")) {
         result = ofort_stats_sd_r8(x, n);
+    } else if (str_eq_nocase(name, "median")) {
+        result = ofort_stats_median_r8(x, n);
     } else {
         if (!borrowed_x) free(x);
         ofort_error(I, "Unknown unary ofort statistics function '%s'", name);
@@ -20309,7 +20746,7 @@ static OfortValue call_ofort_stats_binary(OfortInterpreter *I, const char *name,
     }
     if (str_eq_nocase(name, "cov")) {
         result = ofort_stats_cov_r8(x, y, nx);
-    } else if (str_eq_nocase(name, "cor")) {
+    } else if (str_eq_nocase(name, "cor") || str_eq_nocase(name, "corr")) {
         result = ofort_stats_cor_r8(x, y, nx);
     } else {
         if (!borrowed_x) free(x);
@@ -20350,7 +20787,134 @@ static OfortValue call_ofort_stats_given_mean(OfortInterpreter *I, const char *n
 }
 
 static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char *name,
-                                                OfortValue *args, int nargs) {
+                                                OfortValue *args, int nargs,
+                                                char arg_names[OFORT_MAX_PARAMS][256]) {
+    if (str_eq_nocase(name, "rvs_normal")) {
+        double loc = 0.0;
+        double scale = 1.0;
+        int array_size = -1;
+        int loc_idx = -1;
+        int scale_idx = -1;
+        int size_idx = -1;
+        int method = 2;
+
+        for (int i = 0; i < nargs; i++) {
+            const char *pname = arg_names ? arg_names[i] : "";
+            if (!pname || !pname[0]) continue;
+            if (str_eq_nocase(pname, "loc")) loc_idx = i;
+            else if (str_eq_nocase(pname, "scale")) scale_idx = i;
+            else if (str_eq_nocase(pname, "array_size")) size_idx = i;
+            else if (str_eq_nocase(pname, "mold")) {
+                /* mold selects result type/kind in stdlib; this subset always returns REAL(8). */
+            } else {
+                ofort_error(I, "Unknown RVS_NORMAL keyword '%s'", pname);
+            }
+        }
+        if (size_idx >= 0) array_size = (int)val_to_int(args[size_idx]);
+        if (nargs == 0) return make_double(ofort_rnorm_sample(I, method));
+        if (size_idx >= 0) {
+            if (loc_idx < 0 && scale_idx >= 0) ofort_error(I, "RVS_NORMAL scale requires loc");
+        } else if (loc_idx >= 0 || scale_idx >= 0) {
+            if (loc_idx < 0 || scale_idx < 0) ofort_error(I, "RVS_NORMAL loc and scale must be supplied together");
+        } else if (nargs == 1 && args[0].type == FVAL_INTEGER) {
+            array_size = (int)val_to_int(args[0]);
+        } else if (nargs == 1) {
+            loc_idx = 0;
+        } else if (nargs == 2 && args[0].type == FVAL_INTEGER) {
+            array_size = (int)val_to_int(args[0]);
+        } else if (nargs == 2) {
+            loc_idx = 0;
+            scale_idx = 1;
+        } else if (nargs == 3) {
+            loc_idx = 0;
+            scale_idx = 1;
+            size_idx = 2;
+            array_size = (int)val_to_int(args[size_idx]);
+        } else {
+            ofort_error(I, "RVS_NORMAL takes zero to three arguments");
+        }
+        if (loc_idx >= 0) loc = val_to_real(args[loc_idx]);
+        if (scale_idx >= 0) scale = val_to_real(args[scale_idx]);
+        if (scale <= 0.0) return make_double(NAN);
+        if (array_size >= 0) {
+            int dims[1];
+            OfortValue result;
+            if (array_size < 0) ofort_error(I, "RVS_NORMAL array_size must be nonnegative");
+            dims[0] = array_size;
+            result = make_array_with_char_len_options(FVAL_DOUBLE, dims, 1, 0, 1);
+            for (int i = 0; i < result.v.arr.len; i++)
+                ofort_assign_real_array_element(&result, i, loc + scale * ofort_rnorm_sample(I, method));
+            return result;
+        }
+        return make_double(loc + scale * ofort_rnorm_sample(I, method));
+    }
+    if (str_eq_nocase(name, "pdf_normal") ||
+        str_eq_nocase(name, "cdf_normal")) {
+        int result_len = 0;
+        int array_arg = -1;
+        int is_pdf = str_eq_nocase(name, "pdf_normal");
+        if (nargs != 3) ofort_error(I, "%s takes x, loc, and scale", name);
+        for (int i = 0; i < 3; i++) {
+            if (args[i].type == FVAL_ARRAY) {
+                if (args[i].v.arr.n_dims != 1)
+                    ofort_error(I, "%s supports only scalar or rank-1 arguments", name);
+                if (args[i].v.arr.elem_type != FVAL_INTEGER &&
+                    args[i].v.arr.elem_type != FVAL_REAL &&
+                    args[i].v.arr.elem_type != FVAL_DOUBLE)
+                    ofort_error(I, "%s array arguments must be numeric", name);
+                if (result_len == 0) {
+                    result_len = args[i].v.arr.len;
+                    array_arg = i;
+                } else if (args[i].v.arr.len != result_len) {
+                    ofort_error(I, "%s rank-1 arguments must have the same length", name);
+                }
+            }
+        }
+        (void)array_arg;
+        if (result_len > 0) {
+            int dims[1];
+            OfortValue result;
+            dims[0] = result_len;
+            result = make_array_with_char_len_options(FVAL_DOUBLE, dims, 1, 0, 1);
+            for (int i = 0; i < result_len; i++) {
+                double vals[3];
+                double z;
+                double out;
+                for (int j = 0; j < 3; j++) {
+                    if (args[j].type == FVAL_ARRAY) {
+                        OfortValue elem = array_element_value(&args[j], i);
+                        vals[j] = val_to_real(elem);
+                        free_value(&elem);
+                    } else {
+                        vals[j] = val_to_real(args[j]);
+                    }
+                }
+                if (vals[2] <= 0.0) out = NAN;
+                else {
+                    z = (vals[0] - vals[1]) / vals[2];
+                    out = is_pdf
+                        ? exp(-0.5 * z * z) / (vals[2] * sqrt(2.0 * 3.14159265358979323846264338327950288))
+                        : 0.5 * (1.0 + erf(z / sqrt(2.0)));
+                }
+                ofort_assign_real_array_element(&result, i, out);
+            }
+            return result;
+        } else {
+            double x = val_to_real(args[0]);
+            double loc = val_to_real(args[1]);
+            double scale = val_to_real(args[2]);
+            double z;
+            double result;
+            if (scale <= 0.0) return make_double(NAN);
+            z = (x - loc) / scale;
+            if (is_pdf) {
+                result = exp(-0.5 * z * z) / (scale * sqrt(2.0 * 3.14159265358979323846264338327950288));
+            } else {
+                result = 0.5 * (1.0 + erf(z / sqrt(2.0)));
+            }
+            return make_double(result);
+        }
+    }
     if (str_eq_nocase(name, "rnorm")) {
         int method = nargs >= 2 ? ofort_rnorm_method(I, &args[1]) : 2;
         if (nargs == 0) {
@@ -20375,11 +20939,31 @@ static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char
     }
     if (str_eq_nocase(name, "mean") ||
         str_eq_nocase(name, "variance") ||
-        str_eq_nocase(name, "sd")) {
+        str_eq_nocase(name, "var") ||
+        str_eq_nocase(name, "sd") ||
+        str_eq_nocase(name, "median")) {
         return call_ofort_stats_unary(I, name, args, nargs);
     }
+    if (str_eq_nocase(name, "moment")) {
+        double *x;
+        double result;
+        int n;
+        int order;
+        double center;
+        int borrowed_x = 0;
+        if (nargs != 2 && nargs != 3) ofort_error(I, "MOMENT takes array, order, and optional center");
+        x = ofort_stats_array_arg(I, &args[0], &n);
+        borrowed_x = x == args[0].v.arr.real_data;
+        order = (int)val_to_int(args[1]);
+        center = nargs == 3 ? val_to_real(args[2]) : ofort_stats_mean_r8(x, n);
+        result = ofort_stats_moment_r8(x, n, order, center);
+        if (!borrowed_x) free(x);
+        if (isnan(result)) ofort_error(I, "MOMENT is undefined for this input");
+        return make_double(result);
+    }
     if (str_eq_nocase(name, "cov") ||
-        str_eq_nocase(name, "cor")) {
+        str_eq_nocase(name, "cor") ||
+        str_eq_nocase(name, "corr")) {
         if (nargs == 1)
             return call_ofort_stats_matrix_cov_cor(I, name, &args[0]);
         return call_ofort_stats_binary(I, name, args, nargs);
@@ -20801,7 +21385,7 @@ static OfortValue call_ofort_stats_matrix_cov_cor(OfortInterpreter *I, const cha
             covs[k + j * ncol] = covs[j + k * ncol];
         }
     }
-    if (str_eq_nocase(name, "cor")) {
+    if (str_eq_nocase(name, "cor") || str_eq_nocase(name, "corr")) {
         vars = (double *)calloc((size_t)ncol, sizeof(*vars));
         if (!vars) {
             free(means);
@@ -20829,6 +21413,83 @@ static OfortValue call_ofort_stats_matrix_cov_cor(OfortInterpreter *I, const cha
     free(covs);
     free(means);
     return result;
+}
+
+static int ofort_jacobi_symmetric(double *a, int n, double *eigvals, double *eigvecs) {
+    const int max_iter = 100 * 64 * 64;
+    double eps = 1.0e-12;
+    if (!a || !eigvals || !eigvecs || n <= 0 || n > 64) return 0;
+    for (int j = 0; j < n; j++) {
+        for (int i = 0; i < n; i++) eigvecs[i + j * n] = (i == j) ? 1.0 : 0.0;
+    }
+    for (int iter = 0; iter < max_iter; iter++) {
+        int p = 0, q = 1;
+        double max_off = 0.0;
+        if (n == 1) break;
+        for (int j = 1; j < n; j++) {
+            for (int i = 0; i < j; i++) {
+                double v = fabs(a[i + j * n]);
+                if (v > max_off) {
+                    max_off = v;
+                    p = i;
+                    q = j;
+                }
+            }
+        }
+        if (max_off < eps) break;
+        {
+            double app = a[p + p * n];
+            double aqq = a[q + q * n];
+            double apq = a[p + q * n];
+            double tau = (aqq - app) / (2.0 * apq);
+            double t = (tau >= 0.0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau * tau));
+            double c = 1.0 / sqrt(1.0 + t * t);
+            double s = t * c;
+            double new_app = app - t * apq;
+            double new_aqq = aqq + t * apq;
+            a[p + p * n] = new_app;
+            a[q + q * n] = new_aqq;
+            a[p + q * n] = 0.0;
+            a[q + p * n] = 0.0;
+            for (int k = 0; k < n; k++) {
+                if (k != p && k != q) {
+                    double akp = a[k + p * n];
+                    double akq = a[k + q * n];
+                    a[k + p * n] = c * akp - s * akq;
+                    a[p + k * n] = a[k + p * n];
+                    a[k + q * n] = s * akp + c * akq;
+                    a[q + k * n] = a[k + q * n];
+                }
+            }
+            for (int k = 0; k < n; k++) {
+                double vkp = eigvecs[k + p * n];
+                double vkq = eigvecs[k + q * n];
+                eigvecs[k + p * n] = c * vkp - s * vkq;
+                eigvecs[k + q * n] = s * vkp + c * vkq;
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) eigvals[i] = a[i + i * n];
+    return 1;
+}
+
+static void ofort_sort_eigen_desc(double *eigvals, double *eigvecs, int n) {
+    for (int i = 0; i < n - 1; i++) {
+        int best = i;
+        for (int j = i + 1; j < n; j++) {
+            if (eigvals[j] > eigvals[best]) best = j;
+        }
+        if (best != i) {
+            double tmp = eigvals[i];
+            eigvals[i] = eigvals[best];
+            eigvals[best] = tmp;
+            for (int r = 0; r < n; r++) {
+                double tv = eigvecs[r + i * n];
+                eigvecs[r + i * n] = eigvecs[r + best * n];
+                eigvecs[r + best * n] = tv;
+            }
+        }
+    }
 }
 
 static void ofort_require_rank2_numeric(OfortInterpreter *I, OfortValue *x, const char *name) {
@@ -21378,6 +22039,169 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
             ofort_error(I, "RNORM_FILL argument must be a variable");
         }
         ofort_rnorm_fill_value(I, target, method);
+        return 1;
+    }
+
+    if (str_eq_nocase(extension_name, "pca")) {
+        int x_idx = -1, components_idx = -1, singular_idx = -1, mean_idx = -1;
+        OfortValue *xval;
+        OfortValue *components;
+        OfortValue *singular;
+        OfortValue *xmean_out = NULL;
+        int nrow, ncol, ncomp;
+        double *means;
+        double *cov;
+        double *eigvals;
+        double *eigvecs;
+
+        for (int i = 0; i < n->n_stmts; i++) {
+            const char *pname = n->param_names[i];
+            if (pname[0]) {
+                if (str_eq_nocase(pname, "x")) x_idx = i;
+                else if (str_eq_nocase(pname, "components")) components_idx = i;
+                else if (str_eq_nocase(pname, "singular_values")) singular_idx = i;
+                else if (str_eq_nocase(pname, "x_mean")) mean_idx = i;
+                else if (str_eq_nocase(pname, "method") || str_eq_nocase(pname, "overwrite_x")) {
+                    OfortValue ignored = eval_node(I, n->stmts[i]);
+                    free_value(&ignored);
+                } else if (str_eq_nocase(pname, "err")) {
+                    ofort_error(I, "PCA err argument is not supported");
+                } else {
+                    ofort_error(I, "Unknown PCA keyword '%s'", pname);
+                }
+            }
+        }
+        if (x_idx < 0 && n->n_stmts >= 1 && n->param_names[0][0] == '\0') x_idx = 0;
+        if (components_idx < 0 && n->n_stmts >= 2 && n->param_names[1][0] == '\0') components_idx = 1;
+        if (singular_idx < 0 && n->n_stmts >= 3 && n->param_names[2][0] == '\0') singular_idx = 2;
+        if (mean_idx < 0 && n->n_stmts >= 4 && n->param_names[3][0] == '\0') mean_idx = 3;
+        if (x_idx < 0 || components_idx < 0 || singular_idx < 0)
+            ofort_error(I, "PCA requires x, components, and singular_values");
+
+        xval = ofort_calc_stats_input_lvalue(I, n->stmts[x_idx]);
+        ofort_require_rank2_numeric(I, xval, "PCA x");
+        nrow = xval->v.arr.dims[0];
+        ncol = xval->v.arr.dims[1];
+        if (nrow < 2 || ncol <= 0 || ncol > 64) ofort_error(I, "PCA requires 2+ rows and up to 64 columns");
+        components = ofort_output_array_lvalue_any(I, n->stmts[components_idx], "components");
+        singular = ofort_output_array_lvalue_any(I, n->stmts[singular_idx], "singular_values");
+        if (components->type != FVAL_ARRAY || components->v.arr.n_dims != 2 ||
+            singular->type != FVAL_ARRAY || singular->v.arr.n_dims != 1)
+            ofort_error(I, "PCA components must be rank-2 and singular_values rank-1");
+        ncomp = components->v.arr.dims[0];
+        if (components->v.arr.dims[1] != ncol || singular->v.arr.dims[0] != ncomp || ncomp < 1 || ncomp > ncol)
+            ofort_error(I, "PCA output shapes must be components(ncomp,ncol), singular_values(ncomp)");
+        if (mean_idx >= 0) xmean_out = ofort_array_output_lvalue(I, n->stmts[mean_idx], "x_mean", 1, ncol, 0);
+
+        means = (double *)calloc((size_t)ncol, sizeof(*means));
+        cov = (double *)calloc((size_t)ncol * (size_t)ncol, sizeof(*cov));
+        eigvals = (double *)calloc((size_t)ncol, sizeof(*eigvals));
+        eigvecs = (double *)calloc((size_t)ncol * (size_t)ncol, sizeof(*eigvecs));
+        if (!means || !cov || !eigvals || !eigvecs) {
+            free(means); free(cov); free(eigvals); free(eigvecs);
+            ofort_error(I, "Out of memory");
+        }
+        for (int j = 0; j < ncol; j++) {
+            for (int i = 0; i < nrow; i++) means[j] += ofort_matrix_real_element(I, xval, i + j * nrow);
+            means[j] /= (double)nrow;
+            if (xmean_out) ofort_assign_real_array_element(xmean_out, j, means[j]);
+        }
+        for (int j = 0; j < ncol; j++) {
+            for (int k = j; k < ncol; k++) {
+                double ss = 0.0;
+                for (int i = 0; i < nrow; i++) {
+                    double xj = ofort_matrix_real_element(I, xval, i + j * nrow) - means[j];
+                    double xk = ofort_matrix_real_element(I, xval, i + k * nrow) - means[k];
+                    ss += xj * xk;
+                }
+                cov[j + k * ncol] = ss / (double)(nrow - 1);
+                cov[k + j * ncol] = cov[j + k * ncol];
+            }
+        }
+        if (!ofort_jacobi_symmetric(cov, ncol, eigvals, eigvecs)) {
+            free(means); free(cov); free(eigvals); free(eigvecs);
+            ofort_error(I, "PCA eigendecomposition failed");
+        }
+        ofort_sort_eigen_desc(eigvals, eigvecs, ncol);
+        for (int c = 0; c < ncomp; c++) {
+            double ev = eigvals[c] > 0.0 ? eigvals[c] : 0.0;
+            ofort_assign_real_array_element(singular, c, sqrt(ev * (double)(nrow - 1)));
+            for (int j = 0; j < ncol; j++)
+                ofort_assign_real_array_element(components, c + j * ncomp, eigvecs[j + c * ncol]);
+        }
+        free(means); free(cov); free(eigvals); free(eigvecs);
+        return 1;
+    }
+
+    if (str_eq_nocase(extension_name, "pca_transform") ||
+        str_eq_nocase(extension_name, "pca_inverse_transform")) {
+        int x_idx = -1, components_idx = -1, out_idx = -1, mean_idx = -1;
+        OfortValue *xval;
+        OfortValue *components;
+        OfortValue *out;
+        OfortValue *xmean = NULL;
+
+        for (int i = 0; i < n->n_stmts; i++) {
+            const char *pname = n->param_names[i];
+            if (pname[0]) {
+                if (str_eq_nocase(pname, "x") || str_eq_nocase(pname, "x_reduced")) x_idx = i;
+                else if (str_eq_nocase(pname, "components")) components_idx = i;
+                else if (str_eq_nocase(pname, "x_transformed") || str_eq_nocase(pname, "x_reconstructed")) out_idx = i;
+                else if (str_eq_nocase(pname, "x_mean")) mean_idx = i;
+                else ofort_error(I, "Unknown PCA transform keyword '%s'", pname);
+            }
+        }
+        if (x_idx < 0 && n->n_stmts >= 1 && n->param_names[0][0] == '\0') x_idx = 0;
+        if (components_idx < 0 && n->n_stmts >= 2 && n->param_names[1][0] == '\0') components_idx = 1;
+        if (out_idx < 0 && n->n_stmts >= 3 && n->param_names[2][0] == '\0') out_idx = 2;
+        if (mean_idx < 0 && n->n_stmts >= 4 && n->param_names[3][0] == '\0') mean_idx = 3;
+        if (x_idx < 0 || components_idx < 0 || out_idx < 0)
+            ofort_error(I, "%s requires x, components, and output", extension_name);
+
+        xval = ofort_calc_stats_input_lvalue(I, n->stmts[x_idx]);
+        components = ofort_calc_stats_input_lvalue(I, n->stmts[components_idx]);
+        out = ofort_output_array_lvalue_any(I, n->stmts[out_idx], "PCA output");
+        ofort_require_rank2_numeric(I, xval, extension_name);
+        ofort_require_rank2_numeric(I, components, "components");
+        if (mean_idx >= 0) xmean = ofort_calc_stats_input_lvalue(I, n->stmts[mean_idx]);
+
+        if (str_eq_nocase(extension_name, "pca_transform")) {
+            int nrow = xval->v.arr.dims[0], ncol = xval->v.arr.dims[1];
+            int ncomp = components->v.arr.dims[0];
+            if (components->v.arr.dims[1] != ncol || out->type != FVAL_ARRAY || out->v.arr.n_dims != 2 ||
+                out->v.arr.dims[0] != nrow || out->v.arr.dims[1] != ncomp)
+                ofort_error(I, "PCA_TRANSFORM output shape must be (nrow,ncomp)");
+            if (xmean && (xmean->type != FVAL_ARRAY || xmean->v.arr.n_dims != 1 || xmean->v.arr.dims[0] != ncol))
+                ofort_error(I, "PCA_TRANSFORM x_mean has wrong shape");
+            for (int c = 0; c < ncomp; c++) {
+                for (int i = 0; i < nrow; i++) {
+                    double sum = 0.0;
+                    for (int j = 0; j < ncol; j++) {
+                        double mu = xmean ? ofort_matrix_real_element(I, xmean, j) : 0.0;
+                        sum += (ofort_matrix_real_element(I, xval, i + j * nrow) - mu) *
+                               ofort_matrix_real_element(I, components, c + j * ncomp);
+                    }
+                    ofort_assign_real_array_element(out, i + c * nrow, sum);
+                }
+            }
+        } else {
+            int nrow = xval->v.arr.dims[0], ncomp = xval->v.arr.dims[1];
+            int ncol = components->v.arr.dims[1];
+            if (components->v.arr.dims[0] != ncomp || out->type != FVAL_ARRAY || out->v.arr.n_dims != 2 ||
+                out->v.arr.dims[0] != nrow || out->v.arr.dims[1] != ncol)
+                ofort_error(I, "PCA_INVERSE_TRANSFORM output shape must be (nrow,ncol)");
+            if (xmean && (xmean->type != FVAL_ARRAY || xmean->v.arr.n_dims != 1 || xmean->v.arr.dims[0] != ncol))
+                ofort_error(I, "PCA_INVERSE_TRANSFORM x_mean has wrong shape");
+            for (int j = 0; j < ncol; j++) {
+                for (int i = 0; i < nrow; i++) {
+                    double sum = xmean ? ofort_matrix_real_element(I, xmean, j) : 0.0;
+                    for (int c = 0; c < ncomp; c++)
+                        sum += ofort_matrix_real_element(I, xval, i + c * nrow) *
+                               ofort_matrix_real_element(I, components, c + j * ncomp);
+                    ofort_assign_real_array_element(out, i + j * nrow, sum);
+                }
+            }
+        }
         return 1;
     }
 
@@ -24859,6 +25683,9 @@ void ofort_destroy(OfortInterpreter *interp) {
             if (n->fast_cache[4] == &fast_numeric_loop_plan_tag && n->fast_cache[5]) {
                 free_fast_numeric_loop_plan((FastNumericLoopPlan *)n->fast_cache[5]);
             }
+            if (n->fast_cache[4] == &fast_array_expr_program_tag && n->fast_cache[5]) {
+                free_fast_array_expr_program((FastArrayExprProgram *)n->fast_cache[5]);
+            }
             free(n);
         }
         free(interp->node_pool);
@@ -24888,6 +25715,8 @@ void ofort_destroy(OfortInterpreter *interp) {
     free(interp->generics);
     free(interp->funcs);
     free(interp->tokens);
+    free(interp->cached_source_text);
+    free(interp->cached_processed_source);
     free(interp);
 }
 
@@ -24895,6 +25724,7 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     double total_start;
     double stage_start;
     char *processed_source = NULL;
+    int use_cached_ast = 0;
     if (!interp || !source) return -1;
     total_start = ofort_monotonic_seconds();
     clear_timing(interp);
@@ -24921,31 +25751,41 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     }
 
     if (setjmp(interp->err_jmp) != 0) {
+        if (processed_source && processed_source != interp->cached_processed_source) free(processed_source);
         return -1;
     }
 
-    processed_source = preprocess_source(interp, source);
-    if (!processed_source) {
-        snprintf(interp->error, sizeof(interp->error), "Out of memory preprocessing source");
-        interp->has_error = 1;
-        return -1;
+    use_cached_ast = interp->cached_ast && interp->cached_source_text &&
+                     strcmp(interp->cached_source_text, source) == 0 &&
+                     interp->cached_processed_source;
+    if (use_cached_ast) {
+        processed_source = interp->cached_processed_source;
+        interp->source = processed_source;
+        interp->ast = interp->cached_ast;
+    } else {
+        processed_source = preprocess_source(interp, source);
+        if (!processed_source) {
+            snprintf(interp->error, sizeof(interp->error), "Out of memory preprocessing source");
+            interp->has_error = 1;
+            return -1;
+        }
+        interp->source = processed_source;
+
+        /* Tokenize */
+        stage_start = ofort_monotonic_seconds();
+        tokenize(interp, processed_source);
+        interp->timing.lex = ofort_monotonic_seconds() - stage_start;
+        interp->tok_pos = 0;
+
+        /* Parse */
+        stage_start = ofort_monotonic_seconds();
+        interp->ast = parse_program(interp);
+        interp->timing.parse = ofort_monotonic_seconds() - stage_start;
     }
-    interp->source = processed_source;
-
-    /* Tokenize */
-    stage_start = ofort_monotonic_seconds();
-    tokenize(interp, processed_source);
-    interp->timing.lex = ofort_monotonic_seconds() - stage_start;
-    interp->tok_pos = 0;
-
-    /* Parse */
-    stage_start = ofort_monotonic_seconds();
-    interp->ast = parse_program(interp);
-    interp->timing.parse = ofort_monotonic_seconds() - stage_start;
 
     /* First pass: register all top-level functions/subroutines/modules */
     stage_start = ofort_monotonic_seconds();
-    if (interp->ast && interp->ast->type == FND_BLOCK) {
+    if (!use_cached_ast && interp->ast && interp->ast->type == FND_BLOCK) {
         for (int i = 0; i < interp->ast->n_stmts; i++) {
             OfortNode *s = interp->ast->stmts[i];
             if (!s) continue;
@@ -24959,8 +25799,22 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     interp->timing.register_time = ofort_monotonic_seconds() - stage_start;
     if (interp->has_error) {
         interp->timing.total = ofort_monotonic_seconds() - total_start;
-        free(processed_source);
+        if (processed_source && processed_source != interp->cached_processed_source) free(processed_source);
         return -1;
+    }
+    if (!use_cached_ast) {
+        char *source_copy = ofort_strdup_local(source);
+        char *processed_copy = ofort_strdup_local(processed_source);
+        if (source_copy && processed_copy) {
+            free(interp->cached_source_text);
+            free(interp->cached_processed_source);
+            interp->cached_source_text = source_copy;
+            interp->cached_processed_source = processed_copy;
+            interp->cached_ast = interp->ast;
+        } else {
+            free(source_copy);
+            free(processed_copy);
+        }
     }
 
     /* Second pass: execute everything else */
@@ -24985,7 +25839,7 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
 
     {
         int rc = interp->has_error ? -1 : 0;
-        free(processed_source);
+        if (processed_source && processed_source != interp->cached_processed_source) free(processed_source);
         return rc;
     }
 }
