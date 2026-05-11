@@ -359,6 +359,25 @@ static double ofort_monotonic_seconds(void) {
 #endif
 }
 
+static long long ofort_system_clock_count(long long *rate_out, long long *max_out) {
+#ifdef _WIN32
+    LARGE_INTEGER counter;
+    LARGE_INTEGER frequency;
+    QueryPerformanceCounter(&counter);
+    QueryPerformanceFrequency(&frequency);
+    if (rate_out) *rate_out = (long long)frequency.QuadPart;
+    if (max_out) *max_out = LLONG_MAX;
+    return (long long)counter.QuadPart;
+#else
+    struct timespec ts;
+    const long long rate = 1000000000LL;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (rate_out) *rate_out = rate;
+    if (max_out) *max_out = LLONG_MAX;
+    return (long long)ts.tv_sec * rate + (long long)ts.tv_nsec;
+#endif
+}
+
 static void clear_timing(OfortInterpreter *I) {
     if (I) memset(&I->timing, 0, sizeof(I->timing));
 }
@@ -10750,6 +10769,20 @@ static void append_to_buffer(char *buf, int bufsize, const char *text) {
     strncat(buf, text, avail - 1);
 }
 
+static void ofort_format_list_real(char *buf, int bufsize, double value, int precision) {
+    int has_decimal = 0;
+    if (!buf || bufsize <= 0) return;
+    snprintf(buf, bufsize, precision > 7 ? "%.15g" : "%.7g", value);
+    for (int i = 0; buf[i]; i++) {
+        if (buf[i] == '.' || buf[i] == 'e' || buf[i] == 'E' ||
+            (buf[i] == 'n' || buf[i] == 'N') || (buf[i] == 'i' || buf[i] == 'I')) {
+            has_decimal = 1;
+            break;
+        }
+    }
+    if (!has_decimal && strlen(buf) + 2 < (size_t)bufsize) strcat(buf, ".0");
+}
+
 /* Convert value to string for output */
 static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bufsize) {
     switch (v.type) {
@@ -10759,10 +10792,10 @@ static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bu
             else snprintf(buf, bufsize, "%lld", v.v.i);
             break;
         case FVAL_REAL:
-            snprintf(buf, bufsize, "%.7g", v.v.r);
+            ofort_format_list_real(buf, bufsize, v.v.r, 7);
             break;
         case FVAL_DOUBLE:
-            snprintf(buf, bufsize, "%.15g", v.v.r);
+            ofort_format_list_real(buf, bufsize, v.v.r, 15);
             break;
         case FVAL_COMPLEX:
             snprintf(buf, bufsize, "(%.7g,%.7g)", v.v.cx.re, v.v.cx.im);
@@ -16100,6 +16133,7 @@ static int ofort_extension_module_exists(const char *module_name) {
            str_eq_nocase(module_name, "ofort_stats_mod") ||
            str_eq_nocase(module_name, "stdlib_stats") ||
            str_eq_nocase(module_name, "stdlib_linalg") ||
+           str_eq_nocase(module_name, "stdlib_io") ||
            str_eq_nocase(module_name, "stdlib_stats_distribution_normal");
 }
 
@@ -16127,6 +16161,10 @@ static int ofort_extension_module_exports(const char *module_name, const char *n
     if (str_eq_nocase(module_name, "ofort_io_mod")) {
         return str_eq_nocase(name, "read_matrix") ||
                str_eq_nocase(name, "read_vector");
+    }
+    if (str_eq_nocase(module_name, "stdlib_io")) {
+        return str_eq_nocase(name, "loadtxt") ||
+               str_eq_nocase(name, "savetxt");
     }
     if (str_eq_nocase(module_name, "stdlib_stats_distribution_normal")) {
         return str_eq_nocase(name, "rvs_normal") ||
@@ -17038,6 +17076,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     } else if (str_eq_nocase(n->name, "ofort_io_mod")) {
                         import_ofort_extension_intrinsic(I, "read_matrix", "read_matrix");
                         import_ofort_extension_intrinsic(I, "read_vector", "read_vector");
+                    } else if (str_eq_nocase(n->name, "stdlib_io")) {
+                        import_ofort_extension_intrinsic(I, "loadtxt", "loadtxt");
+                        import_ofort_extension_intrinsic(I, "savetxt", "savetxt");
                     } else if (str_eq_nocase(n->name, "stdlib_stats_distribution_normal")) {
                         import_ofort_extension_intrinsic(I, "rvs_normal", "rvs_normal");
                         import_ofort_extension_intrinsic(I, "pdf_normal", "pdf_normal");
@@ -19266,21 +19307,23 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             break;
         }
         if (strcmp(call_upper, "SYSTEM_CLOCK") == 0) {
-            long long now = (long long)time(NULL);
+            long long rate = 1;
+            long long count_max = LLONG_MAX;
+            long long now = ofort_system_clock_count(&rate, &count_max);
             for (int i = 0; i < n->n_stmts; i++) {
                 if (n->stmts[i]->type != FND_IDENT) continue;
                 if (n->param_names[i][0] == '\0' && i == 0) {
                     set_var(I, n->stmts[i]->name, make_integer(now));
                 } else if (n->param_names[i][0] == '\0' && i == 1) {
-                    set_var(I, n->stmts[i]->name, make_integer(1));
+                    set_var(I, n->stmts[i]->name, make_integer(rate));
                 } else if (n->param_names[i][0] == '\0' && i == 2) {
-                    set_var(I, n->stmts[i]->name, make_integer(LLONG_MAX));
+                    set_var(I, n->stmts[i]->name, make_integer(count_max));
                 } else if (str_eq_nocase(n->param_names[i], "count")) {
                     set_var(I, n->stmts[i]->name, make_integer(now));
                 } else if (str_eq_nocase(n->param_names[i], "count_rate")) {
-                    set_var(I, n->stmts[i]->name, make_integer(1));
+                    set_var(I, n->stmts[i]->name, make_integer(rate));
                 } else if (str_eq_nocase(n->param_names[i], "count_max")) {
-                    set_var(I, n->stmts[i]->name, make_integer(LLONG_MAX));
+                    set_var(I, n->stmts[i]->name, make_integer(count_max));
                 }
             }
             break;
@@ -21876,6 +21919,7 @@ typedef struct {
     char comment;
     int header;
     int skiprows;
+    int max_rows;
     int ncol;
     int has_row_labels;
     int file_idx;
@@ -22017,6 +22061,7 @@ static void ofort_read_options_init(OfortReadOptions *opts) {
     memset(opts, 0, sizeof(*opts));
     opts->delimiter = '\0';
     opts->comment = '#';
+    opts->max_rows = -1;
     opts->ncol = 0;
     opts->file_idx = -1;
     opts->out_idx = -1;
@@ -22041,6 +22086,19 @@ static void ofort_read_parse_common_options(OfortInterpreter *I, OfortNode *n,
                 opts->header = ofort_eval_logical_arg(I, n->stmts[i]);
             else if (str_eq_nocase(pname, "skiprows") || str_eq_nocase(pname, "skip_rows"))
                 opts->skiprows = ofort_eval_int_arg(I, n->stmts[i], "skiprows");
+            else if (str_eq_nocase(pname, "max_rows")) {
+                OfortValue max_rows_val = eval_node(I, n->stmts[i]);
+                opts->max_rows = (int)val_to_int(max_rows_val);
+                free_value(&max_rows_val);
+            }
+            else if (str_eq_nocase(pname, "fmt")) {
+                char *fmt = ofort_eval_string_arg(I, n->stmts[i], "fmt");
+                if (fmt[0] && strcmp(fmt, "*") != 0) {
+                    free(fmt);
+                    ofort_error(I, "Only fmt='*' is supported in %s", vector_mode ? "READ_VECTOR" : "READ_MATRIX");
+                }
+                free(fmt);
+            }
             else if (!vector_mode && str_eq_nocase(pname, "ncol"))
                 opts->ncol = ofort_eval_int_arg(I, n->stmts[i], "ncol");
             else if (!vector_mode && (str_eq_nocase(pname, "row_labels") ||
@@ -22048,6 +22106,8 @@ static void ofort_read_parse_common_options(OfortInterpreter *I, OfortNode *n,
                                       str_eq_nocase(pname, "labels"))) {
                 opts->row_labels_idx = i;
                 opts->has_row_labels = 1;
+            } else if (!vector_mode && str_eq_nocase(pname, "array")) {
+                opts->out_idx = i;
             } else {
                 ofort_error(I, "Unknown %s keyword '%s'", vector_mode ? "READ_VECTOR" : "READ_MATRIX", pname);
             }
@@ -22055,6 +22115,25 @@ static void ofort_read_parse_common_options(OfortInterpreter *I, OfortNode *n,
     }
     if (opts->file_idx < 0 && n->n_stmts >= 1 && n->param_names[0][0] == '\0') opts->file_idx = 0;
     if (opts->out_idx < 0 && n->n_stmts >= 2 && n->param_names[1][0] == '\0') opts->out_idx = 1;
+    if (n->n_stmts >= 3 && n->param_names[2][0] == '\0') {
+        opts->skiprows = ofort_eval_int_arg(I, n->stmts[2], "skiprows");
+    }
+    if (n->n_stmts >= 4 && n->param_names[3][0] == '\0') {
+        OfortValue max_rows_val = eval_node(I, n->stmts[3]);
+        opts->max_rows = (int)val_to_int(max_rows_val);
+        free_value(&max_rows_val);
+    }
+    if (n->n_stmts >= 5 && n->param_names[4][0] == '\0') {
+        char *fmt = ofort_eval_string_arg(I, n->stmts[4], "fmt");
+        if (fmt[0] && strcmp(fmt, "*") != 0) {
+            free(fmt);
+            ofort_error(I, "Only fmt='*' is supported in %s", vector_mode ? "READ_VECTOR" : "READ_MATRIX");
+        }
+        free(fmt);
+    }
+    if (n->n_stmts >= 6 && n->param_names[5][0] == '\0') {
+        opts->delimiter = ofort_eval_char_option(I, n->stmts[5], '\0', "delimiter");
+    }
     if (opts->file_idx < 0 || opts->out_idx < 0)
         ofort_error(I, "%s requires file and output arguments", vector_mode ? "READ_VECTOR" : "READ_MATRIX");
     opts->filename = ofort_eval_string_arg(I, n->stmts[opts->file_idx], "file");
@@ -22103,6 +22182,10 @@ static void ofort_io_read_matrix(OfortInterpreter *I, OfortNode *n) {
             header_left--;
             free(trimmed_line);
             continue;
+        }
+        if (opts.max_rows >= 0 && nrow >= opts.max_rows) {
+            free(trimmed_line);
+            break;
         }
         nf = ofort_split_fields(trimmed_line, opts.delimiter, fields, MAX_FIELDS);
         if (nf <= first_numeric) {
@@ -22204,8 +22287,13 @@ static void ofort_io_read_vector(OfortInterpreter *I, OfortNode *n) {
             free(trimmed_line);
             continue;
         }
+        if (opts.max_rows >= 0 && nval >= opts.max_rows) {
+            free(trimmed_line);
+            break;
+        }
         nf = ofort_split_fields(trimmed_line, opts.delimiter, fields, MAX_FIELDS);
         for (int j = 0; j < nf; j++) {
+            if (opts.max_rows >= 0 && nval >= opts.max_rows) break;
             if (nval >= capacity) {
                 int new_capacity = capacity > 0 ? capacity * 2 : 1024;
                 double *new_values = (double *)realloc(values, (size_t)new_capacity * sizeof(*values));
@@ -22227,6 +22315,164 @@ static void ofort_io_read_vector(OfortInterpreter *I, OfortNode *n) {
     }
     free(values);
     free(opts.filename);
+}
+
+typedef struct {
+    char *filename;
+    int array_idx;
+    char *delimiter;
+    char *header;
+    char *footer;
+    char *comments;
+} OfortSaveTxtOptions;
+
+static void ofort_savetxt_options_init(OfortSaveTxtOptions *opts) {
+    memset(opts, 0, sizeof(*opts));
+    opts->array_idx = -1;
+    opts->delimiter = ofort_strdup_trimmed(" ");
+    opts->header = ofort_strdup_trimmed("");
+    opts->footer = ofort_strdup_trimmed("");
+    opts->comments = ofort_strdup_trimmed("# ");
+}
+
+static void ofort_savetxt_options_free(OfortSaveTxtOptions *opts) {
+    free(opts->filename);
+    free(opts->delimiter);
+    free(opts->header);
+    free(opts->footer);
+    free(opts->comments);
+}
+
+static void ofort_savetxt_set_string(char **target, char *value) {
+    free(*target);
+    *target = value;
+}
+
+static void ofort_io_savetxt(OfortInterpreter *I, OfortNode *n) {
+    OfortSaveTxtOptions opts;
+    OfortValue *matrix_val = NULL;
+    OfortValue tmp = make_void_val();
+    FILE *fp;
+    int nrow;
+    int ncol;
+
+    ofort_savetxt_options_init(&opts);
+    if (!opts.delimiter || !opts.header || !opts.footer || !opts.comments)
+        ofort_error(I, "Out of memory");
+
+    for (int i = 0; i < n->n_stmts; i++) {
+        const char *pname = n->param_names[i];
+        if (pname[0]) {
+            if (str_eq_nocase(pname, "filename") || str_eq_nocase(pname, "file") ||
+                str_eq_nocase(pname, "path")) {
+                free(opts.filename);
+                opts.filename = ofort_eval_string_arg(I, n->stmts[i], "filename");
+            } else if (str_eq_nocase(pname, "array") || str_eq_nocase(pname, "x")) {
+                opts.array_idx = i;
+            } else if (str_eq_nocase(pname, "delimiter")) {
+                ofort_savetxt_set_string(&opts.delimiter,
+                                         ofort_eval_string_arg(I, n->stmts[i], "delimiter"));
+            } else if (str_eq_nocase(pname, "fmt")) {
+                char *fmt = ofort_eval_string_arg(I, n->stmts[i], "fmt");
+                if (fmt[0] && strcmp(fmt, "*") != 0) {
+                    free(fmt);
+                    ofort_savetxt_options_free(&opts);
+                    ofort_error(I, "Only fmt='*' is supported in SAVETXT");
+                }
+                free(fmt);
+            } else if (str_eq_nocase(pname, "header")) {
+                ofort_savetxt_set_string(&opts.header,
+                                         ofort_eval_string_arg(I, n->stmts[i], "header"));
+            } else if (str_eq_nocase(pname, "footer")) {
+                ofort_savetxt_set_string(&opts.footer,
+                                         ofort_eval_string_arg(I, n->stmts[i], "footer"));
+            } else if (str_eq_nocase(pname, "comments")) {
+                ofort_savetxt_set_string(&opts.comments,
+                                         ofort_eval_string_arg(I, n->stmts[i], "comments"));
+            } else {
+                ofort_savetxt_options_free(&opts);
+                ofort_error(I, "Unknown SAVETXT keyword '%s'", pname);
+            }
+        }
+    }
+    if (!opts.filename && n->n_stmts >= 1 && n->param_names[0][0] == '\0')
+        opts.filename = ofort_eval_string_arg(I, n->stmts[0], "filename");
+    if (opts.array_idx < 0 && n->n_stmts >= 2 && n->param_names[1][0] == '\0')
+        opts.array_idx = 1;
+    if (n->n_stmts >= 3 && n->param_names[2][0] == '\0') {
+        ofort_savetxt_set_string(&opts.delimiter,
+                                 ofort_eval_string_arg(I, n->stmts[2], "delimiter"));
+    }
+    if (n->n_stmts >= 4 && n->param_names[3][0] == '\0') {
+        char *fmt = ofort_eval_string_arg(I, n->stmts[3], "fmt");
+        if (fmt[0] && strcmp(fmt, "*") != 0) {
+            free(fmt);
+            ofort_savetxt_options_free(&opts);
+            ofort_error(I, "Only fmt='*' is supported in SAVETXT");
+        }
+        free(fmt);
+    }
+    if (n->n_stmts >= 5 && n->param_names[4][0] == '\0') {
+        ofort_savetxt_set_string(&opts.header,
+                                 ofort_eval_string_arg(I, n->stmts[4], "header"));
+    }
+    if (n->n_stmts >= 6 && n->param_names[5][0] == '\0') {
+        ofort_savetxt_set_string(&opts.footer,
+                                 ofort_eval_string_arg(I, n->stmts[5], "footer"));
+    }
+    if (n->n_stmts >= 7 && n->param_names[6][0] == '\0') {
+        ofort_savetxt_set_string(&opts.comments,
+                                 ofort_eval_string_arg(I, n->stmts[6], "comments"));
+    }
+
+    if (!opts.filename || opts.array_idx < 0) {
+        ofort_savetxt_options_free(&opts);
+        ofort_error(I, "SAVETXT requires filename and array arguments");
+    }
+
+    matrix_val = ofort_calc_stats_input_lvalue(I, n->stmts[opts.array_idx]);
+    if (!matrix_val) {
+        tmp = eval_node(I, n->stmts[opts.array_idx]);
+        matrix_val = &tmp;
+    }
+    if (!matrix_val || matrix_val->type != FVAL_ARRAY || matrix_val->v.arr.n_dims != 2) {
+        free_value(&tmp);
+        ofort_savetxt_options_free(&opts);
+        ofort_error(I, "SAVETXT requires a rank-2 numeric array");
+    }
+    if (matrix_val->v.arr.elem_type != FVAL_REAL && matrix_val->v.arr.elem_type != FVAL_DOUBLE &&
+        matrix_val->v.arr.elem_type != FVAL_INTEGER) {
+        free_value(&tmp);
+        ofort_savetxt_options_free(&opts);
+        ofort_error(I, "SAVETXT requires a numeric array");
+    }
+
+    fp = fopen(opts.filename, "w");
+    if (!fp) {
+        free_value(&tmp);
+        ofort_savetxt_options_free(&opts);
+        ofort_error(I, "SAVETXT cannot open '%s'", opts.filename);
+    }
+
+    if (opts.header && opts.header[0])
+        fprintf(fp, "%s%s\n", opts.comments ? opts.comments : "", opts.header);
+
+    nrow = matrix_val->v.arr.dims[0];
+    ncol = matrix_val->v.arr.dims[1];
+    for (int i = 0; i < nrow; i++) {
+        for (int j = 0; j < ncol; j++) {
+            if (j > 0) fputs(opts.delimiter ? opts.delimiter : " ", fp);
+            fprintf(fp, "%.17g", ofort_matrix_real_element(I, matrix_val, i + j * nrow));
+        }
+        fputc('\n', fp);
+    }
+
+    if (opts.footer && opts.footer[0])
+        fprintf(fp, "%s%s\n", opts.comments ? opts.comments : "", opts.footer);
+
+    fclose(fp);
+    free_value(&tmp);
+    ofort_savetxt_options_free(&opts);
 }
 
 static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
@@ -22472,8 +22718,14 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
         return 1;
     }
 
-    if (str_eq_nocase(extension_name, "read_matrix")) {
+    if (str_eq_nocase(extension_name, "read_matrix") ||
+        str_eq_nocase(extension_name, "loadtxt")) {
         ofort_io_read_matrix(I, n);
+        return 1;
+    }
+
+    if (str_eq_nocase(extension_name, "savetxt")) {
+        ofort_io_savetxt(I, n);
         return 1;
     }
 
@@ -23116,15 +23368,20 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     }
 
     if (nargs > 0 && args[0].type == FVAL_ARRAY && is_elemental_unary_intrinsic(upper)) {
-        OfortValue result = copy_value(args[0]);
-        result.v.arr.elem_type = elemental_result_type(upper, args[0].v.arr.elem_type);
+        OfortValType result_type = elemental_result_type(upper, args[0].v.arr.elem_type);
+        OfortValue result = make_array_with_char_len_options(result_type, args[0].v.arr.dims,
+                                                             args[0].v.arr.n_dims, 0, 1);
 
         for (int i = 0; i < result.v.arr.len; i++) {
-            OfortValue elem_arg = copy_value(args[0].v.arr.data[i]);
+            OfortValue elem_arg = array_element_value(&args[0], i);
             OfortValue elem_result = call_intrinsic(I, name, &elem_arg, 1, NULL);
             free_value(&elem_arg);
-            free_value(&result.v.arr.data[i]);
-            result.v.arr.data[i] = elem_result;
+            if (assign_packed_array_element(&result, i, elem_result)) {
+                free_value(&elem_result);
+            } else {
+                free_value(&result.v.arr.data[i]);
+                result.v.arr.data[i] = elem_result;
+            }
         }
 
         return result;
@@ -23155,13 +23412,17 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         for (int i = 0; i < result.v.arr.len; i++) {
             OfortValue elem_args[2];
             OfortValue elem_result;
-            elem_args[0] = args[0].type == FVAL_ARRAY ? copy_value(args[0].v.arr.data[i]) : copy_value(args[0]);
-            elem_args[1] = args[1].type == FVAL_ARRAY ? copy_value(args[1].v.arr.data[i]) : copy_value(args[1]);
+            elem_args[0] = args[0].type == FVAL_ARRAY ? array_element_value(&args[0], i) : copy_value(args[0]);
+            elem_args[1] = args[1].type == FVAL_ARRAY ? array_element_value(&args[1], i) : copy_value(args[1]);
             elem_result = call_intrinsic(I, name, elem_args, 2, NULL);
             free_value(&elem_args[0]);
             free_value(&elem_args[1]);
-            free_value(&result.v.arr.data[i]);
-            result.v.arr.data[i] = elem_result;
+            if (assign_packed_array_element(&result, i, elem_result)) {
+                free_value(&elem_result);
+            } else {
+                free_value(&result.v.arr.data[i]);
+                result.v.arr.data[i] = elem_result;
+            }
         }
         return result;
     }
