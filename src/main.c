@@ -75,6 +75,7 @@ static int g_save_free_form = 0;
 static int g_quiet = 0;
 static int g_repl_auto_end = 0;
 static int g_repl_defer_check = 0;
+static int g_repl_autorun = 0;
 
 static int append_text(char **buf, size_t *len, size_t *cap, const char *text) {
     size_t n = strlen(text);
@@ -1508,6 +1509,28 @@ static int repl_line_post_indent(const char *line) {
         return 1;
     }
     return 0;
+}
+
+static int repl_line_is_autorun_candidate(const char *line, int line_indent, int has_generated_end) {
+    const char *p = skip_space(line);
+    char lower[4096];
+
+    if (!g_repl_autorun || g_repl_defer_check) return 0;
+    if (line_indent != 0 || has_generated_end) return 0;
+    if (is_blank_or_comment_line(line)) return 0;
+    if (is_repl_declaration_line(p)) return 0;
+    if (repl_line_pre_dedent(p) || repl_line_post_indent(p)) return 0;
+    lower_logical_line(lower, sizeof(lower), p);
+    if (line_starts_word_lower(lower, "program") ||
+        line_starts_word_lower(lower, "module") ||
+        line_starts_word_lower(lower, "subroutine") ||
+        line_starts_word_lower(lower, "function") ||
+        line_starts_word_lower(lower, "contains") ||
+        line_starts_word_lower(lower, "use") ||
+        line_starts_word_lower(lower, "implicit")) {
+        return 0;
+    }
+    return 1;
 }
 
 static void build_indented_repl_line(char *indented, size_t indented_size,
@@ -4567,7 +4590,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
 
     if (!g_no_logo) {
         printf("Enter Fortran source.\n");
-        printf("Commands: . runs, .ofort/.gfortran/.ifx/.lfortran/.g95 [options] run with selected compiler (-c compiles only for external compilers), .timec [n] .ofort ; .gfortran [options] times compiler runs, .run [n] [-- args] repeats, .time [n] [-- args] times, .runq [n] [-- args] runs and quits, .quit quits and saves, .quit! quits without saving, .save [file] saves, .saveq [file] saves and quits, .clear clears, .prompt text changes the prompt, .del n[:m] deletes lines, .ins n text inserts, .rep n text replaces, .rename old new renames, .group-decl groups simple declarations, .unused lists unused simple declarations, .undecl names removes declarations, .drop-unused removes unused simple declarations, .list lists, .list -n lists without line numbers, .decl lists declarations, .vars [names] lists values, .info [names] lists details, .shapes [names] lists array shapes, .sizes [names] lists array sizes, .stats [names] lists array stats, .load file loads, .load-run file loads/runs. With --trace-assign, top-level assignments run immediately. With --auto-end, block openers insert matching END lines.\n");
+        printf("Commands: . runs, .ofort/.gfortran/.ifx/.lfortran/.g95 [options] run with selected compiler (-c compiles only for external compilers), .timec [n] .ofort ; .gfortran [options] times compiler runs, .run [n] [-- args] repeats, .time [n] [-- args] times, .runq [n] [-- args] runs and quits, .quit quits and saves, .quit! quits without saving, .save [file] saves, .saveq [file] saves and quits, .clear clears, .prompt text changes the prompt, .del n[:m] deletes lines, .ins n text inserts, .rep n text replaces, .rename old new renames, .group-decl groups simple declarations, .unused lists unused simple declarations, .undecl names removes declarations, .drop-unused removes unused simple declarations, .list lists, .list -n lists without line numbers, .decl lists declarations, .vars [names] lists values, .info [names] lists details, .shapes [names] lists array shapes, .sizes [names] lists array sizes, .stats [names] lists array stats, .load file loads, .load-run file loads/runs. With --trace-assign, top-level assignments run immediately. With --auto-end, block openers insert matching END lines. With --defer-check, source lines are checked only when run. With --autorun, complete top-level executable lines run the current source.\n");
     }
 
     repl_interp = create_repl_interpreter();
@@ -5329,6 +5352,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
             int line_indent;
             int assignment_immediate = 0;
             int print_immediate = 0;
+            int autorun_immediate = 0;
             int immediate_execute = 0;
             int declaration_after_execution = (executed_len > 0 && is_repl_declaration_line(line));
             size_t old_len = len;
@@ -5361,8 +5385,9 @@ static int run_interactive(const char *load_path, int run_after_load) {
 
             assignment_immediate = (line_indent == 0 && is_trace_assign_immediate_line(line));
             print_immediate = (line_indent == 0 && starts_with_word_nocase(skip_space(line), "print"));
-            immediate_execute = assignment_immediate || print_immediate;
             has_generated_end = repl_auto_end_for_line(line, generated_end, sizeof(generated_end));
+            autorun_immediate = repl_line_is_autorun_candidate(line, line_indent, has_generated_end);
+            immediate_execute = assignment_immediate || print_immediate || autorun_immediate;
             if (repl_line_pre_dedent(line) && line_indent > 0) {
                 line_indent--;
             }
@@ -5416,6 +5441,28 @@ static int run_interactive(const char *load_path, int run_after_load) {
                 }
             }
             if (immediate_execute) {
+                if (autorun_immediate) {
+                    char *effective = make_effective_source(buf ? buf : "", footer);
+                    if (!effective) {
+                        free(buf);
+                        free(footer);
+                        ofort_destroy(repl_interp);
+                        return 2;
+                    }
+                    ofort_destroy(repl_interp);
+                    repl_interp = create_repl_interpreter();
+                    if (!repl_interp) {
+                        fprintf(stderr, "failed to create Fortran interpreter\n");
+                        free(effective);
+                        free(buf);
+                        free(footer);
+                        return 2;
+                    }
+                    last_rc = execute_source_text_on_interpreter(repl_interp, effective, 1, 0, 0, NULL);
+                    executed_len = last_rc == 0 ? strlen(buf ? buf : "") : 0;
+                    free(effective);
+                    continue;
+                }
                 if (executed_len == 0 && old_len > 0) {
                     last_rc = execute_repl_source_prefix(repl_interp, buf ? buf : "", old_len,
                                                         &executed_len, 0);
@@ -5753,7 +5800,7 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--time|--time-detail] [--profile-lines] [--trace-assign] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--time|--time-detail] [--profile-lines] [--trace-assign] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
     fprintf(stderr, "       %s --each [--check] [--quiet] [--limit n] [--max-fail n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
@@ -5766,6 +5813,7 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --prompt text sets the interactive prompt text\n");
     fprintf(stderr, "       --auto-end makes the REPL insert matching END lines for block openers\n");
     fprintf(stderr, "       --defer-check makes the REPL check source lines only when run\n");
+    fprintf(stderr, "       --autorun runs complete top-level executable REPL lines after entry\n");
     fprintf(stderr, "       -w suppresses warnings\n");
     fprintf(stderr, "       --quiet suppresses success/progress output but not diagnostics\n");
     fprintf(stderr, "       --std=f2023 rejects known nonstandard extensions; --std=legacy is the default\n");
@@ -5896,6 +5944,8 @@ int main(int argc, char **argv) {
             g_repl_auto_end = 1;
         } else if (strcmp(argv[i], "--defer-check") == 0) {
             g_repl_defer_check = 1;
+        } else if (strcmp(argv[i], "--autorun") == 0) {
+            g_repl_autorun = 1;
         } else if (strcmp(argv[i], "--prompt") == 0) {
             if (++i >= argc) {
                 fprintf(stderr, "--prompt requires text\n");
