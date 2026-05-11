@@ -16099,6 +16099,7 @@ static int ofort_extension_module_exists(const char *module_name) {
            str_eq_nocase(module_name, "ofort_statistics_mod") ||
            str_eq_nocase(module_name, "ofort_stats_mod") ||
            str_eq_nocase(module_name, "stdlib_stats") ||
+           str_eq_nocase(module_name, "stdlib_linalg") ||
            str_eq_nocase(module_name, "stdlib_stats_distribution_normal");
 }
 
@@ -16114,7 +16115,14 @@ static int ofort_extension_module_exports(const char *module_name, const char *n
                str_eq_nocase(name, "tcrossprod") ||
                str_eq_nocase(name, "center_cols") ||
                str_eq_nocase(name, "col_sums") ||
-               str_eq_nocase(name, "col_means");
+               str_eq_nocase(name, "col_means") ||
+               str_eq_nocase(name, "eye") ||
+               str_eq_nocase(name, "diag") ||
+               str_eq_nocase(name, "trace") ||
+               str_eq_nocase(name, "outer_product") ||
+               str_eq_nocase(name, "is_square") ||
+               str_eq_nocase(name, "is_diagonal") ||
+               str_eq_nocase(name, "is_symmetric");
     }
     if (str_eq_nocase(module_name, "ofort_io_mod")) {
         return str_eq_nocase(name, "read_matrix") ||
@@ -16135,6 +16143,15 @@ static int ofort_extension_module_exports(const char *module_name, const char *n
                str_eq_nocase(name, "pca") ||
                str_eq_nocase(name, "pca_transform") ||
                str_eq_nocase(name, "pca_inverse_transform");
+    }
+    if (str_eq_nocase(module_name, "stdlib_linalg")) {
+        return str_eq_nocase(name, "eye") ||
+               str_eq_nocase(name, "diag") ||
+               str_eq_nocase(name, "trace") ||
+               str_eq_nocase(name, "outer_product") ||
+               str_eq_nocase(name, "is_square") ||
+               str_eq_nocase(name, "is_diagonal") ||
+               str_eq_nocase(name, "is_symmetric");
     }
     if (str_eq_nocase(module_name, "ofort_statistics_mod") ||
         str_eq_nocase(module_name, "ofort_stats_mod")) {
@@ -17011,6 +17028,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         import_ofort_extension_intrinsic(I, "center_cols", "center_cols");
                         import_ofort_extension_intrinsic(I, "col_sums", "col_sums");
                         import_ofort_extension_intrinsic(I, "col_means", "col_means");
+                        import_ofort_extension_intrinsic(I, "eye", "eye");
+                        import_ofort_extension_intrinsic(I, "diag", "diag");
+                        import_ofort_extension_intrinsic(I, "trace", "trace");
+                        import_ofort_extension_intrinsic(I, "outer_product", "outer_product");
+                        import_ofort_extension_intrinsic(I, "is_square", "is_square");
+                        import_ofort_extension_intrinsic(I, "is_diagonal", "is_diagonal");
+                        import_ofort_extension_intrinsic(I, "is_symmetric", "is_symmetric");
                     } else if (str_eq_nocase(n->name, "ofort_io_mod")) {
                         import_ofort_extension_intrinsic(I, "read_matrix", "read_matrix");
                         import_ofort_extension_intrinsic(I, "read_vector", "read_vector");
@@ -17028,6 +17052,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         import_ofort_extension_intrinsic(I, "pca", "pca");
                         import_ofort_extension_intrinsic(I, "pca_transform", "pca_transform");
                         import_ofort_extension_intrinsic(I, "pca_inverse_transform", "pca_inverse_transform");
+                    } else if (str_eq_nocase(n->name, "stdlib_linalg")) {
+                        import_ofort_extension_intrinsic(I, "eye", "eye");
+                        import_ofort_extension_intrinsic(I, "diag", "diag");
+                        import_ofort_extension_intrinsic(I, "trace", "trace");
+                        import_ofort_extension_intrinsic(I, "outer_product", "outer_product");
+                        import_ofort_extension_intrinsic(I, "is_square", "is_square");
+                        import_ofort_extension_intrinsic(I, "is_diagonal", "is_diagonal");
+                        import_ofort_extension_intrinsic(I, "is_symmetric", "is_symmetric");
                     } else {
                         import_ofort_extension_intrinsic(I, "mean", "mean");
                         import_ofort_extension_intrinsic(I, "variance", "variance");
@@ -20977,7 +21009,14 @@ static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char
         str_eq_nocase(name, "crossprod") ||
         str_eq_nocase(name, "tcrossprod") ||
         str_eq_nocase(name, "col_sums") ||
-        str_eq_nocase(name, "col_means")) {
+        str_eq_nocase(name, "col_means") ||
+        str_eq_nocase(name, "eye") ||
+        str_eq_nocase(name, "diag") ||
+        str_eq_nocase(name, "trace") ||
+        str_eq_nocase(name, "outer_product") ||
+        str_eq_nocase(name, "is_square") ||
+        str_eq_nocase(name, "is_diagonal") ||
+        str_eq_nocase(name, "is_symmetric")) {
         return call_ofort_la_intrinsic(I, name, args, nargs);
     }
     ofort_error(I, "Unknown ofort extension intrinsic '%s'", name);
@@ -21500,6 +21539,19 @@ static void ofort_require_rank2_numeric(OfortInterpreter *I, OfortValue *x, cons
         ofort_error(I, "%s requires a numeric array", name);
 }
 
+static void ofort_require_rank1_numeric(OfortInterpreter *I, OfortValue *x, const char *name) {
+    if (!x || x->type != FVAL_ARRAY || x->v.arr.n_dims != 1)
+        ofort_error(I, "%s requires a rank-1 numeric array", name);
+    if (x->v.arr.elem_type != FVAL_REAL && x->v.arr.elem_type != FVAL_DOUBLE &&
+        x->v.arr.elem_type != FVAL_INTEGER)
+        ofort_error(I, "%s requires a numeric array", name);
+}
+
+static void ofort_require_rank2_array(OfortInterpreter *I, OfortValue *x, const char *name) {
+    if (!x || x->type != FVAL_ARRAY || x->v.arr.n_dims != 2)
+        ofort_error(I, "%s requires a rank-2 array", name);
+}
+
 static OfortValue ofort_make_double_matrix(int nrow, int ncol) {
     int dims[2];
     dims[0] = nrow;
@@ -21624,8 +21676,172 @@ static OfortValue ofort_la_col_sums_means(OfortInterpreter *I, OfortValue *x, in
     return result;
 }
 
+static OfortValue ofort_la_eye(OfortInterpreter *I, OfortValue *args, int nargs) {
+    int nrow;
+    int ncol;
+    int ndiag;
+    OfortValue result;
+    if (nargs != 1 && nargs != 2 && nargs != 3) ofort_error(I, "EYE takes one, two, or three arguments");
+    (void)I;
+    nrow = (int)val_to_int(args[0]);
+    ncol = nargs >= 2 ? (int)val_to_int(args[1]) : nrow;
+    if (nrow < 0 || ncol < 0) ofort_error(I, "EYE dimensions must be nonnegative");
+    result = ofort_make_double_matrix(nrow, ncol);
+    ndiag = nrow < ncol ? nrow : ncol;
+    for (int i = 0; i < ndiag; i++)
+        ofort_assign_real_array_element(&result, i + i * nrow, 1.0);
+    return result;
+}
+
+static int ofort_la_diag_k(OfortInterpreter *I, OfortValue *args, int nargs) {
+    if (nargs == 1) return 0;
+    if (nargs == 2) return (int)val_to_int(args[1]);
+    ofort_error(I, "DIAG takes one array argument and optional k");
+    return 0;
+}
+
+static OfortValue ofort_la_diag(OfortInterpreter *I, OfortValue *args, int nargs) {
+    OfortValue *x;
+    int k;
+    if (nargs != 1 && nargs != 2) ofort_error(I, "DIAG takes one array argument and optional k");
+    x = &args[0];
+    k = ofort_la_diag_k(I, args, nargs);
+    if (!x || x->type != FVAL_ARRAY)
+        ofort_error(I, "DIAG requires an array argument");
+    if (x->v.arr.n_dims == 1) {
+        int n = x->v.arr.len;
+        int d = n + (k < 0 ? -k : k);
+        int row0 = k < 0 ? -k : 0;
+        int col0 = k > 0 ? k : 0;
+        OfortValue result;
+        ofort_require_rank1_numeric(I, x, "DIAG");
+        result = ofort_make_double_matrix(d, d);
+        for (int i = 0; i < n; i++) {
+            ofort_assign_real_array_element(&result, (row0 + i) + (col0 + i) * d,
+                                            ofort_matrix_real_element(I, x, i));
+        }
+        return result;
+    }
+    if (x->v.arr.n_dims == 2) {
+        int nrow = x->v.arr.dims[0];
+        int ncol = x->v.arr.dims[1];
+        int row0 = k < 0 ? -k : 0;
+        int col0 = k > 0 ? k : 0;
+        int n = 0;
+        OfortValue result;
+        ofort_require_rank2_numeric(I, x, "DIAG");
+        if (row0 < nrow && col0 < ncol) {
+            int rows_left = nrow - row0;
+            int cols_left = ncol - col0;
+            n = rows_left < cols_left ? rows_left : cols_left;
+        }
+        result = ofort_make_double_vector(n);
+        for (int i = 0; i < n; i++) {
+            ofort_assign_real_array_element(&result, i,
+                                            ofort_matrix_real_element(I, x, (row0 + i) + (col0 + i) * nrow));
+        }
+        return result;
+    }
+    ofort_error(I, "DIAG requires a rank-1 or rank-2 array");
+    return make_void_val();
+}
+
+static OfortValue ofort_la_trace(OfortInterpreter *I, OfortValue *x) {
+    int nrow;
+    int ncol;
+    int ndiag;
+    double sum = 0.0;
+    ofort_require_rank2_numeric(I, x, "TRACE");
+    nrow = x->v.arr.dims[0];
+    ncol = x->v.arr.dims[1];
+    ndiag = nrow < ncol ? nrow : ncol;
+    for (int i = 0; i < ndiag; i++)
+        sum += ofort_matrix_real_element(I, x, i + i * nrow);
+    return make_double(sum);
+}
+
+static OfortValue ofort_la_outer_product(OfortInterpreter *I, OfortValue *u, OfortValue *v) {
+    int m;
+    int n;
+    OfortValue result;
+    ofort_require_rank1_numeric(I, u, "OUTER_PRODUCT");
+    ofort_require_rank1_numeric(I, v, "OUTER_PRODUCT");
+    m = u->v.arr.len;
+    n = v->v.arr.len;
+    result = ofort_make_double_matrix(m, n);
+    for (int j = 0; j < n; j++) {
+        double vj = ofort_matrix_real_element(I, v, j);
+        for (int i = 0; i < m; i++) {
+            ofort_assign_real_array_element(&result, i + j * m,
+                                            ofort_matrix_real_element(I, u, i) * vj);
+        }
+    }
+    return result;
+}
+
+static OfortValue ofort_la_is_square(OfortInterpreter *I, OfortValue *x) {
+    ofort_require_rank2_array(I, x, "IS_SQUARE");
+    return make_logical(x->v.arr.dims[0] == x->v.arr.dims[1]);
+}
+
+static OfortValue ofort_la_is_diagonal(OfortInterpreter *I, OfortValue *x) {
+    int nrow;
+    int ncol;
+    ofort_require_rank2_numeric(I, x, "IS_DIAGONAL");
+    nrow = x->v.arr.dims[0];
+    ncol = x->v.arr.dims[1];
+    for (int j = 0; j < ncol; j++) {
+        for (int i = 0; i < nrow; i++) {
+            if (i != j && ofort_matrix_real_element(I, x, i + j * nrow) != 0.0)
+                return make_logical(0);
+        }
+    }
+    return make_logical(1);
+}
+
+static OfortValue ofort_la_is_symmetric(OfortInterpreter *I, OfortValue *x) {
+    int n;
+    ofort_require_rank2_numeric(I, x, "IS_SYMMETRIC");
+    if (x->v.arr.dims[0] != x->v.arr.dims[1]) return make_logical(0);
+    n = x->v.arr.dims[0];
+    for (int j = 0; j < n; j++) {
+        for (int i = j + 1; i < n; i++) {
+            double aij = ofort_matrix_real_element(I, x, i + j * n);
+            double aji = ofort_matrix_real_element(I, x, j + i * n);
+            if (aij != aji) return make_logical(0);
+        }
+    }
+    return make_logical(1);
+}
+
 static OfortValue call_ofort_la_intrinsic(OfortInterpreter *I, const char *name,
                                           OfortValue *args, int nargs) {
+    if (str_eq_nocase(name, "eye")) {
+        return ofort_la_eye(I, args, nargs);
+    }
+    if (str_eq_nocase(name, "diag")) {
+        return ofort_la_diag(I, args, nargs);
+    }
+    if (str_eq_nocase(name, "trace")) {
+        if (nargs != 1) ofort_error(I, "TRACE takes one matrix argument");
+        return ofort_la_trace(I, &args[0]);
+    }
+    if (str_eq_nocase(name, "outer_product")) {
+        if (nargs != 2) ofort_error(I, "OUTER_PRODUCT takes two vector arguments");
+        return ofort_la_outer_product(I, &args[0], &args[1]);
+    }
+    if (str_eq_nocase(name, "is_square")) {
+        if (nargs != 1) ofort_error(I, "IS_SQUARE takes one matrix argument");
+        return ofort_la_is_square(I, &args[0]);
+    }
+    if (str_eq_nocase(name, "is_diagonal")) {
+        if (nargs != 1) ofort_error(I, "IS_DIAGONAL takes one matrix argument");
+        return ofort_la_is_diagonal(I, &args[0]);
+    }
+    if (str_eq_nocase(name, "is_symmetric")) {
+        if (nargs != 1) ofort_error(I, "IS_SYMMETRIC takes one matrix argument");
+        return ofort_la_is_symmetric(I, &args[0]);
+    }
     if (str_eq_nocase(name, "transpose2")) {
         if (nargs != 1) ofort_error(I, "TRANSPOSE2 takes one matrix argument");
         return ofort_la_transpose2(I, &args[0]);
