@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 
 #ifdef _WIN32
+#include <direct.h>
 #include <io.h>
 #include <process.h>
 #include <windows.h>
@@ -28,6 +29,7 @@ static void normalize_newlines(char *source);
 static char *maybe_wrap_loose_source(char *source);
 static char *read_file(const char *path);
 static char *read_source_file(const char *path);
+static int source_path_is_fixed_form(const char *path);
 static char *copy_string(const char *text);
 static const char *skip_space(const char *line);
 static int starts_with_word_nocase(const char *line, const char *word);
@@ -73,6 +75,7 @@ typedef enum {
 static SourceFormMode g_source_form = SOURCE_FORM_AUTO;
 static int g_save_free_form = 0;
 static int g_quiet = 0;
+static int g_cache_mode = 0;
 static int g_repl_auto_end = 0;
 static int g_repl_defer_check = 0;
 static int g_repl_autorun = 0;
@@ -309,6 +312,34 @@ static int set_repl_prompt_from_command(const char *line) {
     memcpy(g_repl_prompt, p, len);
     g_repl_prompt[len] = '\0';
     return 1;
+}
+
+static void strip_pasted_repl_prompt(char *line, size_t line_size) {
+    const char *p = line;
+    size_t prompt_len;
+
+    if (!line || line_size == 0 || line[0] == '\0') return;
+
+    prompt_len = strlen(g_repl_prompt);
+    if (prompt_len > 0 && strncmp(line, g_repl_prompt, prompt_len) == 0) {
+        memmove(line, line + prompt_len, strlen(line + prompt_len) + 1);
+        return;
+    }
+
+    if (strncmp(line, "ofort>", 6) == 0 &&
+        (line[6] == '\0' || line[6] == '\n' || line[6] == '\r' ||
+         isspace((unsigned char)line[6]))) {
+        p = skip_space(line + 6);
+        memmove(line, p, strlen(p) + 1);
+        return;
+    }
+
+    if (line[0] == '>' &&
+        (line[1] == '\0' || line[1] == '\n' || line[1] == '\r' ||
+         isspace((unsigned char)line[1]))) {
+        p = skip_space(line + 1);
+        memmove(line, p, strlen(p) + 1);
+    }
 }
 
 static void free_split_args(char **args, int nargs) {
@@ -782,6 +813,269 @@ static int source_uses_name_outside_line(const char *source, int skip_line_no, c
     return 0;
 }
 
+static const char *skip_fortran_string(const char *p, const char *end) {
+    char quote = *p++;
+    while (p < end) {
+        if (*p == quote) {
+            if (p + 1 < end && p[1] == quote) {
+                p += 2;
+                continue;
+            }
+            return p + 1;
+        }
+        p++;
+    }
+    return p;
+}
+
+static int span_contains_word_nocase(const char *start, const char *end, const char *word) {
+    size_t word_len = strlen(word);
+    const char *p = start;
+    while (p < end) {
+        if (*p == '\'' || *p == '"') {
+            p = skip_fortran_string(p, end);
+            continue;
+        }
+        if (isalpha((unsigned char)*p) || *p == '_') {
+            const char *tok = p;
+            size_t tok_len;
+            while (p < end && identifier_char((unsigned char)*p)) p++;
+            tok_len = (size_t)(p - tok);
+            if (tok_len == word_len) {
+                int same = 1;
+                for (size_t i = 0; i < word_len; i++) {
+                    if (tolower((unsigned char)tok[i]) != tolower((unsigned char)word[i])) {
+                        same = 0;
+                        break;
+                    }
+                }
+                if (same) return 1;
+            }
+            continue;
+        }
+        p++;
+    }
+    return 0;
+}
+
+static int unused_decl_prefix_allowed(const char *start, const char *end) {
+    const char *p = start;
+    trim_span(&p, &end);
+    if (p >= end) return 0;
+    if (starts_with_word_nocase(p, "integer") ||
+        starts_with_word_nocase(p, "real") ||
+        starts_with_word_nocase(p, "logical") ||
+        starts_with_word_nocase(p, "character") ||
+        starts_with_word_nocase(p, "complex") ||
+        starts_with_word_nocase(p, "type") ||
+        starts_with_word_nocase(p, "class") ||
+        starts_with_word_nocase(p, "double precision")) {
+        return 1;
+    }
+    return 0;
+}
+
+static int parse_unused_decl_names(const char *line, size_t line_len,
+                                   char names[OFORT_MAX_PARAMS][256],
+                                   int *line_no_out, int *n_names) {
+    const char *start = line;
+    const char *end = line + line_len;
+    const char *dc = NULL;
+    const char *p;
+    int depth = 0;
+    int n = 0;
+
+    (void)line_no_out;
+    *n_names = 0;
+    while (end > start && (end[-1] == '\r' || end[-1] == '\n')) end--;
+    while (start < end && isspace((unsigned char)*start)) start++;
+    if (start >= end || *start == '!') return 0;
+
+    p = start;
+    while (p < end) {
+        if (*p == '!') break;
+        if (*p == '\'' || *p == '"') {
+            p = skip_fortran_string(p, end);
+            continue;
+        }
+        if (*p == ':' && p + 1 < end && p[1] == ':') {
+            dc = p;
+            break;
+        }
+        p++;
+    }
+    if (!dc) return 0;
+    if (!unused_decl_prefix_allowed(start, dc)) return 0;
+    if (span_contains_word_nocase(start, dc, "parameter")) return 0;
+    if (span_contains_word_nocase(start, dc, "intent")) return 0;
+    if (span_contains_word_nocase(start, dc, "external")) return 0;
+    if (span_contains_word_nocase(start, dc, "procedure")) return 0;
+    if (span_contains_word_nocase(start, dc, "interface")) return 0;
+
+    p = dc + 2;
+    while (p < end) {
+        const char *item_start;
+        const char *item_end;
+        const char *q;
+        while (p < end && (isspace((unsigned char)*p) || *p == ',')) p++;
+        if (p >= end || *p == '!') break;
+        item_start = p;
+        depth = 0;
+        while (p < end) {
+            if (*p == '!') break;
+            if (*p == '\'' || *p == '"') {
+                p = skip_fortran_string(p, end);
+                continue;
+            }
+            if (*p == '(' || *p == '[') depth++;
+            else if ((*p == ')' || *p == ']') && depth > 0) depth--;
+            else if (*p == ',' && depth == 0) break;
+            p++;
+        }
+        item_end = p;
+        trim_span(&item_start, &item_end);
+        if (item_start < item_end && (isalpha((unsigned char)*item_start) || *item_start == '_')) {
+            size_t len;
+            q = item_start + 1;
+            while (q < item_end && identifier_char((unsigned char)*q)) q++;
+            len = (size_t)(q - item_start);
+            if (len > 0 && len < 256 && n < OFORT_MAX_PARAMS) {
+                memcpy(names[n], item_start, len);
+                names[n][len] = '\0';
+                n++;
+            }
+        }
+        if (p < end && *p == ',') p++;
+    }
+    *n_names = n;
+    return n > 0;
+}
+
+static int token_equals_nocase(const char *tok, size_t tok_len, const char *name) {
+    size_t name_len = strlen(name);
+    if (tok_len != name_len) return 0;
+    for (size_t i = 0; i < name_len; i++) {
+        if (tolower((unsigned char)tok[i]) != tolower((unsigned char)name[i])) return 0;
+    }
+    return 1;
+}
+
+static int token_is_assignment_lhs(const char *line, const char *tok, size_t tok_len, const char *end) {
+    const char *p = line;
+    const char *q = tok + tok_len;
+    int depth = 0;
+
+    while (p < tok && isspace((unsigned char)*p)) p++;
+    if (p != tok) return 0;
+
+    while (q < end && isspace((unsigned char)*q)) q++;
+    if (q < end && *q == '(') {
+        depth = 1;
+        q++;
+        while (q < end && depth > 0) {
+            if (*q == '\'' || *q == '"') {
+                q = skip_fortran_string(q, end);
+                continue;
+            }
+            if (*q == '(') depth++;
+            else if (*q == ')') depth--;
+            q++;
+        }
+        while (q < end && isspace((unsigned char)*q)) q++;
+    }
+    if (q < end && *q == '%') {
+        while (q < end && *q != '=') q++;
+    }
+    if (q >= end || *q != '=') return 0;
+    if (q + 1 < end && q[1] == '>') return 0;
+    if (q > line && (q[-1] == '<' || q[-1] == '>' || q[-1] == '=' || q[-1] == '/')) return 0;
+    if (q + 1 < end && q[1] == '=') return 0;
+    return 1;
+}
+
+static int source_line_reads_name(const char *line, size_t line_len, const char *name) {
+    const char *p = line;
+    const char *end = line + line_len;
+
+    while (p < end) {
+        if (*p == '!') break;
+        if (*p == '\'' || *p == '"') {
+            p = skip_fortran_string(p, end);
+            continue;
+        }
+        if (isalpha((unsigned char)*p) || *p == '_') {
+            const char *tok = p;
+            size_t tok_len;
+            while (p < end && identifier_char((unsigned char)*p)) p++;
+            tok_len = (size_t)(p - tok);
+            if (token_equals_nocase(tok, tok_len, name) &&
+                !token_is_assignment_lhs(line, tok, tok_len, end)) {
+                return 1;
+            }
+            continue;
+        }
+        p++;
+    }
+    return 0;
+}
+
+static int source_reads_name_outside_line(const char *source, int skip_line_no, const char *name) {
+    const char *line = source;
+    int line_no = 1;
+
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        size_t line_len = end ? (size_t)(end - line) : strlen(line);
+        if (line_no != skip_line_no && source_line_reads_name(line, line_len, name)) {
+            return 1;
+        }
+        line = end ? end + 1 : line + line_len;
+        line_no++;
+    }
+    return 0;
+}
+
+static int warn_unused_declarations_in_source(const char *source) {
+    const char *line = source ? source : "";
+    int line_no = 1;
+    int n_unused = 0;
+    int in_type_def = 0;
+
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        size_t line_len = end ? (size_t)(end - line) : strlen(line);
+        const char *trimmed = line;
+        const char *trimmed_end = line + line_len;
+        char names[OFORT_MAX_PARAMS][256];
+        int n_names = 0;
+        trim_span(&trimmed, &trimmed_end);
+        if (trimmed < trimmed_end) {
+            if (starts_with_word_nocase(trimmed, "end type")) {
+                in_type_def = 0;
+            } else if (!in_type_def && starts_with_word_nocase(trimmed, "type") &&
+                       !starts_with_word_nocase(trimmed, "type is") &&
+                       !starts_with_word_nocase(trimmed, "type(")) {
+                in_type_def = 1;
+            }
+        }
+        if (!in_type_def && parse_unused_decl_names(line, line_len, names, NULL, &n_names)) {
+            for (int i = 0; i < n_names; i++) {
+                if (!source_reads_name_outside_line(source, line_no, names[i])) {
+                    fprintf(stderr, "warning: variable '%s' declared but never used\n", names[i]);
+                    fprintf(stderr, "line %d: %.*s\n\n", line_no, (int)line_len, line);
+                    n_unused++;
+                }
+            }
+        }
+        line = end ? end + 1 : line + line_len;
+        line_no++;
+    }
+    return n_unused;
+}
+
+static int warn_unused_repl_source_if_enabled(const char *source, int fast_mode, int separate_stdout);
+static int current_repl_fast_mode(void);
+
 static int name_in_command_args(const char *name, char **args, int nargs) {
     for (int i = 0; i < nargs; i++) {
         if (string_eq_nocase(name, args[i])) return 1;
@@ -1247,6 +1541,7 @@ static int save_interactive_source_to_path(const char *source, const char *foote
         fprintf(stderr, "out of memory\n");
         return 1;
     }
+    warn_unused_repl_source_if_enabled(effective, current_repl_fast_mode(), 1);
     fputs(effective, fp);
     free(effective);
     fclose(fp);
@@ -1268,11 +1563,109 @@ static int save_interactive_source(const char *source, const char *footer) {
     return save_interactive_source_to_path(source, footer, path, 0);
 }
 
+#define OFORT_STATE_INITIAL_BYTES ((size_t)OFORT_MAX_OUTPUT * 4u)
+#define OFORT_STATE_MAX_BYTES ((size_t)512u * 1024u * 1024u)
+#define OFORT_STATE_BINARY_ARRAY_THRESHOLD 1000000
+
+static int dump_interactive_state_with_growth(OfortInterpreter *interp, char **out_buf,
+                                              size_t *out_size, const char *binary_dir,
+                                              int binary_array_threshold) {
+    size_t size = OFORT_STATE_INITIAL_BYTES;
+
+    if (!out_buf || !out_size) return -1;
+    *out_buf = NULL;
+    *out_size = 0;
+    while (size <= OFORT_STATE_MAX_BYTES) {
+        char *buf = (char *)calloc(1, size);
+        if (!buf) return -1;
+        if (ofort_dump_state_initializers_binary(interp, buf, size,
+                                                 binary_dir, binary_array_threshold) >= 0) {
+            *out_buf = buf;
+            *out_size = size;
+            return 0;
+        }
+        free(buf);
+        if (size > OFORT_STATE_MAX_BYTES / 2u) break;
+        size *= 2u;
+    }
+    return -2;
+}
+
+static int make_directory_if_needed(const char *path) {
+    struct stat st;
+    if (!path || path[0] == '\0') return 0;
+    if (stat(path, &st) == 0) {
+        return (st.st_mode & S_IFDIR) ? 0 : 1;
+    }
+#ifdef _WIN32
+    return _mkdir(path) == 0 ? 0 : 1;
+#else
+    return mkdir(path, 0777) == 0 ? 0 : 1;
+#endif
+}
+
+static void state_binary_dir_for_path(const char *path, char *dir, size_t dir_size) {
+    size_t len;
+    if (!dir || dir_size == 0) return;
+    dir[0] = '\0';
+    if (!path || path[0] == '\0') {
+        snprintf(dir, dir_size, "ofort_state_data");
+        return;
+    }
+    snprintf(dir, dir_size, "%s", path);
+    len = strlen(dir);
+    for (size_t i = len; i > 0; i--) {
+        if (dir[i - 1] == '.' && i - 1 > 0) {
+            dir[i - 1] = '\0';
+            break;
+        }
+        if (dir[i - 1] == '/' || dir[i - 1] == '\\') break;
+    }
+    snprintf(dir + strlen(dir), dir_size - strlen(dir), "_data");
+}
+
+static int state_line_is_replay_inspection(const char *line, size_t line_len) {
+    char local[4096];
+    size_t copy_len = line_len;
+    const char *p;
+
+    if (copy_len > 0 && (line[copy_len - 1] == '\n' || line[copy_len - 1] == '\r')) copy_len--;
+    if (copy_len > 0 && line[copy_len - 1] == '\r') copy_len--;
+    if (copy_len >= sizeof(local)) copy_len = sizeof(local) - 1;
+    memcpy(local, line, copy_len);
+    local[copy_len] = '\0';
+    p = skip_space(local);
+    return starts_with_word_nocase(p, "print");
+}
+
+static void write_state_replay_inspection_lines(FILE *fp, const char *effective_source) {
+    const char *line = effective_source ? effective_source : "";
+    int wrote_header = 0;
+
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        size_t line_len = end ? (size_t)(end - line + 1) : strlen(line);
+        if (state_line_is_replay_inspection(line, line_len)) {
+            if (!wrote_header) {
+                fputs("! replay inspection lines from saved source\n", fp);
+                wrote_header = 1;
+            }
+            fwrite(line, 1, line_len, fp);
+            if (!end) fputc('\n', fp);
+        }
+        line = end ? end + 1 : line + line_len;
+    }
+}
+
 static int save_interactive_state_to_path(OfortInterpreter *interp, const char *source,
                                           const char *footer, const char *path,
-                                          int overwrite) {
+                                          int overwrite, int binary_arrays,
+                                          int binary_array_threshold) {
     char *effective = NULL;
     char *state_buf = NULL;
+    char binary_dir[1024];
+    size_t state_buf_size = 0;
+    int state_status;
     FILE *fp;
     const char *line;
 
@@ -1285,18 +1678,33 @@ static int save_interactive_state_to_path(OfortInterpreter *interp, const char *
         fprintf(stderr, "out of memory\n");
         return 1;
     }
-    state_buf = (char *)calloc(1, OFORT_MAX_OUTPUT * 4);
-    if (!state_buf) {
-        free(effective);
-        fprintf(stderr, "out of memory\n");
-        return 1;
+    binary_dir[0] = '\0';
+    if (binary_arrays) {
+        state_binary_dir_for_path(path, binary_dir, sizeof(binary_dir));
+        if (make_directory_if_needed(binary_dir) != 0) {
+            free(effective);
+            fprintf(stderr, "failed to create binary state directory %s\n", binary_dir);
+            return 1;
+        }
     }
-    if (ofort_dump_state_initializers(interp, state_buf, OFORT_MAX_OUTPUT * 4) < 0) {
+    state_status = dump_interactive_state_with_growth(interp, &state_buf, &state_buf_size,
+                                                      binary_arrays ? binary_dir : NULL,
+                                                      binary_array_threshold);
+    if (state_status < 0) {
         free(effective);
         free(state_buf);
-        fprintf(stderr, "failed to serialize state\n");
+        if (state_status == -2) {
+            fprintf(stderr,
+                    "failed to serialize state: generated state is too large for .save-state "
+                    "(limit %.1f MB). Large arrays can make state files very large; use .save "
+                    "to save only the source, or reduce the variables to serialize.\n",
+                    (double)OFORT_STATE_MAX_BYTES / (1024.0 * 1024.0));
+        } else {
+            fprintf(stderr, "failed to serialize state: out of memory while allocating state buffer\n");
+        }
         return 1;
     }
+    (void)state_buf_size;
     fp = fopen(path, "wb");
     if (!fp) {
         free(effective);
@@ -1321,18 +1729,26 @@ static int save_interactive_state_to_path(OfortInterpreter *interp, const char *
     }
     fputs("! OFORT_SOURCE_END\n", fp);
     fputs("! OFORT_STATE_BEGIN\n", fp);
+    if (binary_arrays && binary_dir[0]) {
+        fprintf(fp, "! binary arrays directory: %s\n", binary_dir);
+    }
     fputs(state_buf, fp);
     if (state_buf[0] && state_buf[strlen(state_buf) - 1] != '\n') fputc('\n', fp);
+    write_state_replay_inspection_lines(fp, effective);
     fputs("end\n", fp);
     fputs("! OFORT_STATE_END\n", fp);
     fclose(fp);
     free(effective);
     free(state_buf);
     printf("Saved state %s\n", path);
+    if (binary_arrays && binary_dir[0]) {
+        printf("Saved binary arrays in %s\n", binary_dir);
+    }
     return 0;
 }
 
-static int save_interactive_state(OfortInterpreter *interp, const char *source, const char *footer) {
+static int save_interactive_state(OfortInterpreter *interp, const char *source, const char *footer,
+                                  int binary_arrays, int binary_array_threshold) {
     char path[64];
     int i;
 
@@ -1340,7 +1756,8 @@ static int save_interactive_state(OfortInterpreter *interp, const char *source, 
     for (i = 1; file_exists(path); i++) {
         snprintf(path, sizeof(path), "ofort_state%d.f90", i);
     }
-    return save_interactive_state_to_path(interp, source, footer, path, 0);
+    return save_interactive_state_to_path(interp, source, footer, path, 0,
+                                          binary_arrays, binary_array_threshold);
 }
 
 static const char *skip_space(const char *line) {
@@ -2224,7 +2641,8 @@ static int rewrite_repl_character_constructor_shortcut(char *line, size_t line_s
 
 static int parse_save_command(const char *line, const char *command,
                               char *path, size_t path_size, int *has_path,
-                              int *overwrite) {
+                              int *overwrite, int *binary_arrays,
+                              int *binary_array_threshold) {
     char *args[OFORT_MAX_PARAMS];
     int nargs = 0;
     const char *p;
@@ -2234,22 +2652,45 @@ static int parse_save_command(const char *line, const char *command,
     p = skip_space(line + strlen(command));
     *has_path = 0;
     *overwrite = 0;
+    if (binary_arrays) *binary_arrays = 0;
+    if (binary_array_threshold) *binary_array_threshold = OFORT_STATE_BINARY_ARRAY_THRESHOLD;
     if (!split_command_args(p, args, &nargs)) return -1;
-    if (nargs == 0) return 1;
-    if (nargs == 1) {
-        if (strcmp(args[0], "--overwrite") == 0) {
-            fprintf(stderr, "%s --overwrite requires a filename\n", command);
+    for (int i = 0; i < nargs; i++) {
+        if (strcmp(args[i], "--overwrite") == 0) {
+            *overwrite = 1;
+        } else if (strcmp(args[i], "--binary-arrays") == 0) {
+            if (binary_arrays) *binary_arrays = 1;
+        } else if (strcmp(args[i], "--array-threshold") == 0) {
+            char *endptr;
+            long n;
+            if (!binary_array_threshold || i + 1 >= nargs) {
+                fprintf(stderr, "%s --array-threshold requires a positive integer\n", command);
+                ok = 0;
+                break;
+            }
+            n = strtol(args[++i], &endptr, 10);
+            if (endptr == args[i] || *endptr != '\0' || n < 1 || n > 2000000000L) {
+                fprintf(stderr, "%s --array-threshold requires a positive integer\n", command);
+                ok = 0;
+                break;
+            }
+            *binary_array_threshold = (int)n;
+        } else if (args[i][0] == '-' && args[i][1] == '-') {
+            fprintf(stderr, "unknown option for %s: %s\n", command, args[i]);
             ok = 0;
-        } else {
-            snprintf(path, path_size, "%s", args[0]);
+            break;
+        } else if (!*has_path) {
+            snprintf(path, path_size, "%s", args[i]);
             *has_path = 1;
+        } else {
+            fprintf(stderr, "usage: %s [file] [--overwrite] [--binary-arrays] [--array-threshold n]\n", command);
+            ok = 0;
+            break;
         }
-    } else if (nargs == 2 && strcmp(args[1], "--overwrite") == 0) {
-        snprintf(path, path_size, "%s", args[0]);
-        *has_path = 1;
-        *overwrite = 1;
-    } else {
-        fprintf(stderr, "usage: %s [file] [--overwrite]\n", command);
+    }
+    if (ok && *overwrite && !*has_path && strcmp(command, ".save") != 0 &&
+        strcmp(command, ".saveq") != 0 && strcmp(command, ".save-state") != 0 &&
+        strcmp(command, ".saveq-state") != 0) {
         ok = 0;
     }
     free_split_args(args, nargs);
@@ -2374,6 +2815,139 @@ static int source_parameter_line_number(const char *source, const char *name) {
         line_no++;
     }
     return 0;
+}
+
+static int copy_source_line_text(const char *source, int line_no, char *out, size_t out_size) {
+    const char *start;
+    const char *end;
+    size_t len;
+
+    if (!out || out_size == 0) return 0;
+    out[0] = '\0';
+    start = source_line_start(source ? source : "", line_no);
+    if (!start) return 0;
+    end = strchr(start, '\n');
+    len = end ? (size_t)(end - start) : strlen(start);
+    while (len > 0 && (start[len - 1] == '\r' || start[len - 1] == '\n')) len--;
+    if (len >= out_size) return 0;
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return 1;
+}
+
+static const char *skip_reconst_quoted_string(const char *p, const char *end) {
+    char quote = *p++;
+    while (p < end && *p) {
+        if (*p == quote) {
+            if (p + 1 < end && p[1] == quote) {
+                p += 2;
+                continue;
+            }
+            return p + 1;
+        }
+        p++;
+    }
+    return p;
+}
+
+static const char *find_top_level_comma_or_end(const char *p, const char *end) {
+    int depth = 0;
+    while (p < end && *p) {
+        if (*p == '\'' || *p == '"') {
+            p = skip_reconst_quoted_string(p, end);
+            continue;
+        }
+        if (*p == '(' || *p == '[') depth++;
+        else if ((*p == ')' || *p == ']') && depth > 0) depth--;
+        else if (*p == ',' && depth == 0) break;
+        p++;
+    }
+    return p;
+}
+
+static int parameter_segment_name_matches(const char *start, const char *end, const char *name) {
+    const char *p = start;
+    const char *name_start;
+    size_t name_len;
+
+    while (p < end && isspace((unsigned char)*p)) p++;
+    if (!(p < end && (isalpha((unsigned char)*p) || *p == '_'))) return 0;
+    name_start = p;
+    p++;
+    while (p < end && identifier_char((unsigned char)*p)) p++;
+    name_len = (size_t)(p - name_start);
+    if (strlen(name) != name_len) return 0;
+    for (size_t i = 0; i < name_len; i++) {
+        if (tolower((unsigned char)name_start[i]) != tolower((unsigned char)name[i])) return 0;
+    }
+    return 1;
+}
+
+static int line_parameter_declarator_count(const char *line) {
+    const char *dc = strstr(line, "::");
+    const char *p;
+    const char *end;
+    int count = 0;
+
+    if (!dc) return 0;
+    p = dc + 2;
+    end = line + strlen(line);
+    while (p < end) {
+        const char *seg_end = find_top_level_comma_or_end(p, end);
+        const char *q = p;
+        while (q < seg_end && isspace((unsigned char)*q)) q++;
+        if (q < seg_end) count++;
+        p = seg_end;
+        if (p < end && *p == ',') p++;
+    }
+    return count;
+}
+
+static int rewrite_reconst_multidecl_line(const char *old_line, const char *name,
+                                          const char *shape, const char *rhs,
+                                          char *out, size_t out_size) {
+    const char *dc = strstr(old_line, "::");
+    const char *p;
+    const char *end;
+    size_t used = 0;
+    int replaced = 0;
+
+    if (!old_line || !dc || line_parameter_declarator_count(old_line) < 2) return 0;
+    if ((size_t)(dc + 2 - old_line) >= out_size) return 0;
+    memcpy(out, old_line, (size_t)(dc + 2 - old_line));
+    used = (size_t)(dc + 2 - old_line);
+    out[used] = '\0';
+    p = dc + 2;
+    end = old_line + strlen(old_line);
+    while (p < end) {
+        const char *seg_start = p;
+        const char *seg_end = find_top_level_comma_or_end(p, end);
+        int match = parameter_segment_name_matches(seg_start, seg_end, name);
+        int written;
+
+        if (seg_start != dc + 2) {
+            if (used + 1 >= out_size) return -1;
+            out[used++] = ',';
+            out[used] = '\0';
+        }
+        if (match) {
+            written = snprintf(out + used, out_size - used, " %s%s = %s",
+                               name, shape ? shape : "", skip_space(rhs));
+            replaced = 1;
+        } else {
+            size_t seg_len = (size_t)(seg_end - seg_start);
+            if (seg_len >= out_size - used) return -1;
+            memcpy(out + used, seg_start, seg_len);
+            used += seg_len;
+            out[used] = '\0';
+            written = 0;
+        }
+        if (written < 0 || (size_t)written >= out_size - used) return -1;
+        used += (size_t)written;
+        p = seg_end;
+        if (p < end && *p == ',') p++;
+    }
+    return replaced ? 1 : 0;
 }
 
 static int copy_repl_shortcut_shape(const char **p_in, char *shape, size_t shape_size) {
@@ -2511,7 +3085,9 @@ static int apply_repl_reconst_shortcut(char **buf, size_t *len, size_t *cap, con
     char shape[256];
     char decl[256];
     char rewritten[4096];
+    char old_line[4096];
     int line_no;
+    int multi_rc;
 
     if (!parse_repl_decl_shortcut(line, &keyword, name, sizeof(name), shape, sizeof(shape), &rhs)) return 0;
     if (strcmp(keyword, "reconst") != 0) return 0;
@@ -2528,6 +3104,15 @@ static int apply_repl_reconst_shortcut(char **buf, size_t *len, size_t *cap, con
             fprintf(stderr, "RECONST name '%s' is not an existing PARAMETER\n", name);
         }
         return -1;
+    }
+    if (copy_source_line_text(*buf ? *buf : "", line_no, old_line, sizeof(old_line))) {
+        multi_rc = rewrite_reconst_multidecl_line(old_line, name, shape, rhs,
+                                                  rewritten, sizeof(rewritten));
+        if (multi_rc < 0) return -1;
+        if (multi_rc > 0) {
+            if (!replace_source_line(buf, len, cap, line_no, rewritten)) return -1;
+            return 1;
+        }
     }
     build_repl_decl_shortcut_line(rewritten, sizeof(rewritten), keyword, name, decl, shape,
                                   rhs, line, (size_t)(skip_space(line) - line));
@@ -2849,6 +3434,7 @@ static int g_specialized_fast_paths = 1;
 static int g_line_profile = 0;
 static int g_trace_assign = 0;
 static int g_check_uninitialized = 0;
+static int g_warn_unused = 1;
 static int g_no_logo = 0;
 static int g_init_integer_enabled = 0;
 static long long g_init_integer_value = 0;
@@ -2857,6 +3443,22 @@ static double g_init_real_value = 0.0;
 static int g_init_character_enabled = 0;
 static char g_init_character_value[OFORT_MAX_STRLEN] = "";
 static OfortStandardMode g_standard_mode = OFORT_STD_LEGACY;
+
+static int current_repl_fast_mode(void) {
+    return g_fast_mode;
+}
+
+static int warn_unused_repl_source_if_enabled(const char *source, int fast_mode, int separate_stdout) {
+    int n_unused;
+    if (!g_warn_unused || !g_warnings_enabled || fast_mode) {
+        return 0;
+    }
+    n_unused = warn_unused_declarations_in_source(source);
+    if (n_unused > 0 && separate_stdout) {
+        fputc('\n', stdout);
+    }
+    return n_unused;
+}
 
 static OfortInterpreter *create_ofort_interpreter(void) {
     OfortInterpreter *interp = ofort_create();
@@ -2966,16 +3568,23 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
     if (rc == 0) {
         const char *warnings = ofort_get_warnings(interp);
         const char *output = ofort_get_output(interp);
+        int emitted_unused_warning = 0;
         if (g_time_detail) {
             OfortTiming timing;
             if (ofort_get_timing(interp, &timing) == 0) {
                 print_detailed_time(setup_elapsed, &timing);
             }
         }
+        if (g_warn_unused && g_warnings_enabled) {
+            emitted_unused_warning = warn_unused_declarations_in_source(source) > 0;
+        }
         if (warnings && warnings[0] != '\0') {
             fputs(warnings, stderr);
         }
         if (output && output[0] != '\0') {
+            if (emitted_unused_warning) {
+                fputc('\n', stdout);
+            }
             fputs(output, stdout);
         }
         if (g_line_profile) {
@@ -3433,6 +4042,7 @@ static int execute_repl_run(OfortInterpreter **interp, const char *source, int r
     int last_rc = 0;
 
     if (repeat_count < 1) repeat_count = 1;
+    warn_unused_repl_source_if_enabled(source ? source : "", g_fast_mode, 1);
     for (int i = 0; i < repeat_count; i++) {
         ofort_destroy(*interp);
         *interp = create_ofort_interpreter();
@@ -3459,15 +4069,28 @@ static int execute_repl_timed_run(OfortInterpreter **interp, const char *source,
     int last_rc = 0;
 
     if (repeat_count < 1) repeat_count = 1;
-    for (int i = 0; i < repeat_count; i++) {
-        double start;
-        double elapsed;
-
+    warn_unused_repl_source_if_enabled(source ? source : "", g_fast_mode, 1);
+    if (g_cache_mode) {
         ofort_destroy(*interp);
         *interp = create_ofort_interpreter();
         if (!*interp) {
             fprintf(stderr, "failed to create Fortran interpreter\n");
             return 2;
+        }
+    }
+    for (int i = 0; i < repeat_count; i++) {
+        double start;
+        double elapsed;
+
+        if (!g_cache_mode) {
+            ofort_destroy(*interp);
+            *interp = create_ofort_interpreter();
+            if (!*interp) {
+                fprintf(stderr, "failed to create Fortran interpreter\n");
+                return 2;
+            }
+        } else {
+            ofort_reset(*interp);
         }
         start = monotonic_seconds();
         last_rc = execute_source_text_on_interpreter(
@@ -3615,6 +4238,7 @@ static int run_repl_source_with_ofort(OfortInterpreter **interp, const char *sou
     char *effective = make_effective_source(source ? source : "", footer);
     char *exec_source;
     int rc;
+    int emitted_unused_warning = 0;
 
     if (!effective) {
         return 2;
@@ -3645,6 +4269,7 @@ static int run_repl_source_with_ofort(OfortInterpreter **interp, const char *sou
     ofort_set_fast_mode(*interp, fast_mode);
     ofort_set_specialized_fast_paths(*interp, specialized_fast_paths);
     ofort_set_live_stdout(*interp, 1);
+    emitted_unused_warning = warn_unused_repl_source_if_enabled(exec_source, fast_mode, 1) > 0;
     rc = ofort_execute(*interp, exec_source);
     if (rc == 0) {
         const char *warnings = ofort_get_warnings(*interp);
@@ -3653,6 +4278,9 @@ static int run_repl_source_with_ofort(OfortInterpreter **interp, const char *sou
             fputs(warnings, stderr);
         }
         if (output && output[0] != '\0') {
+            if (emitted_unused_warning) {
+                fputc('\n', stdout);
+            }
             fputs(output, stdout);
         }
     } else {
@@ -4807,6 +5435,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
             }
             break;
         }
+        strip_pasted_repl_prompt(line, sizeof(line));
 
         if (is_command(line, ".")) {
             last_rc = run_repl_source_with_ofort(&repl_interp, buf ? buf : "", footer,
@@ -4954,16 +5583,21 @@ static int run_interactive(const char *load_path, int run_after_load) {
             char save_path[1024];
             int has_path = 0;
             int overwrite = 0;
+            int binary_arrays = 0;
+            int binary_array_threshold = OFORT_STATE_BINARY_ARRAY_THRESHOLD;
             int parsed = parse_save_command(line, ".save-state", save_path, sizeof(save_path),
-                                            &has_path, &overwrite);
+                                            &has_path, &overwrite, &binary_arrays,
+                                            &binary_array_threshold);
             if (parsed != 0) {
                 if (parsed > 0) {
                     last_rc = execute_repl_pending_source(repl_interp, buf ? buf : "", &executed_len);
                     if (last_rc == 0) {
                         last_rc = has_path ?
                                   save_interactive_state_to_path(repl_interp, buf ? buf : "", footer,
-                                                                 save_path, overwrite) :
-                                  save_interactive_state(repl_interp, buf ? buf : "", footer);
+                                                                 save_path, overwrite, binary_arrays,
+                                                                 binary_array_threshold) :
+                                  save_interactive_state(repl_interp, buf ? buf : "", footer,
+                                                         binary_arrays, binary_array_threshold);
                     }
                 } else {
                     last_rc = 1;
@@ -4976,16 +5610,21 @@ static int run_interactive(const char *load_path, int run_after_load) {
             char save_path[1024];
             int has_path = 0;
             int overwrite = 0;
+            int binary_arrays = 0;
+            int binary_array_threshold = OFORT_STATE_BINARY_ARRAY_THRESHOLD;
             int parsed = parse_save_command(line, ".saveq-state", save_path, sizeof(save_path),
-                                            &has_path, &overwrite);
+                                            &has_path, &overwrite, &binary_arrays,
+                                            &binary_array_threshold);
             if (parsed != 0) {
                 if (parsed > 0) {
                     last_rc = execute_repl_pending_source(repl_interp, buf ? buf : "", &executed_len);
                     if (last_rc == 0) {
                         last_rc = has_path ?
                                   save_interactive_state_to_path(repl_interp, buf ? buf : "", footer,
-                                                                 save_path, overwrite) :
-                                  save_interactive_state(repl_interp, buf ? buf : "", footer);
+                                                                 save_path, overwrite, binary_arrays,
+                                                                 binary_array_threshold) :
+                                  save_interactive_state(repl_interp, buf ? buf : "", footer,
+                                                         binary_arrays, binary_array_threshold);
                     }
                     if (last_rc == 0) {
                         free(buf);
@@ -5005,7 +5644,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
             int has_path = 0;
             int overwrite = 0;
             int parsed = parse_save_command(line, ".save", save_path, sizeof(save_path),
-                                            &has_path, &overwrite);
+                                            &has_path, &overwrite, NULL, NULL);
             if (parsed != 0) {
                 if (parsed > 0) {
                     last_rc = has_path ?
@@ -5023,7 +5662,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
             int has_path = 0;
             int overwrite = 0;
             int parsed = parse_save_command(line, ".saveq", save_path, sizeof(save_path),
-                                            &has_path, &overwrite);
+                                            &has_path, &overwrite, NULL, NULL);
             if (parsed != 0) {
                 if (parsed > 0) {
                     last_rc = has_path ?
@@ -5745,6 +6384,79 @@ static char *read_file(const char *path) {
     return source;
 }
 
+static unsigned long long cache_fnv1a_update(unsigned long long h, const char *text) {
+    const unsigned char *p = (const unsigned char *)(text ? text : "");
+    while (*p) {
+        h ^= (unsigned long long)*p++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static void cache_paths_for_source(const char *path, char *src_path, size_t src_size,
+                                   char *meta_path, size_t meta_size) {
+    unsigned long long h = 1469598103934665603ULL;
+    char tag[64];
+    h = cache_fnv1a_update(h, path ? path : "");
+    snprintf(tag, sizeof(tag), "|form=%d|fixed=%d", (int)g_source_form, source_path_is_fixed_form(path));
+    h = cache_fnv1a_update(h, tag);
+    snprintf(src_path, src_size, ".ofort_cache/%016llx.f90", h);
+    snprintf(meta_path, meta_size, ".ofort_cache/%016llx.meta", h);
+}
+
+static char *read_cached_source_file(const char *path) {
+    struct stat st;
+    char src_path[256], meta_path[256];
+    FILE *fp;
+    long long cached_size = -1;
+    long long cached_mtime = -1;
+    int cached_form = -1;
+    int cached_fixed = -1;
+    int fixed;
+    char *source;
+
+    if (!g_cache_mode || !path || stat(path, &st) != 0) return NULL;
+    fixed = source_path_is_fixed_form(path);
+    cache_paths_for_source(path, src_path, sizeof(src_path), meta_path, sizeof(meta_path));
+    fp = fopen(meta_path, "rb");
+    if (!fp) return NULL;
+    if (fscanf(fp, "ofort-cache-v1\nsize=%lld\nmtime=%lld\nform=%d\nfixed=%d\n",
+               &cached_size, &cached_mtime, &cached_form, &cached_fixed) != 4) {
+        fclose(fp);
+        return NULL;
+    }
+    fclose(fp);
+    if (cached_size != (long long)st.st_size ||
+        cached_mtime != (long long)st.st_mtime ||
+        cached_form != (int)g_source_form ||
+        cached_fixed != fixed) {
+        return NULL;
+    }
+    source = read_file(src_path);
+    if (source) normalize_newlines(source);
+    return source;
+}
+
+static void write_cached_source_file(const char *path, const char *source) {
+    struct stat st;
+    char src_path[256], meta_path[256];
+    FILE *fp;
+
+    if (!g_cache_mode || !path || !source || stat(path, &st) != 0) return;
+    if (make_directory_if_needed(".ofort_cache") != 0) return;
+    cache_paths_for_source(path, src_path, sizeof(src_path), meta_path, sizeof(meta_path));
+    fp = fopen(src_path, "wb");
+    if (!fp) return;
+    fputs(source, fp);
+    fclose(fp);
+    fp = fopen(meta_path, "wb");
+    if (!fp) return;
+    fprintf(fp, "ofort-cache-v1\nsize=%lld\nmtime=%lld\nform=%d\nfixed=%d\n",
+            (long long)st.st_size, (long long)st.st_mtime,
+            (int)g_source_form, source_path_is_fixed_form(path));
+    fclose(fp);
+}
+
 static int source_path_is_fixed_form(const char *path) {
     const char *slash1;
     const char *slash2;
@@ -5863,7 +6575,14 @@ static char *convert_fixed_source_text(char *source, const char *path) {
 }
 
 static char *read_source_file(const char *path) {
-    char *source = read_file(path);
+    char *source = read_cached_source_file(path);
+    if (source) {
+        if (g_save_free_form && source_path_is_fixed_form(path)) {
+            save_converted_free_form(path, source);
+        }
+        return source;
+    }
+    source = read_file(path);
     if (!source) return NULL;
     normalize_newlines(source);
     if (source_path_is_fixed_form(path)) {
@@ -5872,6 +6591,7 @@ static char *read_source_file(const char *path) {
             save_converted_free_form(path, source);
         }
     }
+    if (source) write_cached_source_file(path, source);
     return source;
 }
 
@@ -6035,7 +6755,7 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--time|--time-detail] [--profile-lines] [--trace-assign] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--cache] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--time|--time-detail] [--profile-lines] [--trace-assign] [--warn-unused|--no-warn-unused] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
     fprintf(stderr, "       %s --each [--check] [--quiet] [--limit n] [--max-fail n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
@@ -6053,11 +6773,14 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --quiet suppresses success/progress output but not diagnostics\n");
     fprintf(stderr, "       --std=f2023 rejects known nonstandard extensions; --std=legacy is the default\n");
     fprintf(stderr, "       --fast enables safe interpreter fast paths and suppresses warnings\n");
+    fprintf(stderr, "       --cache caches normalized/free-form source in .ofort_cache for repeated runs\n");
     fprintf(stderr, "       --no-specialize disables specialized pattern/program fast paths\n");
     fprintf(stderr, "       --time prints elapsed time for the requested operation\n");
     fprintf(stderr, "       --time-detail prints setup, lex, parse, register, execute, and total times\n");
     fprintf(stderr, "       --profile-lines prints elapsed execution time by source line\n");
     fprintf(stderr, "       --trace-assign prints assignment trace diagnostics\n");
+    fprintf(stderr, "       --warn-unused warns about simple declarations whose variables are never read (default unless --fast or -w)\n");
+    fprintf(stderr, "       --no-warn-unused disables declared-but-unused variable warnings\n");
     fprintf(stderr, "       --check-uninitialized, --check-uninit rejects reads of declared variables before assignment\n");
     fprintf(stderr, "       --init-int value initializes otherwise uninitialized INTEGER variables to value\n");
     fprintf(stderr, "       --init-real value|nan initializes otherwise uninitialized REAL/DOUBLE variables to value or NaN\n");
@@ -6201,6 +6924,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--fast") == 0) {
             g_fast_mode = 1;
             g_warnings_enabled = 0;
+        } else if (strcmp(argv[i], "--cache") == 0) {
+            g_cache_mode = 1;
         } else if (strcmp(argv[i], "--no-specialize") == 0) {
             g_specialized_fast_paths = 0;
         } else if (strcmp(argv[i], "--time") == 0) {
@@ -6213,6 +6938,10 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--trace-assign") == 0) {
             g_trace_assign = 1;
             g_specialized_fast_paths = 0;
+        } else if (strcmp(argv[i], "--warn-unused") == 0) {
+            g_warn_unused = 1;
+        } else if (strcmp(argv[i], "--no-warn-unused") == 0) {
+            g_warn_unused = 0;
         } else if (strcmp(argv[i], "--check-uninitialized") == 0 ||
                    strcmp(argv[i], "--check-uninit") == 0) {
             g_check_uninitialized = 1;
