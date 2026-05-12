@@ -20550,6 +20550,28 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         I->procedure_depth--;
         I->returning = 0;
 
+        int pointer_copyback[OFORT_MAX_PARAMS] = {0};
+        char pointer_copyback_target[OFORT_MAX_PARAMS][256];
+        int pointer_copyback_has_slice[OFORT_MAX_PARAMS] = {0};
+        int pointer_copyback_slice_start[OFORT_MAX_PARAMS] = {0};
+        int pointer_copyback_slice_end[OFORT_MAX_PARAMS] = {0};
+        int pointer_copyback_slice_stride[OFORT_MAX_PARAMS] = {0};
+
+        for (int i = 0; i < fn->n_params && i < nargs; i++) {
+            OfortVar *pv = find_var(I, fn->param_names[i]);
+            if (!pv || !pv->is_pointer || !pv->pointer_associated || !pv->pointer_target[0]) continue;
+            for (int j = 0; j < fn->n_params && j < nargs; j++) {
+                if (!str_eq_nocase(pv->pointer_target, fn->param_names[j])) continue;
+                if (n->stmts[j]->type != FND_IDENT) continue;
+                copy_cstr(pv->pointer_target, sizeof(pv->pointer_target), n->stmts[j]->name);
+                free_value(&pv->val);
+                pv->val = pointer_referenced_value(I, pv->pointer_target, pv->pointer_has_slice,
+                                                    pv->pointer_slice_start, pv->pointer_slice_end,
+                                                    pv->pointer_slice_stride);
+                break;
+            }
+        }
+
         /* Handle INTENT(OUT/INOUT) — copy back */
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             if (!arg_alias[i] && fn->param_intents[i] != 1) {
@@ -20566,6 +20588,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 if (pv && pv->present &&
                     (n->stmts[i]->type == FND_IDENT || n->stmts[i]->type == FND_MEMBER)) {
+                    if (n->stmts[i]->type == FND_IDENT) {
+                        OfortVar *actual = find_var(I, n->stmts[i]->name);
+                        if (actual && actual->is_pointer && pv->is_pointer) {
+                            pointer_copyback[i] = pv->pointer_associated;
+                            copy_cstr(pointer_copyback_target[i], sizeof(pointer_copyback_target[i]), pv->pointer_target);
+                            pointer_copyback_has_slice[i] = pv->pointer_has_slice;
+                            pointer_copyback_slice_start[i] = pv->pointer_slice_start;
+                            pointer_copyback_slice_end[i] = pv->pointer_slice_end;
+                            pointer_copyback_slice_stride[i] = pv->pointer_slice_stride;
+                        }
+                    }
                     free_value(&args[i]);
                     args[i] = copy_value(pv->val);
                 }
@@ -20581,6 +20614,18 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 args[i].type != FVAL_VOID && !procedure_ref_name(&args[i])) {
                 OfortVar *actual = find_var(I, n->stmts[i]->name);
                 if (actual && actual->is_parameter) continue;
+                if (actual && actual->is_pointer && pointer_copyback[i]) {
+                    free_value(&actual->val);
+                    actual->val = copy_value(args[i]);
+                    actual->pointer_associated = 1;
+                    actual->is_initialized = 1;
+                    copy_cstr(actual->pointer_target, sizeof(actual->pointer_target), pointer_copyback_target[i]);
+                    actual->pointer_has_slice = pointer_copyback_has_slice[i];
+                    actual->pointer_slice_start = pointer_copyback_slice_start[i];
+                    actual->pointer_slice_end = pointer_copyback_slice_end[i];
+                    actual->pointer_slice_stride = pointer_copyback_slice_stride[i] ? pointer_copyback_slice_stride[i] : 1;
+                    continue;
+                }
                 set_var(I, n->stmts[i]->name, copy_value(args[i]));
             } else if (!arg_alias[i] && n->stmts[i]->type == FND_MEMBER && fn->param_intents[i] != 1 &&
                        args[i].type != FVAL_VOID && !procedure_ref_name(&args[i])) {
