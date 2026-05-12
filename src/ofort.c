@@ -14015,6 +14015,24 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             /* Get result */
             OfortVar *rv = find_var(I, res_name);
             OfortValue result = rv ? copy_value(rv->val) : make_void_val();
+            if (rv && rv->is_pointer && rv->pointer_associated && rv->pointer_target[0]) {
+                for (int j = 0; j < fn->n_params && j < nargs; j++) {
+                    if (!str_eq_nocase(rv->pointer_target, fn->param_names[j])) continue;
+                    if (n->stmts[j]->type != FND_IDENT) continue;
+                    copy_cstr(rv->pointer_target, sizeof(rv->pointer_target), n->stmts[j]->name);
+                    break;
+                }
+                free_value(&result);
+                result = pointer_referenced_value(I, rv->pointer_target, rv->pointer_has_slice,
+                                                  rv->pointer_slice_start, rv->pointer_slice_end,
+                                                  rv->pointer_slice_stride);
+                result.is_pointer_ref = 1;
+                copy_cstr(result.pointer_target, sizeof(result.pointer_target), rv->pointer_target);
+                result.pointer_has_slice = rv->pointer_has_slice;
+                result.pointer_slice_start = rv->pointer_slice_start;
+                result.pointer_slice_end = rv->pointer_slice_end;
+                result.pointer_slice_stride = rv->pointer_slice_stride ? rv->pointer_slice_stride : 1;
+            }
 
             /* Handle INTENT(OUT/INOUT) — copy back */
             for (int i = 0; i < fn->n_params && i < nargs; i++) {
@@ -18708,10 +18726,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (lhs->type == FND_MEMBER) {
             OfortValue *target = member_lvalue(I, lhs);
             if (!target) ofort_error(I, "Pointer assignment target not found");
-            if (!pointer_target_descriptor(I, rhs_node, target_name, sizeof(target_name),
-                                           &has_slice, &slice_start, &slice_end, &slice_stride))
-                ofort_error(I, "Invalid pointer target");
             rhs = eval_node(I, rhs_node);
+            if (!pointer_target_descriptor(I, rhs_node, target_name, sizeof(target_name),
+                                           &has_slice, &slice_start, &slice_end, &slice_stride)) {
+                if (rhs.is_pointer_ref && rhs.pointer_target[0]) {
+                    copy_cstr(target_name, sizeof(target_name), rhs.pointer_target);
+                    has_slice = rhs.pointer_has_slice;
+                    slice_start = rhs.pointer_slice_start;
+                    slice_end = rhs.pointer_slice_end;
+                    slice_stride = rhs.pointer_slice_stride ? rhs.pointer_slice_stride : 1;
+                } else {
+                    free_value(&rhs);
+                    ofort_error(I, "Invalid pointer target");
+                }
+            }
             free_value(target);
             *target = rhs;
             target->is_pointer_ref = 1;
@@ -18765,10 +18793,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             trace_assignment_value(I, lhs, ptr->val);
             break;
         }
-        if (!pointer_target_descriptor(I, rhs_node, target_name, sizeof(target_name),
-                                       &has_slice, &slice_start, &slice_end, &slice_stride))
-            ofort_error(I, "Invalid pointer target");
         rhs = eval_node(I, rhs_node);
+        if (!pointer_target_descriptor(I, rhs_node, target_name, sizeof(target_name),
+                                       &has_slice, &slice_start, &slice_end, &slice_stride)) {
+            if (rhs.is_pointer_ref && rhs.pointer_target[0]) {
+                copy_cstr(target_name, sizeof(target_name), rhs.pointer_target);
+                has_slice = rhs.pointer_has_slice;
+                slice_start = rhs.pointer_slice_start;
+                slice_end = rhs.pointer_slice_end;
+                slice_stride = rhs.pointer_slice_stride ? rhs.pointer_slice_stride : 1;
+            } else {
+                free_value(&rhs);
+                ofort_error(I, "Invalid pointer target");
+            }
+        }
         free_value(&ptr->val);
         ptr->val = rhs;
         if (remap_bounds && ptr->val.type == FVAL_ARRAY && ptr->val.v.arr.n_dims > 0)
