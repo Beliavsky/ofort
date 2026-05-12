@@ -9446,6 +9446,226 @@ static int assign_packed_array_element(OfortValue *arr, int index, OfortValue rh
     return 0;
 }
 
+static int fast_real_square_matrix_invertible(OfortInterpreter *I, const OfortValue *matrix,
+                                              double tol, int *ok_out) {
+    int n;
+    double *a;
+    if (!matrix || matrix->type != FVAL_ARRAY || !ok_out ||
+        matrix->v.arr.n_dims != 2 || matrix->v.arr.dims[0] != matrix->v.arr.dims[1] ||
+        (matrix->v.arr.elem_type != FVAL_REAL && matrix->v.arr.elem_type != FVAL_DOUBLE)) {
+        return 0;
+    }
+    n = matrix->v.arr.dims[0];
+    if (n <= 0) return 0;
+    a = (double *)malloc(sizeof(double) * (size_t)n * (size_t)n);
+    if (!a) ofort_error(I, "Out of memory");
+    if (matrix->v.arr.real_data) {
+        memcpy(a, matrix->v.arr.real_data, sizeof(double) * (size_t)n * (size_t)n);
+    } else {
+        for (int idx = 0; idx < n * n; idx++) {
+            OfortValue elem = array_element_value(matrix, idx);
+            a[idx] = val_to_real(elem);
+            free_value(&elem);
+        }
+    }
+
+    *ok_out = 1;
+    for (int k = 0; k < n; k++) {
+        int pivot_row = k;
+        double best_abs = fabs(a[k + k * n]);
+        for (int i = k + 1; i < n; i++) {
+            double pivot_abs = fabs(a[i + k * n]);
+            if (pivot_abs > best_abs) {
+                best_abs = pivot_abs;
+                pivot_row = i;
+            }
+        }
+        if (best_abs <= tol) {
+            *ok_out = 0;
+            break;
+        }
+        if (pivot_row != k) {
+            for (int j = 0; j < n; j++) {
+                double tmp = a[k + j * n];
+                a[k + j * n] = a[pivot_row + j * n];
+                a[pivot_row + j * n] = tmp;
+            }
+        }
+        for (int i = k + 1; i < n; i++) {
+            double factor = a[i + k * n] / a[k + k * n];
+            a[i + k * n] = 0.0;
+            for (int j = k + 1; j < n; j++) {
+                a[i + j * n] -= factor * a[k + j * n];
+            }
+        }
+    }
+    free(a);
+    return 1;
+}
+
+static int fast_real_square_matrix_det(OfortInterpreter *I, const OfortValue *matrix,
+                                       double *det_out) {
+    int n;
+    double *a;
+    double det = 1.0;
+    int sign = 1;
+    if (!matrix || matrix->type != FVAL_ARRAY || !det_out ||
+        matrix->v.arr.n_dims != 2 || matrix->v.arr.dims[0] != matrix->v.arr.dims[1] ||
+        (matrix->v.arr.elem_type != FVAL_REAL && matrix->v.arr.elem_type != FVAL_DOUBLE)) {
+        return 0;
+    }
+    n = matrix->v.arr.dims[0];
+    if (n <= 0) return 0;
+    a = (double *)malloc(sizeof(double) * (size_t)n * (size_t)n);
+    if (!a) ofort_error(I, "Out of memory");
+    if (matrix->v.arr.real_data) {
+        memcpy(a, matrix->v.arr.real_data, sizeof(double) * (size_t)n * (size_t)n);
+    } else {
+        for (int idx = 0; idx < n * n; idx++) {
+            OfortValue elem = array_element_value(matrix, idx);
+            a[idx] = val_to_real(elem);
+            free_value(&elem);
+        }
+    }
+
+    for (int k = 0; k < n; k++) {
+        int pivot_row = k;
+        double best_abs = fabs(a[k + k * n]);
+        for (int i = k + 1; i < n; i++) {
+            double pivot_abs = fabs(a[i + k * n]);
+            if (pivot_abs > best_abs) {
+                best_abs = pivot_abs;
+                pivot_row = i;
+            }
+        }
+        if (best_abs == 0.0) {
+            det = 0.0;
+            break;
+        }
+        if (pivot_row != k) {
+            for (int j = 0; j < n; j++) {
+                double tmp = a[k + j * n];
+                a[k + j * n] = a[pivot_row + j * n];
+                a[pivot_row + j * n] = tmp;
+            }
+            sign = -sign;
+        }
+        for (int i = k + 1; i < n; i++) {
+            double factor = a[i + k * n] / a[k + k * n];
+            a[i + k * n] = 0.0;
+            for (int j = k + 1; j < n; j++) {
+                a[i + j * n] -= factor * a[k + j * n];
+            }
+        }
+    }
+    if (det != 0.0) {
+        det = (double)sign;
+        for (int i = 0; i < n; i++) det *= a[i + i * n];
+    }
+    free(a);
+    *det_out = det;
+    return 1;
+}
+
+typedef struct {
+    double re;
+    double im;
+} OfortComplexPair;
+
+static OfortComplexPair ofort_complex_div(OfortComplexPair a, OfortComplexPair b) {
+    double denom = b.re * b.re + b.im * b.im;
+    OfortComplexPair r;
+    r.re = (a.re * b.re + a.im * b.im) / denom;
+    r.im = (a.im * b.re - a.re * b.im) / denom;
+    return r;
+}
+
+static OfortComplexPair ofort_complex_mul(OfortComplexPair a, OfortComplexPair b) {
+    OfortComplexPair r;
+    r.re = a.re * b.re - a.im * b.im;
+    r.im = a.re * b.im + a.im * b.re;
+    return r;
+}
+
+static OfortComplexPair ofort_complex_sub(OfortComplexPair a, OfortComplexPair b) {
+    OfortComplexPair r;
+    r.re = a.re - b.re;
+    r.im = a.im - b.im;
+    return r;
+}
+
+static int fast_complex_square_matrix_det(OfortInterpreter *I, const OfortValue *matrix,
+                                          double *re_out, double *im_out) {
+    int n;
+    OfortComplexPair *a;
+    OfortComplexPair det;
+    int sign = 1;
+    if (!matrix || matrix->type != FVAL_ARRAY || !re_out || !im_out ||
+        matrix->v.arr.n_dims != 2 || matrix->v.arr.dims[0] != matrix->v.arr.dims[1] ||
+        matrix->v.arr.elem_type != FVAL_COMPLEX) {
+        return 0;
+    }
+    n = matrix->v.arr.dims[0];
+    if (n <= 0) return 0;
+    a = (OfortComplexPair *)calloc((size_t)n * (size_t)n, sizeof(*a));
+    if (!a) ofort_error(I, "Out of memory");
+    for (int idx = 0; idx < n * n; idx++) {
+        OfortValue elem = array_element_value(matrix, idx);
+        if (elem.type == FVAL_COMPLEX) {
+            a[idx].re = elem.v.cx.re;
+            a[idx].im = elem.v.cx.im;
+        } else {
+            a[idx].re = val_to_real(elem);
+            a[idx].im = 0.0;
+        }
+        free_value(&elem);
+    }
+
+    for (int k = 0; k < n; k++) {
+        int pivot_row = k;
+        double best_abs = hypot(a[k + k * n].re, a[k + k * n].im);
+        for (int i = k + 1; i < n; i++) {
+            double pivot_abs = hypot(a[i + k * n].re, a[i + k * n].im);
+            if (pivot_abs > best_abs) {
+                best_abs = pivot_abs;
+                pivot_row = i;
+            }
+        }
+        if (best_abs == 0.0) {
+            det.re = 0.0;
+            det.im = 0.0;
+            free(a);
+            *re_out = det.re;
+            *im_out = det.im;
+            return 1;
+        }
+        if (pivot_row != k) {
+            for (int j = 0; j < n; j++) {
+                OfortComplexPair tmp = a[k + j * n];
+                a[k + j * n] = a[pivot_row + j * n];
+                a[pivot_row + j * n] = tmp;
+            }
+            sign = -sign;
+        }
+        for (int i = k + 1; i < n; i++) {
+            OfortComplexPair factor = ofort_complex_div(a[i + k * n], a[k + k * n]);
+            a[i + k * n].re = 0.0;
+            a[i + k * n].im = 0.0;
+            for (int j = k + 1; j < n; j++) {
+                OfortComplexPair prod = ofort_complex_mul(factor, a[k + j * n]);
+                a[i + j * n] = ofort_complex_sub(a[i + j * n], prod);
+            }
+        }
+    }
+    det.re = (double)sign;
+    det.im = 0.0;
+    for (int i = 0; i < n; i++) det = ofort_complex_mul(det, a[i + i * n]);
+    free(a);
+    *re_out = det.re;
+    *im_out = det.im;
+    return 1;
+}
+
 static OfortValue make_array_with_char_len_options(OfortValType elem_type, int *dims, int n_dims,
                                                    int char_len, int defer_numeric_tags) {
     OfortValue v; memset(&v, 0, sizeof(v));
@@ -13404,6 +13624,15 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         if (!args) ofort_error(I, "Out of memory");
         for (int i = 0; i < nargs; i++) args[i] = eval_node(I, n->stmts[i]);
 
+        if (I->fast_mode && I->specialized_fast_paths &&
+            str_eq_nocase(n->name, "is_invertible_real") && nargs == 1) {
+            int ok = 0;
+            if (fast_real_square_matrix_invertible(I, &args[0], 1.0e-10, &ok)) {
+                free_call_args(args, nargs); args = NULL;
+                return make_logical(ok);
+            }
+        }
+
         if (str_eq_nocase(n->name, ".IN.") && nargs == 2) {
             OfortValue result = eval_in_operator(I, args[0], args[1]);
             free_call_args(args, nargs); args = NULL;
@@ -14315,6 +14544,47 @@ static int exec_fast_array_affine_assignment(OfortInterpreter *I, OfortNode *n) 
     return 1;
 }
 
+static int exec_fast_array_floor_affine_assignment(OfortInterpreter *I, OfortNode *n) {
+    OfortNode *lhs;
+    OfortNode *rhs;
+    OfortVar *target;
+    OfortVar *source = NULL;
+    double coef = 0.0;
+    double constant = 0.0;
+    int len;
+
+    if (!I || !I->fast_mode || !n || n->type != FND_ASSIGN) return 0;
+    lhs = n->children[0];
+    rhs = n->children[1];
+    if (!lhs || lhs->type != FND_IDENT || !rhs ||
+        rhs->type != FND_FUNC_CALL || !str_eq_nocase(rhs->name, "floor") ||
+        rhs->n_stmts < 1) {
+        return 0;
+    }
+    target = cached_ident_var(I, n, 0, lhs);
+    if (!target || target->is_parameter || target->is_protected ||
+        target->val.type != FVAL_ARRAY || !array_has_packed_numeric(&target->val))
+        return 0;
+    if (!fast_array_expr_coeff(I, rhs->stmts[0], &source, &coef, &constant) || !source)
+        return 0;
+    if (source->val.type != FVAL_ARRAY || !array_has_packed_numeric(&source->val))
+        return 0;
+    if (target->val.v.arr.len != source->val.v.arr.len)
+        return 0;
+
+    len = target->val.v.arr.len;
+    for (int i = 0; i < len; i++) {
+        double x = source->val.v.arr.real_data ?
+                   source->val.v.arr.real_data[i] :
+                   (double)source->val.v.arr.int_data[i];
+        double y = floor(coef * x + constant);
+        if (target->val.v.arr.real_data) target->val.v.arr.real_data[i] = y;
+        else target->val.v.arr.int_data[i] = (long long)y;
+    }
+    target->is_initialized = 1;
+    return 1;
+}
+
 static int fast_array_poly2_expr_coeff(OfortInterpreter *I, OfortNode *n, OfortVar **source,
                                        double coeff[3]) {
     OfortVar *var;
@@ -14832,6 +15102,7 @@ static int exec_fast_scalar_affine_recurrence_loop(OfortInterpreter *I, OfortNod
     lhs = assign->children[0];
     rhs = assign->children[1];
     if (!lhs || lhs->type != FND_IDENT || !rhs) return 0;
+    if (expr_mentions_ident(rhs, n->name)) return 0;
     if (!fast_scalar_affine_expr_coeff(I, rhs, lhs->name, &coef, &constant)) return 0;
     target = find_var(I, lhs->name);
     loop_var = find_var(I, n->name);
@@ -14897,6 +15168,7 @@ enum {
     FAST_EXPR_INT,
     FAST_EXPR_REAL,
     FAST_EXPR_SQRT,
+    FAST_EXPR_FLOOR,
     FAST_EXPR_MOD
 };
 
@@ -14976,6 +15248,10 @@ static int compile_fast_array_expr_node(OfortInterpreter *I, FastArrayExprProgra
             return compile_fast_array_expr_node(I, program, n->stmts[0], array_name, loop_name) &&
                    fast_array_expr_emit(program, FAST_EXPR_SQRT, 0.0, NULL);
         }
+        if (str_eq_nocase(n->name, "FLOOR") && n->n_stmts >= 1) {
+            return compile_fast_array_expr_node(I, program, n->stmts[0], array_name, loop_name) &&
+                   fast_array_expr_emit(program, FAST_EXPR_FLOOR, 0.0, NULL);
+        }
         if (str_eq_nocase(n->name, "MOD") && n->n_stmts == 2) {
             return compile_fast_array_expr_node(I, program, n->stmts[0], array_name, loop_name) &&
                    compile_fast_array_expr_node(I, program, n->stmts[1], array_name, loop_name) &&
@@ -15042,6 +15318,10 @@ static int eval_fast_array_expr_program(FastArrayExprProgram *program,
         case FAST_EXPR_SQRT:
             if (sp < 1 || stack[sp - 1] < 0.0) return 0;
             stack[sp - 1] = sqrt(stack[sp - 1]);
+            break;
+        case FAST_EXPR_FLOOR:
+            if (sp < 1) return 0;
+            stack[sp - 1] = floor(stack[sp - 1]);
             break;
         case FAST_EXPR_ADD:
         case FAST_EXPR_SUB:
@@ -16152,11 +16432,13 @@ static int ofort_extension_module_exports(const char *module_name, const char *n
                str_eq_nocase(name, "col_means") ||
                str_eq_nocase(name, "eye") ||
                str_eq_nocase(name, "diag") ||
+               str_eq_nocase(name, "det") ||
                str_eq_nocase(name, "trace") ||
                str_eq_nocase(name, "outer_product") ||
                str_eq_nocase(name, "is_square") ||
                str_eq_nocase(name, "is_diagonal") ||
-               str_eq_nocase(name, "is_symmetric");
+               str_eq_nocase(name, "is_symmetric") ||
+               str_eq_nocase(name, "is_invertible");
     }
     if (str_eq_nocase(module_name, "ofort_io_mod")) {
         return str_eq_nocase(name, "read_matrix") ||
@@ -16185,11 +16467,13 @@ static int ofort_extension_module_exports(const char *module_name, const char *n
     if (str_eq_nocase(module_name, "stdlib_linalg")) {
         return str_eq_nocase(name, "eye") ||
                str_eq_nocase(name, "diag") ||
+               str_eq_nocase(name, "det") ||
                str_eq_nocase(name, "trace") ||
                str_eq_nocase(name, "outer_product") ||
                str_eq_nocase(name, "is_square") ||
                str_eq_nocase(name, "is_diagonal") ||
-               str_eq_nocase(name, "is_symmetric");
+               str_eq_nocase(name, "is_symmetric") ||
+               str_eq_nocase(name, "is_invertible");
     }
     if (str_eq_nocase(module_name, "ofort_statistics_mod") ||
         str_eq_nocase(module_name, "ofort_stats_mod")) {
@@ -17068,11 +17352,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         import_ofort_extension_intrinsic(I, "col_means", "col_means");
                         import_ofort_extension_intrinsic(I, "eye", "eye");
                         import_ofort_extension_intrinsic(I, "diag", "diag");
+                        import_ofort_extension_intrinsic(I, "det", "det");
                         import_ofort_extension_intrinsic(I, "trace", "trace");
                         import_ofort_extension_intrinsic(I, "outer_product", "outer_product");
                         import_ofort_extension_intrinsic(I, "is_square", "is_square");
                         import_ofort_extension_intrinsic(I, "is_diagonal", "is_diagonal");
                         import_ofort_extension_intrinsic(I, "is_symmetric", "is_symmetric");
+                        import_ofort_extension_intrinsic(I, "is_invertible", "is_invertible");
                     } else if (str_eq_nocase(n->name, "ofort_io_mod")) {
                         import_ofort_extension_intrinsic(I, "read_matrix", "read_matrix");
                         import_ofort_extension_intrinsic(I, "read_vector", "read_vector");
@@ -17096,11 +17382,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     } else if (str_eq_nocase(n->name, "stdlib_linalg")) {
                         import_ofort_extension_intrinsic(I, "eye", "eye");
                         import_ofort_extension_intrinsic(I, "diag", "diag");
+                        import_ofort_extension_intrinsic(I, "det", "det");
                         import_ofort_extension_intrinsic(I, "trace", "trace");
                         import_ofort_extension_intrinsic(I, "outer_product", "outer_product");
                         import_ofort_extension_intrinsic(I, "is_square", "is_square");
                         import_ofort_extension_intrinsic(I, "is_diagonal", "is_diagonal");
                         import_ofort_extension_intrinsic(I, "is_symmetric", "is_symmetric");
+                        import_ofort_extension_intrinsic(I, "is_invertible", "is_invertible");
                     } else {
                         import_ofort_extension_intrinsic(I, "mean", "mean");
                         import_ofort_extension_intrinsic(I, "variance", "variance");
@@ -18099,6 +18387,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         if (I->where_mask) I->where_mask_index = 0;
         if (!I->where_mask && exec_fast_array_poly2_assignment(I, n)) {
+            break;
+        }
+        if (!I->where_mask && exec_fast_array_floor_affine_assignment(I, n)) {
             break;
         }
         if (!I->where_mask && exec_fast_array_affine_assignment(I, n)) {
@@ -21055,11 +21346,13 @@ static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char
         str_eq_nocase(name, "col_means") ||
         str_eq_nocase(name, "eye") ||
         str_eq_nocase(name, "diag") ||
+        str_eq_nocase(name, "det") ||
         str_eq_nocase(name, "trace") ||
         str_eq_nocase(name, "outer_product") ||
         str_eq_nocase(name, "is_square") ||
         str_eq_nocase(name, "is_diagonal") ||
-        str_eq_nocase(name, "is_symmetric")) {
+        str_eq_nocase(name, "is_symmetric") ||
+        str_eq_nocase(name, "is_invertible")) {
         return call_ofort_la_intrinsic(I, name, args, nargs);
     }
     ofort_error(I, "Unknown ofort extension intrinsic '%s'", name);
@@ -21803,6 +22096,27 @@ static OfortValue ofort_la_trace(OfortInterpreter *I, OfortValue *x) {
     return make_double(sum);
 }
 
+static OfortValue ofort_la_det(OfortInterpreter *I, OfortValue *x) {
+    double det;
+    double re;
+    double im;
+    if (!x || x->type != FVAL_ARRAY || x->v.arr.n_dims != 2)
+        ofort_error(I, "DET requires a rank-2 numeric array");
+    if (x->v.arr.elem_type != FVAL_REAL && x->v.arr.elem_type != FVAL_DOUBLE &&
+        x->v.arr.elem_type != FVAL_INTEGER && x->v.arr.elem_type != FVAL_COMPLEX)
+        ofort_error(I, "DET requires a numeric square matrix");
+    if (x->v.arr.dims[0] != x->v.arr.dims[1])
+        ofort_error(I, "DET requires a square matrix");
+    if (x->v.arr.elem_type == FVAL_COMPLEX) {
+        if (!fast_complex_square_matrix_det(I, x, &re, &im))
+            ofort_error(I, "DET requires a numeric square matrix");
+        return make_complex_kind(re, im, value_declared_kind(x));
+    }
+    if (!fast_real_square_matrix_det(I, x, &det))
+        ofort_error(I, "DET requires a numeric square matrix");
+    return make_double(det);
+}
+
 static OfortValue ofort_la_outer_product(OfortInterpreter *I, OfortValue *u, OfortValue *v) {
     int m;
     int n;
@@ -21857,6 +22171,16 @@ static OfortValue ofort_la_is_symmetric(OfortInterpreter *I, OfortValue *x) {
     return make_logical(1);
 }
 
+static OfortValue ofort_la_is_invertible(OfortInterpreter *I, OfortValue *x) {
+    int ok = 0;
+    ofort_require_rank2_numeric(I, x, "IS_INVERTIBLE");
+    if (x->v.arr.dims[0] != x->v.arr.dims[1])
+        return make_logical(0);
+    if (!fast_real_square_matrix_invertible(I, x, 1.0e-10, &ok))
+        ofort_error(I, "IS_INVERTIBLE requires a numeric square matrix");
+    return make_logical(ok);
+}
+
 static OfortValue call_ofort_la_intrinsic(OfortInterpreter *I, const char *name,
                                           OfortValue *args, int nargs) {
     if (str_eq_nocase(name, "eye")) {
@@ -21868,6 +22192,10 @@ static OfortValue call_ofort_la_intrinsic(OfortInterpreter *I, const char *name,
     if (str_eq_nocase(name, "trace")) {
         if (nargs != 1) ofort_error(I, "TRACE takes one matrix argument");
         return ofort_la_trace(I, &args[0]);
+    }
+    if (str_eq_nocase(name, "det")) {
+        if (nargs != 1) ofort_error(I, "DET takes one matrix argument");
+        return ofort_la_det(I, &args[0]);
     }
     if (str_eq_nocase(name, "outer_product")) {
         if (nargs != 2) ofort_error(I, "OUTER_PRODUCT takes two vector arguments");
@@ -21884,6 +22212,10 @@ static OfortValue call_ofort_la_intrinsic(OfortInterpreter *I, const char *name,
     if (str_eq_nocase(name, "is_symmetric")) {
         if (nargs != 1) ofort_error(I, "IS_SYMMETRIC takes one matrix argument");
         return ofort_la_is_symmetric(I, &args[0]);
+    }
+    if (str_eq_nocase(name, "is_invertible")) {
+        if (nargs != 1) ofort_error(I, "IS_INVERTIBLE takes one matrix argument");
+        return ofort_la_is_invertible(I, &args[0]);
     }
     if (str_eq_nocase(name, "transpose2")) {
         if (nargs != 1) ofort_error(I, "TRANSPOSE2 takes one matrix argument");
