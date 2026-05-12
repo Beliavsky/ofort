@@ -95,6 +95,7 @@ static int write_through_pointer_value(OfortInterpreter *I, OfortValue *ptr, Ofo
 static OfortValue pointer_referenced_value(OfortInterpreter *I, const char *target_name,
                                            int has_slice, int slice_start, int slice_end,
                                            int slice_stride);
+static void set_allocate_status(OfortInterpreter *I, OfortNode *n, int stat, const char *errmsg);
 
 typedef struct {
     char name[256];
@@ -1780,6 +1781,60 @@ static OfortValue make_named_derived_scalar(const char *type_name, long long tag
     copy_cstr(v.v.dt.field_names[0], sizeof(v.v.dt.field_names[0]), "tag");
     v.v.dt.fields[0] = make_integer(tag);
     return v;
+}
+
+static void set_allocate_status(OfortInterpreter *I, OfortNode *n, int stat, const char *errmsg) {
+    if (!n) return;
+    if (n->param_names[0][0]) {
+        set_var(I, n->param_names[0], make_integer(stat));
+    }
+    if (n->param_names[1][0]) {
+        set_var(I, n->param_names[1], make_character(stat == 0 ? "" : (errmsg ? errmsg : "Allocation failed")));
+    }
+}
+
+static int allocation_extents_fit_int(OfortInterpreter *I, OfortNode *n,
+                                      int *dims, int *lower_bounds,
+                                      const char **errmsg_out) {
+    long long total = 1;
+    if (!n || !dims || !lower_bounds) return 1;
+    for (int i = 0; i < n->n_stmts; i++) {
+        long long lower = 1;
+        OfortValue dv = eval_node(I, n->stmts[i]);
+        long long upper = val_to_int(dv);
+        long long extent;
+        free_value(&dv);
+        if (n->has_lower_bound[i]) {
+            if (n->children[2 + i]) {
+                OfortValue lv = eval_node(I, n->children[2 + i]);
+                lower = val_to_int(lv);
+                free_value(&lv);
+            } else {
+                lower = n->lower_bounds[i];
+            }
+            extent = upper - lower + 1;
+            lower_bounds[i] = (lower < INT_MIN || lower > INT_MAX) ? 1 : (int)lower;
+        } else {
+            extent = upper;
+            lower_bounds[i] = 1;
+        }
+        if (extent < 0) extent = 0;
+        if (extent > INT_MAX) {
+            if (errmsg_out) *errmsg_out = "Insufficient virtual memory";
+            return 0;
+        }
+        if (extent > 0 && total > LLONG_MAX / extent) {
+            if (errmsg_out) *errmsg_out = "Insufficient virtual memory";
+            return 0;
+        }
+        total *= extent;
+        if (total > INT_MAX) {
+            if (errmsg_out) *errmsg_out = "Insufficient virtual memory";
+            return 0;
+        }
+        dims[i] = (int)extent;
+    }
+    return 1;
 }
 
 static int ieee_name_kind(const char *name, const char **type_name, long long *tag) {
@@ -7442,6 +7497,8 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
     OfortNode *block = alloc_node(I, FND_BLOCK);
     OfortNode *source_expr = NULL;
     OfortNode *mold_expr = NULL;
+    char stat_name[256] = "";
+    char errmsg_name[256] = "";
     int cap = 0;
     block->line = at->line;
     expect(I, FTOK_LPAREN);
@@ -7454,6 +7511,14 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
                 source_expr = parse_expr(I);
             } else if (str_eq_nocase(arg_name, "mold")) {
                 mold_expr = parse_expr(I);
+            } else if (str_eq_nocase(arg_name, "stat")) {
+                OfortNode *stat_expr = parse_expr(I);
+                if (stat_expr && stat_expr->type == FND_IDENT)
+                    copy_cstr(stat_name, sizeof(stat_name), stat_expr->name);
+            } else if (str_eq_nocase(arg_name, "errmsg")) {
+                OfortNode *errmsg_expr = parse_expr(I);
+                if (errmsg_expr && errmsg_expr->type == FND_IDENT)
+                    copy_cstr(errmsg_name, sizeof(errmsg_name), errmsg_expr->name);
             } else {
                 parse_expr(I);
             }
@@ -7696,12 +7761,14 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
         else break;
     }
     expect(I, FTOK_RPAREN);
-    if (source_expr || mold_expr) {
+    if (source_expr || mold_expr || stat_name[0] || errmsg_name[0]) {
         for (int i = 0; i < block->n_stmts; i++) {
             OfortNode *n = block->stmts[i];
             n->children[0] = source_expr;
             n->children[1] = mold_expr;
             n->n_children = 2;
+            if (stat_name[0]) copy_cstr(n->param_names[0], sizeof(n->param_names[0]), stat_name);
+            if (errmsg_name[0]) copy_cstr(n->param_names[1], sizeof(n->param_names[1]), errmsg_name);
         }
     }
     return block;
@@ -20630,9 +20697,17 @@ unresolved_external_call_done:
         OfortVar *var = find_var(I, n->name);
         if (!var) ofort_error(I, "Variable '%s' not found for ALLOCATE", n->name);
         if (var->val.type == FVAL_ARRAY && var->val.v.arr.allocated) {
+            if (n->param_names[0][0]) {
+                set_allocate_status(I, n, 5014, "Attempt to allocate an allocated object");
+                break;
+            }
             ofort_error(I, "Attempting to allocate already allocated variable '%s'", n->name);
         }
         if (var->is_allocatable && var->val.type != FVAL_ARRAY && var->scalar_allocated) {
+            if (n->param_names[0][0]) {
+                set_allocate_status(I, n, 5014, "Attempt to allocate an allocated object");
+                break;
+            }
             ofort_error(I, "Attempting to allocate already allocated variable '%s'", n->name);
         }
         /* Get dimensions */
@@ -20705,25 +20780,13 @@ unresolved_external_call_done:
             break;
         }
         if (ndims > 0) {
-            for (int i = 0; i < ndims; i++) {
-                int lower = 1;
-                OfortValue dv = eval_node(I, n->stmts[i]);
-                int upper = (int)val_to_int(dv);
-                free_value(&dv);
-                if (n->has_lower_bound[i]) {
-                    if (n->children[2 + i]) {
-                        OfortValue lv = eval_node(I, n->children[2 + i]);
-                        lower = (int)val_to_int(lv);
-                        free_value(&lv);
-                    } else {
-                        lower = n->lower_bounds[i];
-                    }
-                    dims[i] = upper - lower + 1;
-                    lower_bounds[i] = lower;
-                } else {
-                    dims[i] = upper;
+            const char *alloc_errmsg = "Insufficient virtual memory";
+            if (!allocation_extents_fit_int(I, n, dims, lower_bounds, &alloc_errmsg)) {
+                if (n->param_names[0][0]) {
+                    set_allocate_status(I, n, 5020, alloc_errmsg);
+                    break;
                 }
-                if (dims[i] < 0) dims[i] = 0;
+                ofort_error(I, "%s", alloc_errmsg);
             }
         } else if (n->children[1]) {
             OfortValue mold = eval_allocate_mold_expr(I, n->children[1]);
@@ -20787,6 +20850,7 @@ unresolved_external_call_done:
             }
             free_value(&source);
         }
+        set_allocate_status(I, n, 0, "");
         break;
     }
 
