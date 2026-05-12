@@ -64,6 +64,7 @@ typedef struct {
     int pointer_has_slice;
     int pointer_slice_start;
     int pointer_slice_end;
+    int pointer_slice_stride;
 } OfortVar;
 
 typedef struct OfortScope {
@@ -87,6 +88,13 @@ typedef struct {
     OfortVar saved_vars[OFORT_MAX_SAVED_VARS];
     int n_saved_vars;
 } OfortFunc;
+
+static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val);
+static int write_through_pointer_var(OfortInterpreter *I, OfortVar *ptr, OfortValue *rhs);
+static int write_through_pointer_value(OfortInterpreter *I, OfortValue *ptr, OfortValue *rhs);
+static OfortValue pointer_referenced_value(OfortInterpreter *I, const char *target_name,
+                                           int has_slice, int slice_start, int slice_end,
+                                           int slice_stride);
 
 typedef struct {
     char name[256];
@@ -315,6 +323,9 @@ static OfortValue call_ofort_stats_matrix_cov_cor(OfortInterpreter *I, const cha
                                                   OfortValue *arg);
 static OfortValue call_ofort_la_intrinsic(OfortInterpreter *I, const char *name,
                                           OfortValue *args, int nargs);
+static OfortValue call_ofort_sorting_intrinsic(OfortInterpreter *I, const char *name,
+                                               OfortValue *args, int nargs,
+                                               char arg_names[OFORT_MAX_PARAMS][256]);
 static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char *name,
                                                  OfortValue *args, int nargs,
                                                  char arg_names[OFORT_MAX_PARAMS][256]);
@@ -963,6 +974,12 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
             if (s->vars[i].intent == 1)
                 ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", name);
+            if (s->vars[i].is_pointer && s->vars[i].pointer_associated &&
+                s->vars[i].pointer_target[0]) {
+                write_through_pointer_var(I, &s->vars[i], &val);
+                free_value(&val);
+                return &s->vars[i];
+            }
             if (s->vars[i].is_alias && s->vars[i].pointer_target[0]) {
                 OfortVar *target = find_var(I, s->vars[i].pointer_target);
                 OfortValue alias_val = copy_value(val);
@@ -989,6 +1006,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 s->vars[i].pointer_has_slice = 0;
                 s->vars[i].pointer_slice_start = 0;
                 s->vars[i].pointer_slice_end = 0;
+                s->vars[i].pointer_slice_stride = 1;
                 return &s->vars[i];
             }
             if (deferred_char_alloc && s->vars[i].declared_type != FVAL_VOID) {
@@ -1032,6 +1050,12 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                     ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
                 if (ps->vars[i].intent == 1)
                     ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", name);
+                if (ps->vars[i].is_pointer && ps->vars[i].pointer_associated &&
+                    ps->vars[i].pointer_target[0]) {
+                    write_through_pointer_var(I, &ps->vars[i], &val);
+                    free_value(&val);
+                    return &ps->vars[i];
+                }
                 if (ps->vars[i].is_alias && ps->vars[i].pointer_target[0]) {
                     OfortVar *target = find_var(I, ps->vars[i].pointer_target);
                     OfortValue alias_val = copy_value(val);
@@ -1058,6 +1082,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                     ps->vars[i].pointer_has_slice = 0;
                     ps->vars[i].pointer_slice_start = 0;
                     ps->vars[i].pointer_slice_end = 0;
+                    ps->vars[i].pointer_slice_stride = 1;
                     return &ps->vars[i];
                 }
                 if (deferred_char_alloc && ps->vars[i].declared_type != FVAL_VOID) {
@@ -1135,6 +1160,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->pointer_has_slice = 0;
     v->pointer_slice_start = 0;
     v->pointer_slice_end = 0;
+    v->pointer_slice_stride = 1;
     return v;
 }
 
@@ -1192,6 +1218,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->pointer_has_slice = 0;
     v->pointer_slice_start = 0;
     v->pointer_slice_end = 0;
+    v->pointer_slice_stride = 1;
     return v;
 }
 
@@ -1226,6 +1253,7 @@ static OfortVar *declare_alias_var(OfortInterpreter *I, const char *name, OfortV
     v->pointer_has_slice = target->pointer_has_slice;
     v->pointer_slice_start = target->pointer_slice_start;
     v->pointer_slice_end = target->pointer_slice_end;
+    v->pointer_slice_stride = target->pointer_slice_stride;
     return v;
 }
 
@@ -1656,6 +1684,7 @@ static void restore_saved_vars(OfortInterpreter *I, OfortFunc *func) {
         v->pointer_has_slice = func->saved_vars[i].pointer_has_slice;
         v->pointer_slice_start = func->saved_vars[i].pointer_slice_start;
         v->pointer_slice_end = func->saved_vars[i].pointer_slice_end;
+        v->pointer_slice_stride = func->saved_vars[i].pointer_slice_stride;
     }
 }
 
@@ -1696,6 +1725,7 @@ static void store_saved_vars(OfortFunc *func, OfortScope *scope) {
         dst->pointer_has_slice = src->pointer_has_slice;
         dst->pointer_slice_start = src->pointer_slice_start;
         dst->pointer_slice_end = src->pointer_slice_end;
+        dst->pointer_slice_stride = src->pointer_slice_stride;
     }
 }
 
@@ -1725,6 +1755,7 @@ static void copy_imported_var_attrs(OfortVar *dst, const OfortVar *src) {
     dst->pointer_has_slice = src->pointer_has_slice;
     dst->pointer_slice_start = src->pointer_slice_start;
     dst->pointer_slice_end = src->pointer_slice_end;
+    dst->pointer_slice_stride = src->pointer_slice_stride;
 }
 
 static void copy_var_payload_and_attrs(OfortVar *dst, const OfortVar *src) {
@@ -9446,6 +9477,140 @@ static int assign_packed_array_element(OfortValue *arr, int index, OfortValue rh
     return 0;
 }
 
+static int slice_count(int start, int end, int stride) {
+    int count = 0;
+    if (stride == 0) return 0;
+    for (int s = start; stride > 0 ? s <= end : s >= end; s += stride) count++;
+    return count;
+}
+
+static OfortValue pointer_referenced_value(OfortInterpreter *I, const char *target_name,
+                                           int has_slice, int slice_start, int slice_end,
+                                           int slice_stride) {
+    OfortVar *target = find_var(I, target_name);
+    if (!target) return make_void_val();
+    if (!has_slice) return copy_value(target->val);
+    if (target->val.type != FVAL_ARRAY) return make_void_val();
+    int dims[1] = { slice_count(slice_start, slice_end, slice_stride) };
+    OfortValue result = make_array(target->val.v.arr.elem_type, dims, 1);
+    result.v.arr.lower_bounds[0] = 1;
+    for (int pos = 0, sub = slice_start; pos < dims[0]; pos++, sub += slice_stride) {
+        int subs[1] = { sub };
+        int idx = section_linear_index(&target->val, subs, 1);
+        OfortValue elem = array_element_value(&target->val, idx);
+        if (assign_packed_array_element(&result, pos, elem)) {
+            free_value(&elem);
+        } else if (result.v.arr.data) {
+            free_value(&result.v.arr.data[pos]);
+            result.v.arr.data[pos] = elem;
+        } else {
+            free_value(&elem);
+        }
+    }
+    return result;
+}
+
+static int write_through_pointer_var(OfortInterpreter *I, OfortVar *ptr, OfortValue *rhs) {
+    OfortVar *target;
+    if (!ptr || !ptr->is_pointer || !ptr->pointer_associated || !ptr->pointer_target[0]) return 0;
+    target = find_var(I, ptr->pointer_target);
+    if (!target) return 0;
+    if (ptr->pointer_has_slice) {
+        int count = slice_count(ptr->pointer_slice_start, ptr->pointer_slice_end,
+                                ptr->pointer_slice_stride);
+        if (target->val.type != FVAL_ARRAY) return 0;
+        if (rhs->type == FVAL_ARRAY && rhs->v.arr.len != count)
+            ofort_error(I, "Array assignment shape mismatch");
+        for (int pos = 0, sub = ptr->pointer_slice_start; pos < count;
+             pos++, sub += ptr->pointer_slice_stride) {
+            int subs[1] = { sub };
+            int idx = section_linear_index(&target->val, subs, 1);
+            OfortValue elem = rhs->type == FVAL_ARRAY ? array_element_value(rhs, pos) : copy_value(*rhs);
+            if (assign_packed_array_element(&target->val, idx, elem)) {
+                free_value(&elem);
+            } else if (target->val.v.arr.data) {
+                free_value(&target->val.v.arr.data[idx]);
+                target->val.v.arr.data[idx] = elem;
+            } else {
+                free_value(&elem);
+            }
+        }
+        free_value(&ptr->val);
+        ptr->val = pointer_referenced_value(I, ptr->pointer_target, ptr->pointer_has_slice,
+                                            ptr->pointer_slice_start, ptr->pointer_slice_end,
+                                            ptr->pointer_slice_stride);
+        target->is_initialized = 1;
+        ptr->is_initialized = 1;
+        return 1;
+    }
+    if (target->val.type == FVAL_ARRAY) {
+        if (rhs->type == FVAL_ARRAY && rhs->v.arr.len != target->val.v.arr.len)
+            ofort_error(I, "Array assignment shape mismatch");
+        if (rhs->type == FVAL_ARRAY) {
+            for (int i = 0; i < target->val.v.arr.len; i++) {
+                OfortValue elem = array_element_value(rhs, i);
+                if (assign_packed_array_element(&target->val, i, elem)) {
+                    free_value(&elem);
+                } else if (target->val.v.arr.data) {
+                    free_value(&target->val.v.arr.data[i]);
+                    target->val.v.arr.data[i] = elem;
+                } else {
+                    free_value(&elem);
+                }
+            }
+        } else {
+            for (int i = 0; i < target->val.v.arr.len; i++) {
+                OfortValue elem = copy_value(*rhs);
+                if (assign_packed_array_element(&target->val, i, elem)) {
+                    free_value(&elem);
+                } else if (target->val.v.arr.data) {
+                    free_value(&target->val.v.arr.data[i]);
+                    target->val.v.arr.data[i] = elem;
+                } else {
+                    free_value(&elem);
+                }
+            }
+        }
+        free_value(&ptr->val);
+        ptr->val = copy_value(target->val);
+        target->is_initialized = 1;
+        ptr->is_initialized = 1;
+        return 1;
+    }
+    set_var(I, target->name, copy_value(*rhs));
+    free_value(&ptr->val);
+    ptr->val = copy_value(target->val);
+    ptr->is_initialized = 1;
+    return 1;
+}
+
+static int write_through_pointer_value(OfortInterpreter *I, OfortValue *ptr, OfortValue *rhs) {
+    if (!ptr || !ptr->is_pointer_ref || !ptr->pointer_target[0]) return 0;
+    OfortVar fake;
+    memset(&fake, 0, sizeof(fake));
+    fake.is_pointer = 1;
+    fake.pointer_associated = 1;
+    copy_cstr(fake.pointer_target, sizeof(fake.pointer_target), ptr->pointer_target);
+    fake.pointer_has_slice = ptr->pointer_has_slice;
+    fake.pointer_slice_start = ptr->pointer_slice_start;
+    fake.pointer_slice_end = ptr->pointer_slice_end;
+    fake.pointer_slice_stride = ptr->pointer_slice_stride ? ptr->pointer_slice_stride : 1;
+    fake.val = copy_value(*ptr);
+    if (!write_through_pointer_var(I, &fake, rhs)) {
+        free_value(&fake.val);
+        return 0;
+    }
+    free_value(ptr);
+    *ptr = fake.val;
+    ptr->is_pointer_ref = 1;
+    copy_cstr(ptr->pointer_target, sizeof(ptr->pointer_target), fake.pointer_target);
+    ptr->pointer_has_slice = fake.pointer_has_slice;
+    ptr->pointer_slice_start = fake.pointer_slice_start;
+    ptr->pointer_slice_end = fake.pointer_slice_end;
+    ptr->pointer_slice_stride = fake.pointer_slice_stride;
+    return 1;
+}
+
 static int fast_real_square_matrix_invertible(OfortInterpreter *I, const OfortValue *matrix,
                                               double tol, int *ok_out) {
     int n;
@@ -10342,10 +10507,12 @@ static void assign_character_substring(OfortInterpreter *I, OfortVar *var, Ofort
 
 static int pointer_target_descriptor(OfortInterpreter *I, OfortNode *node,
                                      char *name, size_t name_size,
-                                     int *has_slice, int *slice_start, int *slice_end) {
+                                     int *has_slice, int *slice_start, int *slice_end,
+                                     int *slice_stride) {
     *has_slice = 0;
     *slice_start = 0;
     *slice_end = 0;
+    *slice_stride = 1;
     if (node->type == FND_IDENT) {
         copy_cstr(name, name_size, node->name);
         return 1;
@@ -10360,6 +10527,7 @@ static int pointer_target_descriptor(OfortInterpreter *I, OfortNode *node,
         *has_slice = 1;
         *slice_start = range.start;
         *slice_end = range.end;
+        *slice_stride = range.step;
         return 1;
     }
     return 0;
@@ -10371,7 +10539,7 @@ static int is_null_func_call_node(OfortNode *node) {
 
 static int pointer_matches_target(OfortInterpreter *I, OfortVar *ptr, OfortNode *target) {
     char target_name[256];
-    int has_slice, start, end;
+    int has_slice, start, end, stride;
     if (!ptr || !ptr->is_pointer || !ptr->pointer_associated) return 0;
     if (target->type == FND_IDENT) {
         OfortVar *target_var = find_var(I, target->name);
@@ -10380,14 +10548,17 @@ static int pointer_matches_target(OfortInterpreter *I, OfortVar *ptr, OfortNode 
                    str_eq_nocase(ptr->pointer_target, target_var->pointer_target) &&
                    ptr->pointer_has_slice == target_var->pointer_has_slice &&
                    ptr->pointer_slice_start == target_var->pointer_slice_start &&
-                   ptr->pointer_slice_end == target_var->pointer_slice_end;
+                   ptr->pointer_slice_end == target_var->pointer_slice_end &&
+                   ptr->pointer_slice_stride == target_var->pointer_slice_stride;
         }
     }
-    if (!pointer_target_descriptor(I, target, target_name, sizeof(target_name), &has_slice, &start, &end))
+    if (!pointer_target_descriptor(I, target, target_name, sizeof(target_name), &has_slice, &start, &end, &stride))
         return 0;
     return str_eq_nocase(ptr->pointer_target, target_name) &&
            ptr->pointer_has_slice == has_slice &&
-           (!has_slice || (ptr->pointer_slice_start == start && ptr->pointer_slice_end == end));
+           (!has_slice || (ptr->pointer_slice_start == start &&
+                           ptr->pointer_slice_end == end &&
+                           ptr->pointer_slice_stride == stride));
 }
 
 static int subscript_spec_element_count(OfortSubscriptSpec *specs, int nargs) {
@@ -13582,6 +13753,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         if ((str_eq_nocase(n->name, "kind") || str_eq_nocase(n->name, "size") ||
              str_eq_nocase(n->name, "lbound") || str_eq_nocase(n->name, "ubound") ||
              str_eq_nocase(n->name, "shape") || str_eq_nocase(n->name, "rank")) &&
+            !find_imported_extension_intrinsic(I, n->name) &&
             nargs >= 1 && n->stmts[0]->type == FND_IDENT) {
             OfortVar *inquiry_var = find_var(I, n->stmts[0]->name);
             if (inquiry_var) {
@@ -13898,6 +14070,15 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         if (field_idx >= 0) {
             OfortValue result = copy_value(obj.v.dt.fields[field_idx]);
             free_value(&obj);
+            if (result.is_pointer_ref) {
+                OfortValue deref = pointer_referenced_value(I, result.pointer_target,
+                                                            result.pointer_has_slice,
+                                                            result.pointer_slice_start,
+                                                            result.pointer_slice_end,
+                                                            result.pointer_slice_stride ? result.pointer_slice_stride : 1);
+                free_value(&result);
+                return deref;
+            }
             return result;
         }
         ofort_error(I, "Unknown member '%s'", n->name);
@@ -16407,6 +16588,7 @@ static void check_semantics_block(OfortInterpreter *I, OfortNode *block) {
 
 static int ofort_extension_module_exists(const char *module_name) {
     return str_eq_nocase(module_name, "ofort_random_mod") ||
+           str_eq_nocase(module_name, "ofort_sorting_mod") ||
            str_eq_nocase(module_name, "ofort_la_mod") ||
            str_eq_nocase(module_name, "ofort_io_mod") ||
            str_eq_nocase(module_name, "ofort_statistics_mod") ||
@@ -16422,6 +16604,14 @@ static int ofort_extension_module_exports(const char *module_name, const char *n
         return str_eq_nocase(name, "rnorm") ||
                str_eq_nocase(name, "rnorm_fill");
     }
+    if (str_eq_nocase(module_name, "ofort_sorting_mod")) {
+        return str_eq_nocase(name, "sorted") ||
+               str_eq_nocase(name, "sort") ||
+               str_eq_nocase(name, "sort_index") ||
+               str_eq_nocase(name, "is_sorted") ||
+               str_eq_nocase(name, "rank_order") ||
+               str_eq_nocase(name, "unique");
+    }
     if (str_eq_nocase(module_name, "ofort_la_mod")) {
         return str_eq_nocase(name, "matmul2") ||
                str_eq_nocase(name, "transpose2") ||
@@ -16433,6 +16623,15 @@ static int ofort_extension_module_exports(const char *module_name, const char *n
                str_eq_nocase(name, "eye") ||
                str_eq_nocase(name, "diag") ||
                str_eq_nocase(name, "det") ||
+               str_eq_nocase(name, "norm") ||
+               str_eq_nocase(name, "triu") ||
+               str_eq_nocase(name, "tril") ||
+               str_eq_nocase(name, "kron") ||
+               str_eq_nocase(name, "solve") ||
+               str_eq_nocase(name, "mldivide") ||
+               str_eq_nocase(name, "inv") ||
+               str_eq_nocase(name, "rank") ||
+               str_eq_nocase(name, "chol") ||
                str_eq_nocase(name, "trace") ||
                str_eq_nocase(name, "outer_product") ||
                str_eq_nocase(name, "is_square") ||
@@ -16468,6 +16667,14 @@ static int ofort_extension_module_exports(const char *module_name, const char *n
         return str_eq_nocase(name, "eye") ||
                str_eq_nocase(name, "diag") ||
                str_eq_nocase(name, "det") ||
+               str_eq_nocase(name, "norm") ||
+               str_eq_nocase(name, "triu") ||
+               str_eq_nocase(name, "tril") ||
+               str_eq_nocase(name, "kron") ||
+               str_eq_nocase(name, "solve") ||
+               str_eq_nocase(name, "inv") ||
+               str_eq_nocase(name, "rank") ||
+               str_eq_nocase(name, "chol") ||
                str_eq_nocase(name, "trace") ||
                str_eq_nocase(name, "outer_product") ||
                str_eq_nocase(name, "is_square") ||
@@ -17342,6 +17549,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     if (str_eq_nocase(n->name, "ofort_random_mod")) {
                         import_ofort_extension_intrinsic(I, "rnorm", "rnorm");
                         import_ofort_extension_intrinsic(I, "rnorm_fill", "rnorm_fill");
+                    } else if (str_eq_nocase(n->name, "ofort_sorting_mod")) {
+                        import_ofort_extension_intrinsic(I, "sorted", "sorted");
+                        import_ofort_extension_intrinsic(I, "sort", "sort");
+                        import_ofort_extension_intrinsic(I, "sort_index", "sort_index");
+                        import_ofort_extension_intrinsic(I, "is_sorted", "is_sorted");
+                        import_ofort_extension_intrinsic(I, "rank_order", "rank_order");
+                        import_ofort_extension_intrinsic(I, "unique", "unique");
                     } else if (str_eq_nocase(n->name, "ofort_la_mod")) {
                         import_ofort_extension_intrinsic(I, "matmul2", "matmul2");
                         import_ofort_extension_intrinsic(I, "transpose2", "transpose2");
@@ -17353,6 +17567,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         import_ofort_extension_intrinsic(I, "eye", "eye");
                         import_ofort_extension_intrinsic(I, "diag", "diag");
                         import_ofort_extension_intrinsic(I, "det", "det");
+                        import_ofort_extension_intrinsic(I, "norm", "norm");
+                        import_ofort_extension_intrinsic(I, "triu", "triu");
+                        import_ofort_extension_intrinsic(I, "tril", "tril");
+                        import_ofort_extension_intrinsic(I, "kron", "kron");
+                        import_ofort_extension_intrinsic(I, "solve", "solve");
+                        import_ofort_extension_intrinsic(I, "mldivide", "mldivide");
+                        import_ofort_extension_intrinsic(I, "inv", "inv");
+                        import_ofort_extension_intrinsic(I, "rank", "rank");
+                        import_ofort_extension_intrinsic(I, "chol", "chol");
                         import_ofort_extension_intrinsic(I, "trace", "trace");
                         import_ofort_extension_intrinsic(I, "outer_product", "outer_product");
                         import_ofort_extension_intrinsic(I, "is_square", "is_square");
@@ -17383,6 +17606,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         import_ofort_extension_intrinsic(I, "eye", "eye");
                         import_ofort_extension_intrinsic(I, "diag", "diag");
                         import_ofort_extension_intrinsic(I, "det", "det");
+                        import_ofort_extension_intrinsic(I, "norm", "norm");
+                        import_ofort_extension_intrinsic(I, "triu", "triu");
+                        import_ofort_extension_intrinsic(I, "tril", "tril");
+                        import_ofort_extension_intrinsic(I, "kron", "kron");
+                        import_ofort_extension_intrinsic(I, "solve", "solve");
+                        import_ofort_extension_intrinsic(I, "inv", "inv");
+                        import_ofort_extension_intrinsic(I, "rank", "rank");
+                        import_ofort_extension_intrinsic(I, "chol", "chol");
                         import_ofort_extension_intrinsic(I, "trace", "trace");
                         import_ofort_extension_intrinsic(I, "outer_product", "outer_product");
                         import_ofort_extension_intrinsic(I, "is_square", "is_square");
@@ -18289,6 +18520,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         v->pointer_has_slice = 0;
         v->pointer_slice_start = 0;
         v->pointer_slice_end = 0;
+        v->pointer_slice_stride = 1;
         if (n->is_pointer && n->n_children > 0 && n->children[0]) {
             if (is_null_func_call_node(n->children[0])) {
                 free_value(&v->val);
@@ -18299,14 +18531,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 break;
             }
             char target_name[256];
-            int has_slice = 0, slice_start = 0, slice_end = 0;
+            int has_slice = 0, slice_start = 0, slice_end = 0, slice_stride = 1;
             v->pointer_associated = 1;
             if (pointer_target_descriptor(I, n->children[0], target_name, sizeof(target_name),
-                                          &has_slice, &slice_start, &slice_end)) {
+                                          &has_slice, &slice_start, &slice_end, &slice_stride)) {
                 copy_cstr(v->pointer_target, sizeof(v->pointer_target), target_name);
                 v->pointer_has_slice = has_slice;
                 v->pointer_slice_start = slice_start;
                 v->pointer_slice_end = slice_end;
+                v->pointer_slice_stride = slice_stride;
             }
             if (v->val.type == FVAL_CHARACTER && v->val.v.s) {
                 v->char_len = (int)strlen(v->val.v.s);
@@ -18334,23 +18567,59 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortNode *lhs = n->children[0];
         OfortNode *rhs_node = n->children[1];
         OfortVar *ptr;
+        const char *ptr_name = NULL;
+        int remap_bounds = 0;
+        int remap_lower = 1;
         char target_name[256];
-        int has_slice, slice_start, slice_end;
+        int has_slice, slice_start, slice_end, slice_stride;
         OfortValue rhs;
         if (lhs->type == FND_MEMBER) {
             OfortValue *target = member_lvalue(I, lhs);
             if (!target) ofort_error(I, "Pointer assignment target not found");
+            if (!pointer_target_descriptor(I, rhs_node, target_name, sizeof(target_name),
+                                           &has_slice, &slice_start, &slice_end, &slice_stride))
+                ofort_error(I, "Invalid pointer target");
             rhs = eval_node(I, rhs_node);
             free_value(target);
             *target = rhs;
+            target->is_pointer_ref = 1;
+            copy_cstr(target->pointer_target, sizeof(target->pointer_target), target_name);
+            target->pointer_has_slice = has_slice;
+            target->pointer_slice_start = slice_start;
+            target->pointer_slice_end = slice_end;
+            target->pointer_slice_stride = slice_stride;
             trace_assignment_value(I, lhs, rhs);
             break;
         }
-        if (lhs->type != FND_IDENT)
+        if (lhs->type == FND_IDENT) {
+            ptr_name = lhs->name;
+        } else if (lhs->type == FND_FUNC_CALL && lhs->n_stmts == 1 &&
+                   lhs->stmts[0] && lhs->stmts[0]->type == FND_SLICE) {
+            OfortNode *sl = lhs->stmts[0];
+            ptr_name = lhs->name;
+            remap_bounds = 1;
+            if (sl->children[0]) {
+                OfortValue lv = eval_node(I, sl->children[0]);
+                remap_lower = (int)val_to_int(lv);
+                free_value(&lv);
+            }
+        } else if (lhs->type == FND_ARRAY_REF && lhs->children[0] &&
+                   lhs->children[0]->type == FND_IDENT && lhs->n_stmts == 1 &&
+                   lhs->stmts[0] && lhs->stmts[0]->type == FND_SLICE) {
+            OfortNode *sl = lhs->stmts[0];
+            ptr_name = lhs->children[0]->name;
+            remap_bounds = 1;
+            if (sl->children[0]) {
+                OfortValue lv = eval_node(I, sl->children[0]);
+                remap_lower = (int)val_to_int(lv);
+                free_value(&lv);
+            }
+        } else {
             ofort_error(I, "Pointer assignment target must be a pointer variable");
-        ptr = find_var(I, lhs->name);
+        }
+        ptr = find_var(I, ptr_name);
         if (!ptr || !ptr->is_pointer)
-            ofort_error(I, "'%s' is not a pointer", lhs->name);
+            ofort_error(I, "'%s' is not a pointer", ptr_name);
         if (is_null_func_call_node(rhs_node)) {
             free_value(&ptr->val);
             ptr->val = make_void_val();
@@ -18360,21 +18629,25 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             ptr->pointer_has_slice = 0;
             ptr->pointer_slice_start = 0;
             ptr->pointer_slice_end = 0;
+            ptr->pointer_slice_stride = 1;
             trace_assignment_value(I, lhs, ptr->val);
             break;
         }
         if (!pointer_target_descriptor(I, rhs_node, target_name, sizeof(target_name),
-                                       &has_slice, &slice_start, &slice_end))
+                                       &has_slice, &slice_start, &slice_end, &slice_stride))
             ofort_error(I, "Invalid pointer target");
         rhs = eval_node(I, rhs_node);
         free_value(&ptr->val);
         ptr->val = rhs;
+        if (remap_bounds && ptr->val.type == FVAL_ARRAY && ptr->val.v.arr.n_dims > 0)
+            ptr->val.v.arr.lower_bounds[0] = remap_lower;
         ptr->pointer_associated = 1;
         ptr->is_initialized = 1;
         copy_cstr(ptr->pointer_target, sizeof(ptr->pointer_target), target_name);
         ptr->pointer_has_slice = has_slice;
         ptr->pointer_slice_start = slice_start;
         ptr->pointer_slice_end = slice_end;
+        ptr->pointer_slice_stride = slice_stride;
         trace_assignment_value(I, lhs, ptr->val);
         break;
     }
@@ -18406,6 +18679,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (v && v->is_parameter) ofort_error(I, "Cannot assign to PARAMETER '%s'", lhs->name);
             if (v && v->is_protected) ofort_error(I, "Cannot assign to PROTECTED variable '%s'", lhs->name);
             if (v && v->intent == 1) ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", lhs->name);
+            if (v && v->is_pointer && v->pointer_associated && v->pointer_target[0]) {
+                write_through_pointer_var(I, v, &rhs);
+                trace_assignment_value(I, lhs, rhs);
+                free_value(&rhs);
+                break;
+            }
             if (v && v->val.type == FVAL_ARRAY) {
                 if (v->val.v.arr.elem_type == FVAL_CHARACTER) {
                     warn_character_truncation(I, lhs->name, &rhs, v->char_len);
@@ -18505,6 +18784,49 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             OfortVar *var = find_var(I, lhs->name);
             if (!var) ofort_error(I, "Undefined variable '%s'", lhs->name);
             if (var->is_protected) ofort_error(I, "Cannot assign to PROTECTED variable '%s'", lhs->name);
+            if (var->is_pointer && var->pointer_associated && var->pointer_target[0] &&
+                var->val.type == FVAL_ARRAY && lhs->n_stmts == 1) {
+                OfortVar *target_var = find_var(I, var->pointer_target);
+                OfortSubscriptRange prange;
+                if (target_var && target_var->val.type == FVAL_ARRAY &&
+                    !eval_subscript_range(I, lhs->stmts[0], var->val.v.arr.lower_bounds[0],
+                                          var->val.v.arr.dims[0], &prange)) {
+                    int psubs[1] = { prange.start };
+                    int pidx = section_linear_index(&var->val, psubs, 1);
+                    int tidx = pidx;
+                    if (var->pointer_has_slice) {
+                        int target_sub = var->pointer_slice_start + pidx * var->pointer_slice_stride;
+                        int tsubs[1] = { target_sub };
+                        tidx = section_linear_index(&target_var->val, tsubs, 1);
+                    }
+                    if (pidx < 0 || pidx >= var->val.v.arr.len ||
+                        tidx < 0 || tidx >= target_var->val.v.arr.len)
+                        ofort_error(I, "Array index out of bounds");
+                    OfortValue elem = copy_value(rhs);
+                    if (assign_packed_array_element(&target_var->val, tidx, elem)) {
+                        free_value(&elem);
+                    } else if (target_var->val.v.arr.data) {
+                        free_value(&target_var->val.v.arr.data[tidx]);
+                        target_var->val.v.arr.data[tidx] = elem;
+                    } else {
+                        free_value(&elem);
+                    }
+                    elem = copy_value(rhs);
+                    if (assign_packed_array_element(&var->val, pidx, elem)) {
+                        free_value(&elem);
+                    } else if (var->val.v.arr.data) {
+                        free_value(&var->val.v.arr.data[pidx]);
+                        var->val.v.arr.data[pidx] = elem;
+                    } else {
+                        free_value(&elem);
+                    }
+                    target_var->is_initialized = 1;
+                    var->is_initialized = 1;
+                    trace_assignment_value(I, lhs, rhs);
+                    free_value(&rhs);
+                    break;
+                }
+            }
             if (var->val.type == FVAL_CHARACTER) {
                 assign_character_substring(I, var, lhs, &rhs);
                 var->is_initialized = 1;
@@ -18573,6 +18895,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             OfortValue *target = member_lvalue(I, lhs);
             if (target) {
+                if (target->is_pointer_ref) {
+                    write_through_pointer_value(I, target, &rhs);
+                    trace_assignment_value(I, lhs, rhs);
+                    free_value(&rhs);
+                    break;
+                }
                 if (target->type == FVAL_ARRAY) {
                     if (rhs.type == FVAL_ARRAY) {
                         if (rhs.v.arr.len != target->v.arr.len)
@@ -21214,6 +21542,13 @@ static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char
         }
         return make_double(loc + scale * ofort_rnorm_sample(I, method));
     }
+    if (str_eq_nocase(name, "sorted") ||
+        str_eq_nocase(name, "sort_index") ||
+        str_eq_nocase(name, "is_sorted") ||
+        str_eq_nocase(name, "rank_order") ||
+        str_eq_nocase(name, "unique")) {
+        return call_ofort_sorting_intrinsic(I, name, args, nargs, arg_names);
+    }
     if (str_eq_nocase(name, "pdf_normal") ||
         str_eq_nocase(name, "cdf_normal")) {
         int result_len = 0;
@@ -21347,6 +21682,15 @@ static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char
         str_eq_nocase(name, "eye") ||
         str_eq_nocase(name, "diag") ||
         str_eq_nocase(name, "det") ||
+        str_eq_nocase(name, "norm") ||
+        str_eq_nocase(name, "triu") ||
+        str_eq_nocase(name, "tril") ||
+        str_eq_nocase(name, "kron") ||
+        str_eq_nocase(name, "solve") ||
+        str_eq_nocase(name, "mldivide") ||
+        str_eq_nocase(name, "inv") ||
+        str_eq_nocase(name, "rank") ||
+        str_eq_nocase(name, "chol") ||
         str_eq_nocase(name, "trace") ||
         str_eq_nocase(name, "outer_product") ||
         str_eq_nocase(name, "is_square") ||
@@ -21458,6 +21802,189 @@ static void ofort_assign_real_array_element(OfortValue *target, int index, doubl
         free_value(&target->v.arr.data[index]);
         target->v.arr.data[index] = elem;
     }
+}
+
+static void ofort_assign_array_element_copy(OfortInterpreter *I, OfortValue *target, int index,
+                                            OfortValue value) {
+    (void)I;
+    if (!target || target->type != FVAL_ARRAY || index < 0 || index >= target->v.arr.len) return;
+    if (assign_packed_array_element(target, index, value)) {
+        free_value(&value);
+    } else {
+        free_value(&target->v.arr.data[index]);
+        target->v.arr.data[index] = value;
+    }
+}
+
+static int ofort_sorting_supported_array(OfortValue *x) {
+    if (!x || x->type != FVAL_ARRAY || x->v.arr.n_dims != 1) return 0;
+    return x->v.arr.elem_type == FVAL_INTEGER ||
+           x->v.arr.elem_type == FVAL_REAL ||
+           x->v.arr.elem_type == FVAL_DOUBLE ||
+           x->v.arr.elem_type == FVAL_CHARACTER;
+}
+
+static int ofort_sort_compare_indices(OfortInterpreter *I, OfortValue *x, int ia, int ib,
+                                      int reverse) {
+    OfortValue a = array_element_value(x, ia);
+    OfortValue b = array_element_value(x, ib);
+    int cmp = values_compare_fortran(I, a, b);
+    free_value(&a);
+    free_value(&b);
+    return reverse ? -cmp : cmp;
+}
+
+static int ofort_sort_reverse_from_args(OfortInterpreter *I, OfortValue *args, int nargs,
+                                        char arg_names[OFORT_MAX_PARAMS][256], int start_idx) {
+    int reverse = 0;
+    for (int i = start_idx; i < nargs; i++) {
+        const char *pname = arg_names ? arg_names[i] : "";
+        if (pname && pname[0]) {
+            if (str_eq_nocase(pname, "reverse")) reverse = val_to_logical(args[i]);
+            else ofort_error(I, "Unknown sorting keyword '%s'", pname);
+        } else {
+            reverse = val_to_logical(args[i]);
+        }
+    }
+    return reverse;
+}
+
+static int ofort_sort_reverse_from_call(OfortInterpreter *I, OfortNode *n, int start_idx) {
+    int reverse = 0;
+    for (int i = start_idx; i < n->n_stmts; i++) {
+        const char *pname = n->param_names[i];
+        OfortValue v;
+        if (pname && pname[0] && !str_eq_nocase(pname, "reverse"))
+            ofort_error(I, "Unknown SORT keyword '%s'", pname);
+        v = eval_node(I, n->stmts[i]);
+        reverse = val_to_logical(v);
+        free_value(&v);
+    }
+    return reverse;
+}
+
+static int *ofort_sort_index_vector(OfortInterpreter *I, OfortValue *x, int reverse) {
+    int n = x->v.arr.len;
+    int *idx = (int *)malloc(sizeof(*idx) * (size_t)n);
+    if (!idx) ofort_error(I, "Out of memory");
+    for (int i = 0; i < n; i++) idx[i] = i;
+    for (int i = 1; i < n; i++) {
+        int key = idx[i];
+        int j = i - 1;
+        while (j >= 0 && ofort_sort_compare_indices(I, x, key, idx[j], reverse) < 0) {
+            idx[j + 1] = idx[j];
+            j--;
+        }
+        idx[j + 1] = key;
+    }
+    return idx;
+}
+
+static OfortValue ofort_sorting_sorted_value(OfortInterpreter *I, OfortValue *x, int reverse) {
+    int *idx;
+    OfortValue result;
+    if (!ofort_sorting_supported_array(x))
+        ofort_error(I, "SORTED requires a rank-1 INTEGER, REAL, or CHARACTER array");
+    idx = ofort_sort_index_vector(I, x, reverse);
+    result = make_array_with_char_len_options(x->v.arr.elem_type, x->v.arr.dims, 1, 0, 1);
+    for (int i = 0; i < x->v.arr.len; i++) {
+        OfortValue elem = array_element_value(x, idx[i]);
+        ofort_assign_array_element_copy(I, &result, i, elem);
+    }
+    free(idx);
+    return result;
+}
+
+static OfortValue ofort_sorting_sort_index_value(OfortInterpreter *I, OfortValue *x, int reverse) {
+    int dims[1];
+    int *idx;
+    OfortValue result;
+    if (!ofort_sorting_supported_array(x))
+        ofort_error(I, "SORT_INDEX requires a rank-1 INTEGER, REAL, or CHARACTER array");
+    idx = ofort_sort_index_vector(I, x, reverse);
+    dims[0] = x->v.arr.len;
+    result = make_array_with_char_len_options(FVAL_INTEGER, dims, 1, 0, 1);
+    for (int i = 0; i < x->v.arr.len; i++) {
+        OfortValue elem = make_integer(idx[i] + 1);
+        ofort_assign_array_element_copy(I, &result, i, elem);
+    }
+    free(idx);
+    return result;
+}
+
+static OfortValue ofort_sorting_is_sorted_value(OfortInterpreter *I, OfortValue *x, int reverse) {
+    if (!ofort_sorting_supported_array(x))
+        ofort_error(I, "IS_SORTED requires a rank-1 INTEGER, REAL, or CHARACTER array");
+    for (int i = 1; i < x->v.arr.len; i++) {
+        if (ofort_sort_compare_indices(I, x, i - 1, i, reverse) > 0) return make_logical(0);
+    }
+    return make_logical(1);
+}
+
+static OfortValue ofort_sorting_rank_order_value(OfortInterpreter *I, OfortValue *x) {
+    int dims[1];
+    int *idx;
+    OfortValue result;
+    if (!ofort_sorting_supported_array(x))
+        ofort_error(I, "RANK_ORDER requires a rank-1 INTEGER, REAL, or CHARACTER array");
+    idx = ofort_sort_index_vector(I, x, 0);
+    dims[0] = x->v.arr.len;
+    result = make_array_with_char_len_options(FVAL_INTEGER, dims, 1, 0, 1);
+    for (int rank = 0; rank < x->v.arr.len; rank++) {
+        OfortValue elem = make_integer(rank + 1);
+        ofort_assign_array_element_copy(I, &result, idx[rank], elem);
+    }
+    free(idx);
+    return result;
+}
+
+static OfortValue ofort_sorting_unique_value(OfortInterpreter *I, OfortValue *x) {
+    OfortValue sorted;
+    OfortValue result;
+    int count = 0;
+    int dims[1];
+    if (!ofort_sorting_supported_array(x))
+        ofort_error(I, "UNIQUE requires a rank-1 INTEGER, REAL, or CHARACTER array");
+    sorted = ofort_sorting_sorted_value(I, x, 0);
+    for (int i = 0; i < sorted.v.arr.len; i++) {
+        if (i == 0 || ofort_sort_compare_indices(I, &sorted, i - 1, i, 0) != 0) count++;
+    }
+    dims[0] = count;
+    result = make_array_with_char_len_options(x->v.arr.elem_type, dims, 1, 0, 1);
+    count = 0;
+    for (int i = 0; i < sorted.v.arr.len; i++) {
+        if (i == 0 || ofort_sort_compare_indices(I, &sorted, i - 1, i, 0) != 0) {
+            OfortValue elem = array_element_value(&sorted, i);
+            ofort_assign_array_element_copy(I, &result, count++, elem);
+        }
+    }
+    free_value(&sorted);
+    return result;
+}
+
+static OfortValue call_ofort_sorting_intrinsic(OfortInterpreter *I, const char *name,
+                                               OfortValue *args, int nargs,
+                                               char arg_names[OFORT_MAX_PARAMS][256]) {
+    OfortValue *x;
+    int reverse;
+    if (nargs < 1 || nargs > 2) ofort_error(I, "%s takes array and optional reverse argument", name);
+    if (arg_names && arg_names[0][0] && !str_eq_nocase(arg_names[0], "x"))
+        ofort_error(I, "First sorting argument must be x");
+    x = &args[0];
+    reverse = ofort_sort_reverse_from_args(I, args, nargs, arg_names, 1);
+    if (str_eq_nocase(name, "sorted")) return ofort_sorting_sorted_value(I, x, reverse);
+    if (str_eq_nocase(name, "sort_index")) return ofort_sorting_sort_index_value(I, x, reverse);
+    if (str_eq_nocase(name, "is_sorted")) return ofort_sorting_is_sorted_value(I, x, reverse);
+    if (str_eq_nocase(name, "rank_order")) {
+        if (nargs != 1) ofort_error(I, "RANK_ORDER takes one array argument");
+        return ofort_sorting_rank_order_value(I, x);
+    }
+    if (str_eq_nocase(name, "unique")) {
+        if (nargs != 1) ofort_error(I, "UNIQUE takes one array argument");
+        return ofort_sorting_unique_value(I, x);
+    }
+    ofort_error(I, "Unknown sorting intrinsic '%s'", name);
+    return make_void_val();
 }
 
 static OfortValue *ofort_calc_stats_input_lvalue(OfortInterpreter *I, OfortNode *node) {
@@ -22117,6 +22644,288 @@ static OfortValue ofort_la_det(OfortInterpreter *I, OfortValue *x) {
     return make_double(det);
 }
 
+static OfortValue ofort_la_norm(OfortInterpreter *I, OfortValue *args, int nargs) {
+    OfortValue *x;
+    double ss = 0.0;
+    if (nargs != 1) ofort_error(I, "NORM takes one array argument");
+    x = &args[0];
+    if (!x || x->type != FVAL_ARRAY || (x->v.arr.n_dims != 1 && x->v.arr.n_dims != 2))
+        ofort_error(I, "NORM requires a rank-1 or rank-2 numeric array");
+    if (x->v.arr.elem_type != FVAL_REAL && x->v.arr.elem_type != FVAL_DOUBLE &&
+        x->v.arr.elem_type != FVAL_INTEGER && x->v.arr.elem_type != FVAL_COMPLEX)
+        ofort_error(I, "NORM requires a numeric array");
+    for (int i = 0; i < x->v.arr.len; i++) {
+        OfortValue elem = array_element_value(x, i);
+        double mag;
+        if (elem.type == FVAL_COMPLEX) mag = hypot(elem.v.cx.re, elem.v.cx.im);
+        else mag = val_to_real(elem);
+        ss += mag * mag;
+        free_value(&elem);
+    }
+    return make_double(sqrt(ss));
+}
+
+static OfortValue ofort_la_triangular(OfortInterpreter *I, const char *name,
+                                      OfortValue *args, int nargs) {
+    OfortValue *x;
+    OfortValue result;
+    int nrow;
+    int ncol;
+    int k = 0;
+    int upper = str_eq_nocase(name, "triu");
+    if (nargs != 1 && nargs != 2) ofort_error(I, "%s takes matrix and optional diagonal offset", name);
+    x = &args[0];
+    if (!x || x->type != FVAL_ARRAY || x->v.arr.n_dims != 2)
+        ofort_error(I, "%s requires a rank-2 array", name);
+    if (nargs == 2) k = (int)val_to_int(args[1]);
+    nrow = x->v.arr.dims[0];
+    ncol = x->v.arr.dims[1];
+    result = make_array_with_char_len_options(x->v.arr.elem_type, x->v.arr.dims, 2, 0, 1);
+    for (int j = 0; j < ncol; j++) {
+        for (int i = 0; i < nrow; i++) {
+            int keep = upper ? (j - i >= k) : (j - i <= k);
+            int idx = i + j * nrow;
+            if (keep) {
+                OfortValue elem = array_element_value(x, idx);
+                if (assign_packed_array_element(&result, idx, elem)) {
+                    free_value(&elem);
+                } else {
+                    free_value(&result.v.arr.data[idx]);
+                    result.v.arr.data[idx] = elem;
+                }
+            }
+        }
+    }
+    return result;
+}
+
+static OfortValue ofort_la_kron(OfortInterpreter *I, OfortValue *a, OfortValue *b) {
+    int ar;
+    int ac;
+    int br;
+    int bc;
+    int dims[2];
+    OfortValue result;
+    ofort_require_rank2_numeric(I, a, "KRON");
+    ofort_require_rank2_numeric(I, b, "KRON");
+    ar = a->v.arr.dims[0];
+    ac = a->v.arr.dims[1];
+    br = b->v.arr.dims[0];
+    bc = b->v.arr.dims[1];
+    dims[0] = ar * br;
+    dims[1] = ac * bc;
+    result = make_array_with_char_len_options(FVAL_DOUBLE, dims, 2, 0, 1);
+    for (int ja = 0; ja < ac; ja++) {
+        for (int ia = 0; ia < ar; ia++) {
+            double av = ofort_matrix_real_element(I, a, ia + ja * ar);
+            for (int jb = 0; jb < bc; jb++) {
+                for (int ib = 0; ib < br; ib++) {
+                    int ri = ia * br + ib;
+                    int rj = ja * bc + jb;
+                    double bv = ofort_matrix_real_element(I, b, ib + jb * br);
+                    ofort_assign_real_array_element(&result, ri + rj * dims[0], av * bv);
+                }
+            }
+        }
+    }
+    return result;
+}
+
+static int ofort_gauss_jordan_solve(double *a, double *b, int n, int nrhs, double tol) {
+    for (int k = 0; k < n; k++) {
+        int pivot_row = k;
+        double best_abs = fabs(a[k + k * n]);
+        for (int i = k + 1; i < n; i++) {
+            double pivot_abs = fabs(a[i + k * n]);
+            if (pivot_abs > best_abs) {
+                best_abs = pivot_abs;
+                pivot_row = i;
+            }
+        }
+        if (best_abs <= tol) return 0;
+        if (pivot_row != k) {
+            for (int j = 0; j < n; j++) {
+                double tmp = a[k + j * n];
+                a[k + j * n] = a[pivot_row + j * n];
+                a[pivot_row + j * n] = tmp;
+            }
+            for (int j = 0; j < nrhs; j++) {
+                double tmp = b[k + j * n];
+                b[k + j * n] = b[pivot_row + j * n];
+                b[pivot_row + j * n] = tmp;
+            }
+        }
+        {
+            double pivot = a[k + k * n];
+            for (int j = 0; j < n; j++) a[k + j * n] /= pivot;
+            for (int j = 0; j < nrhs; j++) b[k + j * n] /= pivot;
+        }
+        for (int i = 0; i < n; i++) {
+            double factor;
+            if (i == k) continue;
+            factor = a[i + k * n];
+            if (factor == 0.0) continue;
+            for (int j = 0; j < n; j++) a[i + j * n] -= factor * a[k + j * n];
+            for (int j = 0; j < nrhs; j++) b[i + j * n] -= factor * b[k + j * n];
+        }
+    }
+    return 1;
+}
+
+static OfortValue ofort_la_solve(OfortInterpreter *I, OfortValue *a_arg, OfortValue *b_arg) {
+    int n;
+    int nrhs;
+    int b_rank;
+    double *a;
+    double *b;
+    OfortValue result;
+    ofort_require_rank2_numeric(I, a_arg, "SOLVE");
+    if (a_arg->v.arr.dims[0] != a_arg->v.arr.dims[1])
+        ofort_error(I, "SOLVE requires a square coefficient matrix");
+    if (!b_arg || b_arg->type != FVAL_ARRAY || (b_arg->v.arr.n_dims != 1 && b_arg->v.arr.n_dims != 2))
+        ofort_error(I, "SOLVE requires a rank-1 or rank-2 right-hand side");
+    if (b_arg->v.arr.elem_type != FVAL_REAL && b_arg->v.arr.elem_type != FVAL_DOUBLE &&
+        b_arg->v.arr.elem_type != FVAL_INTEGER)
+        ofort_error(I, "SOLVE right-hand side must be numeric");
+    n = a_arg->v.arr.dims[0];
+    b_rank = b_arg->v.arr.n_dims;
+    if (b_arg->v.arr.dims[0] != n)
+        ofort_error(I, "SOLVE right-hand side has incompatible shape");
+    nrhs = b_rank == 1 ? 1 : b_arg->v.arr.dims[1];
+    a = (double *)malloc(sizeof(*a) * (size_t)n * (size_t)n);
+    b = (double *)malloc(sizeof(*b) * (size_t)n * (size_t)nrhs);
+    if (!a || !b) {
+        free(a);
+        free(b);
+        ofort_error(I, "Out of memory");
+    }
+    for (int idx = 0; idx < n * n; idx++) a[idx] = ofort_matrix_real_element(I, a_arg, idx);
+    for (int idx = 0; idx < n * nrhs; idx++) b[idx] = ofort_matrix_real_element(I, b_arg, idx);
+    if (!ofort_gauss_jordan_solve(a, b, n, nrhs, 1.0e-12)) {
+        free(a);
+        free(b);
+        ofort_error(I, "SOLVE matrix is singular to working precision");
+    }
+    if (b_rank == 1) {
+        int dims[1];
+        dims[0] = n;
+        result = make_array_with_char_len_options(FVAL_DOUBLE, dims, 1, 0, 1);
+    } else {
+        int dims[2];
+        dims[0] = n;
+        dims[1] = nrhs;
+        result = make_array_with_char_len_options(FVAL_DOUBLE, dims, 2, 0, 1);
+    }
+    for (int idx = 0; idx < n * nrhs; idx++) ofort_assign_real_array_element(&result, idx, b[idx]);
+    free(a);
+    free(b);
+    return result;
+}
+
+static OfortValue ofort_la_inv(OfortInterpreter *I, OfortValue *a_arg) {
+    int n;
+    int dims[2];
+    OfortValue eye;
+    ofort_require_rank2_numeric(I, a_arg, "INV");
+    if (a_arg->v.arr.dims[0] != a_arg->v.arr.dims[1])
+        ofort_error(I, "INV requires a square matrix");
+    n = a_arg->v.arr.dims[0];
+    dims[0] = n;
+    dims[1] = n;
+    eye = make_array_with_char_len_options(FVAL_DOUBLE, dims, 2, 0, 1);
+    for (int i = 0; i < n; i++) ofort_assign_real_array_element(&eye, i + i * n, 1.0);
+    return ofort_la_solve(I, a_arg, &eye);
+}
+
+static OfortValue ofort_la_rank(OfortInterpreter *I, OfortValue *x) {
+    int nrow;
+    int ncol;
+    int rank = 0;
+    int row = 0;
+    double max_abs = 0.0;
+    double tol;
+    double *a;
+    ofort_require_rank2_numeric(I, x, "RANK");
+    nrow = x->v.arr.dims[0];
+    ncol = x->v.arr.dims[1];
+    a = (double *)malloc(sizeof(*a) * (size_t)nrow * (size_t)ncol);
+    if (!a) ofort_error(I, "Out of memory");
+    for (int idx = 0; idx < nrow * ncol; idx++) {
+        a[idx] = ofort_matrix_real_element(I, x, idx);
+        if (fabs(a[idx]) > max_abs) max_abs = fabs(a[idx]);
+    }
+    tol = 1.0e-12 * (double)(nrow > ncol ? nrow : ncol) * (max_abs > 1.0 ? max_abs : 1.0);
+    for (int col = 0; col < ncol && row < nrow; col++) {
+        int pivot_row = row;
+        double best_abs = fabs(a[row + col * nrow]);
+        for (int i = row + 1; i < nrow; i++) {
+            double pivot_abs = fabs(a[i + col * nrow]);
+            if (pivot_abs > best_abs) {
+                best_abs = pivot_abs;
+                pivot_row = i;
+            }
+        }
+        if (best_abs <= tol) continue;
+        if (pivot_row != row) {
+            for (int j = col; j < ncol; j++) {
+                double tmp = a[row + j * nrow];
+                a[row + j * nrow] = a[pivot_row + j * nrow];
+                a[pivot_row + j * nrow] = tmp;
+            }
+        }
+        {
+            double pivot = a[row + col * nrow];
+            for (int j = col; j < ncol; j++) a[row + j * nrow] /= pivot;
+        }
+        for (int i = 0; i < nrow; i++) {
+            double factor;
+            if (i == row) continue;
+            factor = a[i + col * nrow];
+            if (factor == 0.0) continue;
+            for (int j = col; j < ncol; j++) a[i + j * nrow] -= factor * a[row + j * nrow];
+        }
+        row++;
+        rank++;
+    }
+    free(a);
+    return make_integer(rank);
+}
+
+static OfortValue ofort_la_chol(OfortInterpreter *I, OfortValue *x) {
+    int n;
+    OfortValue result;
+    double *l;
+    ofort_require_rank2_numeric(I, x, "CHOL");
+    if (x->v.arr.dims[0] != x->v.arr.dims[1])
+        ofort_error(I, "CHOL requires a square matrix");
+    n = x->v.arr.dims[0];
+    l = (double *)calloc((size_t)n * (size_t)n, sizeof(*l));
+    if (!l) ofort_error(I, "Out of memory");
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j <= i; j++) {
+            double sum = ofort_matrix_real_element(I, x, i + j * n);
+            for (int k = 0; k < j; k++) sum -= l[i + k * n] * l[j + k * n];
+            if (i == j) {
+                if (sum <= 0.0) {
+                    free(l);
+                    ofort_error(I, "CHOL matrix is not positive definite");
+                }
+                l[i + j * n] = sqrt(sum);
+            } else {
+                l[i + j * n] = sum / l[j + j * n];
+            }
+        }
+    }
+    result = ofort_make_double_matrix(n, n);
+    for (int j = 0; j < n; j++) {
+        for (int i = 0; i <= j; i++) {
+            ofort_assign_real_array_element(&result, i + j * n, l[j + i * n]);
+        }
+    }
+    free(l);
+    return result;
+}
+
 static OfortValue ofort_la_outer_product(OfortInterpreter *I, OfortValue *u, OfortValue *v) {
     int m;
     int n;
@@ -22196,6 +23005,32 @@ static OfortValue call_ofort_la_intrinsic(OfortInterpreter *I, const char *name,
     if (str_eq_nocase(name, "det")) {
         if (nargs != 1) ofort_error(I, "DET takes one matrix argument");
         return ofort_la_det(I, &args[0]);
+    }
+    if (str_eq_nocase(name, "norm")) {
+        return ofort_la_norm(I, args, nargs);
+    }
+    if (str_eq_nocase(name, "triu") || str_eq_nocase(name, "tril")) {
+        return ofort_la_triangular(I, name, args, nargs);
+    }
+    if (str_eq_nocase(name, "kron")) {
+        if (nargs != 2) ofort_error(I, "KRON takes two matrix arguments");
+        return ofort_la_kron(I, &args[0], &args[1]);
+    }
+    if (str_eq_nocase(name, "solve") || str_eq_nocase(name, "mldivide")) {
+        if (nargs != 2) ofort_error(I, "SOLVE takes matrix and right-hand side arguments");
+        return ofort_la_solve(I, &args[0], &args[1]);
+    }
+    if (str_eq_nocase(name, "inv")) {
+        if (nargs != 1) ofort_error(I, "INV takes one matrix argument");
+        return ofort_la_inv(I, &args[0]);
+    }
+    if (str_eq_nocase(name, "rank")) {
+        if (nargs != 1) ofort_error(I, "RANK takes one matrix argument");
+        return ofort_la_rank(I, &args[0]);
+    }
+    if (str_eq_nocase(name, "chol")) {
+        if (nargs != 1) ofort_error(I, "CHOL takes one matrix argument");
+        return ofort_la_chol(I, &args[0]);
     }
     if (str_eq_nocase(name, "outer_product")) {
         if (nargs != 2) ofort_error(I, "OUTER_PRODUCT takes two vector arguments");
@@ -22812,6 +23647,42 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
     if (!n || !find_imported_extension_intrinsic(I, n->name)) return 0;
     extension_name = resolve_imported_extension_intrinsic(I, n->name);
     if (!extension_name) extension_name = n->name;
+
+    if (str_eq_nocase(extension_name, "sort")) {
+        int x_idx = -1;
+        int reverse = 0;
+        OfortValue *target;
+        OfortValue sorted;
+        for (int i = 0; i < n->n_stmts; i++) {
+            const char *pname = n->param_names[i];
+            if (pname[0]) {
+                if (str_eq_nocase(pname, "x")) x_idx = i;
+                else if (str_eq_nocase(pname, "reverse")) {
+                    OfortValue v = eval_node(I, n->stmts[i]);
+                    reverse = val_to_logical(v);
+                    free_value(&v);
+                } else {
+                    ofort_error(I, "Unknown SORT keyword '%s'", pname);
+                }
+            }
+        }
+        if (x_idx < 0 && n->n_stmts >= 1 && n->param_names[0][0] == '\0') x_idx = 0;
+        if (x_idx < 0) ofort_error(I, "SORT requires array argument x");
+        reverse = reverse || ofort_sort_reverse_from_call(I, n, x_idx + 1);
+        if (n->stmts[x_idx]->type == FND_IDENT) {
+            OfortVar *v = find_var(I, n->stmts[x_idx]->name);
+            if (!v) ofort_error(I, "Undefined variable '%s' in SORT", n->stmts[x_idx]->name);
+            target = &v->val;
+        } else if (n->stmts[x_idx]->type == FND_MEMBER) {
+            target = member_lvalue(I, n->stmts[x_idx]);
+        } else {
+            ofort_error(I, "SORT argument must be a variable");
+        }
+        sorted = ofort_sorting_sorted_value(I, target, reverse);
+        free_value(target);
+        *target = sorted;
+        return 1;
+    }
 
     if (str_eq_nocase(extension_name, "rnorm_fill")) {
         OfortValue *target = NULL;
