@@ -1788,8 +1788,8 @@ static void set_allocate_status(OfortInterpreter *I, OfortNode *n, int stat, con
     if (n->param_names[0][0]) {
         set_var(I, n->param_names[0], make_integer(stat));
     }
-    if (n->param_names[1][0]) {
-        set_var(I, n->param_names[1], make_character(stat == 0 ? "" : (errmsg ? errmsg : "Allocation failed")));
+    if (stat != 0 && n->param_names[1][0]) {
+        set_var(I, n->param_names[1], make_character(errmsg ? errmsg : "Allocation failed"));
     }
 }
 
@@ -4936,6 +4936,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                             OfortNode *dh = parse_expr_until_colon(I);
                             if (dh->type == FND_INT_LIT) {
                                 decl->dims[dim_index] = (int)dh->int_val;
+                                if (dh->int_val <= 0 && dim_index < decl->n_stmts) decl->stmts[dim_index] = dh;
                             } else if (dim_index < decl->n_stmts) {
                                 decl->stmts[dim_index] = dh;
                                 decl->dims[dim_index] = 0;
@@ -20867,6 +20868,22 @@ unresolved_external_call_done:
                 else
                     *target = make_array(elem_type, dims, ndims);
                 set_array_lower_bounds(target, lower_bounds, ndims);
+                if (n->children[0]) {
+                    OfortValue source = eval_node(I, n->children[0]);
+                    if (source.type == FVAL_ARRAY) {
+                        int count = source.v.arr.len < target->v.arr.len ? source.v.arr.len : target->v.arr.len;
+                        for (int i = 0; i < count; i++) {
+                            free_value(&target->v.arr.data[i]);
+                            target->v.arr.data[i] = copy_value(source.v.arr.data[i]);
+                        }
+                    } else {
+                        for (int i = 0; i < target->v.arr.len; i++) {
+                            free_value(&target->v.arr.data[i]);
+                            target->v.arr.data[i] = copy_value(source);
+                        }
+                    }
+                    free_value(&source);
+                }
             } else if (n->children[1]) {
                 OfortValue mold = eval_allocate_mold_expr(I, n->children[1]);
                 if (mold.type == FVAL_ARRAY) {
