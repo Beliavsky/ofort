@@ -1,8 +1,8 @@
-/*
- * OfflinAi Fortran Interpreter — single-file implementation.
+﻿/*
+ * OfflinAi Fortran Interpreter â€” single-file implementation.
  * Lexer -> Parser -> Tree-walking interpreter.
  *
- * Supports: Fortran 90/95/2003 subset — INTEGER, REAL, DOUBLE PRECISION,
+ * Supports: Fortran 90/95/2003 subset â€” INTEGER, REAL, DOUBLE PRECISION,
  * CHARACTER, LOGICAL, COMPLEX, arrays (1-based, multi-dim, allocatable),
  * derived types, modules, subroutines, functions with INTENT/RESULT,
  * DO/DO WHILE, IF/ELSE IF/ELSE, SELECT CASE, intrinsic functions,
@@ -35,9 +35,9 @@
 #include <io.h>
 #endif
 
-/* ══════════════════════════════════════════════
+/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
  *  Interpreter state
- * ══════════════════════════════════════════════ */
+ * â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
 
 typedef struct {
     char name[256];
@@ -268,7 +268,7 @@ struct OfortInterpreter {
     OfortNode *cached_ast;
 };
 
-/* ── Forward declarations ────────────────────── */
+/* â”€â”€ Forward declarations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static char fast_local_array_cache_tag;
 static char fast_numeric_loop_plan_tag;
 static char fast_array_expr_program_tag;
@@ -479,7 +479,7 @@ static void add_line_profile_time(OfortInterpreter *I, int line, double seconds)
     I->line_profile_counts[line]++;
 }
 
-/* ── Helpers ─────────────────────────────────── */
+/* â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 
 static void copy_cstr(char *dst, size_t dst_size, const char *src) {
     size_t len;
@@ -664,7 +664,7 @@ static void ofort_warning(OfortInterpreter *I, int line, const char *fmt, ...) {
     append_source_line_to_warning(I, line);
 }
 
-/* ── String upper-case helper (for case-insensitive matching) ── */
+/* â”€â”€ String upper-case helper (for case-insensitive matching) â”€â”€ */
 static void str_upper(char *dst, const char *src, int maxlen) {
     int i;
     for (i = 0; i < maxlen - 1 && src[i]; i++)
@@ -688,7 +688,7 @@ static int name_in_list_nocase(const char *name, char names[OFORT_MAX_PARAMS][25
     return 0;
 }
 
-/* ── Value constructors ─────────────────────── */
+/* â”€â”€ Value constructors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static int make_procedure_ref_text(const char *name, char *buf, size_t buf_size) {
     const char *prefix = "__ofort_proc:";
     size_t prefix_len = strlen(prefix);
@@ -719,7 +719,7 @@ static void free_call_args(OfortValue *args, int nargs) {
     free(args);
 }
 
-/* ── Node allocation (tracked for cleanup) ───── */
+/* â”€â”€ Node allocation (tracked for cleanup) â”€â”€â”€â”€â”€ */
 static OfortNode *alloc_node(OfortInterpreter *I, OfortNodeType type) {
     OfortNode *n = (OfortNode *)calloc(1, sizeof(OfortNode));
     if (!n) ofort_error(I, "Out of memory");
@@ -733,7 +733,7 @@ static OfortNode *alloc_node(OfortInterpreter *I, OfortNodeType type) {
     return n;
 }
 
-/* ── Scope management ────────────────────────── */
+/* â”€â”€ Scope management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static OfortScope *push_scope(OfortInterpreter *I) {
     OfortScope *s = (OfortScope *)calloc(1, sizeof(OfortScope));
     s->parent = I->current_scope;
@@ -1279,7 +1279,7 @@ static OfortVar *declare_alias_value_var(OfortInterpreter *I, const char *name, 
     return v;
 }
 
-/* ── Function lookup ─────────────────────────── */
+/* â”€â”€ Function lookup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static OfortVar *declare_absent_optional_var(OfortInterpreter *I, const char *name) {
     OfortVar *v = declare_var(I, name, make_void_val());
     v->present = 0;
@@ -1730,7 +1730,7 @@ static void store_saved_vars(OfortFunc *func, OfortScope *scope) {
     }
 }
 
-/* ── Type definition lookup ──────────────────── */
+/* â”€â”€ Type definition lookup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static void copy_imported_var_attrs(OfortVar *dst, const OfortVar *src) {
     if (!dst || !src) return;
     dst->is_parameter = src->is_parameter;
@@ -1915,9 +1915,9 @@ static OfortTypeDef *find_type_def(OfortInterpreter *I, const char *name) {
     return NULL;
 }
 
-/* ══════════════════════════════════════════════
+/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
  *  LEXER
- * ══════════════════════════════════════════════ */
+ * â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
 
 typedef struct {
     const char *keyword;
@@ -2865,7 +2865,7 @@ static void tokenize(OfortInterpreter *I, const char *src) {
                 }
             }
 
-            /* check for END PROGRAM, END DO, etc. — we'll let the parser handle multi-word END */
+            /* check for END PROGRAM, END DO, etc. â€” we'll let the parser handle multi-word END */
             /* keyword lookup */
             t->type = FTOK_IDENT;
             for (int k = 0; fortran_keywords[k].keyword; k++) {
@@ -2916,7 +2916,7 @@ static void tokenize(OfortInterpreter *I, const char *src) {
             while (isalnum((unsigned char)*p) || *p == '_') p++;
             continue;
         }
-        /* array constructor (/ ... /) — bracket form */
+        /* array constructor (/ ... /) â€” bracket form */
         if (*p == '(' && *(p+1) == '/') {
             t->type = FTOK_LBRACKET; t->length = 2; p += 2;
             I->n_tokens++; continue;
@@ -2960,9 +2960,9 @@ static void tokenize(OfortInterpreter *I, const char *src) {
     t->line = line;
 }
 
-/* ══════════════════════════════════════════════
+/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
  *  PARSER
- * ══════════════════════════════════════════════ */
+ * â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
 
 static OfortToken *peek(OfortInterpreter *I) {
     return &I->tokens[I->tok_pos];
@@ -3719,7 +3719,7 @@ static void apply_pending_construct_name(OfortInterpreter *I, OfortNode *n) {
     }
 }
 
-/* ── Expression parsing (precedence climbing) ── */
+/* â”€â”€ Expression parsing (precedence climbing) â”€â”€ */
 static OfortNode *parse_expr(OfortInterpreter *I);
 static OfortNode *parse_statement(OfortInterpreter *I);
 
@@ -4031,7 +4031,7 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         advance(I);
         return parse_unary(I);
     }
-    /* identifier — could be variable, function call, or array ref */
+    /* identifier â€” could be variable, function call, or array ref */
     if (t->type == FTOK_IDENT && peek_ahead(I, 1)->type == FTOK_STRING_LIT) {
         size_t idlen = strlen(t->str_val);
         if (idlen > 1 && t->str_val[idlen - 1] == '_') {
@@ -4405,7 +4405,7 @@ static OfortNode *parse_expr_until_colon(OfortInterpreter *I) {
     return n;
 }
 
-/* ── Type keyword checking ──────────────────── */
+/* â”€â”€ Type keyword checking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static int is_type_keyword(OfortTokenType t) {
     return t == FTOK_INTEGER || t == FTOK_REAL || t == FTOK_DOUBLE_PRECISION ||
            t == FTOK_CHARACTER || t == FTOK_LOGICAL || t == FTOK_COMPLEX;
@@ -4501,7 +4501,7 @@ static int parse_kind_selector_ex(OfortInterpreter *I, OfortNode **kind_expr_out
 }
 
 
-/* ── Declaration parsing ────────────────────── */
+/* â”€â”€ Declaration parsing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static int int_constant_node(OfortNode *n, int *value) {
     if (!n || !value) return 0;
     if (n->type == FND_INT_LIT) {
@@ -5016,7 +5016,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
     return block;
 }
 
-/* ── Statement parsing ──────────────────────── */
+/* â”€â”€ Statement parsing â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static OfortNode *parse_block_until_end(OfortInterpreter *I, const char *end_keyword);
 static OfortNode *parse_block_until_label(OfortInterpreter *I, long long terminal_label);
 
@@ -8808,14 +8808,14 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return parse_bind_statement(I);
     }
 
-    /* END (bare) — shouldn't be reached normally */
+    /* END (bare) â€” shouldn't be reached normally */
     if (t->type == FTOK_END) {
         I->consumed_bare_end = 1;
         skip_to_next_line(I);
         return NULL;
     }
 
-    /* DATA statement: DATA var /value/ — simplified */
+    /* DATA statement: DATA var /value/ â€” simplified */
     if (t->type == FTOK_DATA && data_statement_follows(I)) {
         return parse_data_statement(I);
     }
@@ -9083,9 +9083,9 @@ static OfortNode *parse_program(OfortInterpreter *I) {
     return prog;
 }
 
-/* ══════════════════════════════════════════════
+/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
  *  EVALUATOR
- * ══════════════════════════════════════════════ */
+ * â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
 
 static OfortValue default_value(OfortValType vtype, int char_len) {
     switch (vtype) {
@@ -14058,7 +14058,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 result.pointer_slice_stride = rv->pointer_slice_stride ? rv->pointer_slice_stride : 1;
             }
 
-            /* Handle INTENT(OUT/INOUT) — copy back */
+            /* Handle INTENT(OUT/INOUT) â€” copy back */
             for (int i = 0; i < fn->n_params && i < nargs; i++) {
                 if (fn->param_intents[i] == 2 || fn->param_intents[i] == 3) {
                     OfortVar *pv = find_var(I, fn->param_names[i]);
@@ -20556,7 +20556,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int nargs = n->n_stmts;
 
         /* Check for intrinsic subroutines */
-        /* (none currently — user subroutines only) */
+        /* (none currently â€” user subroutines only) */
 
         if (nargs > OFORT_MAX_PARAMS) too_many_params_error(I, "subroutine call arguments");
         OfortValue *args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
@@ -20688,7 +20688,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
         }
 
-        /* Handle INTENT(OUT/INOUT) — copy back */
+        /* Handle INTENT(OUT/INOUT) â€” copy back */
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             if (!arg_alias[i] && fn->param_intents[i] != 1) {
                 if (procedure_ref_name(&args[i])) continue;
@@ -20932,7 +20932,7 @@ unresolved_external_call_done:
                 free_value(&source);
             } else {
                 OfortValType target_type = n->val_type != FVAL_VOID ? n->val_type : target->type;
-                if (target->type == FVAL_VOID && target_type != FVAL_DERIVED)
+                if (target->type == FVAL_VOID && target_type == FVAL_VOID)
                     ofort_error(I, "ALLOCATE component target has no declared type");
                 int char_len = 1;
                 if (target_type == FVAL_CHARACTER) {
@@ -21281,9 +21281,9 @@ unresolved_external_call_done:
     }
 }
 
-/* ══════════════════════════════════════════════
+/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
  *  INTRINSIC FUNCTIONS
- * ══════════════════════════════════════════════ */
+ * â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
 
 static const char *intrinsic_names[] = {
     /* Math */
@@ -27644,9 +27644,9 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     return make_void_val();
 }
 
-/* ══════════════════════════════════════════════
+/* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
  *  PUBLIC API
- * ══════════════════════════════════════════════ */
+ * â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
 
 OfortInterpreter *ofort_create(void) {
     OfortInterpreter *I = (OfortInterpreter *)calloc(1, sizeof(OfortInterpreter));
