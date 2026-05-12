@@ -9475,6 +9475,29 @@ static OfortValue *member_lvalue(OfortInterpreter *I, OfortNode *n) {
         int subscripts[7];
         int index;
         if (!arr || arr->type != FVAL_ARRAY) ofort_error(I, "Array reference target is not an array");
+        if (arr->is_pointer_ref && arr->pointer_target[0] && arr->v.arr.n_dims == 1 && n->n_stmts == 1) {
+            OfortSubscriptRange prange;
+            if (!eval_subscript_range(I, n->stmts[0], arr->v.arr.lower_bounds[0], arr->v.arr.dims[0], &prange)) {
+                int psubs[1] = { prange.start };
+                int pidx = section_linear_index(arr, psubs, 1);
+                int target_sub = prange.start;
+                OfortVar *target_var = find_var(I, arr->pointer_target);
+                int tidx;
+                if (!target_var || target_var->val.type != FVAL_ARRAY)
+                    ofort_error(I, "Pointer target is not an array");
+                if (arr->pointer_has_slice)
+                    target_sub = arr->pointer_slice_start + pidx * (arr->pointer_slice_stride ? arr->pointer_slice_stride : 1);
+                {
+                    int tsubs[1] = { target_sub };
+                    tidx = section_linear_index(&target_var->val, tsubs, 1);
+                }
+                if (pidx < 0 || pidx >= arr->v.arr.len ||
+                    tidx < 0 || tidx >= target_var->val.v.arr.len)
+                    ofort_error(I, "Array index out of bounds");
+                if (!target_var->val.v.arr.data) return NULL;
+                return &target_var->val.v.arr.data[tidx];
+            }
+        }
         for (int i = 0; i < n->n_stmts; i++) {
             int extent = i < arr->v.arr.n_dims ? arr->v.arr.dims[i] : arr->v.arr.len;
             int lower = i < arr->v.arr.n_dims ? arr->v.arr.lower_bounds[i] : 1;
@@ -19073,8 +19096,23 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 if (target->type == FVAL_ARRAY) {
                     if (rhs.type == FVAL_ARRAY) {
-                        if (rhs.v.arr.len != target->v.arr.len)
-                            ofort_error(I, "Array assignment shape mismatch");
+                        if (!target->v.arr.allocated || rhs.v.arr.len != target->v.arr.len) {
+                            OfortValType elem_type = target->v.arr.elem_type != FVAL_VOID ?
+                                                     target->v.arr.elem_type : rhs.v.arr.elem_type;
+                            int n_dims = rhs.v.arr.n_dims;
+                            char elem_type_name[64];
+                            copy_cstr(elem_type_name, sizeof(elem_type_name), target->v.arr.elem_type_name);
+                            free_value(target);
+                            *target = copy_value(rhs);
+                            target->v.arr.elem_type = elem_type;
+                            target->v.arr.allocated = 1;
+                            if (!target->v.arr.elem_type_name[0] && elem_type_name[0])
+                                copy_cstr(target->v.arr.elem_type_name, sizeof(target->v.arr.elem_type_name), elem_type_name);
+                            if (n_dims > 0) target->v.arr.n_dims = n_dims;
+                            trace_assignment_value(I, lhs, rhs);
+                            free_value(&rhs);
+                            break;
+                        }
                         for (int i = 0; i < target->v.arr.len; i++) {
                             OfortValue elem = array_element_value(&rhs, i);
                             if (target->v.arr.data && target->v.arr.data[i].kind > 0 && is_numeric_type(elem.type))
@@ -20597,16 +20635,35 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             OfortVar *pv = find_var(I, fn->param_names[i]);
-            if (!pv || !pv->is_pointer || !pv->pointer_associated || !pv->pointer_target[0]) continue;
-            for (int j = 0; j < fn->n_params && j < nargs; j++) {
-                if (!str_eq_nocase(pv->pointer_target, fn->param_names[j])) continue;
-                if (n->stmts[j]->type != FND_IDENT) continue;
-                copy_cstr(pv->pointer_target, sizeof(pv->pointer_target), n->stmts[j]->name);
-                free_value(&pv->val);
-                pv->val = pointer_referenced_value(I, pv->pointer_target, pv->pointer_has_slice,
-                                                    pv->pointer_slice_start, pv->pointer_slice_end,
-                                                    pv->pointer_slice_stride);
-                break;
+            OfortValue *vals[OFORT_MAX_FIELDS + 1];
+            int n_vals = 0;
+            if (!pv) continue;
+            vals[n_vals++] = &pv->val;
+            if (pv->val.type == FVAL_DERIVED) {
+                for (int fi = 0; fi < pv->val.v.dt.n_fields && n_vals < OFORT_MAX_FIELDS + 1; fi++)
+                    vals[n_vals++] = &pv->val.v.dt.fields[fi];
+            }
+            for (int vi = 0; vi < n_vals; vi++) {
+                OfortValue *val = vals[vi];
+                if (!val->is_pointer_ref || !val->pointer_target[0]) continue;
+                for (int j = 0; j < fn->n_params && j < nargs; j++) {
+                    if (!str_eq_nocase(val->pointer_target, fn->param_names[j])) continue;
+                    if (n->stmts[j]->type != FND_IDENT) continue;
+                    copy_cstr(val->pointer_target, sizeof(val->pointer_target), n->stmts[j]->name);
+                    break;
+                }
+            }
+            if (pv->is_pointer && pv->pointer_associated && pv->pointer_target[0]) {
+                for (int j = 0; j < fn->n_params && j < nargs; j++) {
+                    if (!str_eq_nocase(pv->pointer_target, fn->param_names[j])) continue;
+                    if (n->stmts[j]->type != FND_IDENT) continue;
+                    copy_cstr(pv->pointer_target, sizeof(pv->pointer_target), n->stmts[j]->name);
+                    free_value(&pv->val);
+                    pv->val = pointer_referenced_value(I, pv->pointer_target, pv->pointer_has_slice,
+                                                        pv->pointer_slice_start, pv->pointer_slice_end,
+                                                        pv->pointer_slice_stride);
+                    break;
+                }
             }
         }
 
