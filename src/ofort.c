@@ -7777,6 +7777,8 @@ static OfortNode *parse_allocate(OfortInterpreter *I) {
 static OfortNode *parse_deallocate(OfortInterpreter *I) {
     OfortToken *dt = advance(I); /* DEALLOCATE */
     OfortNode *block = alloc_node(I, FND_BLOCK);
+    char stat_name[256] = "";
+    char errmsg_name[256] = "";
     int cap = 0;
     block->line = dt->line;
     expect(I, FTOK_LPAREN);
@@ -7784,8 +7786,14 @@ static OfortNode *parse_deallocate(OfortInterpreter *I) {
         if (check_keyword_arg(I)) {
             const char *name = token_arg_name(advance(I));
             advance(I); /* = */
-            if (str_eq_nocase(name, "stat") || str_eq_nocase(name, "errmsg")) {
-                parse_expr(I);
+            if (str_eq_nocase(name, "stat")) {
+                OfortNode *stat_expr = parse_expr(I);
+                if (stat_expr && stat_expr->type == FND_IDENT)
+                    copy_cstr(stat_name, sizeof(stat_name), stat_expr->name);
+            } else if (str_eq_nocase(name, "errmsg")) {
+                OfortNode *errmsg_expr = parse_expr(I);
+                if (errmsg_expr && errmsg_expr->type == FND_IDENT)
+                    copy_cstr(errmsg_name, sizeof(errmsg_name), errmsg_expr->name);
             } else {
                 parse_expr(I);
             }
@@ -7811,6 +7819,13 @@ static OfortNode *parse_deallocate(OfortInterpreter *I) {
         else break;
     }
     expect(I, FTOK_RPAREN);
+    if (stat_name[0] || errmsg_name[0]) {
+        for (int i = 0; i < block->n_stmts; i++) {
+            OfortNode *n = block->stmts[i];
+            if (stat_name[0]) copy_cstr(n->param_names[0], sizeof(n->param_names[0]), stat_name);
+            if (errmsg_name[0]) copy_cstr(n->param_names[1], sizeof(n->param_names[1]), errmsg_name);
+        }
+    }
     return block;
 }
 
@@ -20864,16 +20879,27 @@ unresolved_external_call_done:
         }
         OfortVar *var = find_var(I, n->name);
         if (!var) ofort_error(I, "Variable '%s' not found for DEALLOCATE", n->name);
+        if ((var->is_allocatable || var->is_pointer) &&
+            ((var->val.type == FVAL_ARRAY && !var->val.v.arr.allocated) ||
+             (var->val.type != FVAL_ARRAY && !var->scalar_allocated))) {
+            if (n->param_names[0][0]) {
+                set_allocate_status(I, n, 1, "Attempt to deallocate an unallocated object");
+                break;
+            }
+            ofort_error(I, "Attempting to deallocate unallocated variable '%s'", n->name);
+        }
         if (var->is_allocatable && var->val.type != FVAL_ARRAY) {
             free_value(&var->val);
             var->val = make_void_val();
             var->scalar_allocated = 0;
             if (var->is_pointer) var->pointer_associated = 0;
+            set_allocate_status(I, n, 0, "");
             break;
         }
         if (var->val.type == FVAL_DERIVED && (var->is_pointer || var->is_allocatable)) {
             if (var->is_pointer) var->pointer_associated = 0;
             var->scalar_allocated = 0;
+            set_allocate_status(I, n, 0, "");
             break;
         }
         free_value(&var->val);
@@ -20881,6 +20907,7 @@ unresolved_external_call_done:
         memset(&var->val.v.arr, 0, sizeof(var->val.v.arr));
         var->val.v.arr.allocated = 0;
         var->scalar_allocated = 0;
+        set_allocate_status(I, n, 0, "");
         break;
     }
 
