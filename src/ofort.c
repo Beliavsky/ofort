@@ -20063,47 +20063,67 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             break;
         }
         if (strcmp(call_upper, "MOVE_ALLOC") == 0) {
-            OfortVar *from_var;
-            OfortVar *to_var;
+            OfortVar *from_var = NULL;
+            OfortVar *to_var = NULL;
+            OfortValue *from_val = NULL;
+            OfortValue *to_val = NULL;
             OfortValue moved;
             OfortValue from_placeholder;
-            if (n->n_stmts != 2 || n->stmts[0]->type != FND_IDENT || n->stmts[1]->type != FND_IDENT)
+            if (n->n_stmts != 2)
                 ofort_error(I, "MOVE_ALLOC requires two variable arguments");
-            from_var = find_var(I, n->stmts[0]->name);
-            to_var = find_var(I, n->stmts[1]->name);
-            if (!from_var)
-                ofort_error(I, "Undefined variable '%s' in MOVE_ALLOC", n->stmts[0]->name);
-            if (!to_var)
-                ofort_error(I, "Undefined variable '%s' in MOVE_ALLOC", n->stmts[1]->name);
-            if (!from_var->is_allocatable || !to_var->is_allocatable)
-                ofort_error(I, "MOVE_ALLOC arguments must be allocatable");
+            if (n->stmts[0]->type == FND_IDENT) {
+                from_var = find_var(I, n->stmts[0]->name);
+                if (!from_var)
+                    ofort_error(I, "Undefined variable '%s' in MOVE_ALLOC", n->stmts[0]->name);
+                if (!from_var->is_allocatable)
+                    ofort_error(I, "MOVE_ALLOC arguments must be allocatable");
+                from_val = &from_var->val;
+            } else if (n->stmts[0]->type == FND_MEMBER) {
+                from_val = member_lvalue(I, n->stmts[0]);
+            } else {
+                ofort_error(I, "MOVE_ALLOC requires two variable arguments");
+            }
+            if (n->stmts[1]->type == FND_IDENT) {
+                to_var = find_var(I, n->stmts[1]->name);
+                if (!to_var)
+                    ofort_error(I, "Undefined variable '%s' in MOVE_ALLOC", n->stmts[1]->name);
+                if (!to_var->is_allocatable)
+                    ofort_error(I, "MOVE_ALLOC arguments must be allocatable");
+                to_val = &to_var->val;
+            } else if (n->stmts[1]->type == FND_MEMBER) {
+                to_val = member_lvalue(I, n->stmts[1]);
+            } else {
+                ofort_error(I, "MOVE_ALLOC requires two variable arguments");
+            }
+            if (!from_val || !to_val)
+                ofort_error(I, "MOVE_ALLOC arguments must be variables");
 
-            if (from_var->val.type == FVAL_ARRAY) {
-                int was_allocated = from_var->val.v.arr.allocated;
-                OfortValType elem_type = from_var->val.v.arr.elem_type;
-                int n_dims = from_var->val.v.arr.n_dims;
+            if (from_val->type == FVAL_ARRAY) {
+                int was_allocated = from_val->v.arr.allocated;
+                OfortValType elem_type = from_val->v.arr.elem_type;
+                int n_dims = from_val->v.arr.n_dims;
                 char elem_type_name[64];
                 int lower_bounds[7];
                 int dims[7];
-                copy_cstr(elem_type_name, sizeof(elem_type_name), from_var->val.v.arr.elem_type_name);
+                copy_cstr(elem_type_name, sizeof(elem_type_name), from_val->v.arr.elem_type_name);
                 for (int i = 0; i < 7; i++) {
-                    lower_bounds[i] = from_var->val.v.arr.lower_bounds[i];
+                    lower_bounds[i] = from_val->v.arr.lower_bounds[i];
                     dims[i] = 0;
                 }
-                moved = from_var->val;
-                free_value(&to_var->val);
+                moved = *from_val;
+                free_value(to_val);
                 if (was_allocated) {
-                    to_var->val = moved;
-                    to_var->scalar_allocated = 0;
+                    *to_val = moved;
+                    if (to_var) to_var->scalar_allocated = 0;
                 } else {
-                    to_var->val.type = FVAL_ARRAY;
-                    memset(&to_var->val.v.arr, 0, sizeof(to_var->val.v.arr));
-                    to_var->val.v.arr.elem_type = elem_type;
-                    to_var->val.v.arr.n_dims = n_dims;
-                    to_var->val.v.arr.allocated = 0;
-                    copy_cstr(to_var->val.v.arr.elem_type_name, sizeof(to_var->val.v.arr.elem_type_name), elem_type_name);
-                    for (int i = 0; i < n_dims && i < 7; i++) to_var->val.v.arr.lower_bounds[i] = lower_bounds[i] ? lower_bounds[i] : 1;
-                    to_var->scalar_allocated = 0;
+                    to_val->type = FVAL_ARRAY;
+                    memset(&to_val->v.arr, 0, sizeof(to_val->v.arr));
+                    to_val->v.arr.elem_type = elem_type;
+                    to_val->v.arr.n_dims = n_dims;
+                    to_val->v.arr.allocated = 0;
+                    copy_cstr(to_val->v.arr.elem_type_name, sizeof(to_val->v.arr.elem_type_name), elem_type_name);
+                    for (int i = 0; i < n_dims && i < 7; i++) to_val->v.arr.lower_bounds[i] = lower_bounds[i] ? lower_bounds[i] : 1;
+                    if (to_var) to_var->scalar_allocated = 0;
                 }
                 from_placeholder.type = FVAL_ARRAY;
                 memset(&from_placeholder.v.arr, 0, sizeof(from_placeholder.v.arr));
@@ -20115,22 +20135,22 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     from_placeholder.v.arr.dims[i] = dims[i];
                     from_placeholder.v.arr.lower_bounds[i] = lower_bounds[i] ? lower_bounds[i] : 1;
                 }
-                from_var->val = from_placeholder;
-                from_var->scalar_allocated = 0;
+                *from_val = from_placeholder;
+                if (from_var) from_var->scalar_allocated = 0;
             } else {
-                int was_allocated = from_var->scalar_allocated;
-                moved = from_var->val;
-                free_value(&to_var->val);
+                int was_allocated = from_var ? from_var->scalar_allocated : from_val->type != FVAL_VOID;
+                moved = *from_val;
+                free_value(to_val);
                 if (was_allocated) {
-                    to_var->val = moved;
-                    to_var->scalar_allocated = 1;
+                    *to_val = moved;
+                    if (to_var) to_var->scalar_allocated = 1;
                 } else {
-                    to_var->val = make_void_val();
-                    to_var->scalar_allocated = 0;
+                    *to_val = make_void_val();
+                    if (to_var) to_var->scalar_allocated = 0;
                     free_value(&moved);
                 }
-                from_var->val = make_void_val();
-                from_var->scalar_allocated = 0;
+                *from_val = make_void_val();
+                if (from_var) from_var->scalar_allocated = 0;
             }
             break;
         }
