@@ -9245,7 +9245,21 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
         if (field_char_len >= OFORT_MAX_STRLEN) field_char_len = OFORT_MAX_STRLEN - 1;
         resolve_type_field_shape(I, td, i, field_dims, field_lower_bounds);
         copy_cstr(v.v.dt.field_names[i], sizeof(v.v.dt.field_names[i]), td->field_names[i]);
-        if (td->field_is_allocatable[i]) {
+        if ((td->field_is_allocatable[i] || td->field_is_pointer[i]) && td->field_n_dims[i] > 0) {
+            v.v.dt.fields[i].type = FVAL_ARRAY;
+            memset(&v.v.dt.fields[i].v.arr, 0, sizeof(v.v.dt.fields[i].v.arr));
+            v.v.dt.fields[i].v.arr.elem_type = field_type;
+            v.v.dt.fields[i].v.arr.n_dims = td->field_n_dims[i];
+            for (int d = 0; d < td->field_n_dims[i] && d < 7; d++) {
+                v.v.dt.fields[i].v.arr.dims[d] = 0;
+                v.v.dt.fields[i].v.arr.lower_bounds[d] = 1;
+            }
+            if (field_type == FVAL_DERIVED && td->field_type_names[i][0])
+                copy_cstr(v.v.dt.fields[i].v.arr.elem_type_name,
+                          sizeof(v.v.dt.fields[i].v.arr.elem_type_name),
+                          td->field_type_names[i]);
+            v.v.dt.fields[i].v.arr.allocated = 0;
+        } else if (td->field_is_allocatable[i]) {
             if (td->field_n_dims[i] > 0) {
                 v.v.dt.fields[i].type = FVAL_ARRAY;
                 memset(&v.v.dt.fields[i].v.arr, 0, sizeof(v.v.dt.fields[i].v.arr));
@@ -13148,6 +13162,10 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         }
         if (v->is_pointer) {
             if (!v->pointer_associated && v->val.type == FVAL_VOID) return make_void_val();
+            if (v->pointer_associated && v->pointer_target[0])
+                return pointer_referenced_value(I, v->pointer_target, v->pointer_has_slice,
+                                                v->pointer_slice_start, v->pointer_slice_end,
+                                                v->pointer_slice_stride);
             return copy_value(v->val);
         }
         if (I->strict_uninitialized && !v->is_initialized) {
@@ -20651,6 +20669,13 @@ unresolved_external_call_done:
         if (n->children[OFORT_ALLOC_TARGET_CHILD]) {
         OfortValue *target = member_lvalue(I, n->children[OFORT_ALLOC_TARGET_CHILD]);
             if (!target) ofort_error(I, "ALLOCATE target not found");
+            if (target->type == FVAL_ARRAY && target->v.arr.allocated) {
+                if (n->param_names[0][0]) {
+                    set_allocate_status(I, n, 5014, "Attempt to allocate an allocated object");
+                    break;
+                }
+                ofort_error(I, "Attempting to allocate already allocated component");
+            }
             int dims[7];
             int lower_bounds[7];
             int ndims = n->n_stmts;
@@ -20713,7 +20738,10 @@ unresolved_external_call_done:
                         lower_bounds[i] = mold.v.arr.lower_bounds[i];
                     }
                     free_value(target);
-                    *target = make_array(elem_type, dims, ndims);
+                    if (elem_type == FVAL_CHARACTER)
+                        *target = make_array_with_char_len(elem_type, dims, ndims, alloc_char_len);
+                    else
+                        *target = make_array(elem_type, dims, ndims);
                     set_array_lower_bounds(target, lower_bounds, ndims);
                 } else {
                     free_value(target);
@@ -20740,6 +20768,7 @@ unresolved_external_call_done:
                 else
                     *target = default_value(target_type, char_len);
             }
+            set_allocate_status(I, n, 0, "");
             break;
         }
         OfortVar *var = find_var(I, n->name);
@@ -20909,8 +20938,17 @@ unresolved_external_call_done:
         if (n->children[OFORT_ALLOC_TARGET_CHILD]) {
             OfortValue *target = member_lvalue(I, n->children[OFORT_ALLOC_TARGET_CHILD]);
             if (!target) ofort_error(I, "DEALLOCATE target not found");
+            if ((target->type == FVAL_ARRAY && !target->v.arr.allocated) ||
+                target->type == FVAL_VOID) {
+                if (n->param_names[0][0]) {
+                    set_allocate_status(I, n, 1, "Attempt to deallocate an unallocated object");
+                    break;
+                }
+                ofort_error(I, "Attempting to deallocate unallocated component");
+            }
             free_value(target);
             *target = make_void_val();
+            set_allocate_status(I, n, 0, "");
             break;
         }
         OfortVar *var = find_var(I, n->name);
