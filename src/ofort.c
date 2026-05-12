@@ -3984,6 +3984,17 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
             }
             if (has_type_spec) {
                 n->has_explicit_result_type = 1;
+                {
+                    int scan = I->tok_pos;
+                    while (scan < I->n_tokens && I->tokens[scan].type != FTOK_DCOLON &&
+                           I->tokens[scan].type != FTOK_RBRACKET && I->tokens[scan].type != FTOK_EOF) {
+                        if (I->tokens[scan].type == FTOK_INT_LIT) {
+                            n->char_len = (int)I->tokens[scan].int_val;
+                            break;
+                        }
+                        scan++;
+                    }
+                }
                 while (!check(I, FTOK_DCOLON) && !check(I, FTOK_RBRACKET) && !check(I, FTOK_EOF)) {
                     advance(I);
                 }
@@ -9928,6 +9939,7 @@ static OfortValue make_array_with_char_len_options(OfortValType elem_type, int *
     v.v.arr.len = total;
     v.v.arr.cap = total;
     v.v.arr.elem_type = elem_type;
+    if (elem_type == FVAL_CHARACTER && char_len > 0) v.kind = char_len;
     v.v.arr.allocated = 1;
     if (defer_numeric_tags && can_pack_numeric_array(elem_type)) {
         if (elem_type == FVAL_INTEGER) {
@@ -9973,6 +9985,16 @@ static OfortValue make_array_with_char_len_options(OfortValType elem_type, int *
 
 static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, int n_dims, int char_len) {
     return make_array_with_char_len_options(elem_type, dims, n_dims, char_len, 0);
+}
+
+static int array_character_len(const OfortValue *v) {
+    if (!v || v->type != FVAL_ARRAY || v->v.arr.elem_type != FVAL_CHARACTER) return 0;
+    if (v->kind > 0) return v->kind;
+    if (v->v.arr.data && v->v.arr.len > 0 && v->v.arr.data[0].type == FVAL_CHARACTER &&
+        v->v.arr.data[0].v.s) {
+        return (int)strlen(v->v.arr.data[0].v.s);
+    }
+    return 0;
 }
 
 static void set_array_lower_bounds(OfortValue *arr, int *lower_bounds, int n_dims) {
@@ -10022,6 +10044,13 @@ static OfortValue eval_inquiry_intrinsic_for_ident(OfortInterpreter *I, OfortNod
 
     if (str_eq_nocase(name, "kind")) {
         return make_integer(value_declared_kind(val));
+    }
+
+    if (str_eq_nocase(name, "len")) {
+        if (val && val->type == FVAL_ARRAY && val->v.arr.elem_type == FVAL_CHARACTER) {
+            int char_len = var->char_len > 0 ? var->char_len : array_character_len(val);
+            return make_integer(char_len > 0 ? char_len : 1);
+        }
     }
 
     if (str_eq_nocase(name, "rank")) {
@@ -13832,7 +13861,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             }
         }
 
-        if ((str_eq_nocase(n->name, "kind") || str_eq_nocase(n->name, "size") ||
+        if ((str_eq_nocase(n->name, "kind") || str_eq_nocase(n->name, "len") ||
+             str_eq_nocase(n->name, "size") ||
              str_eq_nocase(n->name, "lbound") || str_eq_nocase(n->name, "ubound") ||
              str_eq_nocase(n->name, "shape") || str_eq_nocase(n->name, "rank")) &&
             !find_imported_extension_intrinsic(I, n->name) &&
@@ -14211,6 +14241,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         int char_len = 1;
         if (nelem > 0) etype = elems[0].type;
         if (etype == FVAL_CHARACTER && elems[0].v.s) char_len = (int)strlen(elems[0].v.s);
+        if (etype == FVAL_CHARACTER && n->has_explicit_result_type && n->char_len > 0) char_len = n->char_len;
         if (n->line > 0 && !n->has_explicit_result_type && etype == FVAL_CHARACTER) {
             for (int i = 1; i < nelem; i++) {
                 int elem_len = elems[i].type == FVAL_CHARACTER && elems[i].v.s ? (int)strlen(elems[i].v.s) : 0;
@@ -14223,6 +14254,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         OfortValue arr = make_array_with_char_len(etype, dims, 1, char_len);
         for (int i = 0; i < nelem; i++) {
             free_value(&arr.v.arr.data[i]);
+            if (etype == FVAL_CHARACTER) elems[i] = resize_character_value(elems[i], char_len);
             arr.v.arr.data[i] = elems[i];
         }
         free(elems);
@@ -20675,6 +20707,7 @@ unresolved_external_call_done:
                 if (mold.type == FVAL_ARRAY) {
                     ndims = mold.v.arr.n_dims;
                     elem_type = mold.v.arr.elem_type;
+                    if (elem_type == FVAL_CHARACTER) alloc_char_len = array_character_len(&mold);
                     for (int i = 0; i < ndims; i++) {
                         dims[i] = mold.v.arr.dims[i];
                         lower_bounds[i] = mold.v.arr.lower_bounds[i];
@@ -20809,6 +20842,7 @@ unresolved_external_call_done:
                 ofort_error(I, "ALLOCATE MOLD must be an array");
             ndims = mold.v.arr.n_dims;
             elem_type = mold.v.arr.elem_type;
+            if (elem_type == FVAL_CHARACTER) alloc_char_len = array_character_len(&mold);
             for (int i = 0; i < ndims; i++) {
                 dims[i] = mold.v.arr.dims[i];
                 lower_bounds[i] = mold.v.arr.lower_bounds[i];
@@ -20819,6 +20853,7 @@ unresolved_external_call_done:
             if (source.type == FVAL_ARRAY) {
                 ndims = source.v.arr.n_dims;
                 elem_type = source.v.arr.elem_type;
+                if (elem_type == FVAL_CHARACTER) alloc_char_len = array_character_len(&source);
                 for (int i = 0; i < ndims; i++) {
                     dims[i] = source.v.arr.dims[i];
                     lower_bounds[i] = source.v.arr.lower_bounds[i];
@@ -20843,10 +20878,11 @@ unresolved_external_call_done:
         free_value(&var->val);
         if (elem_type == FVAL_DERIVED && elem_type_name[0])
             var->val = make_derived_array(I, elem_type_name, dims, ndims);
-        else if (elem_type == FVAL_CHARACTER && explicit_type == FVAL_CHARACTER)
+        else if (elem_type == FVAL_CHARACTER)
             var->val = make_array_with_char_len(elem_type, dims, ndims, alloc_char_len);
         else
             var->val = make_array(elem_type, dims, ndims);
+        if (elem_type == FVAL_CHARACTER) var->char_len = alloc_char_len;
         var->scalar_allocated = 0;
         set_array_lower_bounds(&var->val, lower_bounds, ndims);
         if (n->children[0]) {
@@ -25634,6 +25670,8 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     /* === String intrinsics === */
     if (strcmp(upper, "LEN") == 0) {
         if (args[0].type == FVAL_ARRAY && args[0].v.arr.elem_type == FVAL_CHARACTER) {
+            int declared_len = array_character_len(&args[0]);
+            if (declared_len > 0) return make_integer(declared_len);
             if (args[0].v.arr.len > 0) {
                 OfortValue elem = array_element_value(&args[0], 0);
                 long long len = (elem.type == FVAL_CHARACTER && elem.v.s) ? (long long)strlen(elem.v.s) : 0;
