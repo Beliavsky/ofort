@@ -7018,6 +7018,110 @@ static OfortNode *parse_module(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_enum_bind_c(OfortInterpreter *I) {
+    OfortToken *et = advance(I); /* ENUM */
+    OfortNode *block = alloc_node(I, FND_ENUM);
+    int cap = 0;
+    long long next_value = 0;
+    block->line = et->line;
+    block->stmts = NULL;
+    block->n_stmts = 0;
+
+    while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) advance(I);
+    skip_newlines(I);
+
+    while (!check_end(I, "ENUM") && !check(I, FTOK_EOF)) {
+        if (token_ident_upper(peek(I), "ENUMERATOR")) {
+            advance(I);
+            if (check(I, FTOK_DCOLON)) advance(I);
+            while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+                OfortToken *name_tok;
+                OfortNode *param;
+                if (check(I, FTOK_COMMA)) {
+                    advance(I);
+                    continue;
+                }
+                if (!token_can_be_name(peek(I))) expect(I, FTOK_IDENT);
+                name_tok = advance(I);
+                param = alloc_node(I, FND_PARAMDECL);
+                copy_cstr(param->name, sizeof(param->name), token_name_text(name_tok));
+                param->line = name_tok->line;
+                param->val_type = FVAL_INTEGER;
+                param->is_parameter = 1;
+                if (check(I, FTOK_ASSIGN)) {
+                    OfortValue v;
+                    advance(I);
+                    param->children[0] = parse_expr(I);
+                    param->n_children = 1;
+                    v = eval_node(I, param->children[0]);
+                    next_value = val_to_int(v);
+                    free_value(&v);
+                } else {
+                    param->children[0] = alloc_node(I, FND_INT_LIT);
+                    param->children[0]->int_val = next_value;
+                    param->children[0]->line = name_tok->line;
+                    param->n_children = 1;
+                }
+                if (block->n_stmts >= cap) {
+                    cap = cap ? cap * 2 : 4;
+                    block->stmts = (OfortNode **)realloc(block->stmts, sizeof(OfortNode *) * cap);
+                    if (!block->stmts) ofort_error(I, "Out of memory");
+                }
+                block->stmts[block->n_stmts++] = param;
+                next_value++;
+                if (check(I, FTOK_COMMA)) advance(I);
+                else break;
+            }
+        } else {
+            skip_to_next_line(I);
+        }
+        skip_newlines(I);
+    }
+    consume_end(I, "ENUM");
+    return block;
+}
+
+static OfortNode *parse_typeof_declaration(OfortInterpreter *I) {
+    int start_pos = I->tok_pos;
+    OfortToken *type_tok = advance(I); /* TYPEOF or CLASSOF */
+    int decl_kind = 0;
+    int char_len = 1;
+    OfortToken synthetic = *type_tok;
+    int tail_pos;
+    char ref_name[256] = "";
+
+    expect(I, FTOK_LPAREN);
+    if (token_can_be_name(peek(I))) {
+        OfortToken *name_tok = advance(I);
+        copy_cstr(ref_name, sizeof(ref_name), token_name_text(name_tok));
+    } else {
+        ofort_error(I, "%s requires a variable name in this subset", token_name_text(type_tok));
+    }
+    expect(I, FTOK_RPAREN);
+    synthetic.type = FTOK_INTEGER;
+
+    {
+        tail_pos = I->tok_pos;
+        I->tokens[start_pos] = synthetic;
+        memmove(&I->tokens[start_pos + 1], &I->tokens[tail_pos],
+                (size_t)(I->n_tokens - tail_pos) * sizeof(I->tokens[0]));
+        I->n_tokens -= (tail_pos - start_pos - 1);
+        I->tok_pos = start_pos;
+        OfortNode *block = parse_declaration(I);
+        if (block && block->type == FND_BLOCK && block->stmts) {
+            for (int i = 0; i < block->n_stmts; i++) {
+                OfortNode *decl = block->stmts[i];
+                if (!decl || (decl->type != FND_VARDECL && decl->type != FND_PARAMDECL)) continue;
+                decl->val_type = FVAL_VOID;
+                decl->kind = decl_kind;
+                decl->char_len = char_len;
+                copy_cstr(decl->parent_type_name, sizeof(decl->parent_type_name), ref_name);
+            }
+        }
+        return block;
+    }
+}
+
 static OfortNode *parse_submodule(OfortInterpreter *I) {
     OfortToken *st = advance(I); /* SUBMODULE */
     OfortToken *name;
@@ -8216,6 +8320,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         return parse_procedure_declaration(I);
     }
 
+    if (token_ident_upper(t, "ENUM")) {
+        return parse_enum_bind_c(I);
+    }
+
     if (t->type == FTOK_MODULE && token_ident_upper(peek_ahead(I, 1), "PROCEDURE")) {
         return parse_module_procedure_body(I);
     }
@@ -8617,6 +8725,11 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         /* Check if this is "TYPE :: name" (type definition) when token is FTOK_TYPE */
         /* Since TYPE is mapped to FTOK_TYPE for derived types too, handle in TYPE case below */
         return parse_declaration(I);
+    }
+
+    if ((token_ident_upper(t, "TYPEOF") || token_ident_upper(t, "CLASSOF")) &&
+        peek_ahead(I, 1)->type == FTOK_LPAREN) {
+        return parse_typeof_declaration(I);
     }
 
     /* TYPE definition (derived type) */
@@ -16755,6 +16868,7 @@ static int check_semantics_is_spec_node(OfortNode *n) {
         case FND_IMPLICIT_NONE:
         case FND_VARDECL:
         case FND_PARAMDECL:
+        case FND_ENUM:
         case FND_TYPE_DEF:
         case FND_USE:
         case FND_INTERFACE:
@@ -18215,6 +18329,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         break;
     }
 
+    case FND_ENUM: {
+        for (int i = 0; i < n->n_stmts; i++) {
+            exec_node(I, n->stmts[i]);
+        }
+        break;
+    }
+
     case FND_TYPE_DEF: {
         /* Register type definition */
         if (I->n_type_defs >= 64) ofort_error(I, "Too many type definitions");
@@ -18476,6 +18597,24 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* Resolve runtime kind expression (e.g., real(kind=dp) where dp is a parameter) */
         OfortValType effective_type = n->val_type;
         int effective_kind = n->kind;
+        if (n->val_type == FVAL_VOID && n->parent_type_name[0]) {
+            OfortVar *ref_var = find_var(I, n->parent_type_name);
+            if (!ref_var)
+                ofort_error(I, "Undefined variable '%s' in TYPEOF/CLASSOF declaration", n->parent_type_name);
+            effective_type = ref_var->declared_type != FVAL_VOID ? ref_var->declared_type : ref_var->val.type;
+            effective_kind = ref_var->declared_kind ? ref_var->declared_kind : ref_var->val.kind;
+            if (effective_type == FVAL_ARRAY)
+                effective_type = ref_var->val.v.arr.elem_type;
+            if (effective_type == FVAL_DERIVED)
+                ofort_error(I, "TYPEOF/CLASSOF for derived types is not implemented in this subset");
+            n->val_type = effective_type;
+            n->kind = effective_kind;
+            if (effective_type == FVAL_CHARACTER) {
+                n->char_len = ref_var->char_len > 0 ? ref_var->char_len :
+                              (ref_var->val.type == FVAL_CHARACTER && ref_var->val.v.s ?
+                               (int)strlen(ref_var->val.v.s) : 1);
+            }
+        }
         if (n->kind_expr && effective_kind == 0) {
             OfortValue kv = eval_node(I, n->kind_expr);
             effective_kind = (int)val_to_int(kv);
