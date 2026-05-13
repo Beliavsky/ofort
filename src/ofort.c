@@ -12598,6 +12598,21 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
             }
         }
 
+        if ((p[0] == 'A' || p[0] == 'a') && (p[1] == 'T' || p[1] == 't')) {
+            p += 2;
+            if (*vidx >= nvals) break;
+            for (int r = 0; r < repeat && *vidx < nvals; r++, (*vidx)++) {
+                char buf[1024];
+                value_to_string(I, vals[*vidx], buf, sizeof(buf));
+                {
+                    int len = (int)strlen(buf);
+                    while (len > 0 && buf[len - 1] == ' ') buf[--len] = '\0';
+                }
+                out_append(I, buf);
+            }
+            continue;
+        }
+
         fc = (char)toupper((unsigned char)*p);
 
         if (fc == 'A') {
