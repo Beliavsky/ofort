@@ -3039,6 +3039,7 @@ static void tokenize(OfortInterpreter *I, const char *src) {
             case ']': t->type = FTOK_RBRACKET; break;
             case ',': t->type = FTOK_COMMA; break;
             case ':': t->type = FTOK_COLON; break;
+            case '@': t->type = FTOK_AT; break;
             case '?': t->type = FTOK_QUESTION; break;
             case '%': t->type = FTOK_PERCENT; break;
             default:
@@ -3187,6 +3188,7 @@ static const char *token_type_name(OfortTokenType type) {
         case FTOK_COMMA: return "','";
         case FTOK_COLON: return "':'";
         case FTOK_DCOLON: return "'::'";
+        case FTOK_AT: return "'@'";
         case FTOK_QUESTION: return "'?'";
         case FTOK_PERCENT: return "'%'";
         case FTOK_NEWLINE: return "end of statement";
@@ -3823,7 +3825,19 @@ static OfortNode *parse_statement(OfortInterpreter *I);
 
 static OfortNode *parse_subscript_arg(OfortInterpreter *I) {
     OfortNode *arg = NULL;
-    if (check(I, FTOK_DCOLON)) {
+    if (check(I, FTOK_AT)) {
+        OfortToken *at = advance(I);
+        OfortNode *multi = alloc_node(I, FND_MULTIPLE_SUBSCRIPT);
+        multi->line = at->line;
+        multi->children[0] = parse_expr_until_colon(I);
+        multi->n_children = 1;
+        if (check(I, FTOK_COLON)) {
+            advance(I);
+            multi->children[1] = parse_expr_until_colon(I);
+            multi->n_children = 2;
+        }
+        arg = multi;
+    } else if (check(I, FTOK_DCOLON)) {
         OfortNode *slice = alloc_node(I, FND_SLICE);
         slice->children[0] = NULL;
         slice->children[1] = NULL;
@@ -10866,6 +10880,66 @@ static OfortValue eval_subscripted_array(OfortInterpreter *I, OfortValue *array,
     int has_section = 0;
     int subscripts[7] = {0};
     int out_index = 0;
+
+    if (nargs == 1 && n->stmts[0] && n->stmts[0]->type == FND_MULTIPLE_SUBSCRIPT) {
+        OfortNode *multi = n->stmts[0];
+        OfortValue lo = eval_node(I, multi->children[0]);
+        OfortValue hi = make_void_val();
+        int rank = array->v.arr.n_dims;
+        if (lo.type != FVAL_ARRAY || lo.v.arr.elem_type != FVAL_INTEGER)
+            ofort_error(I, "Multiple subscript lower bound must be an integer array");
+        if (rank <= 0) rank = lo.v.arr.len;
+        if (rank > 7) ofort_error(I, "Too many multiple subscript dimensions");
+        if (lo.v.arr.len != rank)
+            ofort_error(I, "Multiple subscript rank does not match array rank");
+
+        if (multi->n_children < 2 || !multi->children[1]) {
+            int index;
+            for (int i = 0; i < rank; i++) {
+                OfortValue v = array_element_value(&lo, i);
+                subscripts[i] = (int)val_to_int(v);
+                free_value(&v);
+            }
+            index = section_linear_index(array, subscripts, rank);
+            free_value(&lo);
+            if (index < 0 || index >= array->v.arr.len)
+                ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, array->v.arr.len);
+            return array_element_value(array, index);
+        }
+
+        hi = eval_node(I, multi->children[1]);
+        if (hi.type != FVAL_ARRAY || hi.v.arr.elem_type != FVAL_INTEGER) {
+            free_value(&lo);
+            ofort_error(I, "Multiple subscript upper bound must be an integer array");
+        }
+        if (hi.v.arr.len != rank) {
+            free_value(&hi);
+            free_value(&lo);
+            ofort_error(I, "Multiple subscript lower and upper bounds must have the same size");
+        }
+
+        memset(specs, 0, sizeof(specs));
+        for (int i = 0; i < rank; i++) {
+            OfortValue lv = array_element_value(&lo, i);
+            OfortValue hv = array_element_value(&hi, i);
+            specs[i].range.start = (int)val_to_int(lv);
+            specs[i].range.end = (int)val_to_int(hv);
+            specs[i].range.step = 1;
+            specs[i].range.is_slice = 1;
+            specs[i].range.count = specs[i].range.end >= specs[i].range.start ?
+                specs[i].range.end - specs[i].range.start + 1 : 0;
+            specs[i].count = specs[i].range.count;
+            result_dims[n_result_dims++] = specs[i].count;
+            free_value(&hv);
+            free_value(&lv);
+        }
+        free_value(&hi);
+        free_value(&lo);
+        if (n_result_dims == 0) n_result_dims = 1;
+        OfortValue result = make_array(array->v.arr.elem_type, result_dims, n_result_dims);
+        copy_subscripted_recursive(I, array, &result, specs, rank, rank - 1, subscripts, &out_index);
+        return result;
+    }
 
     for (int i = 0; i < nargs; i++) {
         int extent = i < array->v.arr.n_dims ? array->v.arr.dims[i] : array->v.arr.len;
