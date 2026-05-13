@@ -9641,6 +9641,19 @@ static OfortValue pointer_referenced_value(OfortInterpreter *I, const char *targ
     return result;
 }
 
+static OfortValue pointer_referenced_value_preserve_lbound(OfortInterpreter *I, const OfortValue *ptr) {
+    OfortValue result;
+    if (!ptr || !ptr->is_pointer_ref || !ptr->pointer_target[0]) return make_void_val();
+    result = pointer_referenced_value(I, ptr->pointer_target, ptr->pointer_has_slice,
+                                      ptr->pointer_slice_start, ptr->pointer_slice_end,
+                                      ptr->pointer_slice_stride ? ptr->pointer_slice_stride : 1);
+    if (result.type == FVAL_ARRAY && ptr->type == FVAL_ARRAY && ptr->v.arr.n_dims > 0) {
+        for (int i = 0; i < result.v.arr.n_dims && i < ptr->v.arr.n_dims && i < 7; i++)
+            result.v.arr.lower_bounds[i] = ptr->v.arr.lower_bounds[i];
+    }
+    return result;
+}
+
 static int write_through_pointer_var(OfortInterpreter *I, OfortVar *ptr, OfortValue *rhs) {
     OfortVar *target;
     if (!ptr || !ptr->is_pointer || !ptr->pointer_associated || !ptr->pointer_target[0]) return 0;
@@ -14264,11 +14277,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             OfortValue result = copy_value(obj.v.dt.fields[field_idx]);
             free_value(&obj);
             if (result.is_pointer_ref) {
-                OfortValue deref = pointer_referenced_value(I, result.pointer_target,
-                                                            result.pointer_has_slice,
-                                                            result.pointer_slice_start,
-                                                            result.pointer_slice_end,
-                                                            result.pointer_slice_stride ? result.pointer_slice_stride : 1);
+                OfortValue deref = pointer_referenced_value_preserve_lbound(I, &result);
                 free_value(&result);
                 return deref;
             }
@@ -18768,6 +18777,45 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         char target_name[256];
         int has_slice, slice_start, slice_end, slice_stride;
         OfortValue rhs;
+        if (lhs->type == FND_ARRAY_REF && lhs->children[0] &&
+            lhs->children[0]->type == FND_MEMBER && lhs->n_stmts == 1 &&
+            lhs->stmts[0] && lhs->stmts[0]->type == FND_SLICE) {
+            OfortNode *sl = lhs->stmts[0];
+            OfortValue *target = member_lvalue(I, lhs->children[0]);
+            if (!target) ofort_error(I, "Pointer assignment target not found");
+            remap_bounds = 1;
+            if (sl->children[0]) {
+                OfortValue lv = eval_node(I, sl->children[0]);
+                remap_lower = (int)val_to_int(lv);
+                free_value(&lv);
+            }
+            rhs = eval_node(I, rhs_node);
+            if (!pointer_target_descriptor(I, rhs_node, target_name, sizeof(target_name),
+                                           &has_slice, &slice_start, &slice_end, &slice_stride)) {
+                if (rhs.is_pointer_ref && rhs.pointer_target[0]) {
+                    copy_cstr(target_name, sizeof(target_name), rhs.pointer_target);
+                    has_slice = rhs.pointer_has_slice;
+                    slice_start = rhs.pointer_slice_start;
+                    slice_end = rhs.pointer_slice_end;
+                    slice_stride = rhs.pointer_slice_stride ? rhs.pointer_slice_stride : 1;
+                } else {
+                    free_value(&rhs);
+                    ofort_error(I, "Invalid pointer target");
+                }
+            }
+            if (remap_bounds && rhs.type == FVAL_ARRAY && rhs.v.arr.n_dims > 0)
+                rhs.v.arr.lower_bounds[0] = remap_lower;
+            free_value(target);
+            *target = rhs;
+            target->is_pointer_ref = 1;
+            copy_cstr(target->pointer_target, sizeof(target->pointer_target), target_name);
+            target->pointer_has_slice = has_slice;
+            target->pointer_slice_start = slice_start;
+            target->pointer_slice_end = slice_end;
+            target->pointer_slice_stride = slice_stride;
+            trace_assignment_value(I, lhs, rhs);
+            break;
+        }
         if (lhs->type == FND_MEMBER) {
             OfortValue *target = member_lvalue(I, lhs);
             if (!target) ofort_error(I, "Pointer assignment target not found");
