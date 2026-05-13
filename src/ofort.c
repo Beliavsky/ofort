@@ -10391,22 +10391,45 @@ static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
     int lower_bounds[7];
     int ndims = n->n_dims;
 
-    if (n->n_dims == 1 && n->stmts && n->n_stmts > 0 && n->stmts[0] && !n->has_lower_bound[0]) {
+    if (n->n_dims == 1 && n->stmts && n->n_stmts > 0 && n->stmts[0]) {
+        OfortValue lv = make_void_val();
         OfortValue dv = eval_node(I, n->stmts[0]);
-        if (dv.type == FVAL_ARRAY && dv.v.arr.elem_type == FVAL_INTEGER) {
-            if (dv.v.arr.len > 7) {
+        if (n->has_lower_bound[0] && n->lower_bound_exprs[0]) {
+            lv = eval_node(I, n->lower_bound_exprs[0]);
+        }
+        if (dv.type == FVAL_ARRAY && dv.v.arr.elem_type == FVAL_INTEGER &&
+            (!n->has_lower_bound[0] || lv.type == FVAL_VOID ||
+             lv.type == FVAL_INTEGER ||
+             (lv.type == FVAL_ARRAY && lv.v.arr.elem_type == FVAL_INTEGER))) {
+            int lb_is_array = lv.type == FVAL_ARRAY;
+            int rank = dv.v.arr.len;
+            if (lb_is_array && lv.v.arr.len != rank) {
                 free_value(&dv);
+                free_value(&lv);
+                ofort_error(I, "Integer array lower and upper bounds must have the same size");
+            }
+            if (rank > 7) {
+                free_value(&dv);
+                free_value(&lv);
                 ofort_error(I, "Too many dimensions from integer array bounds");
             }
-            ndims = dv.v.arr.len;
+            ndims = rank;
             for (int i = 0; i < ndims; i++) {
-                OfortValue elem = array_element_value(&dv, i);
-                lower_bounds[i] = 1;
-                dims[i] = (int)val_to_int(elem);
+                OfortValue hi_elem = array_element_value(&dv, i);
+                OfortValue lo_elem = lb_is_array ? array_element_value(&lv, i) : make_void_val();
+                int lower = n->has_lower_bound[0] ?
+                            (lb_is_array ? (int)val_to_int(lo_elem) :
+                             (lv.type == FVAL_INTEGER ? (int)val_to_int(lv) : n->lower_bounds[0])) :
+                            1;
+                int upper = (int)val_to_int(hi_elem);
+                lower_bounds[i] = lower;
+                dims[i] = n->has_lower_bound[0] ? upper - lower + 1 : upper;
                 if (dims[i] < 0) dims[i] = 0;
-                free_value(&elem);
+                free_value(&hi_elem);
+                free_value(&lo_elem);
             }
             free_value(&dv);
+            free_value(&lv);
             {
                 OfortValue arr = make_array_with_char_len_options(n->val_type, dims, ndims,
                                                                   eval_character_length(I, n),
@@ -10416,6 +10439,7 @@ static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
             }
         }
         free_value(&dv);
+        free_value(&lv);
     }
 
     for (int i = 0; i < ndims; i++) {
