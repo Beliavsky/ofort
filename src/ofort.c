@@ -48,6 +48,7 @@ typedef struct {
     int is_initialized;
     int char_len;     /* declared CHARACTER length, 0 if not CHARACTER */
     int present;      /* 0 for absent OPTIONAL dummy arguments */
+    int is_optional;
     int is_allocatable;
     int scalar_allocated;
     OfortValType declared_type;
@@ -1143,6 +1144,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->is_initialized = val.type != FVAL_VOID;
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     v->present = 1;
+    v->is_optional = 0;
     v->is_allocatable = 0;
     v->scalar_allocated = 0;
     v->declared_type = val.type;
@@ -1182,6 +1184,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
             s->vars[i].is_initialized = val.type != FVAL_VOID;
             s->vars[i].char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
             s->vars[i].present = val.type != FVAL_VOID;
+            s->vars[i].is_optional = 0;
             s->vars[i].scalar_allocated = 0;
             s->vars[i].declared_type = val.type;
             s->vars[i].declared_kind = val.kind;
@@ -1201,6 +1204,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->is_initialized = val.type != FVAL_VOID;
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     v->present = val.type != FVAL_VOID;
+    v->is_optional = 0;
     v->is_allocatable = 0;
     v->scalar_allocated = 0;
     v->declared_type = val.type;
@@ -1238,6 +1242,7 @@ static OfortVar *declare_alias_var(OfortInterpreter *I, const char *name, OfortV
     v->is_initialized = target->is_initialized;
     v->char_len = target->char_len;
     v->present = target->present;
+    v->is_optional = target->is_optional;
     v->is_allocatable = target->is_allocatable;
     v->scalar_allocated = target->scalar_allocated;
     v->declared_type = target->declared_type;
@@ -1270,6 +1275,7 @@ static OfortVar *declare_alias_value_var(OfortInterpreter *I, const char *name, 
     v->intent = 0;
     v->char_len = target->type == FVAL_CHARACTER && target->v.s ? (int)strlen(target->v.s) : 0;
     v->present = 1;
+    v->is_optional = 0;
     v->declared_type = target->type;
     v->declared_kind = target->kind;
     if (target->type == FVAL_DERIVED) {
@@ -1283,6 +1289,7 @@ static OfortVar *declare_alias_value_var(OfortInterpreter *I, const char *name, 
 static OfortVar *declare_absent_optional_var(OfortInterpreter *I, const char *name) {
     OfortVar *v = declare_var(I, name, make_void_val());
     v->present = 0;
+    v->is_optional = 1;
     return v;
 }
 
@@ -1669,6 +1676,7 @@ static void restore_saved_vars(OfortInterpreter *I, OfortFunc *func) {
         v->is_initialized = func->saved_vars[i].is_initialized;
         v->char_len = func->saved_vars[i].char_len;
         v->present = func->saved_vars[i].present;
+        v->is_optional = func->saved_vars[i].is_optional;
         v->is_allocatable = func->saved_vars[i].is_allocatable;
         v->scalar_allocated = func->saved_vars[i].scalar_allocated;
         v->declared_type = func->saved_vars[i].declared_type;
@@ -1710,6 +1718,7 @@ static void store_saved_vars(OfortFunc *func, OfortScope *scope) {
         dst->is_initialized = src->is_initialized;
         dst->char_len = src->char_len;
         dst->present = src->present;
+        dst->is_optional = src->is_optional;
         dst->is_allocatable = src->is_allocatable;
         dst->scalar_allocated = src->scalar_allocated;
         dst->declared_type = src->declared_type;
@@ -1739,6 +1748,7 @@ static void copy_imported_var_attrs(OfortVar *dst, const OfortVar *src) {
     dst->is_initialized = src->is_initialized;
     dst->char_len = src->char_len;
     dst->present = src->present;
+    dst->is_optional = src->is_optional;
     dst->is_allocatable = src->is_allocatable;
     dst->scalar_allocated = src->scalar_allocated;
     dst->declared_type = src->declared_type;
@@ -9439,6 +9449,8 @@ static OfortValue *member_lvalue(OfortInterpreter *I, OfortNode *n) {
     if (!n) return NULL;
     if (n->type == FND_IDENT) {
         OfortVar *v = find_var(I, n->name);
+        if (v && v->is_optional && !v->present)
+            ofort_error(I, "Optional dummy argument '%s' is not present", n->name);
         return v ? &v->val : NULL;
     }
     if (n->type == FND_FUNC_CALL) {
@@ -13088,7 +13100,8 @@ static OfortValue execute_user_function_with_args(OfortInterpreter *I, OfortFunc
     }
     for (int i = 0; i < fn->n_params; i++) {
         if (i < nargs && args[i].type != FVAL_VOID) {
-            declare_var(I, fn->param_names[i], copy_value(args[i]));
+            OfortVar *pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
+            pv->is_optional = fn->param_optional[i];
         } else if (fn->param_optional[i]) {
             declare_absent_optional_var(I, fn->param_names[i]);
         } else {
@@ -13216,6 +13229,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             }
             ofort_error(I, "Undefined variable '%s' at line %d", n->name, n->line);
         }
+        if (v->is_optional && !v->present)
+            ofort_error(I, "Optional dummy argument '%s' is not present", n->name);
         if (v->is_pointer) {
             if (!v->pointer_associated && v->val.type == FVAL_VOID) return make_void_val();
             if (v->pointer_associated && v->pointer_target[0])
@@ -13831,6 +13846,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 return make_logical(present);
             }
             ptr = find_var(I, n->stmts[0]->name);
+            if (ptr && ptr->is_optional && !ptr->present)
+                ofort_error(I, "Optional dummy argument '%s' is not present", n->stmts[0]->name);
             if (!ptr || !ptr->is_pointer) return make_logical(0);
             if (nargs == 1) return make_logical(ptr->pointer_associated);
             return make_logical(pointer_matches_target(I, ptr, n->stmts[1]));
@@ -13850,6 +13867,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 return make_logical(is_alloc);
             }
             alloc_var = find_var(I, n->stmts[0]->name);
+            if (alloc_var && alloc_var->is_optional && !alloc_var->present)
+                ofort_error(I, "Optional dummy argument '%s' is not present", n->stmts[0]->name);
             if (!alloc_var || !alloc_var->is_allocatable) return make_logical(0);
             if (alloc_var->val.type == FVAL_ARRAY)
                 return make_logical(alloc_var->val.v.arr.allocated);
@@ -13988,7 +14007,16 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         /* Evaluate all args */
         args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
         if (!args) ofort_error(I, "Out of memory");
-        for (int i = 0; i < nargs; i++) args[i] = eval_node(I, n->stmts[i]);
+        for (int i = 0; i < nargs; i++) {
+            if (n->stmts[i]->type == FND_IDENT) {
+                OfortVar *actual = find_var(I, n->stmts[i]->name);
+                if (actual && actual->is_optional && !actual->present) {
+                    args[i] = make_void_val();
+                    continue;
+                }
+            }
+            args[i] = eval_node(I, n->stmts[i]);
+        }
 
         if (I->fast_mode && I->specialized_fast_paths &&
             str_eq_nocase(n->name, "is_invertible_real") && nargs == 1) {
@@ -14020,7 +14048,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 push_scope(I);
                 for (int i = 0; i < fn->n_params; i++) {
                     if (i < nargs && args[i].type != FVAL_VOID) {
-                        declare_var(I, fn->param_names[i], copy_value(args[i]));
+                        OfortVar *pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
+                        pv->is_optional = fn->param_optional[i];
                     } else if (fn->param_optional[i]) {
                         declare_absent_optional_var(I, fn->param_names[i]);
                     } else {
@@ -14052,7 +14081,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             /* Bind parameters */
             for (int i = 0; i < fn->n_params; i++) {
                 if (i < nargs && args[i].type != FVAL_VOID) {
-                    declare_var(I, fn->param_names[i], copy_value(args[i]));
+                    OfortVar *pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
+                    pv->is_optional = fn->param_optional[i];
                 } else if (fn->param_optional[i]) {
                     declare_absent_optional_var(I, fn->param_names[i]);
                 } else {
@@ -14515,6 +14545,7 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
             }
             pv->intent = fn->param_intents[i];
             pv->is_value = fn->param_values[i];
+            pv->is_optional = fn->param_optional[i];
         }
         restore_saved_vars(I, func);
         I->procedure_depth++;
@@ -14569,7 +14600,8 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
             if (i < nargs && args[i].type != FVAL_VOID) {
                 OfortValue actual = args[i].type == FVAL_ARRAY ?
                     array_element_value(&args[i], elem) : copy_value(args[i]);
-                declare_var(I, fn->param_names[i], actual);
+                OfortVar *pv = declare_var(I, fn->param_names[i], actual);
+                pv->is_optional = fn->param_optional[i];
             } else if (fn->param_optional[i]) {
                 declare_absent_optional_var(I, fn->param_names[i]);
             } else {
@@ -18314,6 +18346,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             n->val_type != FVAL_VOID && n->type != FND_PARAMDECL &&
             n->n_children == 0) {
             existing->intent = n->intent;
+            existing->is_optional = n->is_optional;
             existing->is_pointer = n->is_pointer;
             existing->is_allocatable = n->is_allocatable;
             existing->is_target = n->is_target;
@@ -18485,6 +18518,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             if (has_assumed_shape) {
                 existing->intent = n->intent;
+                existing->is_optional = n->is_optional;
                 existing->is_pointer = n->is_pointer;
                 existing->is_allocatable = n->is_allocatable;
                 existing->is_target = n->is_target;
@@ -18511,6 +18545,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (existing && existing == existing_current && (n->intent != 0 || n->is_optional || n->is_value)) {
             existing->intent = n->intent;
             existing->is_value = n->is_value;
+            existing->is_optional = n->is_optional;
             existing->is_allocatable = n->is_allocatable;
             existing->is_pointer = n->is_pointer;
             existing->is_target = n->is_target;
@@ -18541,6 +18576,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (existing && existing == existing_current && I->procedure_depth > 0) {
             existing->intent = n->intent;
             existing->is_value = n->is_value;
+            existing->is_optional = n->is_optional;
             existing->is_pointer = n->is_pointer;
             existing->is_allocatable = n->is_allocatable;
             existing->is_target = n->is_target;
@@ -20647,6 +20683,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 pv->intent = fn->param_intents[i];
                 pv->is_value = fn->param_values[i];
+                pv->is_optional = fn->param_optional[i];
             }
             restore_saved_vars(I, func);
             I->procedure_depth++;
@@ -20676,6 +20713,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortNode *fn = func ? func->node : NULL;
         for (int i = 0; i < nargs; i++) {
             args[i] = make_void_val();
+            if (n->stmts[i]->type == FND_IDENT) {
+                OfortVar *actual = find_var(I, n->stmts[i]->name);
+                if (actual && actual->is_optional && !actual->present) {
+                    continue;
+                }
+            }
             if (fn && I->fast_mode && i < fn->n_params && n->stmts[i]->type == FND_IDENT) {
                 OfortVar *actual = find_var(I, n->stmts[i]->name);
                 if (actual && actual->val.type == FVAL_ARRAY && array_has_packed_numeric(&actual->val)) {
@@ -20780,6 +20823,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             pv->intent = fn->param_intents[i];
             pv->is_value = fn->param_values[i];
+            pv->is_optional = fn->param_optional[i];
         }
         restore_saved_vars(I, func);
 
