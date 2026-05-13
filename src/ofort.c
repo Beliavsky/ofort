@@ -6856,6 +6856,7 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
             n->param_optional[n->n_params] = 0;
             n->param_values[n->n_params] = 0;
             n->param_pointers[n->n_params] = 0;
+            n->param_allocatables[n->n_params] = 0;
             n->param_n_dims[n->n_params] = 0;
             n->n_params++;
             if (check(I, FTOK_COMMA)) advance(I);
@@ -6901,6 +6902,7 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
             n->param_optional[n->n_params] = 0;
             n->param_values[n->n_params] = 0;
             n->param_pointers[n->n_params] = 0;
+            n->param_allocatables[n->n_params] = 0;
             n->param_n_dims[n->n_params] = 0;
             n->n_params++;
             if (check(I, FTOK_COMMA)) advance(I);
@@ -7042,6 +7044,7 @@ static OfortNode *parse_module_procedure_body(OfortInterpreter *I) {
             n->param_optional[i] = spec->param_optional[i];
             n->param_values[i] = spec->param_values[i];
             n->param_pointers[i] = spec->param_pointers[i];
+            n->param_allocatables[i] = spec->param_allocatables[i];
             n->param_n_dims[i] = spec->param_n_dims[i];
         }
     }
@@ -14403,6 +14406,7 @@ static void annotate_procedure_params(OfortNode *n) {
                 n->param_optional[k] = d->is_optional;
                 n->param_values[k] = d->is_value;
                 n->param_pointers[k] = d->is_pointer;
+                n->param_allocatables[k] = d->is_allocatable;
                 n->param_n_dims[k] = d->n_dims;
                 break;
                 }
@@ -20684,6 +20688,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 n->stmts[i]->type == FND_MEMBER) {
                 OfortValue *actual = member_lvalue(I, n->stmts[i]);
                 args[i] = actual ? copy_value(*actual) : make_void_val();
+            } else if (fn && i < fn->n_params && fn->param_allocatables[i] &&
+                       n->stmts[i]->type == FND_MEMBER) {
+                OfortValue *actual = member_lvalue(I, n->stmts[i]);
+                args[i] = actual ? copy_value(*actual) : make_void_val();
             } else {
                 args[i] = eval_node(I, n->stmts[i]);
             }
@@ -20739,7 +20747,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             OfortVar *pv;
             if (i < nargs && arg_alias[i]) {
                 pv = declare_alias_var(I, fn->param_names[i], arg_alias_var[i]);
-            } else if (i < nargs && args[i].type != FVAL_VOID) {
+            } else if (i < nargs && (args[i].type != FVAL_VOID || fn->param_allocatables[i])) {
                 pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
                 if (fn->param_pointers[i] && args[i].is_pointer_ref && args[i].pointer_target[0]) {
                     pv->is_pointer = 1;
@@ -20749,6 +20757,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     pv->pointer_slice_start = args[i].pointer_slice_start;
                     pv->pointer_slice_end = args[i].pointer_slice_end;
                     pv->pointer_slice_stride = args[i].pointer_slice_stride ? args[i].pointer_slice_stride : 1;
+                }
+                if (fn->param_allocatables[i]) {
+                    pv->is_allocatable = 1;
+                    pv->present = 1;
+                    pv->scalar_allocated = args[i].type != FVAL_VOID &&
+                                           !(args[i].type == FVAL_ARRAY && !args[i].v.arr.allocated);
                 }
             } else if (fn->param_optional[i]) {
                 pv = declare_absent_optional_var(I, fn->param_names[i]);
@@ -20838,6 +20852,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     free_value(&args[i]);
                     args[i] = copy_value(pv->val);
                 }
+                if (pv && pv->present && fn->param_allocatables[i] &&
+                    (n->stmts[i]->type == FND_IDENT || n->stmts[i]->type == FND_MEMBER)) {
+                    free_value(&args[i]);
+                    args[i] = copy_value(pv->val);
+                }
             }
         }
 
@@ -20864,7 +20883,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 set_var(I, n->stmts[i]->name, copy_value(args[i]));
             } else if (!arg_alias[i] && n->stmts[i]->type == FND_MEMBER && fn->param_intents[i] != 1 &&
-                       args[i].type != FVAL_VOID && !procedure_ref_name(&args[i])) {
+                       (args[i].type != FVAL_VOID || fn->param_allocatables[i]) && !procedure_ref_name(&args[i])) {
                 OfortValue *target = member_lvalue(I, n->stmts[i]);
                 if (target) {
                     free_value(target);
@@ -20918,6 +20937,7 @@ unresolved_external_call_done:
                                     n->param_optional[k] = d->is_optional;
                                     n->param_values[k] = d->is_value;
                                     n->param_pointers[k] = d->is_pointer;
+                                    n->param_allocatables[k] = d->is_allocatable;
                                     n->param_n_dims[k] = d->n_dims;
                                     break;
                                 }
@@ -20939,6 +20959,7 @@ unresolved_external_call_done:
                             n->param_optional[k] = s->is_optional;
                             n->param_values[k] = s->is_value;
                             n->param_pointers[k] = s->is_pointer;
+                            n->param_allocatables[k] = s->is_allocatable;
                             n->param_n_dims[k] = s->n_dims;
                             break;
                         }
