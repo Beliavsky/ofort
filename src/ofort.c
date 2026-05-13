@@ -10710,6 +10710,19 @@ static int pointer_matches_target(OfortInterpreter *I, OfortVar *ptr, OfortNode 
                            ptr->pointer_slice_stride == stride));
 }
 
+static int pointer_value_matches_target(OfortInterpreter *I, OfortValue *ptr, OfortNode *target) {
+    char target_name[256];
+    int has_slice, start, end, stride;
+    if (!ptr || !ptr->is_pointer_ref || !ptr->pointer_target[0]) return 0;
+    if (!pointer_target_descriptor(I, target, target_name, sizeof(target_name), &has_slice, &start, &end, &stride))
+        return 0;
+    return str_eq_nocase(ptr->pointer_target, target_name) &&
+           ptr->pointer_has_slice == has_slice &&
+           (!has_slice || (ptr->pointer_slice_start == start &&
+                           ptr->pointer_slice_end == end &&
+                           ptr->pointer_slice_stride == stride));
+}
+
 static int subscript_spec_element_count(OfortSubscriptSpec *specs, int nargs) {
     int count = 1;
     for (int i = 0; i < nargs; i++) {
@@ -13786,7 +13799,9 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 OfortValue *target = member_lvalue(I, n->stmts[0]);
                 if (target) {
                     if (target->is_pointer_ref)
-                        return make_logical(target->pointer_target[0] != '\0');
+                        return make_logical(nargs == 1 ?
+                                            target->pointer_target[0] != '\0' :
+                                            pointer_value_matches_target(I, target, n->stmts[1]));
                     if (target->type == FVAL_ARRAY)
                         return make_logical(target->v.arr.allocated);
                     return make_logical(target->type != FVAL_VOID);
@@ -18756,6 +18771,18 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (lhs->type == FND_MEMBER) {
             OfortValue *target = member_lvalue(I, lhs);
             if (!target) ofort_error(I, "Pointer assignment target not found");
+            if (is_null_func_call_node(rhs_node)) {
+                free_value(target);
+                *target = make_void_val();
+                target->is_pointer_ref = 0;
+                target->pointer_target[0] = '\0';
+                target->pointer_has_slice = 0;
+                target->pointer_slice_start = 0;
+                target->pointer_slice_end = 0;
+                target->pointer_slice_stride = 1;
+                trace_assignment_value(I, lhs, *target);
+                break;
+            }
             rhs = eval_node(I, rhs_node);
             if (!pointer_target_descriptor(I, rhs_node, target_name, sizeof(target_name),
                                            &has_slice, &slice_start, &slice_end, &slice_stride)) {
