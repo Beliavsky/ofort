@@ -1023,7 +1023,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
             if (deferred_char_alloc) {
                 s->vars[i].scalar_allocated = 1;
             }
-            if (target_kind > 0 && is_numeric_type(val.type)) val.kind = target_kind;
+            if (target_kind > 0 && (is_numeric_type(val.type) || val.type == FVAL_LOGICAL)) val.kind = target_kind;
             if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
             s->vars[i].val = val;
             s->vars[i].is_alias = 0;
@@ -1099,7 +1099,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 if (deferred_char_alloc) {
                     ps->vars[i].scalar_allocated = 1;
                 }
-                if (target_kind > 0 && is_numeric_type(val.type)) val.kind = target_kind;
+                if (target_kind > 0 && (is_numeric_type(val.type) || val.type == FVAL_LOGICAL)) val.kind = target_kind;
                 if (!ps->vars[i].is_alias) free_value(&ps->vars[i].val);
                 ps->vars[i].val = val;
                 ps->vars[i].is_alias = 0;
@@ -21596,7 +21596,7 @@ static const char *intrinsic_names[] = {
     "LGE", "LGT", "LLE", "LLT",
     "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
     "SET_EXPONENT",
-    "SELECTED_INT_KIND", "SELECTED_REAL_KIND", "IEEE_SELECTED_REAL_KIND", "SELECTED_CHAR_KIND",
+    "SELECTED_INT_KIND", "SELECTED_LOGICAL_KIND", "SELECTED_REAL_KIND", "IEEE_SELECTED_REAL_KIND", "SELECTED_CHAR_KIND",
     "IEEE_SUPPORT_FLAG", "IEEE_SUPPORT_HALTING", "IEEE_SUPPORT_ROUNDING", "IEEE_ALL", "IEEE_USUAL",
     /* String */
     "LEN", "LEN_TRIM", "TRIM", "NEW_LINE", "ADJUSTL", "ADJUSTR", "INDEX", "SCAN", "VERIFY",
@@ -26108,6 +26108,18 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (r <= 4) return make_integer(2);
         if (r <= 9) return make_integer(4);
         if (r <= 18) return make_integer(8);
+        return make_integer(-1);
+    }
+    if (strcmp(upper, "SELECTED_LOGICAL_KIND") == 0) {
+        long long bits;
+        if (nargs < 1) ofort_error(I, "SELECTED_LOGICAL_KIND requires 1 argument");
+        if (args[0].type != FVAL_INTEGER)
+            ofort_error(I, "SELECTED_LOGICAL_KIND requires an integer argument");
+        bits = args[0].v.i;
+        if (bits <= 8) return make_integer(1);
+        if (bits <= 16) return make_integer(2);
+        if (bits <= 32) return make_integer(4);
+        if (bits <= 64) return make_integer(8);
         return make_integer(-1);
     }
     if (strcmp(upper, "SELECTED_REAL_KIND") == 0 || strcmp(upper, "IEEE_SELECTED_REAL_KIND") == 0) {
