@@ -6855,6 +6855,7 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
             n->param_intents[n->n_params] = 0;
             n->param_optional[n->n_params] = 0;
             n->param_values[n->n_params] = 0;
+            n->param_pointers[n->n_params] = 0;
             n->param_n_dims[n->n_params] = 0;
             n->n_params++;
             if (check(I, FTOK_COMMA)) advance(I);
@@ -6899,6 +6900,7 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
             n->param_intents[n->n_params] = 0;
             n->param_optional[n->n_params] = 0;
             n->param_values[n->n_params] = 0;
+            n->param_pointers[n->n_params] = 0;
             n->param_n_dims[n->n_params] = 0;
             n->n_params++;
             if (check(I, FTOK_COMMA)) advance(I);
@@ -7039,6 +7041,7 @@ static OfortNode *parse_module_procedure_body(OfortInterpreter *I) {
             n->param_intents[i] = spec->param_intents[i];
             n->param_optional[i] = spec->param_optional[i];
             n->param_values[i] = spec->param_values[i];
+            n->param_pointers[i] = spec->param_pointers[i];
             n->param_n_dims[i] = spec->param_n_dims[i];
         }
     }
@@ -14073,6 +14076,18 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             /* Get result */
             OfortVar *rv = find_var(I, res_name);
             OfortValue result = rv ? copy_value(rv->val) : make_void_val();
+            if (result.type == FVAL_DERIVED) {
+                for (int fi = 0; fi < result.v.dt.n_fields; fi++) {
+                    OfortValue *field = &result.v.dt.fields[fi];
+                    if (!field->is_pointer_ref || !field->pointer_target[0]) continue;
+                    for (int j = 0; j < fn->n_params && j < nargs; j++) {
+                        if (!str_eq_nocase(field->pointer_target, fn->param_names[j])) continue;
+                        if (n->stmts[j]->type != FND_IDENT) continue;
+                        copy_cstr(field->pointer_target, sizeof(field->pointer_target), n->stmts[j]->name);
+                        break;
+                    }
+                }
+            }
             if (rv && rv->is_pointer && rv->pointer_associated && rv->pointer_target[0]) {
                 for (int j = 0; j < fn->n_params && j < nargs; j++) {
                     if (!str_eq_nocase(rv->pointer_target, fn->param_names[j])) continue;
@@ -14387,6 +14402,7 @@ static void annotate_procedure_params(OfortNode *n) {
                     copy_cstr(n->param_type_names[k], sizeof(n->param_type_names[k]), d->str_val);
                 n->param_optional[k] = d->is_optional;
                 n->param_values[k] = d->is_value;
+                n->param_pointers[k] = d->is_pointer;
                 n->param_n_dims[k] = d->n_dims;
                 break;
                 }
@@ -18530,8 +18546,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (n->val_type == FVAL_DERIVED)
                 copy_cstr(existing->declared_type_name,
                           sizeof(existing->declared_type_name), n->str_val);
-            if (n->is_pointer && existing->val.type != FVAL_VOID)
+            if (n->is_pointer && existing->val.is_pointer_ref && existing->val.pointer_target[0]) {
                 existing->pointer_associated = 1;
+                copy_cstr(existing->pointer_target, sizeof(existing->pointer_target), existing->val.pointer_target);
+                existing->pointer_has_slice = existing->val.pointer_has_slice;
+                existing->pointer_slice_start = existing->val.pointer_slice_start;
+                existing->pointer_slice_end = existing->val.pointer_slice_end;
+                existing->pointer_slice_stride = existing->val.pointer_slice_stride ? existing->val.pointer_slice_stride : 1;
+            } else if (n->is_pointer && existing->val.type != FVAL_VOID) {
+                existing->pointer_associated = 1;
+            }
             if (n->val_type == FVAL_CHARACTER) existing->char_len = decl_char_len;
             break;
         }
@@ -20656,7 +20680,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     continue;
                 }
             }
-            args[i] = eval_node(I, n->stmts[i]);
+            if (fn && i < fn->n_params && fn->param_pointers[i] &&
+                n->stmts[i]->type == FND_MEMBER) {
+                OfortValue *actual = member_lvalue(I, n->stmts[i]);
+                args[i] = actual ? copy_value(*actual) : make_void_val();
+            } else {
+                args[i] = eval_node(I, n->stmts[i]);
+            }
         }
         if (!func) {
             func = find_matching_generic_subroutine(I, n->name, args, nargs);
@@ -20711,6 +20741,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 pv = declare_alias_var(I, fn->param_names[i], arg_alias_var[i]);
             } else if (i < nargs && args[i].type != FVAL_VOID) {
                 pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
+                if (fn->param_pointers[i] && args[i].is_pointer_ref && args[i].pointer_target[0]) {
+                    pv->is_pointer = 1;
+                    pv->pointer_associated = 1;
+                    copy_cstr(pv->pointer_target, sizeof(pv->pointer_target), args[i].pointer_target);
+                    pv->pointer_has_slice = args[i].pointer_has_slice;
+                    pv->pointer_slice_start = args[i].pointer_slice_start;
+                    pv->pointer_slice_end = args[i].pointer_slice_end;
+                    pv->pointer_slice_stride = args[i].pointer_slice_stride ? args[i].pointer_slice_stride : 1;
+                }
             } else if (fn->param_optional[i]) {
                 pv = declare_absent_optional_var(I, fn->param_names[i]);
             } else {
@@ -20830,6 +20869,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (target) {
                     free_value(target);
                     *target = copy_value(args[i]);
+                    if (pointer_copyback[i]) {
+                        target->is_pointer_ref = 1;
+                        copy_cstr(target->pointer_target, sizeof(target->pointer_target), pointer_copyback_target[i]);
+                        target->pointer_has_slice = pointer_copyback_has_slice[i];
+                        target->pointer_slice_start = pointer_copyback_slice_start[i];
+                        target->pointer_slice_end = pointer_copyback_slice_end[i];
+                        target->pointer_slice_stride = pointer_copyback_slice_stride[i] ? pointer_copyback_slice_stride[i] : 1;
+                    }
                 }
             }
         }
@@ -20870,6 +20917,7 @@ unresolved_external_call_done:
                                         copy_cstr(n->param_type_names[k], sizeof(n->param_type_names[k]), d->str_val);
                                     n->param_optional[k] = d->is_optional;
                                     n->param_values[k] = d->is_value;
+                                    n->param_pointers[k] = d->is_pointer;
                                     n->param_n_dims[k] = d->n_dims;
                                     break;
                                 }
@@ -20890,6 +20938,7 @@ unresolved_external_call_done:
                                 copy_cstr(n->param_type_names[k], sizeof(n->param_type_names[k]), s->str_val);
                             n->param_optional[k] = s->is_optional;
                             n->param_values[k] = s->is_value;
+                            n->param_pointers[k] = s->is_pointer;
                             n->param_n_dims[k] = s->n_dims;
                             break;
                         }
