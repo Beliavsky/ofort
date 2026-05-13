@@ -20353,6 +20353,91 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             break;
         }
+        if (strcmp(call_upper, "SPLIT") == 0) {
+            int string_idx = -1;
+            int set_idx = -1;
+            int pos_idx = -1;
+            int back_idx = -1;
+            OfortValue string_val;
+            OfortValue set_val;
+            OfortValue back_val;
+            const char *string_text;
+            const char *set_text;
+            int back = 0;
+            int pos = 0;
+            int start_pos = 0;
+            int string_len;
+            int set_len;
+            OfortVar *pos_var;
+            for (int i = 0; i < n->n_stmts; i++) {
+                if (str_eq_nocase(n->param_names[i], "string")) string_idx = i;
+                else if (str_eq_nocase(n->param_names[i], "set")) set_idx = i;
+                else if (str_eq_nocase(n->param_names[i], "pos")) pos_idx = i;
+                else if (str_eq_nocase(n->param_names[i], "back")) back_idx = i;
+            }
+            if (string_idx < 0 && n->n_stmts >= 1 && n->param_names[0][0] == '\0') string_idx = 0;
+            if (set_idx < 0 && n->n_stmts >= 2 && n->param_names[1][0] == '\0') set_idx = 1;
+            if (pos_idx < 0 && n->n_stmts >= 3 && n->param_names[2][0] == '\0') pos_idx = 2;
+            if (back_idx < 0 && n->n_stmts >= 4 && n->param_names[3][0] == '\0') back_idx = 3;
+            if (string_idx < 0 || set_idx < 0 || pos_idx < 0)
+                ofort_error(I, "SPLIT requires STRING, SET, and POS arguments");
+            if (n->stmts[pos_idx]->type != FND_IDENT)
+                ofort_error(I, "SPLIT POS argument must be an integer variable");
+            pos_var = find_var(I, n->stmts[pos_idx]->name);
+            if (!pos_var)
+                ofort_error(I, "Undefined variable '%s' in SPLIT", n->stmts[pos_idx]->name);
+            if (pos_var->val.type != FVAL_INTEGER)
+                ofort_error(I, "SPLIT POS argument must be INTEGER");
+            start_pos = (int)pos_var->val.v.i;
+            string_val = eval_node(I, n->stmts[string_idx]);
+            set_val = eval_node(I, n->stmts[set_idx]);
+            if (string_val.type != FVAL_CHARACTER || set_val.type != FVAL_CHARACTER) {
+                free_value(&string_val);
+                free_value(&set_val);
+                ofort_error(I, "SPLIT STRING and SET arguments must be CHARACTER");
+            }
+            if (back_idx >= 0) {
+                back_val = eval_node(I, n->stmts[back_idx]);
+                if (back_val.type != FVAL_LOGICAL) {
+                    free_value(&string_val);
+                    free_value(&set_val);
+                    free_value(&back_val);
+                    ofort_error(I, "SPLIT BACK argument must be LOGICAL");
+                }
+                back = back_val.v.b != 0;
+                free_value(&back_val);
+            }
+            string_text = string_val.v.s ? string_val.v.s : "";
+            set_text = set_val.v.s ? set_val.v.s : "";
+            string_len = (int)strlen(string_text);
+            set_len = (int)strlen(set_text);
+            pos = back ? 0 : string_len + 1;
+            if (set_len > 0) {
+                if (back) {
+                    int start = start_pos - 2;
+                    if (start >= string_len) start = string_len - 1;
+                    for (int i = start; i >= 0; i--) {
+                        if (strchr(set_text, string_text[i])) {
+                            pos = i + 1;
+                            break;
+                        }
+                    }
+                } else {
+                    int start = start_pos;
+                    if (start < 0) start = 0;
+                    for (int i = start; i < string_len; i++) {
+                        if (strchr(set_text, string_text[i])) {
+                            pos = i + 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            set_var(I, n->stmts[pos_idx]->name, make_integer(pos));
+            free_value(&string_val);
+            free_value(&set_val);
+            break;
+        }
         if (strcmp(call_upper, "SYSTEM_CLOCK") == 0) {
             long long rate = 1;
             long long count_max = LLONG_MAX;
@@ -21600,7 +21685,7 @@ static const char *intrinsic_names[] = {
     "SELECTED_INT_KIND", "SELECTED_LOGICAL_KIND", "SELECTED_REAL_KIND", "IEEE_SELECTED_REAL_KIND", "SELECTED_CHAR_KIND",
     "IEEE_SUPPORT_FLAG", "IEEE_SUPPORT_HALTING", "IEEE_SUPPORT_ROUNDING", "IEEE_ALL", "IEEE_USUAL",
     /* String */
-    "LEN", "LEN_TRIM", "TRIM", "NEW_LINE", "ADJUSTL", "ADJUSTR", "INDEX", "SCAN", "VERIFY",
+    "LEN", "LEN_TRIM", "TRIM", "NEW_LINE", "ADJUSTL", "ADJUSTR", "INDEX", "SCAN", "VERIFY", "SPLIT",
     "CHAR", "ICHAR", "ACHAR", "IACHAR", "REPEAT",
     /* Array */
     "SIZE", "SHAPE", "RANK", "PACK", "UNPACK", "MERGE", "SUM", "PRODUCT", "REDUCE", "MAXVAL", "MINVAL", "MAXLOC", "MINLOC", "FINDLOC",
