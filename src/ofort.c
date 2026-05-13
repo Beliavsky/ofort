@@ -20688,6 +20688,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 n->stmts[i]->type == FND_MEMBER) {
                 OfortValue *actual = member_lvalue(I, n->stmts[i]);
                 args[i] = actual ? copy_value(*actual) : make_void_val();
+            } else if (fn && i < fn->n_params && fn->param_pointers[i] &&
+                       n->stmts[i]->type == FND_IDENT) {
+                OfortVar *actual = find_var(I, n->stmts[i]->name);
+                args[i] = actual ? copy_value(actual->val) : make_void_val();
             } else if (fn && i < fn->n_params && fn->param_allocatables[i] &&
                        n->stmts[i]->type == FND_MEMBER) {
                 OfortValue *actual = member_lvalue(I, n->stmts[i]);
@@ -20747,7 +20751,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             OfortVar *pv;
             if (i < nargs && arg_alias[i]) {
                 pv = declare_alias_var(I, fn->param_names[i], arg_alias_var[i]);
-            } else if (i < nargs && (args[i].type != FVAL_VOID || fn->param_allocatables[i])) {
+            } else if (i < nargs && (args[i].type != FVAL_VOID || fn->param_allocatables[i] || fn->param_pointers[i])) {
                 pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
                 if (fn->param_pointers[i] && args[i].is_pointer_ref && args[i].pointer_target[0]) {
                     pv->is_pointer = 1;
@@ -20757,6 +20761,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     pv->pointer_slice_start = args[i].pointer_slice_start;
                     pv->pointer_slice_end = args[i].pointer_slice_end;
                     pv->pointer_slice_stride = args[i].pointer_slice_stride ? args[i].pointer_slice_stride : 1;
+                } else if (fn->param_pointers[i]) {
+                    pv->is_pointer = 1;
+                    pv->present = 1;
+                    pv->pointer_associated = 0;
                 }
                 if (fn->param_allocatables[i]) {
                     pv->is_allocatable = 1;
