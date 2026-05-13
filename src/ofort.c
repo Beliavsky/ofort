@@ -10697,6 +10697,42 @@ static int pointer_target_descriptor(OfortInterpreter *I, OfortNode *node,
         copy_cstr(name, name_size, node->name);
         return 1;
     }
+    if (node->type == FND_MEMBER) {
+        OfortValue *target = member_lvalue(I, node);
+        if (target && target->is_pointer_ref && target->pointer_target[0]) {
+            copy_cstr(name, name_size, target->pointer_target);
+            *has_slice = target->pointer_has_slice;
+            *slice_start = target->pointer_slice_start;
+            *slice_end = target->pointer_slice_end;
+            *slice_stride = target->pointer_slice_stride ? target->pointer_slice_stride : 1;
+            return 1;
+        }
+        return 0;
+    }
+    if (node->type == FND_ARRAY_REF && node->children[0] &&
+        node->children[0]->type == FND_MEMBER && node->n_stmts == 1 &&
+        node->stmts[0] && node->stmts[0]->type == FND_SLICE) {
+        OfortValue *target = member_lvalue(I, node->children[0]);
+        OfortSubscriptRange range;
+        if (!target || target->type != FVAL_ARRAY) return 0;
+        if (!target->is_pointer_ref || !target->pointer_target[0]) return 0;
+        eval_subscript_range(I, node->stmts[0], target->v.arr.lower_bounds[0],
+                             target->v.arr.dims[0], &range);
+        if (!range.is_slice) return 0;
+        copy_cstr(name, name_size, target->pointer_target);
+        *has_slice = 1;
+        if (target->pointer_has_slice) {
+            int stride = target->pointer_slice_stride ? target->pointer_slice_stride : 1;
+            *slice_start = target->pointer_slice_start + (range.start - target->v.arr.lower_bounds[0]) * stride;
+            *slice_end = target->pointer_slice_start + (range.end - target->v.arr.lower_bounds[0]) * stride;
+            *slice_stride = range.step * stride;
+        } else {
+            *slice_start = range.start;
+            *slice_end = range.end;
+            *slice_stride = range.step;
+        }
+        return 1;
+    }
     if (node->type == FND_FUNC_CALL && node->n_stmts == 1 && node->stmts[0]->type == FND_SLICE) {
         OfortVar *var = find_var(I, node->name);
         OfortSubscriptRange range;
@@ -19121,7 +19157,25 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         } else if (lhs->type == FND_FUNC_CALL) {
             /* Array element assignment: arr(i) = val */
             OfortVar *var = find_var(I, lhs->name);
-            if (!var) ofort_error(I, "Undefined variable '%s'", lhs->name);
+            if (!var) {
+                OfortFunc *lhs_func = find_func(I, lhs->name);
+                if (lhs_func && lhs_func->is_function && lhs->n_stmts == 0) {
+                    OfortValue ptr_result = eval_node(I, lhs);
+                    if (ptr_result.is_pointer_ref && ptr_result.pointer_target[0]) {
+                        if (!write_through_pointer_value(I, &ptr_result, &rhs)) {
+                            free_value(&ptr_result);
+                            free_value(&rhs);
+                            ofort_error(I, "Invalid pointer function assignment target");
+                        }
+                        trace_assignment_value(I, lhs, rhs);
+                        free_value(&ptr_result);
+                        free_value(&rhs);
+                        break;
+                    }
+                    free_value(&ptr_result);
+                }
+                ofort_error(I, "Undefined variable '%s'", lhs->name);
+            }
             if (var->is_protected) ofort_error(I, "Cannot assign to PROTECTED variable '%s'", lhs->name);
             if (var->is_pointer && var->pointer_associated && var->pointer_target[0] &&
                 var->val.type == FVAL_ARRAY && lhs->n_stmts == 1) {
