@@ -10391,6 +10391,33 @@ static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
     int lower_bounds[7];
     int ndims = n->n_dims;
 
+    if (n->n_dims == 1 && n->stmts && n->n_stmts > 0 && n->stmts[0] && !n->has_lower_bound[0]) {
+        OfortValue dv = eval_node(I, n->stmts[0]);
+        if (dv.type == FVAL_ARRAY && dv.v.arr.elem_type == FVAL_INTEGER) {
+            if (dv.v.arr.len > 7) {
+                free_value(&dv);
+                ofort_error(I, "Too many dimensions from integer array bounds");
+            }
+            ndims = dv.v.arr.len;
+            for (int i = 0; i < ndims; i++) {
+                OfortValue elem = array_element_value(&dv, i);
+                lower_bounds[i] = 1;
+                dims[i] = (int)val_to_int(elem);
+                if (dims[i] < 0) dims[i] = 0;
+                free_value(&elem);
+            }
+            free_value(&dv);
+            {
+                OfortValue arr = make_array_with_char_len_options(n->val_type, dims, ndims,
+                                                                  eval_character_length(I, n),
+                                                                  I->fast_mode);
+                set_array_lower_bounds(&arr, lower_bounds, ndims);
+                return arr;
+            }
+        }
+        free_value(&dv);
+    }
+
     for (int i = 0; i < ndims; i++) {
         lower_bounds[i] = n->has_lower_bound[i] ? n->lower_bounds[i] : 1;
         if (n->has_lower_bound[i] && n->lower_bound_exprs[i]) {
