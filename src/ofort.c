@@ -20862,13 +20862,24 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             if (pv->is_pointer && pv->pointer_associated && pv->pointer_target[0]) {
                 for (int j = 0; j < fn->n_params && j < nargs; j++) {
+                    int saved_lower_bounds[7] = {1, 1, 1, 1, 1, 1, 1};
+                    int saved_rank = 0;
                     if (!str_eq_nocase(pv->pointer_target, fn->param_names[j])) continue;
                     if (n->stmts[j]->type != FND_IDENT) continue;
+                    if (pv->val.type == FVAL_ARRAY) {
+                        saved_rank = pv->val.v.arr.n_dims;
+                        for (int lb_i = 0; lb_i < saved_rank && lb_i < 7; lb_i++)
+                            saved_lower_bounds[lb_i] = pv->val.v.arr.lower_bounds[lb_i];
+                    }
                     copy_cstr(pv->pointer_target, sizeof(pv->pointer_target), n->stmts[j]->name);
                     free_value(&pv->val);
                     pv->val = pointer_referenced_value(I, pv->pointer_target, pv->pointer_has_slice,
                                                         pv->pointer_slice_start, pv->pointer_slice_end,
                                                         pv->pointer_slice_stride);
+                    if (pv->val.type == FVAL_ARRAY) {
+                        for (int lb_i = 0; lb_i < saved_rank && lb_i < pv->val.v.arr.n_dims && lb_i < 7; lb_i++)
+                            pv->val.v.arr.lower_bounds[lb_i] = saved_lower_bounds[lb_i];
+                    }
                     break;
                 }
             }
@@ -20917,6 +20928,34 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         pop_scope(I);
         sync_module_vars_to_scope(I, func->module_name);
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
+            if (!arg_alias[i] && n->stmts[i]->type == FND_IDENT && fn->param_intents[i] != 1 &&
+                fn->param_pointers[i]) {
+                OfortVar *actual = find_var(I, n->stmts[i]->name);
+                if (actual && actual->is_pointer) {
+                    if (pointer_copyback[i]) {
+                        free_value(&actual->val);
+                        actual->val = copy_value(args[i]);
+                        actual->pointer_associated = 1;
+                        actual->is_initialized = 1;
+                        copy_cstr(actual->pointer_target, sizeof(actual->pointer_target), pointer_copyback_target[i]);
+                        actual->pointer_has_slice = pointer_copyback_has_slice[i];
+                        actual->pointer_slice_start = pointer_copyback_slice_start[i];
+                        actual->pointer_slice_end = pointer_copyback_slice_end[i];
+                        actual->pointer_slice_stride = pointer_copyback_slice_stride[i] ? pointer_copyback_slice_stride[i] : 1;
+                    } else {
+                        free_value(&actual->val);
+                        actual->val = make_void_val();
+                        actual->pointer_associated = 0;
+                        actual->is_initialized = 0;
+                        actual->pointer_target[0] = '\0';
+                        actual->pointer_has_slice = 0;
+                        actual->pointer_slice_start = 0;
+                        actual->pointer_slice_end = 0;
+                        actual->pointer_slice_stride = 1;
+                    }
+                    continue;
+                }
+            }
             if (!arg_alias[i] && n->stmts[i]->type == FND_IDENT && fn->param_intents[i] != 1 &&
                 args[i].type != FVAL_VOID && !procedure_ref_name(&args[i])) {
                 OfortVar *actual = find_var(I, n->stmts[i]->name);
