@@ -1847,6 +1847,94 @@ static int allocation_extents_fit_int(OfortInterpreter *I, OfortNode *n,
     return 1;
 }
 
+static int allocation_extents_from_integer_array_bounds(OfortInterpreter *I, OfortNode *n,
+                                                        int *dims, int *lower_bounds,
+                                                        int *ndims_io,
+                                                        const char **errmsg_out,
+                                                        int *handled_out) {
+    OfortValue upper = make_void_val();
+    OfortValue lower = make_void_val();
+    int has_lower = 0;
+    int lower_is_array = 0;
+    int lower_scalar = 1;
+    int rank;
+    long long total = 1;
+
+    if (handled_out) *handled_out = 0;
+    if (!I || !n || !dims || !lower_bounds || !ndims_io) return 1;
+    if (n->n_stmts != 1 || !n->stmts || !n->stmts[0]) return 1;
+
+    upper = eval_node(I, n->stmts[0]);
+    if (upper.type != FVAL_ARRAY || upper.v.arr.elem_type != FVAL_INTEGER) {
+        free_value(&upper);
+        return 1;
+    }
+    if (handled_out) *handled_out = 1;
+
+    rank = upper.v.arr.len;
+    if (rank < 0 || rank > 7) {
+        if (errmsg_out) *errmsg_out = "Too many ALLOCATE dimensions";
+        free_value(&upper);
+        return 0;
+    }
+
+    if (n->has_lower_bound[0]) {
+        has_lower = 1;
+        if (n->children[2]) {
+            lower = eval_node(I, n->children[2]);
+            if (lower.type == FVAL_ARRAY) {
+                if (lower.v.arr.elem_type != FVAL_INTEGER || lower.v.arr.len != rank) {
+                    if (errmsg_out) *errmsg_out = "ALLOCATE lower and upper bound arrays must have the same size";
+                    free_value(&lower);
+                    free_value(&upper);
+                    return 0;
+                }
+                lower_is_array = 1;
+            } else {
+                lower_scalar = (int)val_to_int(lower);
+                free_value(&lower);
+                lower = make_void_val();
+            }
+        } else {
+            lower_scalar = n->lower_bounds[0];
+        }
+    }
+
+    for (int i = 0; i < rank; i++) {
+        long long lo = has_lower ?
+            (lower_is_array ? val_to_int(lower.v.arr.data[i]) : lower_scalar) : 1;
+        long long hi = val_to_int(upper.v.arr.data[i]);
+        long long extent = has_lower ? hi - lo + 1 : hi;
+        if (extent < 0) extent = 0;
+        if (extent > INT_MAX || lo < INT_MIN || lo > INT_MAX) {
+            if (errmsg_out) *errmsg_out = "Insufficient virtual memory";
+            free_value(&lower);
+            free_value(&upper);
+            return 0;
+        }
+        if (extent > 0 && total > LLONG_MAX / extent) {
+            if (errmsg_out) *errmsg_out = "Insufficient virtual memory";
+            free_value(&lower);
+            free_value(&upper);
+            return 0;
+        }
+        total *= extent;
+        if (total > INT_MAX) {
+            if (errmsg_out) *errmsg_out = "Insufficient virtual memory";
+            free_value(&lower);
+            free_value(&upper);
+            return 0;
+        }
+        lower_bounds[i] = has_lower ? (int)lo : 1;
+        dims[i] = (int)extent;
+    }
+
+    *ndims_io = rank;
+    free_value(&lower);
+    free_value(&upper);
+    return 1;
+}
+
 static int ieee_name_kind(const char *name, const char **type_name, long long *tag) {
     char upper[256];
     str_upper(upper, name, sizeof(upper));
@@ -21540,25 +21628,38 @@ unresolved_external_call_done:
             for (int i = 0; i < 7; i++) lower_bounds[i] = 1;
 
             if (ndims > 0) {
-                for (int i = 0; i < ndims; i++) {
-                    int lower = 1;
-                    OfortValue dv = eval_node(I, n->stmts[i]);
-                    int upper = (int)val_to_int(dv);
-                    free_value(&dv);
-                    if (n->has_lower_bound[i]) {
-                        if (n->children[2 + i]) {
-                            OfortValue lv = eval_node(I, n->children[2 + i]);
-                            lower = (int)val_to_int(lv);
-                            free_value(&lv);
-                        } else {
-                            lower = n->lower_bounds[i];
-                        }
-                        dims[i] = upper - lower + 1;
-                        lower_bounds[i] = lower;
-                    } else {
-                        dims[i] = upper;
+                const char *alloc_errmsg = "Insufficient virtual memory";
+                int handled_array_bounds = 0;
+                if (!allocation_extents_from_integer_array_bounds(I, n, dims, lower_bounds,
+                                                                  &ndims, &alloc_errmsg,
+                                                                  &handled_array_bounds)) {
+                    if (n->param_names[0][0]) {
+                        set_allocate_status(I, n, 5020, alloc_errmsg);
+                        break;
                     }
-                    if (dims[i] < 0) dims[i] = 0;
+                    ofort_error(I, "%s", alloc_errmsg);
+                }
+                if (!handled_array_bounds) {
+                    for (int i = 0; i < ndims; i++) {
+                        int lower = 1;
+                        OfortValue dv = eval_node(I, n->stmts[i]);
+                        int upper = (int)val_to_int(dv);
+                        free_value(&dv);
+                        if (n->has_lower_bound[i]) {
+                            if (n->children[2 + i]) {
+                                OfortValue lv = eval_node(I, n->children[2 + i]);
+                                lower = (int)val_to_int(lv);
+                                free_value(&lv);
+                            } else {
+                                lower = n->lower_bounds[i];
+                            }
+                            dims[i] = upper - lower + 1;
+                            lower_bounds[i] = lower;
+                        } else {
+                            dims[i] = upper;
+                        }
+                        if (dims[i] < 0) dims[i] = 0;
+                    }
                 }
                 free_value(target);
                 if (elem_type == FVAL_DERIVED && elem_type_name[0])
@@ -21715,7 +21816,18 @@ unresolved_external_call_done:
         }
         if (ndims > 0) {
             const char *alloc_errmsg = "Insufficient virtual memory";
-            if (!allocation_extents_fit_int(I, n, dims, lower_bounds, &alloc_errmsg)) {
+            int handled_array_bounds = 0;
+            if (!allocation_extents_from_integer_array_bounds(I, n, dims, lower_bounds,
+                                                              &ndims, &alloc_errmsg,
+                                                              &handled_array_bounds)) {
+                if (n->param_names[0][0]) {
+                    set_allocate_status(I, n, 5020, alloc_errmsg);
+                    break;
+                }
+                ofort_error(I, "%s", alloc_errmsg);
+            }
+            if (!handled_array_bounds &&
+                !allocation_extents_fit_int(I, n, dims, lower_bounds, &alloc_errmsg)) {
                 if (n->param_names[0][0]) {
                     set_allocate_status(I, n, 5020, alloc_errmsg);
                     break;
