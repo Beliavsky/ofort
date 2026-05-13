@@ -21584,6 +21584,7 @@ unresolved_external_call_done:
 static const char *intrinsic_names[] = {
     /* Math */
     "ABS", "SQRT", "HYPOT", "SIN", "COS", "TAN", "ASIN", "ACOS", "ATAN", "ATAN2",
+    "SINPI", "COSPI", "TANPI", "ASINPI", "ACOSPI", "ATANPI", "ATAN2PI",
     "SIND", "COSD", "TAND", "ASIND", "ACOSD", "ATAND", "ATAN2D",
     "BESSEL_J0", "BESSEL_J1", "BESSEL_Y0", "BESSEL_Y1", "BESSEL_JN", "BESSEL_YN",
     "SINH", "COSH", "TANH", "ASINH", "ACOSH", "ATANH",
@@ -21630,6 +21631,9 @@ static int is_elemental_unary_intrinsic(const char *upper) {
            strcmp(upper, "SQRT") == 0 ||
            strcmp(upper, "SIN") == 0 ||
            strcmp(upper, "COS") == 0 ||
+           strcmp(upper, "SINPI") == 0 ||
+           strcmp(upper, "COSPI") == 0 ||
+           strcmp(upper, "TANPI") == 0 ||
            strcmp(upper, "SIND") == 0 ||
            strcmp(upper, "COSD") == 0 ||
            strcmp(upper, "TAND") == 0 ||
@@ -21641,6 +21645,9 @@ static int is_elemental_unary_intrinsic(const char *upper) {
            strcmp(upper, "ASIND") == 0 ||
            strcmp(upper, "ACOSD") == 0 ||
            strcmp(upper, "ATAND") == 0 ||
+           strcmp(upper, "ASINPI") == 0 ||
+           strcmp(upper, "ACOSPI") == 0 ||
+           strcmp(upper, "ATANPI") == 0 ||
            strcmp(upper, "SINH") == 0 ||
            strcmp(upper, "COSH") == 0 ||
            strcmp(upper, "TANH") == 0 ||
@@ -21692,6 +21699,10 @@ static double ofort_deg_to_rad(double angle_deg) {
 
 static double ofort_rad_to_deg(double angle_rad) {
     return angle_rad * (180.0 / acos(-1.0));
+}
+
+static double ofort_pi(void) {
+    return acos(-1.0);
 }
 
 static int intrinsic_arg_index(char arg_names[OFORT_MAX_PARAMS][256], int nargs, const char *name) {
@@ -25391,6 +25402,48 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "ATAN2") == 0) {
         if (nargs < 2) ofort_error(I, "ATAN2 requires 2 arguments");
         return make_real(atan2(val_to_real(args[0]), val_to_real(args[1])));
+    }
+    if (strcmp(upper, "SINPI") == 0) {
+        if (nargs < 1) ofort_error(I, "SINPI requires 1 argument");
+        {
+            double result = sin(ofort_pi() * val_to_real(args[0]));
+            return make_real(fabs(result) < 1e-15 ? 0.0 : result);
+        }
+    }
+    if (strcmp(upper, "COSPI") == 0) {
+        if (nargs < 1) ofort_error(I, "COSPI requires 1 argument");
+        {
+            double result = cos(ofort_pi() * val_to_real(args[0]));
+            return make_real(fabs(result) < 1e-15 ? 0.0 : result);
+        }
+    }
+    if (strcmp(upper, "TANPI") == 0) {
+        if (nargs < 1) ofort_error(I, "TANPI requires 1 argument");
+        {
+            double radians = ofort_pi() * val_to_real(args[0]);
+            double cos_value = cos(radians);
+            if (fabs(cos_value) < 1e-15) {
+                double sin_value = sin(radians);
+                return make_real(sin_value >= 0.0 ? (1.0 / 0.0) : (-1.0 / 0.0));
+            }
+            return make_real(tan(radians));
+        }
+    }
+    if (strcmp(upper, "ASINPI") == 0) {
+        if (nargs < 1) ofort_error(I, "ASINPI requires 1 argument");
+        return make_real(asin(val_to_real(args[0])) / ofort_pi());
+    }
+    if (strcmp(upper, "ACOSPI") == 0) {
+        if (nargs < 1) ofort_error(I, "ACOSPI requires 1 argument");
+        return make_real(acos(val_to_real(args[0])) / ofort_pi());
+    }
+    if (strcmp(upper, "ATANPI") == 0) {
+        if (nargs < 1) ofort_error(I, "ATANPI requires 1 argument");
+        return make_real(atan(val_to_real(args[0])) / ofort_pi());
+    }
+    if (strcmp(upper, "ATAN2PI") == 0) {
+        if (nargs < 2) ofort_error(I, "ATAN2PI requires 2 arguments");
+        return make_real(atan2(val_to_real(args[0]), val_to_real(args[1])) / ofort_pi());
     }
     if (strcmp(upper, "SIND") == 0) {
         if (nargs < 1) ofort_error(I, "SIND requires 1 argument");
