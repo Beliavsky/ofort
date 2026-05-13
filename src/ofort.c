@@ -13784,7 +13784,13 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             if (nargs < 1) ofort_error(I, "ASSOCIATED requires a pointer argument");
             if (n->stmts[0]->type != FND_IDENT) {
                 OfortValue *target = member_lvalue(I, n->stmts[0]);
-                if (target) return make_logical(target->type != FVAL_VOID);
+                if (target) {
+                    if (target->is_pointer_ref)
+                        return make_logical(target->pointer_target[0] != '\0');
+                    if (target->type == FVAL_ARRAY)
+                        return make_logical(target->v.arr.allocated);
+                    return make_logical(target->type != FVAL_VOID);
+                }
                 OfortValue av = eval_node(I, n->stmts[0]);
                 int present = av.type != FVAL_VOID;
                 free_value(&av);
