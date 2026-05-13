@@ -4740,6 +4740,25 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                 else break;
             }
             expect(I, FTOK_RPAREN);
+        } else if (check(I, FTOK_IDENT) && str_eq_nocase(peek(I)->str_val, "rank")) {
+            OfortNode *rank_expr;
+            int rank_value;
+            advance(I);
+            expect(I, FTOK_LPAREN);
+            rank_expr = parse_expr(I);
+            if (!int_constant_node(rank_expr, &rank_value))
+                ofort_error(I, "RANK attribute requires a constant integer rank");
+            if (rank_value < 0 || rank_value > 7)
+                ofort_error(I, "RANK attribute rank must be between 0 and 7");
+            expect(I, FTOK_RPAREN);
+            n_decl_dims = rank_value;
+            for (int ri = 0; ri < rank_value; ri++) {
+                decl_dims[ri] = 0;
+                decl_dim_exprs[ri] = NULL;
+                decl_lower_bounds[ri] = 1;
+                decl_has_lower_bound[ri] = 0;
+                decl_lower_bound_exprs[ri] = NULL;
+            }
         } else if (check(I, FTOK_ALLOCATABLE)) {
             advance(I);
             is_allocatable = 1;
@@ -26808,6 +26827,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         int op3_idx = intrinsic_arg_index(arg_names, nargs, "operation");
         int identity_idx = intrinsic_arg_index(arg_names, nargs, "identity");
         int mask_idx = intrinsic_arg_index(arg_names, nargs, "mask");
+        int ordered_idx = intrinsic_arg_index(arg_names, nargs, "ordered");
         OfortFunc *op_func = NULL;
         const char *op_name = NULL;
 
@@ -26818,8 +26838,8 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
 
         if (identity_idx < 0 && mask_idx < 0) {
             if (nargs >= 2 && array_idx == 0 && op_idx == 1) {
-                if (nargs >= 3) identity_idx = 2;
-                if (nargs >= 4) mask_idx = 3;
+                if (nargs >= 3 && ordered_idx != 2) identity_idx = 2;
+                if (nargs >= 4 && ordered_idx != 3) mask_idx = 3;
             }
         }
 
@@ -26842,6 +26862,8 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (nargs > 2 && mask_idx >= 0 && (mask_idx == array_idx || mask_idx == op_idx ||
                                            (identity_idx >= 0 && mask_idx == identity_idx)))
             ofort_error(I, "REDUCE has overlapping arguments");
+        if (ordered_idx >= 0 && args[ordered_idx].type != FVAL_LOGICAL)
+            ofort_error(I, "REDUCE ORDERED argument must be LOGICAL");
 
         {
             OfortValue *array = &args[array_idx];
