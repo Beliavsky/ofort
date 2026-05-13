@@ -3624,6 +3624,45 @@ static OfortNode *parse_interface_block(OfortInterpreter *I) {
     return n;
 }
 
+static OfortNode *parse_import_statement(OfortInterpreter *I) {
+    OfortToken *it = advance(I); /* IMPORT */
+    OfortNode *n = alloc_node(I, FND_IMPORT);
+    n->line = it->line;
+    n->n_params = 0;
+
+    if (check(I, FTOK_DCOLON)) {
+        advance(I);
+    } else if (check(I, FTOK_COMMA)) {
+        advance(I);
+        if (token_ident_upper(peek(I), "NONE")) {
+            n->int_val = 1;
+            advance(I);
+        } else if (token_ident_upper(peek(I), "ALL")) {
+            n->int_val = 2;
+            advance(I);
+        } else if (token_ident_upper(peek(I), "ONLY")) {
+            n->int_val = 3;
+            advance(I);
+            if (check(I, FTOK_COLON)) advance(I);
+        }
+    }
+
+    while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
+        if (check(I, FTOK_COMMA)) {
+            advance(I);
+            continue;
+        }
+        if (token_can_be_name(peek(I))) {
+            if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "IMPORT names");
+            copy_cstr(n->param_names[n->n_params++],
+                      sizeof(n->param_names[0]), token_name_text(advance(I)));
+        } else {
+            advance(I);
+        }
+    }
+    return n;
+}
+
 static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
     OfortToken *pt = advance(I); /* PROCEDURE */
     OfortNode *block = alloc_node(I, FND_BLOCK);
@@ -8580,6 +8619,10 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     /* IMPLICIT NONE */
     if (t->type == FTOK_IMPLICIT) {
         return parse_implicit_stmt(I);
+    }
+
+    if (token_ident_upper(t, "IMPORT")) {
+        return parse_import_statement(I);
     }
 
     /* Module access statements: PUBLIC, PRIVATE, PUBLIC :: x, PRIVATE :: x */
@@ -17084,6 +17127,7 @@ static int check_semantics_is_spec_node(OfortNode *n) {
         case FND_ENUM:
         case FND_TYPE_DEF:
         case FND_USE:
+        case FND_IMPORT:
         case FND_INTERFACE:
         case FND_ATTR_STMT:
         case FND_MODULE:
@@ -21663,6 +21707,9 @@ unresolved_external_call_done:
         (void)register_func(I, n->name, n, n->type == FND_FUNCTION);
         break;
     }
+
+    case FND_IMPORT:
+        break;
 
     case FND_INTERFACE:
         register_generic(I, n);
