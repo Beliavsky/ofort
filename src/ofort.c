@@ -18041,14 +18041,24 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         else if (strcmp(ru, "INPUT_UNIT") == 0) declare_var(I, local, make_integer(5));
                         else if (strcmp(ru, "ERROR_UNIT") == 0) declare_var(I, local, make_integer(0));
                         else if (strcmp(ru, "REAL64") == 0) declare_var(I, local, make_integer(8));
+                        else if (strcmp(ru, "REAL16") == 0) declare_var(I, local, make_integer(-2));
                         else if (strcmp(ru, "INT64") == 0) declare_var(I, local, make_integer(8));
+                        else if (strcmp(ru, "LOGICAL8") == 0) declare_var(I, local, make_integer(1));
+                        else if (strcmp(ru, "LOGICAL16") == 0) declare_var(I, local, make_integer(2));
+                        else if (strcmp(ru, "LOGICAL32") == 0) declare_var(I, local, make_integer(4));
+                        else if (strcmp(ru, "LOGICAL64") == 0) declare_var(I, local, make_integer(8));
                     }
                 } else {
                     declare_var(I, "output_unit", make_integer(6));
                     declare_var(I, "input_unit", make_integer(5));
                     declare_var(I, "error_unit", make_integer(0));
                     declare_var(I, "real64", make_integer(8));
+                    declare_var(I, "real16", make_integer(-2));
                     declare_var(I, "int64", make_integer(8));
+                    declare_var(I, "logical8", make_integer(1));
+                    declare_var(I, "logical16", make_integer(2));
+                    declare_var(I, "logical32", make_integer(4));
+                    declare_var(I, "logical64", make_integer(8));
                 }
                 break;
             }
