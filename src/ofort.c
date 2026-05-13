@@ -12529,6 +12529,7 @@ static void read_values_from_stream_file(OfortInterpreter *I, OfortUnitFile *ent
 
 static void format_descriptors(OfortInterpreter *I, const char *p, const char *end,
                                OfortValue *vals, int nvals, int *vidx) {
+    int leading_zero_mode = (I && I->standard_mode == OFORT_STD_F2023) ? 2 : 0; /* 0=processor/default, 1=print, 2=suppress */
     while (*p && (!end || p < end)) {
         int repeat = 1;
         char fc;
@@ -12614,6 +12615,21 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
         }
 
         fc = (char)toupper((unsigned char)*p);
+
+        if (fc == 'L' && (p[1] == 'Z' || p[1] == 'z')) {
+            char mode = (char)toupper((unsigned char)p[2]);
+            if (mode == 'P') {
+                leading_zero_mode = 1;
+                p += 3;
+            } else if (mode == 'S') {
+                leading_zero_mode = 2;
+                p += 3;
+            } else {
+                leading_zero_mode = 0;
+                p += 2;
+            }
+            continue;
+        }
 
         if (fc == 'A') {
             int width = 0;
@@ -12758,6 +12774,55 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
                     snprintf(buf, sizeof(buf), "%*.*g", width, dec, rv);
                 } else {
                     snprintf(buf, sizeof(buf), "%*.*E", width, dec, rv);
+                }
+                if (leading_zero_mode == 1 || leading_zero_mode == 2) {
+                    char adjusted[128];
+                    int bi = 0;
+                    int ai = 0;
+                    int changed = 0;
+                    while (buf[bi] && ai < (int)sizeof(adjusted) - 1) {
+                        int sign_pos = -1;
+                        int zero_pos = -1;
+                        int dot_pos = -1;
+                        if ((buf[bi] == '+' || buf[bi] == '-') && buf[bi + 1] == '0' && buf[bi + 2] == '.') {
+                            sign_pos = bi;
+                            zero_pos = bi + 1;
+                            dot_pos = bi + 2;
+                        } else if (buf[bi] == '0' && buf[bi + 1] == '.') {
+                            zero_pos = bi;
+                            dot_pos = bi + 1;
+                        } else if ((buf[bi] == '+' || buf[bi] == '-') && buf[bi + 1] == '.' &&
+                                   (bi == 0 || !isdigit((unsigned char)buf[bi - 1]))) {
+                            sign_pos = bi;
+                            dot_pos = bi + 1;
+                        } else if (buf[bi] == '.' &&
+                                   (bi == 0 || !isdigit((unsigned char)buf[bi - 1]))) {
+                            dot_pos = bi;
+                        }
+                        if (dot_pos >= 0) {
+                            if (leading_zero_mode == 1) {
+                                if (sign_pos >= 0) adjusted[ai++] = buf[sign_pos];
+                                if (zero_pos < 0 && ai < (int)sizeof(adjusted) - 1) {
+                                    adjusted[ai++] = '0';
+                                    changed = 1;
+                                } else if (zero_pos >= 0 && ai < (int)sizeof(adjusted) - 1) {
+                                    adjusted[ai++] = '0';
+                                }
+                                adjusted[ai++] = '.';
+                                bi = dot_pos + 1;
+                                continue;
+                            } else if (leading_zero_mode == 2) {
+                                if (sign_pos >= 0) adjusted[ai++] = buf[sign_pos];
+                                if (zero_pos >= 0) changed = 1;
+                                adjusted[ai++] = '.';
+                                bi = dot_pos + 1;
+                                continue;
+                            }
+                        }
+                        adjusted[ai++] = buf[bi++];
+                    }
+                    adjusted[ai] = '\0';
+                    if (changed) copy_cstr(buf, sizeof(buf), adjusted);
                 }
                 out_append(I, buf);
             }
