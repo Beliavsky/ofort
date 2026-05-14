@@ -3784,6 +3784,7 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
     int cap = 0;
     int is_pointer = 0;
     int is_optional = 0;
+    int is_value = 0;
     int intent = 0;
     int procedure_nopass = 0;
     char procedure_pass_name[64] = "";
@@ -3810,6 +3811,9 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
         } else if (token_ident_upper(peek(I), "OPTIONAL")) {
             advance(I);
             is_optional = 1;
+        } else if (token_ident_upper(peek(I), "VALUE")) {
+            advance(I);
+            is_value = 1;
         } else if (token_ident_upper(peek(I), "NOPASS")) {
             advance(I);
             procedure_nopass = 1;
@@ -3830,6 +3834,9 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
             advance(I);
         }
     }
+    if (is_pointer && is_value) {
+        ofort_error(I, "VALUE attribute conflicts with POINTER attribute");
+    }
     if (check(I, FTOK_DCOLON)) advance(I);
 
     while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
@@ -3849,6 +3856,7 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
             decl->char_len = 256;
             decl->is_pointer = is_pointer;
             decl->is_optional = is_optional;
+            decl->is_value = is_value;
             decl->intent = intent;
             decl->procedure_nopass = procedure_nopass;
             copy_cstr(decl->procedure_pass_name, sizeof(decl->procedure_pass_name),
