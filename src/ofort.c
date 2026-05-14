@@ -3332,10 +3332,33 @@ static const char *token_name_text(OfortToken *t) {
 static void validate_import_none_tokens(OfortInterpreter *I) {
     if (!I || !I->tokens) return;
     for (int i = 0; i + 2 < I->n_tokens; i++) {
+        int import_none = 0;
+        int import_only = 0;
+        char only_names[OFORT_MAX_PARAMS][256];
+        int n_only = 0;
         if (!token_ident_upper(&I->tokens[i], "IMPORT") ||
-            I->tokens[i + 1].type != FTOK_COMMA ||
-            !(I->tokens[i + 2].type == FTOK_NONE ||
-              token_ident_upper(&I->tokens[i + 2], "NONE"))) {
+            I->tokens[i + 1].type != FTOK_COMMA) {
+            continue;
+        }
+        if (I->tokens[i + 2].type == FTOK_NONE || token_ident_upper(&I->tokens[i + 2], "NONE")) {
+            import_none = 1;
+        } else if (token_ident_upper(&I->tokens[i + 2], "ONLY")) {
+            import_only = 1;
+            int pos = i + 3;
+            if (I->tokens[pos].type == FTOK_COLON) pos++;
+            while (pos < I->n_tokens && I->tokens[pos].type != FTOK_NEWLINE &&
+                   I->tokens[pos].type != FTOK_EOF) {
+                if (I->tokens[pos].type == FTOK_COMMA) {
+                    pos++;
+                    continue;
+                }
+                if (token_can_be_name(&I->tokens[pos]) && n_only < OFORT_MAX_PARAMS) {
+                    copy_cstr(only_names[n_only++], sizeof(only_names[0]),
+                              token_name_text(&I->tokens[pos]));
+                }
+                pos++;
+            }
+        } else {
             continue;
         }
         for (int pos = i + 3; pos + 2 < I->n_tokens; pos++) {
@@ -3349,9 +3372,24 @@ static void validate_import_none_tokens(OfortInterpreter *I) {
                  token_ident_upper(&I->tokens[pos], "LEN")) &&
                 I->tokens[pos + 1].type == FTOK_ASSIGN &&
                 token_can_be_name(&I->tokens[pos + 2])) {
-                ofort_error(I, "IMPORT, NONE prohibits host name '%s' at line %d",
-                            token_name_text(&I->tokens[pos + 2]),
-                            I->tokens[pos].line);
+                const char *name = token_name_text(&I->tokens[pos + 2]);
+                if (import_none) {
+                    ofort_error(I, "IMPORT, NONE prohibits host name '%s' at line %d",
+                                name, I->tokens[pos].line);
+                }
+                if (import_only) {
+                    int allowed = 0;
+                    for (int k = 0; k < n_only; k++) {
+                        if (str_eq_nocase(only_names[k], name)) {
+                            allowed = 1;
+                            break;
+                        }
+                    }
+                    if (!allowed) {
+                        ofort_error(I, "IMPORT, ONLY does not import host name '%s' at line %d",
+                                    name, I->tokens[pos].line);
+                    }
+                }
             }
         }
     }
