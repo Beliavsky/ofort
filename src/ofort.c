@@ -1666,6 +1666,37 @@ static OfortNode *find_module_proc_spec(OfortInterpreter *I, const char *name) {
     return NULL;
 }
 
+static void require_procedure_pointer_interface_compatible(OfortInterpreter *I,
+                                                           OfortVar *ptr,
+                                                           const char *target_name) {
+    if (!I || !ptr || !target_name || !target_name[0] || !ptr->declared_type_name[0]) return;
+    OfortNode *iface = find_module_proc_spec(I, ptr->declared_type_name);
+    OfortFunc *target_func = find_func(I, target_name);
+    OfortNode *target = target_func ? target_func->node : NULL;
+    if (!iface || !target) return;
+    if ((iface->type == FND_FUNCTION) != (target->type == FND_FUNCTION)) {
+        ofort_error(I, "Interface mismatch in procedure pointer assignment: '%s' has wrong procedure kind",
+                    target_name);
+    }
+    if (iface->n_params != target->n_params) {
+        ofort_error(I, "Interface mismatch in procedure pointer assignment: '%s' has the wrong number of arguments",
+                    target_name);
+    }
+    for (int i = 0; i < iface->n_params; i++) {
+        if (iface->param_types[i] != FVAL_VOID && target->param_types[i] != FVAL_VOID &&
+            iface->param_types[i] != target->param_types[i]) {
+            ofort_error(I, "Interface mismatch in procedure pointer assignment: argument '%s' has incompatible type",
+                        target->param_names[i]);
+        }
+    }
+    if (iface->type == FND_FUNCTION &&
+        iface->val_type != FVAL_VOID && target->val_type != FVAL_VOID &&
+        iface->val_type != target->val_type) {
+        ofort_error(I, "Interface mismatch in procedure pointer assignment: '%s' has incompatible result type",
+                    target_name);
+    }
+}
+
 static OfortVar *find_saved_var(OfortFunc *func, const char *name) {
     char upper[256];
     str_upper(upper, name, 256);
@@ -3788,10 +3819,17 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
     int intent = 0;
     int procedure_nopass = 0;
     char procedure_pass_name[64] = "";
+    char procedure_interface_name[64] = "";
     block->line = pt->line;
 
     if (check(I, FTOK_LPAREN)) {
-        skip_balanced_parens(I);
+        advance(I);
+        if (token_can_be_name(peek(I))) {
+            copy_cstr(procedure_interface_name, sizeof(procedure_interface_name),
+                      token_name_text(peek(I)));
+        }
+        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) advance(I);
+        if (check(I, FTOK_RPAREN)) advance(I);
     }
     while (check(I, FTOK_COMMA)) {
         advance(I);
@@ -3861,6 +3899,8 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
             decl->procedure_nopass = procedure_nopass;
             copy_cstr(decl->procedure_pass_name, sizeof(decl->procedure_pass_name),
                       procedure_pass_name);
+            copy_cstr(decl->parent_type_name, sizeof(decl->parent_type_name),
+                      procedure_interface_name);
             decl->line = name_tok->line;
             if (!is_pointer && make_procedure_ref_text(token_name_text(name_tok), proc_ref, sizeof(proc_ref))) {
                 OfortNode *init = alloc_node(I, FND_STRING_LIT);
@@ -19627,6 +19667,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         v->declared_type_name[0] = '\0';
         if (n->val_type == FVAL_DERIVED)
             copy_cstr(v->declared_type_name, sizeof(v->declared_type_name), n->str_val);
+        else if (n->val_type == FVAL_CHARACTER && n->parent_type_name[0])
+            copy_cstr(v->declared_type_name, sizeof(v->declared_type_name), n->parent_type_name);
         v->is_pointer = n->is_pointer;
         v->is_target = n->is_target;
         v->is_protected = n->is_protected;
@@ -19884,6 +19926,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 free_value(&rhs);
                 ofort_error(I, "Invalid pointer target");
             }
+        }
+        if (procedure_ref_name(&rhs)) {
+            require_procedure_pointer_interface_compatible(I, ptr, target_name);
         }
         free_value(&ptr->val);
         ptr->val = rhs;
