@@ -14653,6 +14653,10 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     args[i] = make_void_val();
                     continue;
                 }
+                if (actual && procedure_ref_name(&actual->val)) {
+                    args[i] = copy_value(actual->val);
+                    continue;
+                }
             }
             args[i] = eval_node(I, n->stmts[i]);
         }
