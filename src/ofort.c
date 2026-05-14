@@ -1604,6 +1604,8 @@ static void register_generic_procedure(OfortInterpreter *I, const char *generic_
     copy_cstr(g->procedures[g->n_procedures++], sizeof(g->procedures[0]), procedure_name);
 }
 
+static void annotate_procedure_params(OfortNode *n);
+
 static OfortFunc *register_func(OfortInterpreter *I, const char *name, OfortNode *node, int is_function) {
     for (int i = 0; i < I->n_funcs; i++) {
         if (str_eq_nocase(I->funcs[i].name, name)) {
@@ -1628,6 +1630,7 @@ static void register_contained_procedures(OfortInterpreter *I, OfortNode *body, 
         OfortNode *s = body->stmts[i];
         if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
                   s->type == FND_STMT_FUNCTION)) {
+            annotate_procedure_params(s);
             OfortFunc *func = register_func(I, s->name, s,
                                             s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
             if (module_name && module_name[0])
@@ -15066,7 +15069,9 @@ static void annotate_procedure_params(OfortNode *n) {
         }
         for (int j = 0; j < n_decls; j++) {
             OfortNode *d = decls[j];
-            if (d->type != FND_VARDECL || (d->intent == 0 && !d->is_optional && !d->is_value)) {
+            if (d->type != FND_VARDECL ||
+                (d->intent == 0 && !d->is_optional && !d->is_value &&
+                 !d->is_pointer && !d->is_allocatable && d->n_dims == 0)) {
                 continue;
             }
             for (int k = 0; k < n->n_params; k++) {
@@ -21671,7 +21676,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* Handle INTENT(OUT/INOUT) â€” copy back */
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             if (!arg_alias[i] && fn->param_intents[i] != 1) {
-                if (procedure_ref_name(&args[i])) continue;
+                if (procedure_ref_name(&args[i]) && !fn->param_pointers[i]) continue;
                 OfortVar *pv = find_var(I, fn->param_names[i]);
                 if (pv && pv->present && n->stmts[i]->type == FND_FUNC_CALL) {
                     for (int vi = 0; vi < I->current_scope->n_vars; vi++) {
@@ -21687,12 +21692,21 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     if (n->stmts[i]->type == FND_IDENT) {
                         OfortVar *actual = find_var(I, n->stmts[i]->name);
                         if (actual && actual->is_pointer && pv->is_pointer) {
-                            pointer_copyback[i] = pv->pointer_associated;
-                            copy_cstr(pointer_copyback_target[i], sizeof(pointer_copyback_target[i]), pv->pointer_target);
-                            pointer_copyback_has_slice[i] = pv->pointer_has_slice;
-                            pointer_copyback_slice_start[i] = pv->pointer_slice_start;
-                            pointer_copyback_slice_end[i] = pv->pointer_slice_end;
-                            pointer_copyback_slice_stride[i] = pv->pointer_slice_stride;
+                            if (procedure_ref_name(&pv->val)) {
+                                pointer_copyback[i] = 1;
+                                pointer_copyback_target[i][0] = '\0';
+                                pointer_copyback_has_slice[i] = 0;
+                                pointer_copyback_slice_start[i] = 0;
+                                pointer_copyback_slice_end[i] = 0;
+                                pointer_copyback_slice_stride[i] = 1;
+                            } else {
+                                pointer_copyback[i] = pv->pointer_associated;
+                                copy_cstr(pointer_copyback_target[i], sizeof(pointer_copyback_target[i]), pv->pointer_target);
+                                pointer_copyback_has_slice[i] = pv->pointer_has_slice;
+                                pointer_copyback_slice_start[i] = pv->pointer_slice_start;
+                                pointer_copyback_slice_end[i] = pv->pointer_slice_end;
+                                pointer_copyback_slice_stride[i] = pv->pointer_slice_stride;
+                            }
                         }
                     }
                     free_value(&args[i]);
@@ -21720,11 +21734,19 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         actual->val = copy_value(args[i]);
                         actual->pointer_associated = 1;
                         actual->is_initialized = 1;
-                        copy_cstr(actual->pointer_target, sizeof(actual->pointer_target), pointer_copyback_target[i]);
-                        actual->pointer_has_slice = pointer_copyback_has_slice[i];
-                        actual->pointer_slice_start = pointer_copyback_slice_start[i];
-                        actual->pointer_slice_end = pointer_copyback_slice_end[i];
-                        actual->pointer_slice_stride = pointer_copyback_slice_stride[i] ? pointer_copyback_slice_stride[i] : 1;
+                        if (procedure_ref_name(&args[i])) {
+                            actual->pointer_target[0] = '\0';
+                            actual->pointer_has_slice = 0;
+                            actual->pointer_slice_start = 0;
+                            actual->pointer_slice_end = 0;
+                            actual->pointer_slice_stride = 1;
+                        } else {
+                            copy_cstr(actual->pointer_target, sizeof(actual->pointer_target), pointer_copyback_target[i]);
+                            actual->pointer_has_slice = pointer_copyback_has_slice[i];
+                            actual->pointer_slice_start = pointer_copyback_slice_start[i];
+                            actual->pointer_slice_end = pointer_copyback_slice_end[i];
+                            actual->pointer_slice_stride = pointer_copyback_slice_stride[i] ? pointer_copyback_slice_stride[i] : 1;
+                        }
                     } else {
                         free_value(&actual->val);
                         actual->val = make_void_val();
@@ -21795,7 +21817,9 @@ unresolved_external_call_done:
                     /* declaration block */
                     for (int j = 0; j < s->n_stmts; j++) {
                         OfortNode *d = s->stmts[j];
-                        if (d->type == FND_VARDECL && (d->intent != 0 || d->is_optional || d->is_value)) {
+                        if (d->type == FND_VARDECL &&
+                            (d->intent != 0 || d->is_optional || d->is_value ||
+                             d->is_pointer || d->is_allocatable || d->n_dims > 0)) {
                             /* Match parameter name */
                             char du[256];
                             str_upper(du, d->name, 256);
@@ -21818,7 +21842,9 @@ unresolved_external_call_done:
                             }
                         }
                     }
-                } else if (s->type == FND_VARDECL && (s->intent != 0 || s->is_optional || s->is_value)) {
+                } else if (s->type == FND_VARDECL &&
+                           (s->intent != 0 || s->is_optional || s->is_value ||
+                            s->is_pointer || s->is_allocatable || s->n_dims > 0)) {
                     char du[256];
                     str_upper(du, s->name, 256);
                     for (int k = 0; k < n->n_params; k++) {
