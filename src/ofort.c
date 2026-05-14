@@ -1689,6 +1689,14 @@ static void require_procedure_pointer_interface_compatible(OfortInterpreter *I,
             ofort_error(I, "Interface mismatch in procedure pointer assignment: argument '%s' has incompatible type",
                         target->param_names[i]);
         }
+        if (iface->param_n_dims[i] != target->param_n_dims[i]) {
+            ofort_error(I, "Interface mismatch in procedure pointer assignment: argument '%s' has incompatible rank",
+                        target->param_names[i]);
+        }
+        if (iface->param_intents[i] != target->param_intents[i]) {
+            ofort_error(I, "Interface mismatch in procedure pointer assignment: argument '%s' has incompatible INTENT",
+                        target->param_names[i]);
+        }
     }
     if (iface->type == FND_FUNCTION &&
         iface->val_type != FVAL_VOID && target->val_type != FVAL_VOID &&
