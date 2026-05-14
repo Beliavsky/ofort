@@ -22131,13 +22131,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 set_var(I, n->stmts[i]->name, copy_value(args[i]));
             } else if (!arg_alias[i] && n->stmts[i]->type == FND_MEMBER && fn->param_intents[i] != 1 &&
                        (args[i].type != FVAL_VOID || fn->param_allocatables[i] ||
-                        (fn->param_pointers[i] && procedure_ref_name(&args[i]))) &&
+                        fn->param_pointers[i]) &&
                        (!procedure_ref_name(&args[i]) || fn->param_pointers[i])) {
                 OfortValue *target = member_lvalue(I, n->stmts[i]);
                 if (target) {
                     free_value(target);
                     *target = copy_value(args[i]);
-                    if (pointer_copyback[i]) {
+                    if (fn->param_pointers[i] && !pointer_copyback[i]) {
+                        target->is_pointer_ref = 0;
+                        target->pointer_target[0] = '\0';
+                        target->pointer_has_slice = 0;
+                        target->pointer_slice_start = 0;
+                        target->pointer_slice_end = 0;
+                        target->pointer_slice_stride = 1;
+                    } else if (pointer_copyback[i]) {
                         target->is_pointer_ref = 1;
                         if (procedure_ref_name(&args[i])) {
                             target->pointer_target[0] = '\0';
