@@ -3754,6 +3754,8 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
     OfortNode *block = alloc_node(I, FND_BLOCK);
     int cap = 0;
     int is_pointer = 0;
+    int is_optional = 0;
+    int intent = 0;
     block->line = pt->line;
 
     if (check(I, FTOK_LPAREN)) {
@@ -3763,10 +3765,20 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
         advance(I);
         if (check(I, FTOK_INTENT)) {
             advance(I);
-            if (check(I, FTOK_LPAREN)) skip_balanced_parens(I);
+            if (check(I, FTOK_LPAREN)) {
+                advance(I);
+                if (check(I, FTOK_IN)) { advance(I); intent = 1; }
+                else if (check(I, FTOK_OUT)) { advance(I); intent = 2; }
+                else if (check(I, FTOK_INOUT)) { advance(I); intent = 3; }
+                if (intent == 1 && check(I, FTOK_OUT)) { advance(I); intent = 3; }
+                expect(I, FTOK_RPAREN);
+            }
         } else if (token_ident_upper(peek(I), "POINTER")) {
             advance(I);
             is_pointer = 1;
+        } else if (token_ident_upper(peek(I), "OPTIONAL")) {
+            advance(I);
+            is_optional = 1;
         } else {
             advance(I);
         }
@@ -3786,6 +3798,8 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
             decl->val_type = FVAL_CHARACTER;
             decl->char_len = 256;
             decl->is_pointer = is_pointer;
+            decl->is_optional = is_optional;
+            decl->intent = intent;
             decl->line = name_tok->line;
             if (make_procedure_ref_text(token_name_text(name_tok), proc_ref, sizeof(proc_ref))) {
                 OfortNode *init = alloc_node(I, FND_STRING_LIT);
