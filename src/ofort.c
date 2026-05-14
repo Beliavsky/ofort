@@ -1647,6 +1647,7 @@ static void register_contained_procedures(OfortInterpreter *I, OfortNode *body, 
 
 static void remember_module_proc_spec(OfortInterpreter *I, OfortNode *node) {
     if (!node || (node->type != FND_FUNCTION && node->type != FND_SUBROUTINE)) return;
+    annotate_procedure_params(node);
     for (int i = 0; i < I->n_module_proc_specs; i++) {
         if (str_eq_nocase(I->module_proc_spec_names[i], node->name)) {
             I->module_proc_specs[i] = node;
