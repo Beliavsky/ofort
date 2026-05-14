@@ -21839,6 +21839,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortValue *args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
         if (!args) ofort_error(I, "Out of memory");
         int arg_alias[OFORT_MAX_PARAMS] = {0};
+        int arg_present[OFORT_MAX_PARAMS] = {0};
         OfortVar *arg_alias_var[OFORT_MAX_PARAMS] = {0};
         OfortFunc *func = find_func(I, n->name);
         OfortNode *fn = func ? func->node : NULL;
@@ -21850,6 +21851,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     continue;
                 }
             }
+            arg_present[i] = 1;
             if (fn && I->fast_mode && i < fn->n_params && n->stmts[i]->type == FND_IDENT) {
                 OfortVar *actual = find_var(I, n->stmts[i]->name);
                 if (actual && actual->val.type == FVAL_ARRAY && array_has_packed_numeric(&actual->val)) {
@@ -21925,7 +21927,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             OfortVar *pv;
             if (i < nargs && arg_alias[i]) {
                 pv = declare_alias_var(I, fn->param_names[i], arg_alias_var[i]);
-            } else if (i < nargs && (args[i].type != FVAL_VOID || fn->param_allocatables[i] || fn->param_pointers[i])) {
+            } else if (i < nargs && arg_present[i] &&
+                       (args[i].type != FVAL_VOID || fn->param_allocatables[i] || fn->param_pointers[i])) {
                 pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
                 if (fn->param_pointers[i] && procedure_ref_name(&args[i])) {
                     pv->is_pointer = 1;
