@@ -3854,7 +3854,7 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
             copy_cstr(decl->procedure_pass_name, sizeof(decl->procedure_pass_name),
                       procedure_pass_name);
             decl->line = name_tok->line;
-            if (make_procedure_ref_text(token_name_text(name_tok), proc_ref, sizeof(proc_ref))) {
+            if (!is_pointer && make_procedure_ref_text(token_name_text(name_tok), proc_ref, sizeof(proc_ref))) {
                 OfortNode *init = alloc_node(I, FND_STRING_LIT);
                 copy_cstr(init->str_val, sizeof(init->str_val), proc_ref);
                 init->line = name_tok->line;
@@ -5182,7 +5182,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             char proc_ref[OFORT_MAX_STRLEN];
             decl->val_type = FVAL_CHARACTER;
             decl->char_len = 256;
-            if (make_procedure_ref_text(token_name_text(name_tok), proc_ref, sizeof(proc_ref))) {
+            if (!is_pointer && make_procedure_ref_text(token_name_text(name_tok), proc_ref, sizeof(proc_ref))) {
                 OfortNode *init = alloc_node(I, FND_STRING_LIT);
                 copy_cstr(init->str_val, sizeof(init->str_val), proc_ref);
                 init->line = name_tok->line;
@@ -14539,11 +14539,23 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             if (n->stmts[0]->type != FND_IDENT) {
                 OfortValue *target = member_lvalue(I, n->stmts[0]);
                 if (target) {
-                    if (target->is_pointer_ref)
-                        return make_logical(nargs == 1 ?
-                                            (target->pointer_target[0] != '\0' ||
-                                             procedure_ref_name(target) != NULL) :
-                                            pointer_value_matches_target(I, target, n->stmts[1]));
+                    if (target->is_pointer_ref) {
+                        int associated = target->pointer_target[0] != '\0' ||
+                                         procedure_ref_name(target) != NULL;
+                        return make_logical(nargs == 1 ? associated :
+                                            (associated &&
+                                             pointer_value_matches_target(I, target, n->stmts[1])));
+                    }
+                    if (target->type == FVAL_CHARACTER) {
+                        const char *proc = procedure_ref_name(target);
+                        if (nargs == 1) return make_logical(proc != NULL);
+                        if (!proc) return make_logical(0);
+                        OfortValue tv = eval_node(I, n->stmts[1]);
+                        const char *target_proc = procedure_ref_name(&tv);
+                        int match = target_proc && str_eq_nocase(proc, target_proc);
+                        free_value(&tv);
+                        return make_logical(match);
+                    }
                     if (target->type == FVAL_ARRAY)
                         return make_logical(target->v.arr.allocated);
                     return make_logical(target->type != FVAL_VOID);
