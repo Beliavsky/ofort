@@ -21853,8 +21853,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 pv = declare_alias_var(I, fn->param_names[i], arg_alias_var[i]);
             } else if (i < nargs && (args[i].type != FVAL_VOID || fn->param_allocatables[i] || fn->param_pointers[i])) {
                 pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
-                if (fn->param_pointers[i] && args[i].is_pointer_ref && args[i].pointer_target[0]) {
+                if (fn->param_pointers[i] && procedure_ref_name(&args[i])) {
                     pv->is_pointer = 1;
+                    pv->present = 1;
+                    pv->pointer_associated = 1;
+                } else if (fn->param_pointers[i] && args[i].is_pointer_ref && args[i].pointer_target[0]) {
+                    pv->is_pointer = 1;
+                    pv->present = 1;
                     pv->pointer_associated = 1;
                     copy_cstr(pv->pointer_target, sizeof(pv->pointer_target), args[i].pointer_target);
                     pv->pointer_has_slice = args[i].pointer_has_slice;
