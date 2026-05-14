@@ -9334,8 +9334,12 @@ expression_statement:
         t->type == FTOK_STRING_LIT || t->type == FTOK_TRUE || t->type == FTOK_FALSE ||
         t->type == FTOK_LPAREN || t->type == FTOK_MINUS || t->type == FTOK_PLUS ||
         t->type == FTOK_NOT) {
+        int expr_started_with_lparen = (t->type == FTOK_LPAREN);
         OfortNode *expr = parse_expr(I);
         if (check(I, FTOK_POINTER_ASSIGN)) {
+            if (expr_started_with_lparen) {
+                ofort_error(I, "Invalid pointer assignment target at line %d", t->line);
+            }
             if (expr->type != FND_IDENT && expr->type != FND_FUNC_CALL &&
                 expr->type != FND_MEMBER && expr->type != FND_ARRAY_REF) {
                 ofort_error(I, "Invalid pointer assignment target at line %d", t->line);
@@ -9350,6 +9354,9 @@ expression_statement:
             return n;
         }
         if (check(I, FTOK_ASSIGN)) {
+            if (expr_started_with_lparen) {
+                ofort_error(I, "Invalid assignment target at line %d", t->line);
+            }
             if (I->in_spec_section && is_simple_identifier_call(expr)) {
                 OfortNode *sf = parse_statement_function_from_call(I, expr);
                 if (sf) return sf;
