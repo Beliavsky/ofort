@@ -11340,7 +11340,7 @@ static int pointer_target_descriptor(OfortInterpreter *I, OfortNode *node,
 }
 
 static int is_null_func_call_node(OfortNode *node) {
-    return node && node->type == FND_FUNC_CALL && str_eq_nocase(node->name, "null");
+    return node && str_eq_nocase(node->name, "null");
 }
 
 static int pointer_matches_target(OfortInterpreter *I, OfortVar *ptr, OfortNode *target) {
@@ -19689,10 +19689,28 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 remap_lower = (int)val_to_int(lv);
                 free_value(&lv);
             }
+            if (is_null_func_call_node(rhs_node)) {
+                free_value(target);
+                *target = make_void_val();
+                target->is_pointer_ref = 0;
+                target->pointer_target[0] = '\0';
+                target->pointer_has_slice = 0;
+                target->pointer_slice_start = 0;
+                target->pointer_slice_end = 0;
+                target->pointer_slice_stride = 1;
+                trace_assignment_value(I, lhs, *target);
+                break;
+            }
             rhs = eval_node(I, rhs_node);
             if (!pointer_target_descriptor(I, rhs_node, target_name, sizeof(target_name),
                                            &has_slice, &slice_start, &slice_end, &slice_stride)) {
-                if (rhs.is_pointer_ref && rhs.pointer_target[0]) {
+                if (procedure_ref_name(&rhs)) {
+                    copy_cstr(target_name, sizeof(target_name), procedure_ref_name(&rhs));
+                    has_slice = 0;
+                    slice_start = 0;
+                    slice_end = 0;
+                    slice_stride = 1;
+                } else if (rhs.is_pointer_ref && rhs.pointer_target[0]) {
                     copy_cstr(target_name, sizeof(target_name), rhs.pointer_target);
                     has_slice = rhs.pointer_has_slice;
                     slice_start = rhs.pointer_slice_start;
@@ -19734,7 +19752,25 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             rhs = eval_node(I, rhs_node);
             if (!pointer_target_descriptor(I, rhs_node, target_name, sizeof(target_name),
                                            &has_slice, &slice_start, &slice_end, &slice_stride)) {
-                if (rhs.is_pointer_ref && rhs.pointer_target[0]) {
+                if (procedure_ref_name(&rhs)) {
+                    copy_cstr(target_name, sizeof(target_name), procedure_ref_name(&rhs));
+                    has_slice = 0;
+                    slice_start = 0;
+                    slice_end = 0;
+                    slice_stride = 1;
+                } else if (is_null_func_call_node(rhs_node) && rhs.type == FVAL_VOID) {
+                    free_value(target);
+                    *target = make_void_val();
+                    target->is_pointer_ref = 0;
+                    target->pointer_target[0] = '\0';
+                    target->pointer_has_slice = 0;
+                    target->pointer_slice_start = 0;
+                    target->pointer_slice_end = 0;
+                    target->pointer_slice_stride = 1;
+                    trace_assignment_value(I, lhs, *target);
+                    free_value(&rhs);
+                    break;
+                } else if (rhs.is_pointer_ref && rhs.pointer_target[0]) {
                     copy_cstr(target_name, sizeof(target_name), rhs.pointer_target);
                     has_slice = rhs.pointer_has_slice;
                     slice_start = rhs.pointer_slice_start;
@@ -19813,6 +19849,19 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 slice_start = rhs.pointer_slice_start;
                 slice_end = rhs.pointer_slice_end;
                 slice_stride = rhs.pointer_slice_stride ? rhs.pointer_slice_stride : 1;
+            } else if (rhs.type == FVAL_VOID) {
+                free_value(&ptr->val);
+                ptr->val = make_void_val();
+                ptr->is_initialized = 1;
+                ptr->pointer_associated = 0;
+                ptr->pointer_target[0] = '\0';
+                ptr->pointer_has_slice = 0;
+                ptr->pointer_slice_start = 0;
+                ptr->pointer_slice_end = 0;
+                ptr->pointer_slice_stride = 1;
+                trace_assignment_value(I, lhs, ptr->val);
+                free_value(&rhs);
+                break;
             } else {
                 free_value(&rhs);
                 ofort_error(I, "Invalid pointer target");
