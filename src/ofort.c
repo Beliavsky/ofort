@@ -14476,7 +14476,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 if (target) {
                     if (target->is_pointer_ref)
                         return make_logical(nargs == 1 ?
-                                            target->pointer_target[0] != '\0' :
+                                            (target->pointer_target[0] != '\0' ||
+                                             procedure_ref_name(target) != NULL) :
                                             pointer_value_matches_target(I, target, n->stmts[1]));
                     if (target->type == FVAL_ARRAY)
                         return make_logical(target->v.arr.allocated);
@@ -21732,6 +21733,22 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                                 pointer_copyback_slice_stride[i] = pv->pointer_slice_stride;
                             }
                         }
+                    } else if (n->stmts[i]->type == FND_MEMBER && pv->is_pointer) {
+                        if (procedure_ref_name(&pv->val)) {
+                            pointer_copyback[i] = 1;
+                            pointer_copyback_target[i][0] = '\0';
+                            pointer_copyback_has_slice[i] = 0;
+                            pointer_copyback_slice_start[i] = 0;
+                            pointer_copyback_slice_end[i] = 0;
+                            pointer_copyback_slice_stride[i] = 1;
+                        } else {
+                            pointer_copyback[i] = pv->pointer_associated;
+                            copy_cstr(pointer_copyback_target[i], sizeof(pointer_copyback_target[i]), pv->pointer_target);
+                            pointer_copyback_has_slice[i] = pv->pointer_has_slice;
+                            pointer_copyback_slice_start[i] = pv->pointer_slice_start;
+                            pointer_copyback_slice_end[i] = pv->pointer_slice_end;
+                            pointer_copyback_slice_stride[i] = pv->pointer_slice_stride;
+                        }
                     }
                     free_value(&args[i]);
                     args[i] = copy_value(pv->val);
@@ -21803,18 +21820,28 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 set_var(I, n->stmts[i]->name, copy_value(args[i]));
             } else if (!arg_alias[i] && n->stmts[i]->type == FND_MEMBER && fn->param_intents[i] != 1 &&
-                       (args[i].type != FVAL_VOID || fn->param_allocatables[i]) && !procedure_ref_name(&args[i])) {
+                       (args[i].type != FVAL_VOID || fn->param_allocatables[i] ||
+                        (fn->param_pointers[i] && procedure_ref_name(&args[i]))) &&
+                       (!procedure_ref_name(&args[i]) || fn->param_pointers[i])) {
                 OfortValue *target = member_lvalue(I, n->stmts[i]);
                 if (target) {
                     free_value(target);
                     *target = copy_value(args[i]);
                     if (pointer_copyback[i]) {
                         target->is_pointer_ref = 1;
-                        copy_cstr(target->pointer_target, sizeof(target->pointer_target), pointer_copyback_target[i]);
-                        target->pointer_has_slice = pointer_copyback_has_slice[i];
-                        target->pointer_slice_start = pointer_copyback_slice_start[i];
-                        target->pointer_slice_end = pointer_copyback_slice_end[i];
-                        target->pointer_slice_stride = pointer_copyback_slice_stride[i] ? pointer_copyback_slice_stride[i] : 1;
+                        if (procedure_ref_name(&args[i])) {
+                            target->pointer_target[0] = '\0';
+                            target->pointer_has_slice = 0;
+                            target->pointer_slice_start = 0;
+                            target->pointer_slice_end = 0;
+                            target->pointer_slice_stride = 1;
+                        } else {
+                            copy_cstr(target->pointer_target, sizeof(target->pointer_target), pointer_copyback_target[i]);
+                            target->pointer_has_slice = pointer_copyback_has_slice[i];
+                            target->pointer_slice_start = pointer_copyback_slice_start[i];
+                            target->pointer_slice_end = pointer_copyback_slice_end[i];
+                            target->pointer_slice_stride = pointer_copyback_slice_stride[i] ? pointer_copyback_slice_stride[i] : 1;
+                        }
                     }
                 }
             }
