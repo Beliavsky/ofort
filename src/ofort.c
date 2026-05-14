@@ -21668,7 +21668,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     if (!pargs) ofort_error(I, "Out of memory");
                     int sub_copyback[OFORT_MAX_PARAMS] = {0};
                     int sub_copyback_actual[OFORT_MAX_PARAMS] = {0};
-                    OfortValue sub_copyback_vals[OFORT_MAX_PARAMS];
+                    OfortValue *sub_copyback_vals = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*sub_copyback_vals));
+                    if (!sub_copyback_vals) ofort_error(I, "Out of memory");
                     if (pass_receiver) pargs[pass_index] = copy_value(*receiver_target);
                     for (int ai = 0; ai < n->n_stmts; ai++) {
                         int pi = ai;
@@ -21745,6 +21746,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         free_value(&sub_copyback_vals[pi]);
                     }
                     for (int ai = 0; ai < pnargs; ai++) free_value(&pargs[ai]);
+                    free(sub_copyback_vals);
                     free(pargs);
                     break;
                 }
