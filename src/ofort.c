@@ -15259,6 +15259,9 @@ static int procedure_body_declares_name(OfortNode *body, const char *name) {
             OfortNode *d = decls[j];
             if ((d->type == FND_VARDECL || d->type == FND_PARAMDECL) &&
                 str_eq_nocase(d->name, name)) {
+                for (int pi = 0; pi < body->n_params; pi++) {
+                    if (str_eq_nocase(body->param_names[pi], name)) return 0;
+                }
                 return 1;
             }
         }
