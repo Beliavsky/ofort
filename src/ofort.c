@@ -14661,6 +14661,11 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 return eval_array_section_value(I, &var->val, n);
             }
         }
+        if (var && var->is_pointer && var->pointer_associated &&
+            procedure_ref_name(&var->val)) {
+            const char *proc_name = procedure_ref_name(&var->val);
+            copy_cstr(procedure_call_name, sizeof(procedure_call_name), proc_name);
+        }
 
         if (str_eq_nocase(n->name, "present")) {
             int present = 0;
@@ -14845,7 +14850,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     }
                 }
             }
-            if (rv && rv->is_pointer && rv->pointer_associated && rv->pointer_target[0]) {
+            if (rv && rv->is_pointer && rv->pointer_associated && rv->pointer_target[0] &&
+                !procedure_ref_name(&rv->val)) {
                 for (int j = 0; j < fn->n_params && j < nargs; j++) {
                     if (!str_eq_nocase(rv->pointer_target, fn->param_names[j])) continue;
                     if (n->stmts[j]->type != FND_IDENT) continue;
@@ -19795,7 +19801,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         rhs = eval_node(I, rhs_node);
         if (!pointer_target_descriptor(I, rhs_node, target_name, sizeof(target_name),
                                        &has_slice, &slice_start, &slice_end, &slice_stride)) {
-            if (rhs.is_pointer_ref && rhs.pointer_target[0]) {
+            if (procedure_ref_name(&rhs)) {
+                copy_cstr(target_name, sizeof(target_name), procedure_ref_name(&rhs));
+                has_slice = 0;
+                slice_start = 0;
+                slice_end = 0;
+                slice_stride = 1;
+            } else if (rhs.is_pointer_ref && rhs.pointer_target[0]) {
                 copy_cstr(target_name, sizeof(target_name), rhs.pointer_target);
                 has_slice = rhs.pointer_has_slice;
                 slice_start = rhs.pointer_slice_start;
