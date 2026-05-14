@@ -125,6 +125,7 @@ typedef struct {
     int field_is_pointer[OFORT_MAX_FIELDS];
     int field_is_allocatable[OFORT_MAX_FIELDS];
     int field_procedure_nopass[OFORT_MAX_FIELDS];
+    char field_procedure_pass_names[OFORT_MAX_FIELDS][64];
     int n_fields;
     char type_param_names[OFORT_MAX_PARAMS][64];
     OfortNode *type_param_default_exprs[OFORT_MAX_PARAMS];
@@ -3761,6 +3762,7 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
     int is_optional = 0;
     int intent = 0;
     int procedure_nopass = 0;
+    char procedure_pass_name[64] = "";
     block->line = pt->line;
 
     if (check(I, FTOK_LPAREN)) {
@@ -3790,7 +3792,16 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
         } else if (token_ident_upper(peek(I), "PASS")) {
             advance(I);
             procedure_nopass = 0;
-            if (check(I, FTOK_LPAREN)) skip_balanced_parens(I);
+            procedure_pass_name[0] = '\0';
+            if (check(I, FTOK_LPAREN)) {
+                advance(I);
+                if (token_can_be_name(peek(I))) {
+                    copy_cstr(procedure_pass_name, sizeof(procedure_pass_name),
+                              token_name_text(advance(I)));
+                }
+                while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) advance(I);
+                if (check(I, FTOK_RPAREN)) advance(I);
+            }
         } else {
             advance(I);
         }
@@ -3816,6 +3827,8 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
             decl->is_optional = is_optional;
             decl->intent = intent;
             decl->procedure_nopass = procedure_nopass;
+            copy_cstr(decl->procedure_pass_name, sizeof(decl->procedure_pass_name),
+                      procedure_pass_name);
             decl->line = name_tok->line;
             if (make_procedure_ref_text(token_name_text(name_tok), proc_ref, sizeof(proc_ref))) {
                 OfortNode *init = alloc_node(I, FND_STRING_LIT);
@@ -9796,6 +9809,8 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
                 if (td->field_is_pointer[i] && init.type == FVAL_VOID) {
                     free_value(&v.v.dt.fields[i]);
                     init.procedure_nopass = td->field_procedure_nopass[i];
+                    copy_cstr(init.procedure_pass_name, sizeof(init.procedure_pass_name),
+                              td->field_procedure_pass_names[i]);
                     v.v.dt.fields[i] = init;
                     continue;
                 }
@@ -9808,6 +9823,9 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
             }
         }
         v.v.dt.fields[i].procedure_nopass = td->field_procedure_nopass[i];
+        copy_cstr(v.v.dt.fields[i].procedure_pass_name,
+                  sizeof(v.v.dt.fields[i].procedure_pass_name),
+                  td->field_procedure_pass_names[i]);
     }
     return v;
 }
@@ -15047,19 +15065,37 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 OfortValue result;
                 int pass_receiver = n->children[0] && n->children[0]->type == FND_MEMBER &&
                                     !target.procedure_nopass;
+                int pass_index = 0;
                 int nargs = n->n_stmts + (pass_receiver ? 1 : 0);
                 if (!func || !func->is_function) {
                     free_value(&target);
                     ofort_error(I, "Procedure pointer target '%s' is not a function", proc_name);
                 }
+                if (pass_receiver && target.procedure_pass_name[0]) {
+                    pass_index = -1;
+                    for (int pi = 0; pi < func->node->n_params; pi++) {
+                        if (str_eq_nocase(func->node->param_names[pi], target.procedure_pass_name)) {
+                            pass_index = pi;
+                            break;
+                        }
+                    }
+                    if (pass_index < 0)
+                        ofort_error(I, "PASS argument '%s' is not a dummy argument of '%s'",
+                                    target.procedure_pass_name, proc_name);
+                    if (pass_index > n->n_stmts)
+                        ofort_error(I, "Missing explicit arguments before PASS argument '%s'",
+                                    target.procedure_pass_name);
+                }
                 if (nargs > OFORT_MAX_PARAMS) too_many_params_error(I, "procedure pointer function arguments");
                 args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
                 if (!args) ofort_error(I, "Out of memory");
                 if (pass_receiver) {
-                    args[0] = eval_node(I, n->children[0]->children[0]);
+                    args[pass_index] = eval_node(I, n->children[0]->children[0]);
                 }
                 for (int i = 0; i < n->n_stmts; i++) {
-                    args[i + (pass_receiver ? 1 : 0)] = eval_node(I, n->stmts[i]);
+                    int ai = i;
+                    if (pass_receiver && ai >= pass_index) ai++;
+                    args[ai] = eval_node(I, n->stmts[i]);
                 }
                 result = execute_user_function_with_args(I, func, args, nargs);
                 for (int i = 0; i < nargs; i++) free_value(&args[i]);
@@ -18941,6 +18977,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         td->field_is_pointer[td->n_fields] = d->is_pointer;
                         td->field_is_allocatable[td->n_fields] = d->is_allocatable;
                         td->field_procedure_nopass[td->n_fields] = d->procedure_nopass;
+                        copy_cstr(td->field_procedure_pass_names[td->n_fields],
+                                  sizeof(td->field_procedure_pass_names[td->n_fields]),
+                                  d->procedure_pass_name);
                         memcpy(td->field_dims[td->n_fields], d->dims, sizeof(td->field_dims[td->n_fields]));
                         memcpy(td->field_lower_bounds[td->n_fields], d->lower_bounds,
                                sizeof(td->field_lower_bounds[td->n_fields]));
@@ -19014,6 +19053,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 td->field_is_pointer[td->n_fields] = s->is_pointer;
                 td->field_is_allocatable[td->n_fields] = s->is_allocatable;
                 td->field_procedure_nopass[td->n_fields] = s->procedure_nopass;
+                copy_cstr(td->field_procedure_pass_names[td->n_fields],
+                          sizeof(td->field_procedure_pass_names[td->n_fields]),
+                          s->procedure_pass_name);
                 memcpy(td->field_dims[td->n_fields], s->dims, sizeof(td->field_dims[td->n_fields]));
                 memcpy(td->field_lower_bounds[td->n_fields], s->lower_bounds,
                        sizeof(td->field_lower_bounds[td->n_fields]));
@@ -19630,12 +19672,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (lhs->type == FND_MEMBER) {
             OfortValue *target = member_lvalue(I, lhs);
             int target_procedure_nopass;
+            char target_procedure_pass_name[64];
             if (!target) ofort_error(I, "Pointer assignment target not found");
             target_procedure_nopass = target->procedure_nopass;
+            copy_cstr(target_procedure_pass_name, sizeof(target_procedure_pass_name),
+                      target->procedure_pass_name);
             if (is_null_func_call_node(rhs_node)) {
                 free_value(target);
                 *target = make_void_val();
                 target->procedure_nopass = target_procedure_nopass;
+                copy_cstr(target->procedure_pass_name, sizeof(target->procedure_pass_name),
+                          target_procedure_pass_name);
                 target->is_pointer_ref = 0;
                 target->pointer_target[0] = '\0';
                 target->pointer_has_slice = 0;
@@ -19662,6 +19709,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             free_value(target);
             *target = rhs;
             target->procedure_nopass = target_procedure_nopass;
+            copy_cstr(target->procedure_pass_name, sizeof(target->procedure_pass_name),
+                      target_procedure_pass_name);
             target->is_pointer_ref = 1;
             copy_cstr(target->pointer_target, sizeof(target->pointer_target), target_name);
             target->pointer_has_slice = has_slice;
@@ -21867,9 +21916,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 OfortValue *target = member_lvalue(I, n->stmts[i]);
                 if (target) {
                     int target_procedure_nopass = target->procedure_nopass;
+                    char target_procedure_pass_name[64];
+                    copy_cstr(target_procedure_pass_name, sizeof(target_procedure_pass_name),
+                              target->procedure_pass_name);
                     free_value(target);
                     *target = copy_value(args[i]);
                     target->procedure_nopass = target_procedure_nopass;
+                    copy_cstr(target->procedure_pass_name, sizeof(target->procedure_pass_name),
+                              target_procedure_pass_name);
                     if (pointer_copyback[i]) {
                         target->is_pointer_ref = 1;
                         if (procedure_ref_name(&args[i])) {
