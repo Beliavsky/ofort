@@ -248,6 +248,7 @@ struct OfortInterpreter {
     int check_mode;
     int consumed_bare_end;
     int in_spec_section;
+    int interface_import_none_active;
     char pending_construct_name[256];
     int stop_expr_at_slash;
     int stop_expr_at_colon;
@@ -3328,6 +3329,34 @@ static const char *token_name_text(OfortToken *t) {
     return t->str_val;
 }
 
+static void validate_import_none_tokens(OfortInterpreter *I) {
+    if (!I || !I->tokens) return;
+    for (int i = 0; i + 2 < I->n_tokens; i++) {
+        if (!token_ident_upper(&I->tokens[i], "IMPORT") ||
+            I->tokens[i + 1].type != FTOK_COMMA ||
+            !(I->tokens[i + 2].type == FTOK_NONE ||
+              token_ident_upper(&I->tokens[i + 2], "NONE"))) {
+            continue;
+        }
+        for (int pos = i + 3; pos + 2 < I->n_tokens; pos++) {
+            if (I->tokens[pos].type == FTOK_END &&
+                (I->tokens[pos + 1].type == FTOK_SUBROUTINE ||
+                 I->tokens[pos + 1].type == FTOK_FUNCTION ||
+                 token_ident_upper(&I->tokens[pos + 1], "INTERFACE"))) {
+                break;
+            }
+            if ((token_ident_upper(&I->tokens[pos], "KIND") ||
+                 token_ident_upper(&I->tokens[pos], "LEN")) &&
+                I->tokens[pos + 1].type == FTOK_ASSIGN &&
+                token_can_be_name(&I->tokens[pos + 2])) {
+                ofort_error(I, "IMPORT, NONE prohibits host name '%s' at line %d",
+                            token_name_text(&I->tokens[pos + 2]),
+                            I->tokens[pos].line);
+            }
+        }
+    }
+}
+
 static void skip_to_next_line(OfortInterpreter *I) {
     while (!check(I, FTOK_NEWLINE) && !check(I, FTOK_EOF)) {
         advance(I);
@@ -3589,7 +3618,9 @@ static OfortNode *parse_interface_block(OfortInterpreter *I) {
             skip_newlines(I);
             return n;
         }
-        if (is_procedure_prefix_token(peek(I)) ||
+        if (peek(I)->type == FTOK_SUBROUTINE ||
+            peek(I)->type == FTOK_FUNCTION ||
+            is_procedure_prefix_token(peek(I)) ||
             ((is_type_keyword(peek(I)->type) || peek(I)->type == FTOK_TYPE) &&
              typed_function_follows_type_prefix(I)) ||
             (check(I, FTOK_MODULE) &&
@@ -3636,12 +3667,29 @@ static OfortNode *parse_import_statement(OfortInterpreter *I) {
         advance(I);
         if (token_ident_upper(peek(I), "NONE")) {
             n->int_val = 1;
+            I->interface_import_none_active = 1;
             advance(I);
+            for (int pos = I->tok_pos; pos + 2 < I->n_tokens; pos++) {
+                if (I->tokens[pos].type == FTOK_END &&
+                    (token_ident_upper(&I->tokens[pos + 1], "SUBROUTINE") ||
+                     token_ident_upper(&I->tokens[pos + 1], "FUNCTION"))) {
+                    break;
+                }
+                if (token_ident_upper(&I->tokens[pos], "KIND") &&
+                    I->tokens[pos + 1].type == FTOK_ASSIGN &&
+                    token_can_be_name(&I->tokens[pos + 2])) {
+                    ofort_error(I, "IMPORT, NONE prohibits host name '%s' at line %d",
+                                token_name_text(&I->tokens[pos + 2]),
+                                I->tokens[pos].line);
+                }
+            }
         } else if (token_ident_upper(peek(I), "ALL")) {
             n->int_val = 2;
+            I->interface_import_none_active = 0;
             advance(I);
         } else if (token_ident_upper(peek(I), "ONLY")) {
             n->int_val = 3;
+            I->interface_import_none_active = 0;
             advance(I);
             if (check(I, FTOK_COLON)) advance(I);
         }
@@ -4667,6 +4715,32 @@ static int int_constant_node(OfortNode *n, int *value) {
     return 0;
 }
 
+static int node_first_identifier(OfortNode *n, char *name, size_t name_size, int *line_out) {
+    if (!n) return 0;
+    if (n->type == FND_IDENT) {
+        if (name && name_size > 0) copy_cstr(name, name_size, n->name);
+        if (line_out) *line_out = n->line;
+        return 1;
+    }
+    for (int i = 0; i < n->n_children && i < OFORT_MAX_CHILDREN; i++) {
+        if (node_first_identifier(n->children[i], name, name_size, line_out)) return 1;
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        if (node_first_identifier(n->stmts[i], name, name_size, line_out)) return 1;
+    }
+    return 0;
+}
+
+static void reject_import_none_selector_expr(OfortInterpreter *I, OfortNode *expr, int line) {
+    char name[256];
+    int ident_line = line;
+    if (!I || !I->interface_import_none_active || !expr) return;
+    if (node_first_identifier(expr, name, sizeof(name), &ident_line)) {
+        ofort_error(I, "IMPORT, NONE prohibits host name '%s' at line %d",
+                    name, line ? line : ident_line);
+    }
+}
+
 static OfortNode *parse_dimension_bound_expr(OfortInterpreter *I) {
     return parse_expr_until_colon(I);
 }
@@ -5164,6 +5238,9 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
             decl->children[0] = parse_expr(I);
             decl->n_children = 1;
         }
+
+        reject_import_none_selector_expr(I, decl->kind_expr, decl->line);
+        reject_import_none_selector_expr(I, decl->char_len_expr, decl->line);
 
         if (!check(I, FTOK_COMMA) && !check(I, FTOK_NEWLINE) &&
             !check(I, FTOK_SEMICOLON) && !check(I, FTOK_EOF)) {
@@ -7035,9 +7112,12 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
     }
     {
         int prev_spec_section = I->in_spec_section;
+        int prev_import_none = I->interface_import_none_active;
         I->in_spec_section = 1;
+        I->interface_import_none_active = 0;
         n->children[0] = parse_block_until_end(I, "SUBROUTINE");
         I->in_spec_section = prev_spec_section;
+        I->interface_import_none_active = prev_import_none;
         n->n_children = 1;
         consume_end_named(I, "SUBROUTINE", n->name);
     }
@@ -7099,9 +7179,12 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
 
     {
         int prev_spec_section = I->in_spec_section;
+        int prev_import_none = I->interface_import_none_active;
         I->in_spec_section = 1;
+        I->interface_import_none_active = 0;
         n->children[0] = parse_block_until_end(I, "FUNCTION");
         I->in_spec_section = prev_spec_section;
+        I->interface_import_none_active = prev_import_none;
         n->n_children = 1;
         consume_end_named(I, "FUNCTION", n->name);
     }
@@ -28779,6 +28862,7 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
         /* Tokenize */
         stage_start = ofort_monotonic_seconds();
         tokenize(interp, processed_source);
+        validate_import_none_tokens(interp);
         interp->timing.lex = ofort_monotonic_seconds() - stage_start;
         interp->tok_pos = 0;
 
@@ -28885,6 +28969,7 @@ int ofort_check(OfortInterpreter *interp, const char *source) {
 
     stage_start = ofort_monotonic_seconds();
     tokenize(interp, processed_source);
+    validate_import_none_tokens(interp);
     interp->timing.lex = ofort_monotonic_seconds() - stage_start;
     interp->tok_pos = 0;
     stage_start = ofort_monotonic_seconds();
