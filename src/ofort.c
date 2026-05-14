@@ -14970,7 +14970,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         if (field_idx >= 0) {
             OfortValue result = copy_value(obj.v.dt.fields[field_idx]);
             free_value(&obj);
-            if (result.is_pointer_ref) {
+            if (result.is_pointer_ref && !procedure_ref_name(&result)) {
                 OfortValue deref = pointer_referenced_value_preserve_lbound(I, &result);
                 free_value(&result);
                 return deref;
@@ -15008,6 +15008,30 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             free_value(&receiver);
         }
         OfortValue target = eval_node(I, n->children[0]);
+        {
+            const char *proc_name = procedure_ref_name(&target);
+            if (proc_name) {
+                OfortFunc *func = find_func(I, proc_name);
+                OfortValue *args;
+                OfortValue result;
+                int nargs = n->n_stmts;
+                if (!func || !func->is_function) {
+                    free_value(&target);
+                    ofort_error(I, "Procedure pointer target '%s' is not a function", proc_name);
+                }
+                if (nargs > OFORT_MAX_PARAMS) too_many_params_error(I, "procedure pointer function arguments");
+                args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
+                if (!args) ofort_error(I, "Out of memory");
+                for (int i = 0; i < nargs; i++) {
+                    args[i] = eval_node(I, n->stmts[i]);
+                }
+                result = execute_user_function_with_args(I, func, args, nargs);
+                for (int i = 0; i < nargs; i++) free_value(&args[i]);
+                free(args);
+                free_value(&target);
+                return result;
+            }
+        }
         OfortValue result = eval_array_section_value(I, &target, n);
         free_value(&target);
         return result;
