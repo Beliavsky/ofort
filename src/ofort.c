@@ -1720,6 +1720,13 @@ static void require_procedure_pointer_interface_compatible(OfortInterpreter *I,
         ofort_error(I, "Interface mismatch in procedure pointer assignment: '%s' has incompatible result type",
                     target_name);
     }
+    if (iface->type == FND_FUNCTION &&
+        iface->val_type == FVAL_CHARACTER && target->val_type == FVAL_CHARACTER &&
+        iface->char_len > 0 && target->char_len > 0 &&
+        iface->char_len != target->char_len) {
+        ofort_error(I, "Interface mismatch in procedure pointer assignment: '%s' has incompatible CHARACTER result length",
+                    target_name);
+    }
 }
 
 static OfortVar *find_saved_var(OfortFunc *func, const char *name) {
@@ -7397,11 +7404,14 @@ static OfortNode *parse_function(OfortInterpreter *I) {
 static OfortNode *parse_typed_function(OfortInterpreter *I) {
     OfortToken *type_tok = advance(I);
     OfortValType result_type = token_to_valtype(type_tok->type);
+    int result_char_len = 0;
     char derived_type_name[256];
     derived_type_name[0] = '\0';
 
     if (check(I, FTOK_LPAREN)) {
         int depth = 0;
+        int selector_start = I->tok_pos;
+        int selector_end = selector_start;
         if (type_tok->type == FTOK_TYPE && is_type_keyword(peek_ahead(I, 1)->type)) {
             result_type = token_to_valtype(peek_ahead(I, 1)->type);
         } else if (type_tok->type == FTOK_TYPE && peek_ahead(I, 1)->type == FTOK_IDENT) {
@@ -7411,11 +7421,28 @@ static OfortNode *parse_typed_function(OfortInterpreter *I) {
         do {
             if (check(I, FTOK_LPAREN)) depth++;
             else if (check(I, FTOK_RPAREN)) depth--;
+            if (depth > 0) selector_end = I->tok_pos;
             advance(I);
         } while (depth > 0 && !check(I, FTOK_EOF));
+        if (type_tok->type == FTOK_CHARACTER) {
+            for (int p = selector_start + 1; p <= selector_end && p < I->n_tokens; p++) {
+                if (token_ident_upper(&I->tokens[p], "LEN") &&
+                    p + 2 < I->n_tokens &&
+                    I->tokens[p + 1].type == FTOK_ASSIGN &&
+                    I->tokens[p + 2].type == FTOK_INT_LIT) {
+                    result_char_len = (int)I->tokens[p + 2].int_val;
+                    break;
+                }
+                if (I->tokens[p].type == FTOK_INT_LIT) {
+                    result_char_len = (int)I->tokens[p].int_val;
+                    break;
+                }
+            }
+        }
     }
 
     OfortNode *fn = parse_function_with_type(I, result_type, 1);
+    if (result_type == FVAL_CHARACTER && result_char_len > 0) fn->char_len = result_char_len;
     if (derived_type_name[0]) copy_cstr(fn->str_val, sizeof(fn->str_val), derived_type_name);
     return fn;
 }
