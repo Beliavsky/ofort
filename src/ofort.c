@@ -2021,19 +2021,25 @@ static int allocation_extents_from_integer_array_bounds(OfortInterpreter *I, Ofo
     }
 
     for (int i = 0; i < rank; i++) {
+        OfortValue lo_elem = lower_is_array ? array_element_value(&lower, i) : make_void_val();
+        OfortValue hi_elem = array_element_value(&upper, i);
         long long lo = has_lower ?
-            (lower_is_array ? val_to_int(lower.v.arr.data[i]) : lower_scalar) : 1;
-        long long hi = val_to_int(upper.v.arr.data[i]);
+            (lower_is_array ? val_to_int(lo_elem) : lower_scalar) : 1;
+        long long hi = val_to_int(hi_elem);
         long long extent = has_lower ? hi - lo + 1 : hi;
         if (extent < 0) extent = 0;
         if (extent > INT_MAX || lo < INT_MIN || lo > INT_MAX) {
             if (errmsg_out) *errmsg_out = "Insufficient virtual memory";
+            free_value(&lo_elem);
+            free_value(&hi_elem);
             free_value(&lower);
             free_value(&upper);
             return 0;
         }
         if (extent > 0 && total > LLONG_MAX / extent) {
             if (errmsg_out) *errmsg_out = "Insufficient virtual memory";
+            free_value(&lo_elem);
+            free_value(&hi_elem);
             free_value(&lower);
             free_value(&upper);
             return 0;
@@ -2041,12 +2047,16 @@ static int allocation_extents_from_integer_array_bounds(OfortInterpreter *I, Ofo
         total *= extent;
         if (total > INT_MAX) {
             if (errmsg_out) *errmsg_out = "Insufficient virtual memory";
+            free_value(&lo_elem);
+            free_value(&hi_elem);
             free_value(&lower);
             free_value(&upper);
             return 0;
         }
         lower_bounds[i] = has_lower ? (int)lo : 1;
         dims[i] = (int)extent;
+        free_value(&lo_elem);
+        free_value(&hi_elem);
     }
 
     *ndims_io = rank;
@@ -10964,7 +10974,7 @@ static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
             {
                 OfortValue arr = make_array_with_char_len_options(n->val_type, dims, ndims,
                                                                   eval_character_length(I, n),
-                                                                  I->fast_mode);
+                                                                  I->fast_mode && !n->is_target);
                 set_array_lower_bounds(&arr, lower_bounds, ndims);
                 return arr;
             }
@@ -10994,7 +11004,7 @@ static OfortValue make_array_from_decl(OfortInterpreter *I, OfortNode *n) {
 
     OfortValue arr = make_array_with_char_len_options(n->val_type, dims, ndims,
                                                       eval_character_length(I, n),
-                                                      I->fast_mode);
+                                                      I->fast_mode && !n->is_target);
     set_array_lower_bounds(&arr, lower_bounds, ndims);
     return arr;
 }
@@ -12628,6 +12638,18 @@ static void assign_token_to_value(OfortValue *dest, const char *token) {
     }
 }
 
+static void assign_token_to_array_element(OfortValue *arr, int index, const char *token) {
+    OfortValue tmp;
+    if (!arr || arr->type != FVAL_ARRAY || index < 0 || index >= arr->v.arr.len) return;
+    tmp = default_value(arr->v.arr.elem_type, 1);
+    assign_token_to_value(&tmp, token);
+    if (!assign_packed_array_element(arr, index, tmp)) {
+        free_value(&arr->v.arr.data[index]);
+        arr->v.arr.data[index] = copy_value(tmp);
+    }
+    free_value(&tmp);
+}
+
 static int format_is_character_line_read(const char *fmt) {
     while (*fmt) {
         if (*fmt == 'a' || *fmt == 'A') {
@@ -12862,7 +12884,7 @@ static int read_values_from_stdin(OfortInterpreter *I, OfortNode *n, int is_stre
                         status = 1;
                         break;
                     }
-                    assign_token_to_value(&v->val.v.arr.data[j], tok);
+                    assign_token_to_array_element(&v->val, j, tok);
                 }
                 continue;
             }
@@ -12888,7 +12910,7 @@ static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, c
         if (!v) ofort_error(I, "Undefined variable '%s'", target->name);
         if (v->val.type == FVAL_ARRAY) {
             for (int j = 0; j < v->val.v.arr.len; j++) {
-                assign_token_to_value(&v->val.v.arr.data[j], tok);
+                assign_token_to_array_element(&v->val, j, tok);
             }
         } else {
             assign_token_to_value(&v->val, tok);
@@ -12949,7 +12971,7 @@ static int read_file_target(OfortInterpreter *I, FILE *fp, OfortNode *target, ch
         if (v && v->val.type == FVAL_ARRAY) {
             for (int j = 0; j < v->val.v.arr.len; j++) {
                 if (!read_next_token(fp, tok, tok_size)) return 1;
-                assign_token_to_value(&v->val.v.arr.data[j], tok);
+                assign_token_to_array_element(&v->val, j, tok);
             }
             return 0;
         }
@@ -12987,7 +13009,7 @@ static void read_string_target(OfortInterpreter *I, const char **p, OfortNode *t
         if (v->val.type == FVAL_ARRAY) {
             for (int j = 0; j < v->val.v.arr.len; j++) {
                 if (!read_next_string_token(p, tok, tok_size)) return;
-                assign_token_to_value(&v->val.v.arr.data[j], tok);
+                assign_token_to_array_element(&v->val, j, tok);
             }
             return;
         }
@@ -13290,7 +13312,7 @@ static void read_values_from_stream_file(OfortInterpreter *I, OfortUnitFile *ent
         if (v->val.type == FVAL_ARRAY) {
             for (int j = 0; j < v->val.v.arr.len; j++) {
                 if (!read_stream_token_at(fp, &entry->stream_pos, tok, sizeof(tok))) break;
-                assign_token_to_value(&v->val.v.arr.data[j], tok);
+                assign_token_to_array_element(&v->val, j, tok);
             }
         } else {
             if (read_stream_token_at(fp, &entry->stream_pos, tok, sizeof(tok))) {
@@ -14521,13 +14543,13 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 ofort_error(I, "Array size mismatch in comparison");
 
             for (int i = 0; i < len; i++) {
-                OfortValue *lv = left.type == FVAL_ARRAY ? &left.v.arr.data[i] : &left;
-                OfortValue *rv = right.type == FVAL_ARRAY ? &right.v.arr.data[i] : &right;
+                OfortValue lv = left.type == FVAL_ARRAY ? array_element_value(&left, i) : copy_value(left);
+                OfortValue rv = right.type == FVAL_ARRAY ? array_element_value(&right, i) : copy_value(right);
                 int elem_result = 0;
-                if (lv->type == FVAL_CHARACTER || rv->type == FVAL_CHARACTER) {
+                if (lv.type == FVAL_CHARACTER || rv.type == FVAL_CHARACTER) {
                     char lb[OFORT_MAX_STRLEN], rb[OFORT_MAX_STRLEN];
-                    value_to_string(I, *lv, lb, sizeof(lb));
-                    value_to_string(I, *rv, rb, sizeof(rb));
+                    value_to_string(I, lv, lb, sizeof(lb));
+                    value_to_string(I, rv, rb, sizeof(rb));
                     int cmp = string_compare_fortran(lb, rb);
                     switch (n->type) {
                         case FND_EQ: elem_result = (cmp == 0); break;
@@ -14538,9 +14560,9 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                         case FND_GE: elem_result = (cmp >= 0); break;
                         default: break;
                     }
-                } else if (lv->type == FVAL_INTEGER && rv->type == FVAL_INTEGER &&
-                           (lv->kind == 16 || rv->kind == 16)) {
-                    __int128 a = value_to_int128(*lv), b = value_to_int128(*rv);
+                } else if (lv.type == FVAL_INTEGER && rv.type == FVAL_INTEGER &&
+                           (lv.kind == 16 || rv.kind == 16)) {
+                    __int128 a = value_to_int128(lv), b = value_to_int128(rv);
                     switch (n->type) {
                         case FND_EQ: elem_result = (a == b); break;
                         case FND_NEQ: elem_result = (a != b); break;
@@ -14551,7 +14573,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                         default: break;
                     }
                 } else {
-                    double a = val_to_real(*lv), b = val_to_real(*rv);
+                    double a = val_to_real(lv), b = val_to_real(rv);
                     switch (n->type) {
                         case FND_EQ: elem_result = (a == b); break;
                         case FND_NEQ: elem_result = (a != b); break;
@@ -14564,6 +14586,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 free_value(&result_array.v.arr.data[i]);
                 result_array.v.arr.data[i] = make_logical(elem_result);
+                free_value(&lv);
+                free_value(&rv);
             }
             free_value(&left); free_value(&right);
             return result_array;
@@ -16137,7 +16161,8 @@ static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n
     }
     if (lhs->type != FND_IDENT) return 0;
     target = cached_ident_var(I, n, 0, lhs);
-    if (!target || target->is_parameter || target->is_protected) return 0;
+    if (!target || target->is_parameter || target->is_protected ||
+        target->is_pointer || target->is_alias) return 0;
     if (target->val.type != FVAL_INTEGER &&
         target->val.type != FVAL_REAL &&
         target->val.type != FVAL_DOUBLE) {
@@ -22535,8 +22560,9 @@ unresolved_external_call_done:
                     if (source.type == FVAL_ARRAY) {
                         int count = source.v.arr.len < target->v.arr.len ? source.v.arr.len : target->v.arr.len;
                         for (int i = 0; i < count; i++) {
+                            OfortValue elem = array_element_value(&source, i);
                             free_value(&target->v.arr.data[i]);
-                            target->v.arr.data[i] = copy_value(source.v.arr.data[i]);
+                            target->v.arr.data[i] = elem;
                         }
                     } else {
                         for (int i = 0; i < target->v.arr.len; i++) {
@@ -22749,8 +22775,9 @@ unresolved_external_call_done:
             if (source.type == FVAL_ARRAY) {
                 int count = source.v.arr.len < var->val.v.arr.len ? source.v.arr.len : var->val.v.arr.len;
                 for (int i = 0; i < count; i++) {
+                    OfortValue elem = array_element_value(&source, i);
                     free_value(&var->val.v.arr.data[i]);
-                    var->val.v.arr.data[i] = copy_value(source.v.arr.data[i]);
+                    var->val.v.arr.data[i] = elem;
                 }
             } else {
                 for (int i = 0; i < var->val.v.arr.len; i++) {
