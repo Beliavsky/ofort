@@ -22036,7 +22036,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
             }
             arg_present[i] = 1;
-            if (fn && I->fast_mode && i < fn->n_params && n->stmts[i]->type == FND_IDENT) {
+            if (0 && fn && I->fast_mode && i < fn->n_params && n->stmts[i]->type == FND_IDENT) {
                 OfortVar *actual = find_var(I, n->stmts[i]->name);
                 if (actual && actual->val.type == FVAL_ARRAY && array_has_packed_numeric(&actual->val)) {
                     arg_alias[i] = 1;
@@ -28578,10 +28578,33 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (args[0].type != FVAL_ARRAY || args[1].type != FVAL_ARRAY)
             ofort_error(I, "DOT_PRODUCT requires arrays");
         int len = args[0].v.arr.len < args[1].v.arr.len ? args[0].v.arr.len : args[1].v.arr.len;
-        double sum = 0;
-        for (int i = 0; i < len; i++)
-            sum += val_to_real(args[0].v.arr.data[i]) * val_to_real(args[1].v.arr.data[i]);
-        if (args[0].v.arr.elem_type == FVAL_INTEGER) return make_integer((long long)sum);
+        if (args[0].v.arr.int_data && args[1].v.arr.int_data &&
+            args[0].v.arr.elem_type == FVAL_INTEGER && args[1].v.arr.elem_type == FVAL_INTEGER) {
+            long long isum = 0;
+            for (int i = 0; i < len; i++)
+                isum += args[0].v.arr.int_data[i] * args[1].v.arr.int_data[i];
+            return make_integer(isum);
+        }
+        double sum = 0.0;
+        if (array_has_packed_numeric(&args[0]) && array_has_packed_numeric(&args[1])) {
+            for (int i = 0; i < len; i++) {
+                double a = args[0].v.arr.real_data ? args[0].v.arr.real_data[i] : (double)args[0].v.arr.int_data[i];
+                double b = args[1].v.arr.real_data ? args[1].v.arr.real_data[i] : (double)args[1].v.arr.int_data[i];
+                sum += a * b;
+            }
+        } else {
+            for (int i = 0; i < len; i++) {
+                OfortValue a = array_element_value(&args[0], i);
+                OfortValue b = array_element_value(&args[1], i);
+                sum += val_to_real(a) * val_to_real(b);
+                free_value(&a);
+                free_value(&b);
+            }
+        }
+        if (args[0].v.arr.elem_type == FVAL_INTEGER && args[1].v.arr.elem_type == FVAL_INTEGER)
+            return make_integer((long long)sum);
+        if (args[0].v.arr.elem_type == FVAL_DOUBLE || args[1].v.arr.elem_type == FVAL_DOUBLE)
+            return make_double(sum);
         return make_real(sum);
     }
     if (strcmp(upper, "NORM2") == 0) {
