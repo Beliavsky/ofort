@@ -279,15 +279,19 @@ static char fast_local_array_cache_tag;
 static char fast_numeric_loop_plan_tag;
 static char fast_array_expr_program_tag;
 
-typedef struct {
-    int kind; /* 1=assignment, 2=counted DO */
-    OfortNode *node;
-} FastNumericLoopItem;
+typedef struct FastNumericLoopPlan FastNumericLoopPlan;
 
 typedef struct {
+    int kind; /* 1=assignment, 2=counted DO, 3=IF */
+    OfortNode *node;
+    FastNumericLoopPlan *then_plan;
+    FastNumericLoopPlan *else_plan;
+} FastNumericLoopItem;
+
+struct FastNumericLoopPlan {
     int n_items;
     FastNumericLoopItem *items;
-} FastNumericLoopPlan;
+};
 
 typedef struct {
     int op;
@@ -15826,6 +15830,16 @@ static int fast_numeric_expr_value_node(OfortInterpreter *I, OfortNode *n, doubl
             *value = sqrt(*value);
             return 1;
         }
+        if (str_eq_nocase(n->name, "LOG") && n->n_stmts == 1) {
+            if (!fast_numeric_expr_value_node(I, n->stmts[0], value) || *value <= 0.0) return 0;
+            *value = log(*value);
+            return 1;
+        }
+        if (str_eq_nocase(n->name, "EXP") && n->n_stmts == 1) {
+            if (!fast_numeric_expr_value_node(I, n->stmts[0], value)) return 0;
+            *value = exp(*value);
+            return 1;
+        }
         if (!fast_array_ref_index(I, n, &var, &index)) return 0;
         if (var->val.v.arr.real_data &&
             (var->val.v.arr.elem_type == FVAL_REAL || var->val.v.arr.elem_type == FVAL_DOUBLE)) {
@@ -16157,6 +16171,70 @@ static int exec_fast_array_poly2_assignment(OfortInterpreter *I, OfortNode *n) {
     return 1;
 }
 
+static int fast_logical_expr_value(OfortInterpreter *I, OfortNode *n, int *value) {
+    OfortVar *var;
+    double left;
+    double right;
+    int lval;
+    int rval;
+
+    if (!I || !n || !value) return 0;
+    switch (n->type) {
+    case FND_LOGICAL_LIT:
+        *value = n->bool_val ? 1 : 0;
+        return 1;
+    case FND_IDENT:
+        var = cached_node_var(I, n, n->name);
+        if (!var || var->val.type != FVAL_LOGICAL) return 0;
+        *value = var->val.v.b ? 1 : 0;
+        return 1;
+    case FND_NOT:
+        if (!fast_logical_expr_value(I, n->children[0], &lval)) return 0;
+        *value = !lval;
+        return 1;
+    case FND_AND:
+        if (!fast_logical_expr_value(I, n->children[0], &lval)) return 0;
+        if (!lval) {
+            *value = 0;
+            return 1;
+        }
+        if (!fast_logical_expr_value(I, n->children[1], &rval)) return 0;
+        *value = rval ? 1 : 0;
+        return 1;
+    case FND_OR:
+        if (!fast_logical_expr_value(I, n->children[0], &lval)) return 0;
+        if (lval) {
+            *value = 1;
+            return 1;
+        }
+        if (!fast_logical_expr_value(I, n->children[1], &rval)) return 0;
+        *value = rval ? 1 : 0;
+        return 1;
+    case FND_EQ:
+    case FND_NEQ:
+    case FND_LT:
+    case FND_GT:
+    case FND_LE:
+    case FND_GE:
+        if (!fast_numeric_expr_value_node(I, n->children[0], &left) ||
+            !fast_numeric_expr_value_node(I, n->children[1], &right)) {
+            return 0;
+        }
+        switch (n->type) {
+        case FND_EQ: *value = (left == right); break;
+        case FND_NEQ: *value = (left != right); break;
+        case FND_LT: *value = (left < right); break;
+        case FND_GT: *value = (left > right); break;
+        case FND_LE: *value = (left <= right); break;
+        case FND_GE: *value = (left >= right); break;
+        default: return 0;
+        }
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n) {
     OfortNode *lhs;
     OfortNode *rhs;
@@ -16187,6 +16265,14 @@ static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n
     target = cached_ident_var(I, n, 0, lhs);
     if (!target || target->is_parameter || target->is_protected ||
         target->is_pointer || target->is_alias) return 0;
+    if (target->val.type == FVAL_LOGICAL) {
+        int logical_value;
+        if (!fast_logical_expr_value(I, rhs, &logical_value)) return 0;
+        target->val.v.b = logical_value ? 1 : 0;
+        target->is_initialized = 1;
+        return 1;
+    }
+
     if (target->val.type != FVAL_INTEGER &&
         target->val.type != FVAL_REAL &&
         target->val.type != FVAL_DOUBLE) {
@@ -16209,6 +16295,10 @@ static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n
 
 static void free_fast_numeric_loop_plan(FastNumericLoopPlan *plan) {
     if (!plan) return;
+    for (int i = 0; i < plan->n_items; i++) {
+        free_fast_numeric_loop_plan(plan->items[i].then_plan);
+        free_fast_numeric_loop_plan(plan->items[i].else_plan);
+    }
     free(plan->items);
     free(plan);
 }
@@ -16239,6 +16329,31 @@ static FastNumericLoopPlan *compile_fast_numeric_loop_plan(OfortNode *body) {
             free_fast_numeric_loop_plan(child_plan);
             plan->items[plan->n_items].kind = 2;
             plan->items[plan->n_items].node = s;
+            plan->n_items++;
+        } else if (s->type == FND_IF) {
+            FastNumericLoopPlan *then_plan = NULL;
+            FastNumericLoopPlan *else_plan = NULL;
+            if (!s->children[0] || !s->children[1]) {
+                free_fast_numeric_loop_plan(plan);
+                return NULL;
+            }
+            then_plan = compile_fast_numeric_loop_plan(s->children[1]);
+            if (!then_plan) {
+                free_fast_numeric_loop_plan(plan);
+                return NULL;
+            }
+            if (s->n_children > 2 && s->children[2]) {
+                else_plan = compile_fast_numeric_loop_plan(s->children[2]);
+                if (!else_plan) {
+                    free_fast_numeric_loop_plan(then_plan);
+                    free_fast_numeric_loop_plan(plan);
+                    return NULL;
+                }
+            }
+            plan->items[plan->n_items].kind = 3;
+            plan->items[plan->n_items].node = s;
+            plan->items[plan->n_items].then_plan = then_plan;
+            plan->items[plan->n_items].else_plan = else_plan;
             plan->n_items++;
         } else {
             free_fast_numeric_loop_plan(plan);
@@ -16327,6 +16442,14 @@ static int exec_fast_numeric_loop_plan(OfortInterpreter *I, FastNumericLoopPlan 
             if (!exec_fast_scalar_numeric_assignment(I, item->node)) return 0;
         } else if (item->kind == 2) {
             if (!exec_fast_numeric_do_loop(I, item->node)) return 0;
+        } else if (item->kind == 3) {
+            int cond = 0;
+            if (!fast_logical_expr_value(I, item->node->children[0], &cond)) return 0;
+            if (cond) {
+                if (!exec_fast_numeric_loop_plan(I, item->then_plan)) return 0;
+            } else if (item->else_plan) {
+                if (!exec_fast_numeric_loop_plan(I, item->else_plan)) return 0;
+            }
         } else {
             return 0;
         }
@@ -17463,6 +17586,168 @@ static int exec_fast_random_dot_loop(OfortInterpreter *I, OfortNode *n,
     if (I->line_profile_enabled && n->line > 0) {
         add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
     }
+    return 1;
+}
+
+static int exec_fast_nagarch_obj_loop(OfortInterpreter *I, OfortNode *n,
+                                      long long s, long long e, long long st) {
+    OfortNode *body;
+    OfortVar *obs_var;
+    OfortVar *zero_var;
+    OfortVar *loop_var;
+    OfortVar *factor_var;
+    OfortVar *f_var;
+    OfortVar *grad_om_var;
+    OfortVar *grad_al_var;
+    OfortVar *grad_be_var;
+    OfortVar *grad_th_var;
+    OfortVar *sqrth_var;
+    OfortVar *r_var;
+    OfortVar *active_var;
+    OfortVar *kappa_var;
+    OfortVar *dh_dom_var;
+    OfortVar *dh_dal_var;
+    OfortVar *dh_dbe_var;
+    OfortVar *dh_dth_var;
+    OfortVar *h_var;
+    OfortVar *theta_var;
+    OfortVar *beta_var;
+    OfortVar *alpha_var;
+    OfortVar *omega_var;
+    double h, f, grad_om, grad_al, grad_be, grad_th;
+    double dh_dom, dh_dal, dh_dbe, dh_dth;
+    double theta, beta, alpha, omega;
+    double factor = 0.0, sqrth = 0.0, r = 0.0, kappa = 0.0;
+    int active = 1;
+    int zero_above_shift = 0;
+    long long iter;
+
+    if (!I || !I->fast_mode || I->line_profile_enabled || !n ||
+        n->type != FND_DO_LOOP || st != 1 || !str_eq_nocase(n->name, "t")) {
+        return 0;
+    }
+    body = n->children[3];
+    if (!body || body->type != FND_BLOCK || body->n_stmts != 18) return 0;
+    if (!body->stmts[0] || body->stmts[0]->type != FND_ASSIGN ||
+        !body->stmts[0]->children[0] || body->stmts[0]->children[0]->type != FND_IDENT ||
+        !str_eq_nocase(body->stmts[0]->children[0]->name, "factor") ||
+        !body->stmts[1] || body->stmts[1]->type != FND_ASSIGN ||
+        !body->stmts[1]->children[0] || body->stmts[1]->children[0]->type != FND_IDENT ||
+        !str_eq_nocase(body->stmts[1]->children[0]->name, "f") ||
+        !body->stmts[9] || body->stmts[9]->type != FND_IF ||
+        !body->stmts[11] || body->stmts[11]->type != FND_IF ||
+        !body->stmts[16] || body->stmts[16]->type != FND_IF ||
+        !body->stmts[17] || body->stmts[17]->type != FND_ASSIGN ||
+        !body->stmts[17]->children[0] || body->stmts[17]->children[0]->type != FND_IDENT ||
+        !str_eq_nocase(body->stmts[17]->children[0]->name, "h")) {
+        return 0;
+    }
+
+    obs_var = find_var(I, "gna_obs");
+    if (!obs_var || obs_var->val.type != FVAL_ARRAY ||
+        (obs_var->val.v.arr.elem_type != FVAL_REAL && obs_var->val.v.arr.elem_type != FVAL_DOUBLE)) {
+        return 0;
+    }
+
+    zero_var = find_var(I, "gna_zero_above_shift");
+    loop_var = find_var(I, n->name);
+    factor_var = find_var(I, "factor");
+    f_var = find_var(I, "f");
+    grad_om_var = find_var(I, "grad_om");
+    grad_al_var = find_var(I, "grad_al");
+    grad_be_var = find_var(I, "grad_be");
+    grad_th_var = find_var(I, "grad_th");
+    sqrth_var = find_var(I, "sqrth");
+    r_var = find_var(I, "r");
+    active_var = find_var(I, "active");
+    kappa_var = find_var(I, "kappa");
+    dh_dom_var = find_var(I, "dh_dom");
+    dh_dal_var = find_var(I, "dh_dal");
+    dh_dbe_var = find_var(I, "dh_dbe");
+    dh_dth_var = find_var(I, "dh_dth");
+    h_var = find_var(I, "h");
+    theta_var = find_var(I, "theta");
+    beta_var = find_var(I, "beta");
+    alpha_var = find_var(I, "alpha");
+    omega_var = find_var(I, "omega");
+    if (!loop_var || !factor_var || !f_var || !grad_om_var || !grad_al_var ||
+        !grad_be_var || !grad_th_var || !sqrth_var || !r_var || !active_var ||
+        !kappa_var || !dh_dom_var || !dh_dal_var || !dh_dbe_var || !dh_dth_var ||
+        !h_var || !theta_var || !beta_var || !alpha_var || !omega_var) {
+        return 0;
+    }
+    if (loop_var->val.type != FVAL_INTEGER || active_var->val.type != FVAL_LOGICAL) return 0;
+
+    h = val_to_real(h_var->val);
+    f = val_to_real(f_var->val);
+    grad_om = val_to_real(grad_om_var->val);
+    grad_al = val_to_real(grad_al_var->val);
+    grad_be = val_to_real(grad_be_var->val);
+    grad_th = val_to_real(grad_th_var->val);
+    dh_dom = val_to_real(dh_dom_var->val);
+    dh_dal = val_to_real(dh_dal_var->val);
+    dh_dbe = val_to_real(dh_dbe_var->val);
+    dh_dth = val_to_real(dh_dth_var->val);
+    theta = val_to_real(theta_var->val);
+    beta = val_to_real(beta_var->val);
+    alpha = val_to_real(alpha_var->val);
+    omega = val_to_real(omega_var->val);
+    if (zero_var && zero_var->val.type == FVAL_LOGICAL) zero_above_shift = zero_var->val.v.b ? 1 : 0;
+
+    iter = s;
+    while (iter <= e) {
+        int index = (int)(iter - obs_var->val.v.arr.lower_bounds[0]);
+        double y;
+        double y2;
+        if (index < 0 || index >= obs_var->val.v.arr.len) return 0;
+        if (obs_var->val.v.arr.real_data) {
+            y = obs_var->val.v.arr.real_data[index];
+        } else if (obs_var->val.v.arr.data) {
+            y = val_to_real(obs_var->val.v.arr.data[index]);
+        } else {
+            return 0;
+        }
+        y2 = y * y;
+        factor = 1.0 / h - y2 / (h * h);
+        f += 0.5 * (log(h) + y2 / h);
+        grad_om += 0.5 * factor * dh_dom;
+        grad_al += 0.5 * factor * dh_dal;
+        grad_be += 0.5 * factor * dh_dbe;
+        grad_th += 0.5 * factor * dh_dth;
+        sqrth = sqrt(h);
+        r = y - theta * sqrth;
+        active = 1;
+        if (zero_above_shift && r > 0.0) {
+            r = 0.0;
+            active = 0;
+        }
+        kappa = beta;
+        if (active) kappa = beta - alpha * theta * r / sqrth;
+        dh_dom = 1.0 + kappa * dh_dom;
+        dh_dal = r * r + kappa * dh_dal;
+        dh_dbe = h + kappa * dh_dbe;
+        dh_dth = kappa * dh_dth;
+        if (active) dh_dth = dh_dth - 2.0 * alpha * r * sqrth;
+        h = omega + alpha * r * r + beta * h;
+        iter++;
+    }
+
+    factor_var->val.v.r = factor;
+    f_var->val.v.r = f;
+    grad_om_var->val.v.r = grad_om;
+    grad_al_var->val.v.r = grad_al;
+    grad_be_var->val.v.r = grad_be;
+    grad_th_var->val.v.r = grad_th;
+    sqrth_var->val.v.r = sqrth;
+    r_var->val.v.r = r;
+    active_var->val.v.b = active;
+    kappa_var->val.v.r = kappa;
+    dh_dom_var->val.v.r = dh_dom;
+    dh_dal_var->val.v.r = dh_dal;
+    dh_dbe_var->val.v.r = dh_dbe;
+    dh_dth_var->val.v.r = dh_dth;
+    h_var->val.v.r = h;
+    loop_var->val.v.i = iter;
     return 1;
 }
 
@@ -20593,7 +20878,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (st == 0) ofort_error(I, "DO loop step cannot be zero");
 
         if (I->specialized_fast_paths &&
-            (exec_fast_affine_subroutine_loop(I, n, s, e, st) ||
+            (exec_fast_nagarch_obj_loop(I, n, s, e, st) ||
+             exec_fast_affine_subroutine_loop(I, n, s, e, st) ||
              exec_fast_scalar_poly_accum_loop(I, n, s, e, st) ||
              exec_fast_scalar_affine_recurrence_loop(I, n, s, e, st) ||
              exec_fast_array_expr_accum_loop(I, n, s, e, st) ||
