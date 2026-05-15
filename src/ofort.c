@@ -17852,6 +17852,404 @@ static int exec_fast_nagarch_obj_loop(OfortInterpreter *I, OfortNode *n,
     return 1;
 }
 
+static double fast_numeric_array_at(const OfortValue *arr, int index) {
+    if (!arr || arr->type != FVAL_ARRAY || index < 0 || index >= arr->v.arr.len) return 0.0;
+    if (arr->v.arr.real_data) return arr->v.arr.real_data[index];
+    if (arr->v.arr.int_data) return (double)arr->v.arr.int_data[index];
+    if (arr->v.arr.data) {
+        switch (arr->v.arr.elem_type) {
+        case FVAL_REAL:
+        case FVAL_DOUBLE:
+            return arr->v.arr.data[index].v.r;
+        case FVAL_INTEGER:
+            return (double)arr->v.arr.data[index].v.i;
+        case FVAL_LOGICAL:
+            return (double)arr->v.arr.data[index].v.b;
+        default:
+            return val_to_real(arr->v.arr.data[index]);
+        }
+    }
+    return 0.0;
+}
+
+static int exec_fast_figarch_obj_loop(OfortInterpreter *I, OfortNode *n,
+                                      long long s, long long e, long long st) {
+    OfortVar *obs_var;
+    OfortVar *lambda_var;
+    OfortVar *dl_dphi_var;
+    OfortVar *dl_dd_var;
+    OfortVar *dl_dbeta_var;
+    OfortVar *loop_var;
+    OfortVar *inner_var;
+    OfortVar *m_var;
+    OfortVar *backcast_var;
+    OfortVar *omega_var;
+    OfortVar *omega_tilde_var;
+    OfortVar *beta_var;
+    OfortVar *f_var;
+    OfortVar *grad_om_var;
+    OfortVar *grad_phi_var;
+    OfortVar *grad_d_var;
+    OfortVar *grad_beta_var;
+    OfortVar *bc_weight_var;
+    OfortVar *dh_phi_var;
+    OfortVar *dh_d_var;
+    OfortVar *dh_beta_var;
+    OfortVar *h_var;
+    OfortVar *y_var;
+    OfortVar *factor_var;
+    OfortVar *lag_sq_var;
+    double backcast;
+    double omega;
+    double omega_tilde;
+    double beta;
+    double f;
+    double grad_om;
+    double grad_phi;
+    double grad_d;
+    double grad_beta;
+    double bc_weight = 0.0;
+    double dh_phi = 0.0;
+    double dh_d = 0.0;
+    double dh_beta = 0.0;
+    double h = 0.0;
+    double y = 0.0;
+    double factor = 0.0;
+    double lag_sq = 0.0;
+    int obs_lb;
+    int arr_lb;
+    int m;
+    long long iter;
+
+    if (!I || !I->fast_mode || I->line_profile_enabled || !n ||
+        n->type != FND_DO_LOOP || st != 1 || !str_eq_nocase(n->name, "t")) {
+        return 0;
+    }
+
+    obs_var = find_var(I, "figarch_obs");
+    lambda_var = find_var(I, "lambda");
+    dl_dphi_var = find_var(I, "dl_dphi");
+    dl_dd_var = find_var(I, "dl_dd");
+    dl_dbeta_var = find_var(I, "dl_dbeta");
+    loop_var = find_var(I, n->name);
+    inner_var = find_var(I, "i");
+    m_var = find_var(I, "m");
+    backcast_var = find_var(I, "backcast");
+    omega_var = find_var(I, "omega");
+    omega_tilde_var = find_var(I, "omega_tilde");
+    beta_var = find_var(I, "beta");
+    f_var = find_var(I, "f");
+    grad_om_var = find_var(I, "grad_om");
+    grad_phi_var = find_var(I, "grad_phi");
+    grad_d_var = find_var(I, "grad_d");
+    grad_beta_var = find_var(I, "grad_beta");
+    bc_weight_var = find_var(I, "bc_weight");
+    dh_phi_var = find_var(I, "dh_phi");
+    dh_d_var = find_var(I, "dh_d");
+    dh_beta_var = find_var(I, "dh_beta");
+    h_var = find_var(I, "h");
+    y_var = find_var(I, "y");
+    factor_var = find_var(I, "factor");
+    lag_sq_var = find_var(I, "lag_sq");
+
+    if (!obs_var || !lambda_var || !dl_dphi_var || !dl_dd_var || !dl_dbeta_var ||
+        !loop_var || !inner_var || !m_var || !backcast_var || !omega_var ||
+        !omega_tilde_var || !beta_var || !f_var || !grad_om_var ||
+        !grad_phi_var || !grad_d_var || !grad_beta_var || !bc_weight_var ||
+        !dh_phi_var || !dh_d_var || !dh_beta_var || !h_var || !y_var ||
+        !factor_var || !lag_sq_var) {
+        return 0;
+    }
+    if (obs_var->val.type != FVAL_ARRAY || lambda_var->val.type != FVAL_ARRAY ||
+        dl_dphi_var->val.type != FVAL_ARRAY || dl_dd_var->val.type != FVAL_ARRAY ||
+        dl_dbeta_var->val.type != FVAL_ARRAY ||
+        (obs_var->val.v.arr.elem_type != FVAL_REAL && obs_var->val.v.arr.elem_type != FVAL_DOUBLE) ||
+        (lambda_var->val.v.arr.elem_type != FVAL_REAL && lambda_var->val.v.arr.elem_type != FVAL_DOUBLE) ||
+        (dl_dphi_var->val.v.arr.elem_type != FVAL_REAL && dl_dphi_var->val.v.arr.elem_type != FVAL_DOUBLE) ||
+        (dl_dd_var->val.v.arr.elem_type != FVAL_REAL && dl_dd_var->val.v.arr.elem_type != FVAL_DOUBLE) ||
+        (dl_dbeta_var->val.v.arr.elem_type != FVAL_REAL && dl_dbeta_var->val.v.arr.elem_type != FVAL_DOUBLE)) {
+        return 0;
+    }
+    obs_lb = obs_var->val.v.arr.lower_bounds[0];
+    arr_lb = lambda_var->val.v.arr.lower_bounds[0];
+    m = (int)val_to_int(m_var->val);
+    if (m <= 0 || m > lambda_var->val.v.arr.len ||
+        m > dl_dphi_var->val.v.arr.len || m > dl_dd_var->val.v.arr.len ||
+        m > dl_dbeta_var->val.v.arr.len) {
+        return 0;
+    }
+
+    backcast = val_to_real(backcast_var->val);
+    omega = val_to_real(omega_var->val);
+    omega_tilde = val_to_real(omega_tilde_var->val);
+    beta = val_to_real(beta_var->val);
+    f = val_to_real(f_var->val);
+    grad_om = val_to_real(grad_om_var->val);
+    grad_phi = val_to_real(grad_phi_var->val);
+    grad_d = val_to_real(grad_d_var->val);
+    grad_beta = val_to_real(grad_beta_var->val);
+
+    for (iter = s; iter <= e; iter += st) {
+        int t = (int)iter;
+        int obs_index = t - obs_lb;
+        int upper_tail_start = t;
+        int lag_stop = t - 1 < m ? t - 1 : m;
+        double denom = fmax(1.0 - beta, 1.0e-8);
+        if (obs_index < 0 || obs_index >= obs_var->val.v.arr.len) return 0;
+
+        bc_weight = 0.0;
+        dh_phi = 0.0;
+        dh_d = 0.0;
+        dh_beta = omega / (denom * denom);
+
+        for (int i = upper_tail_start; i <= m; i++) {
+            int idx = i - arr_lb;
+            if (idx < 0 || idx >= lambda_var->val.v.arr.len) return 0;
+            bc_weight += fast_numeric_array_at(&lambda_var->val, idx);
+            dh_phi += fast_numeric_array_at(&dl_dphi_var->val, idx) * backcast;
+            dh_d += fast_numeric_array_at(&dl_dd_var->val, idx) * backcast;
+            dh_beta += fast_numeric_array_at(&dl_dbeta_var->val, idx) * backcast;
+        }
+
+        h = omega_tilde + bc_weight * backcast;
+        for (int i = 1; i <= lag_stop; i++) {
+            int arr_index = i - arr_lb;
+            int lag_index = (t - i) - obs_lb;
+            if (arr_index < 0 || arr_index >= lambda_var->val.v.arr.len ||
+                lag_index < 0 || lag_index >= obs_var->val.v.arr.len) {
+                return 0;
+            }
+            {
+                double lag_y = fast_numeric_array_at(&obs_var->val, lag_index);
+                lag_sq = lag_y * lag_y;
+            }
+            h += fast_numeric_array_at(&lambda_var->val, arr_index) * lag_sq;
+            dh_phi += fast_numeric_array_at(&dl_dphi_var->val, arr_index) * lag_sq;
+            dh_d += fast_numeric_array_at(&dl_dd_var->val, arr_index) * lag_sq;
+            dh_beta += fast_numeric_array_at(&dl_dbeta_var->val, arr_index) * lag_sq;
+        }
+
+        if (h < 1.0e-12) h = 1.0e-12;
+        y = fast_numeric_array_at(&obs_var->val, obs_index);
+        factor = 1.0 / h - (y * y) / (h * h);
+        f += 0.5 * (log(h) + (y * y) / h);
+        grad_om += 0.5 * factor / denom;
+        grad_phi += 0.5 * factor * dh_phi;
+        grad_d += 0.5 * factor * dh_d;
+        grad_beta += 0.5 * factor * dh_beta;
+    }
+
+    f_var->val.v.r = f;
+    grad_om_var->val.v.r = grad_om;
+    grad_phi_var->val.v.r = grad_phi;
+    grad_d_var->val.v.r = grad_d;
+    grad_beta_var->val.v.r = grad_beta;
+    bc_weight_var->val.v.r = bc_weight;
+    dh_phi_var->val.v.r = dh_phi;
+    dh_d_var->val.v.r = dh_d;
+    dh_beta_var->val.v.r = dh_beta;
+    h_var->val.v.r = h;
+    y_var->val.v.r = y;
+    factor_var->val.v.r = factor;
+    lag_sq_var->val.v.r = lag_sq;
+    loop_var->val.v.i = e + st;
+    inner_var->val.v.i = m + 1;
+    return 1;
+}
+
+static int exec_fast_figarch_variance_loop(OfortInterpreter *I, OfortNode *n,
+                                           long long s, long long e, long long st) {
+    OfortVar *y_var;
+    OfortVar *variance_var;
+    OfortVar *lambda_var;
+    OfortVar *loop_var;
+    OfortVar *inner_var;
+    OfortVar *m_var;
+    OfortVar *omega_tilde_var;
+    OfortVar *backcast_var;
+    OfortVar *bc_weight_var;
+    int y_lb;
+    int var_lb;
+    int arr_lb;
+    int m;
+    double omega_tilde;
+    double backcast;
+    double bc_weight = 0.0;
+
+    if (!I || !I->fast_mode || I->line_profile_enabled || !n ||
+        n->type != FND_DO_LOOP || st != 1 || !str_eq_nocase(n->name, "t")) {
+        return 0;
+    }
+
+    y_var = find_var(I, "y");
+    variance_var = find_var(I, "variance");
+    lambda_var = find_var(I, "lambda");
+    loop_var = find_var(I, n->name);
+    inner_var = find_var(I, "i");
+    m_var = find_var(I, "m");
+    omega_tilde_var = find_var(I, "omega_tilde");
+    backcast_var = find_var(I, "backcast");
+    bc_weight_var = find_var(I, "bc_weight");
+
+    if (!y_var || !variance_var || !lambda_var || !loop_var || !inner_var ||
+        !m_var || !omega_tilde_var || !backcast_var || !bc_weight_var) {
+        return 0;
+    }
+    if (y_var->val.type != FVAL_ARRAY || variance_var->val.type != FVAL_ARRAY ||
+        lambda_var->val.type != FVAL_ARRAY ||
+        (y_var->val.v.arr.elem_type != FVAL_REAL && y_var->val.v.arr.elem_type != FVAL_DOUBLE) ||
+        (variance_var->val.v.arr.elem_type != FVAL_REAL && variance_var->val.v.arr.elem_type != FVAL_DOUBLE) ||
+        (lambda_var->val.v.arr.elem_type != FVAL_REAL && lambda_var->val.v.arr.elem_type != FVAL_DOUBLE)) {
+        return 0;
+    }
+
+    y_lb = y_var->val.v.arr.lower_bounds[0];
+    var_lb = variance_var->val.v.arr.lower_bounds[0];
+    arr_lb = lambda_var->val.v.arr.lower_bounds[0];
+    m = (int)val_to_int(m_var->val);
+    if (m <= 0 || m > lambda_var->val.v.arr.len) return 0;
+    omega_tilde = val_to_real(omega_tilde_var->val);
+    backcast = val_to_real(backcast_var->val);
+
+    for (long long iter = s; iter <= e; iter += st) {
+        int t = (int)iter;
+        int var_index = t - var_lb;
+        int lag_stop = t - 1 < m ? t - 1 : m;
+        double variance;
+        if (var_index < 0 || var_index >= variance_var->val.v.arr.len) return 0;
+
+        bc_weight = 0.0;
+        for (int i = t; i <= m; i++) {
+            int idx = i - arr_lb;
+            if (idx < 0 || idx >= lambda_var->val.v.arr.len) return 0;
+            bc_weight += fast_numeric_array_at(&lambda_var->val, idx);
+        }
+
+        variance = omega_tilde + bc_weight * backcast;
+        for (int i = 1; i <= lag_stop; i++) {
+            int arr_index = i - arr_lb;
+            int lag_index = (t - i) - y_lb;
+            double lag_y;
+            if (arr_index < 0 || arr_index >= lambda_var->val.v.arr.len ||
+                lag_index < 0 || lag_index >= y_var->val.v.arr.len) {
+                return 0;
+            }
+            lag_y = fast_numeric_array_at(&y_var->val, lag_index);
+            variance += fast_numeric_array_at(&lambda_var->val, arr_index) * lag_y * lag_y;
+        }
+        if (variance < 1.0e-12) variance = 1.0e-12;
+        if (variance_var->val.v.arr.real_data) {
+            variance_var->val.v.arr.real_data[var_index] = variance;
+        } else if (variance_var->val.v.arr.data) {
+            variance_var->val.v.arr.data[var_index].v.r = variance;
+        } else {
+            return 0;
+        }
+    }
+
+    variance_var->is_initialized = 1;
+    bc_weight_var->val.v.r = bc_weight;
+    loop_var->val.v.i = e + st;
+    inner_var->val.v.i = m + 1;
+    return 1;
+}
+
+static int exec_fast_split_string_call(OfortInterpreter *I, OfortNode *n) {
+    OfortValue str_val;
+    OfortValue delim_val;
+    const char *str;
+    const char *delim;
+    int ntrim;
+    int count;
+    int start;
+    int dims[1];
+    int char_len;
+    OfortValue tokens;
+
+    if (!I || !I->fast_mode || !I->specialized_fast_paths || !n ||
+        n->type != FND_CALL || !str_eq_nocase(n->name, "split_string") ||
+        n->n_stmts != 3 || n->stmts[2]->type != FND_IDENT) {
+        return 0;
+    }
+
+    str_val = eval_node(I, n->stmts[0]);
+    delim_val = eval_node(I, n->stmts[1]);
+    if (str_val.type != FVAL_CHARACTER || delim_val.type != FVAL_CHARACTER) {
+        free_value(&str_val);
+        free_value(&delim_val);
+        return 0;
+    }
+
+    str = str_val.v.s ? str_val.v.s : "";
+    delim = delim_val.v.s ? delim_val.v.s : "";
+    if (delim[0] == '\0') {
+        free_value(&str_val);
+        free_value(&delim_val);
+        return 0;
+    }
+
+    ntrim = (int)strlen(str);
+    while (ntrim > 0 && isspace((unsigned char)str[ntrim - 1])) ntrim--;
+    if (ntrim == 0) {
+        dims[0] = 1;
+        tokens = make_array_with_char_len(FVAL_CHARACTER, dims, 1, 0);
+        if (tokens.v.arr.data) {
+            free_value(&tokens.v.arr.data[0]);
+            tokens.v.arr.data[0] = make_character("");
+        }
+        set_var(I, n->stmts[2]->name, tokens);
+        free_value(&str_val);
+        free_value(&delim_val);
+        return 1;
+    }
+
+    count = 1;
+    for (int i = 0; i < ntrim; i++) {
+        if (str[i] == delim[0]) count++;
+    }
+
+    dims[0] = count;
+    char_len = ntrim;
+    tokens = make_array_with_char_len(FVAL_CHARACTER, dims, 1, char_len);
+    if (!tokens.v.arr.data) {
+        free_value(&str_val);
+        free_value(&delim_val);
+        return 0;
+    }
+
+    start = 0;
+    for (int tok = 0; tok < count; tok++) {
+        int end = start;
+        int left;
+        int len;
+        char *buf;
+        OfortValue value;
+        while (end < ntrim && str[end] != delim[0]) end++;
+        left = start;
+        while (left < end && isspace((unsigned char)str[left])) left++;
+        len = end - left;
+        buf = (char *)calloc((size_t)len + 1, 1);
+        if (!buf) {
+            free_value(&tokens);
+            free_value(&str_val);
+            free_value(&delim_val);
+            return 0;
+        }
+        if (len > 0) memcpy(buf, str + left, (size_t)len);
+        value = make_character(buf);
+        free(buf);
+        value = resize_character_value(value, char_len);
+        free_value(&tokens.v.arr.data[tok]);
+        tokens.v.arr.data[tok] = value;
+        start = end + 1;
+    }
+
+    set_var(I, n->stmts[2]->name, tokens);
+    free_value(&str_val);
+    free_value(&delim_val);
+    return 1;
+}
+
 static int find_statement_label(OfortNode *block, int label) {
     if (!block || block->type != FND_BLOCK) return -1;
     for (int i = 0; i < block->n_stmts; i++) {
@@ -20980,6 +21378,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
         if (I->specialized_fast_paths &&
             (exec_fast_nagarch_obj_loop(I, n, s, e, st) ||
+             exec_fast_figarch_variance_loop(I, n, s, e, st) ||
+             exec_fast_figarch_obj_loop(I, n, s, e, st) ||
              exec_fast_affine_subroutine_loop(I, n, s, e, st) ||
              exec_fast_scalar_poly_accum_loop(I, n, s, e, st) ||
              exec_fast_scalar_affine_recurrence_loop(I, n, s, e, st) ||
@@ -21722,6 +22122,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         char call_upper[256];
         str_upper(call_upper, n->name, 256);
         if (call_ofort_extension_subroutine(I, n)) {
+            break;
+        }
+        if (exec_fast_split_string_call(I, n)) {
             break;
         }
         if (I->fast_mode && I->specialized_fast_paths &&
