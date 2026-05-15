@@ -3927,6 +3927,13 @@ static OfortNode *parse_procedure_declaration(OfortInterpreter *I) {
             copy_cstr(decl->parent_type_name, sizeof(decl->parent_type_name),
                       procedure_interface_name);
             decl->line = name_tok->line;
+            if (is_pointer && procedure_interface_name[0]) {
+                OfortNode *iface = find_module_proc_spec(I, procedure_interface_name);
+                if (iface && iface->is_elemental) {
+                    ofort_error(I, "Procedure pointer '%s' shall not have an ELEMENTAL interface",
+                                token_name_text(name_tok));
+                }
+            }
             if (!is_pointer && make_procedure_ref_text(token_name_text(name_tok), proc_ref, sizeof(proc_ref))) {
                 OfortNode *init = alloc_node(I, FND_STRING_LIT);
                 copy_cstr(init->str_val, sizeof(init->str_val), proc_ref);
