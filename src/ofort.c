@@ -1679,6 +1679,10 @@ static void require_procedure_pointer_interface_compatible(OfortInterpreter *I,
         ofort_error(I, "Interface mismatch in procedure pointer assignment: '%s' has wrong procedure kind",
                     target_name);
     }
+    if (iface->is_pure != target->is_pure) {
+        ofort_error(I, "Interface mismatch in procedure pointer assignment: '%s' has incompatible PURE attribute",
+                    target_name);
+    }
     if (iface->n_params != target->n_params) {
         ofort_error(I, "Interface mismatch in procedure pointer assignment: '%s' has the wrong number of arguments",
                     target_name);
