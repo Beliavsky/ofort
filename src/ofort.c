@@ -27813,7 +27813,14 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         }
 
         for (int i = 0; i < array->v.arr.len; i++) {
-            int take = mask->type == FVAL_ARRAY ? val_to_logical(mask->v.arr.data[i]) : val_to_logical(*mask);
+            int take;
+            if (mask->type == FVAL_ARRAY) {
+                OfortValue mv = array_element_value(mask, i);
+                take = val_to_logical(mv);
+                free_value(&mv);
+            } else {
+                take = val_to_logical(*mask);
+            }
             if (take) selected++;
         }
 
@@ -27823,15 +27830,22 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         result = make_array(array->v.arr.elem_type, dims, 1);
 
         for (int i = 0; i < array->v.arr.len; i++) {
-            int take = mask->type == FVAL_ARRAY ? val_to_logical(mask->v.arr.data[i]) : val_to_logical(*mask);
+            int take;
+            if (mask->type == FVAL_ARRAY) {
+                OfortValue mv = array_element_value(mask, i);
+                take = val_to_logical(mv);
+                free_value(&mv);
+            } else {
+                take = val_to_logical(*mask);
+            }
             if (!take) continue;
             free_value(&result.v.arr.data[out]);
-            result.v.arr.data[out++] = copy_value(array->v.arr.data[i]);
+            result.v.arr.data[out++] = array_element_value(array, i);
         }
         if (vector) {
             for (int i = out; i < result_len; i++) {
                 free_value(&result.v.arr.data[i]);
-                result.v.arr.data[i] = copy_value(vector->v.arr.data[i]);
+                result.v.arr.data[i] = array_element_value(vector, i);
             }
         }
         return result;
@@ -27857,15 +27871,17 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         result = make_array(result_type, mask->v.arr.dims, mask->v.arr.n_dims);
 
         for (int i = 0; i < mask->v.arr.len; i++) {
-            OfortValue *src;
-            if (val_to_logical(mask->v.arr.data[i])) {
+            OfortValue src;
+            OfortValue mv = array_element_value(mask, i);
+            if (val_to_logical(mv)) {
                 if (vin >= vector->v.arr.len) ofort_error(I, "UNPACK VECTOR is too short");
-                src = &vector->v.arr.data[vin++];
+                src = array_element_value(vector, vin++);
             } else {
-                src = field->type == FVAL_ARRAY ? &field->v.arr.data[i] : field;
+                src = field->type == FVAL_ARRAY ? array_element_value(field, i) : copy_value(*field);
             }
+            free_value(&mv);
             free_value(&result.v.arr.data[i]);
-            result.v.arr.data[i] = copy_value(*src);
+            result.v.arr.data[i] = src;
         }
         return result;
     }
@@ -27886,15 +27902,16 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         OfortValue result = make_array(result_type, shape_arg->v.arr.dims, shape_arg->v.arr.n_dims);
 
         for (int i = 0; i < len; i++) {
-            OfortValue *mask = args[2].type == FVAL_ARRAY ? &args[2].v.arr.data[i] : &args[2];
-            OfortValue *selected;
-            if (val_to_logical(*mask)) {
-                selected = args[0].type == FVAL_ARRAY ? &args[0].v.arr.data[i] : &args[0];
+            OfortValue mask = args[2].type == FVAL_ARRAY ? array_element_value(&args[2], i) : copy_value(args[2]);
+            OfortValue selected;
+            if (val_to_logical(mask)) {
+                selected = args[0].type == FVAL_ARRAY ? array_element_value(&args[0], i) : copy_value(args[0]);
             } else {
-                selected = args[1].type == FVAL_ARRAY ? &args[1].v.arr.data[i] : &args[1];
+                selected = args[1].type == FVAL_ARRAY ? array_element_value(&args[1], i) : copy_value(args[1]);
             }
+            free_value(&mask);
             free_value(&result.v.arr.data[i]);
-            result.v.arr.data[i] = copy_value(*selected);
+            result.v.arr.data[i] = selected;
         }
         return result;
     }
@@ -28553,8 +28570,23 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             int best_index = -1;
             double best = 0.0;
             for (int i = 0; i < array->v.arr.len; i++) {
-                if (mask && !val_to_logical(mask->type == FVAL_ARRAY ? mask->v.arr.data[i] : *mask)) continue;
-                double v = val_to_real(array->v.arr.data[i]);
+                OfortValue mv = make_void_val();
+                OfortValue elem;
+                double v;
+                if (mask) {
+                    int take;
+                    if (mask->type == FVAL_ARRAY) {
+                        mv = array_element_value(mask, i);
+                        take = val_to_logical(mv);
+                        free_value(&mv);
+                    } else {
+                        take = val_to_logical(*mask);
+                    }
+                    if (!take) continue;
+                }
+                elem = array_element_value(array, i);
+                v = val_to_real(elem);
+                free_value(&elem);
                 if (best_index < 0 || (want_max ? v > best : v < best)) {
                     best = v;
                     best_index = i;
@@ -28711,8 +28743,11 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                     double sum = 0;
                     for (int kk = 0; kk < k1; kk++) {
                         /* Column-major: A(i,kk) = data[i + kk*m], B(kk,j) = data[kk + j*k2] */
-                        sum += val_to_real(args[0].v.arr.data[i + kk * m]) *
-                               val_to_real(args[1].v.arr.data[kk + j * k2]);
+                        OfortValue av = array_element_value(&args[0], i + kk * m);
+                        OfortValue bv = array_element_value(&args[1], kk + j * k2);
+                        sum += val_to_real(av) * val_to_real(bv);
+                        free_value(&av);
+                        free_value(&bv);
                     }
                     free_value(&result.v.arr.data[i + j * m]);
                     result.v.arr.data[i + j * m] =
@@ -28732,8 +28767,11 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             for (int i = 0; i < m; i++) {
                 double sum = 0;
                 for (int kk = 0; kk < k1; kk++) {
-                    sum += val_to_real(args[0].v.arr.data[i + kk * m]) *
-                           val_to_real(args[1].v.arr.data[kk]);
+                    OfortValue av = array_element_value(&args[0], i + kk * m);
+                    OfortValue bv = array_element_value(&args[1], kk);
+                    sum += val_to_real(av) * val_to_real(bv);
+                    free_value(&av);
+                    free_value(&bv);
                 }
                 free_value(&result.v.arr.data[i]);
                 result.v.arr.data[i] =
@@ -28752,8 +28790,11 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             for (int j = 0; j < nn; j++) {
                 double sum = 0;
                 for (int kk = 0; kk < k1; kk++) {
-                    sum += val_to_real(args[0].v.arr.data[kk]) *
-                           val_to_real(args[1].v.arr.data[kk + j * k2]);
+                    OfortValue av = array_element_value(&args[0], kk);
+                    OfortValue bv = array_element_value(&args[1], kk + j * k2);
+                    sum += val_to_real(av) * val_to_real(bv);
+                    free_value(&av);
+                    free_value(&bv);
                 }
                 free_value(&result.v.arr.data[j]);
                 result.v.arr.data[j] =
@@ -28765,8 +28806,13 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         {
             int len = args[0].v.arr.len < args[1].v.arr.len ? args[0].v.arr.len : args[1].v.arr.len;
             double sum = 0;
-            for (int i = 0; i < len; i++)
-                sum += val_to_real(args[0].v.arr.data[i]) * val_to_real(args[1].v.arr.data[i]);
+            for (int i = 0; i < len; i++) {
+                OfortValue av = array_element_value(&args[0], i);
+                OfortValue bv = array_element_value(&args[1], i);
+                sum += val_to_real(av) * val_to_real(bv);
+                free_value(&av);
+                free_value(&bv);
+            }
             return make_real(sum);
         }
     }
@@ -28779,7 +28825,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         for (int i = 0; i < m; i++) {
             for (int j = 0; j < nn; j++) {
                 free_value(&result.v.arr.data[j + i * nn]);
-                result.v.arr.data[j + i * nn] = copy_value(args[0].v.arr.data[i + j * m]);
+                result.v.arr.data[j + i * nn] = array_element_value(&args[0], i + j * m);
             }
         }
         return result;
@@ -28910,7 +28956,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         result = make_array(result_type, result_dims, result_rank);
 
         for (int out_idx = 0; out_idx < result.v.arr.len; out_idx++) {
-            OfortValue *src = source;
+            OfortValue src = make_void_val();
             int src_idx = 0;
             if (source->type == FVAL_ARRAY) {
                 int rem = out_idx;
@@ -28929,10 +28975,12 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                     src_idx += src_sub[d] * src_stride;
                     src_stride *= source->v.arr.dims[d];
                 }
-                src = &source->v.arr.data[src_idx];
+                src = array_element_value(source, src_idx);
+            } else {
+                src = copy_value(*source);
             }
             free_value(&result.v.arr.data[out_idx]);
-            result.v.arr.data[out_idx] = copy_value(*src);
+            result.v.arr.data[out_idx] = src;
         }
         return result;
     }
@@ -28968,7 +29016,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                 int src = i + sh;
                 free_value(&result.v.arr.data[i]);
                 if (src >= 0 && src < n) {
-                    result.v.arr.data[i] = copy_value(array->v.arr.data[src]);
+                    result.v.arr.data[i] = array_element_value(array, src);
                 } else if (boundary) {
                     result.v.arr.data[i] = copy_value(*boundary);
                 } else {
@@ -28982,13 +29030,15 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             int ncol = array->v.arr.dims[1];
             if (dim == 1) {
                 for (int j = 0; j < ncol; j++) {
-                    int sh = shift->type == FVAL_ARRAY ? (int)val_to_int(shift->v.arr.data[j]) : (int)val_to_int(*shift);
+                    OfortValue shv = shift->type == FVAL_ARRAY ? array_element_value(shift, j) : copy_value(*shift);
+                    int sh = (int)val_to_int(shv);
+                    free_value(&shv);
                     for (int i = 0; i < nrow; i++) {
                         int src_i = i + sh;
                         int idx = i + j * nrow;
                         free_value(&result.v.arr.data[idx]);
                         if (src_i >= 0 && src_i < nrow) {
-                            result.v.arr.data[idx] = copy_value(array->v.arr.data[src_i + j * nrow]);
+                            result.v.arr.data[idx] = array_element_value(array, src_i + j * nrow);
                         } else if (boundary) {
                             result.v.arr.data[idx] = copy_value(*boundary);
                         } else {
@@ -29000,13 +29050,15 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             }
             if (dim == 2) {
                 for (int i = 0; i < nrow; i++) {
-                    int sh = shift->type == FVAL_ARRAY ? (int)val_to_int(shift->v.arr.data[i]) : (int)val_to_int(*shift);
+                    OfortValue shv = shift->type == FVAL_ARRAY ? array_element_value(shift, i) : copy_value(*shift);
+                    int sh = (int)val_to_int(shv);
+                    free_value(&shv);
                     for (int j = 0; j < ncol; j++) {
                         int src_j = j + sh;
                         int idx = i + j * nrow;
                         free_value(&result.v.arr.data[idx]);
                         if (src_j >= 0 && src_j < ncol) {
-                            result.v.arr.data[idx] = copy_value(array->v.arr.data[i + src_j * nrow]);
+                            result.v.arr.data[idx] = array_element_value(array, i + src_j * nrow);
                         } else if (boundary) {
                             result.v.arr.data[idx] = copy_value(*boundary);
                         } else {
@@ -29047,7 +29099,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                 int src = n ? (i + sh) % n : 0;
                 if (src < 0) src += n;
                 free_value(&result.v.arr.data[i]);
-                result.v.arr.data[i] = copy_value(array->v.arr.data[src]);
+                result.v.arr.data[i] = array_element_value(array, src);
             }
             return result;
         }
@@ -29056,26 +29108,30 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             int ncol = array->v.arr.dims[1];
             if (dim == 1) {
                 for (int j = 0; j < ncol; j++) {
-                    int sh = shift->type == FVAL_ARRAY ? (int)val_to_int(shift->v.arr.data[j]) : (int)val_to_int(*shift);
+                    OfortValue shv = shift->type == FVAL_ARRAY ? array_element_value(shift, j) : copy_value(*shift);
+                    int sh = (int)val_to_int(shv);
+                    free_value(&shv);
                     for (int i = 0; i < nrow; i++) {
                         int src_i = nrow ? (i + sh) % nrow : 0;
                         int idx = i + j * nrow;
                         if (src_i < 0) src_i += nrow;
                         free_value(&result.v.arr.data[idx]);
-                        result.v.arr.data[idx] = copy_value(array->v.arr.data[src_i + j * nrow]);
+                        result.v.arr.data[idx] = array_element_value(array, src_i + j * nrow);
                     }
                 }
                 return result;
             }
             if (dim == 2) {
                 for (int i = 0; i < nrow; i++) {
-                    int sh = shift->type == FVAL_ARRAY ? (int)val_to_int(shift->v.arr.data[i]) : (int)val_to_int(*shift);
+                    OfortValue shv = shift->type == FVAL_ARRAY ? array_element_value(shift, i) : copy_value(*shift);
+                    int sh = (int)val_to_int(shv);
+                    free_value(&shv);
                     for (int j = 0; j < ncol; j++) {
                         int src_j = ncol ? (j + sh) % ncol : 0;
                         int idx = i + j * nrow;
                         if (src_j < 0) src_j += ncol;
                         free_value(&result.v.arr.data[idx]);
-                        result.v.arr.data[idx] = copy_value(array->v.arr.data[i + src_j * nrow]);
+                        result.v.arr.data[idx] = array_element_value(array, i + src_j * nrow);
                     }
                 }
                 return result;
@@ -29140,7 +29196,9 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         }
         int count = 0;
         for (int i = 0; i < args[0].v.arr.len; i++) {
-            if (val_to_logical(args[0].v.arr.data[i])) count++;
+            OfortValue elem = array_element_value(&args[0], i);
+            if (val_to_logical(elem)) count++;
+            free_value(&elem);
         }
         return make_integer(count);
     }
@@ -29202,7 +29260,10 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             }
         }
         for (int i = 0; i < args[0].v.arr.len; i++) {
-            if (val_to_logical(args[0].v.arr.data[i])) return make_logical(1);
+            OfortValue elem = array_element_value(&args[0], i);
+            int truth = val_to_logical(elem);
+            free_value(&elem);
+            if (truth) return make_logical(1);
         }
         return make_logical(0);
     }
@@ -29264,7 +29325,10 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             }
         }
         for (int i = 0; i < args[0].v.arr.len; i++) {
-            if (!val_to_logical(args[0].v.arr.data[i])) return make_logical(0);
+            OfortValue elem = array_element_value(&args[0], i);
+            int truth = val_to_logical(elem);
+            free_value(&elem);
+            if (!truth) return make_logical(0);
         }
         return make_logical(1);
     }
