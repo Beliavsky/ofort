@@ -1,4 +1,4 @@
-﻿/*
+/*
  * OfflinAi Fortran Interpreter â€” single-file implementation.
  * Lexer -> Parser -> Tree-walking interpreter.
  *
@@ -71,6 +71,7 @@ typedef struct {
 typedef struct OfortScope {
     OfortVar vars[OFORT_MAX_VARS];
     int n_vars;
+    uint64_t cache_id;
     int implicit_none;
     char implicit_types[26];
     int implicit_char_lens[26];
@@ -204,6 +205,7 @@ struct OfortInterpreter {
     /* runtime */
     OfortScope *global_scope;
     OfortScope *current_scope;
+    uint64_t scope_cache_counter;
     OfortFunc *funcs;
     int n_funcs;
     int func_cap;
@@ -740,6 +742,7 @@ static OfortNode *alloc_node(OfortInterpreter *I, OfortNodeType type) {
 /* â”€â”€ Scope management â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 static OfortScope *push_scope(OfortInterpreter *I) {
     OfortScope *s = (OfortScope *)calloc(1, sizeof(OfortScope));
+    s->cache_id = ++I->scope_cache_counter;
     s->parent = I->current_scope;
     if (s->parent) {
         s->implicit_none = s->parent->implicit_none;
@@ -752,6 +755,11 @@ static OfortScope *push_scope(OfortInterpreter *I) {
     }
     I->current_scope = s;
     return s;
+}
+
+static void *scope_cache_key(OfortInterpreter *I) {
+    if (!I || !I->current_scope) return NULL;
+    return (void *)(uintptr_t)I->current_scope->cache_id;
 }
 
 static void set_scope_explicit_typing(OfortScope *s) {
@@ -1817,11 +1825,23 @@ static void restore_saved_vars(OfortInterpreter *I, OfortFunc *func) {
     }
 }
 
-static void store_saved_vars(OfortFunc *func, OfortScope *scope) {
+static int module_defines_var(OfortInterpreter *I, const char *module_name, const char *name) {
+    OfortModule *mod;
+    if (!I || !module_name || !module_name[0] || !name || !name[0]) return 0;
+    mod = find_module(I, module_name);
+    if (!mod) return 0;
+    for (int i = 0; i < mod->n_vars; i++) {
+        if (str_eq_nocase(mod->vars[i].name, name)) return 1;
+    }
+    return 0;
+}
+
+static void store_saved_vars(OfortInterpreter *I, OfortFunc *func, OfortScope *scope) {
     for (int i = 0; i < scope->n_vars; i++) {
         OfortVar *src = &scope->vars[i];
         OfortVar *dst;
         if (!src->is_save) continue;
+        if (module_defines_var(I, func->module_name, src->name)) continue;
         dst = find_saved_var(func, src->name);
         if (!dst) {
             if (func->n_saved_vars >= OFORT_MAX_SAVED_VARS) continue;
@@ -14037,7 +14057,7 @@ static OfortValue execute_user_function_with_args(OfortInterpreter *I, OfortFunc
         OfortVar *rv = find_var(I, res_name);
         result = rv ? copy_value(rv->val) : make_void_val();
     }
-    store_saved_vars(func, I->current_scope);
+    store_saved_vars(I, func, I->current_scope);
     pop_scope(I);
     return result;
 }
@@ -15090,7 +15110,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 }
             }
 
-            store_saved_vars(func, I->current_scope);
+            store_saved_vars(I, func, I->current_scope);
             sync_module_vars_from_scope(I, func->module_name);
             pop_scope(I);
             sync_module_vars_to_scope(I, func->module_name);
@@ -15567,7 +15587,7 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
                                             arg_alias_var, i, elem, &pv->val);
             }
         }
-        store_saved_vars(func, I->current_scope);
+        store_saved_vars(I, func, I->current_scope);
         pop_scope(I);
         if (I->stopping) break;
     }
@@ -15631,7 +15651,7 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
 
         OfortVar *rv = find_var(I, res_name);
         scalar_result = rv ? copy_value(rv->val) : make_void_val();
-        store_saved_vars(func, I->current_scope);
+        store_saved_vars(I, func, I->current_scope);
         pop_scope(I);
 
         if (elem == 0) {
@@ -15658,10 +15678,12 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
 }
 
 static OfortVar *cached_ident_var(OfortInterpreter *I, OfortNode *owner, int slot, OfortNode *ident) {
+    void *key;
     if (!I || !owner || !ident || ident->type != FND_IDENT || slot < 0 || slot > 6) return NULL;
-    if (owner->fast_cache[7] != I->current_scope) {
+    key = scope_cache_key(I);
+    if (owner->fast_cache[7] != key) {
         for (int i = 0; i < 7; i++) owner->fast_cache[i] = NULL;
-        owner->fast_cache[7] = I->current_scope;
+        owner->fast_cache[7] = key;
     }
     if (!owner->fast_cache[slot]) {
         owner->fast_cache[slot] = find_var(I, ident->name);
@@ -15670,9 +15692,11 @@ static OfortVar *cached_ident_var(OfortInterpreter *I, OfortNode *owner, int slo
 }
 
 static OfortVar *cached_node_var(OfortInterpreter *I, OfortNode *node, const char *name) {
+    void *key;
     if (!I || !node || !name || !name[0]) return NULL;
-    if (node->fast_cache[0] != I->current_scope) {
-        node->fast_cache[0] = I->current_scope;
+    key = scope_cache_key(I);
+    if (node->fast_cache[0] != key) {
+        node->fast_cache[0] = key;
         node->fast_cache[1] = NULL;
     }
     if (!node->fast_cache[1]) {
@@ -21936,7 +21960,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             sub_copyback_vals[pi] = copy_value(pv->val);
                         }
                     }
-                    store_saved_vars(pfunc, I->current_scope);
+                    store_saved_vars(I, pfunc, I->current_scope);
                     sync_module_vars_from_scope(I, pfunc->module_name);
                     pop_scope(I);
                     sync_module_vars_to_scope(I, pfunc->module_name);
@@ -22030,7 +22054,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             exec_node(I, fn->children[0]);
             I->procedure_depth--;
             I->returning = 0;
-            store_saved_vars(func, I->current_scope);
+            store_saved_vars(I, func, I->current_scope);
             pop_scope(I);
             for (int i = 0; i < nargs; i++) free_value(&args[i]);
             free(args);
@@ -22298,7 +22322,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
         }
 
-        store_saved_vars(func, I->current_scope);
+        store_saved_vars(I, func, I->current_scope);
         sync_module_vars_from_scope(I, func->module_name);
         pop_scope(I);
         sync_module_vars_to_scope(I, func->module_name);
@@ -29515,6 +29539,8 @@ OfortInterpreter *ofort_create(void) {
         free(I);
         return NULL;
     }
+    I->scope_cache_counter = 1;
+    I->global_scope->cache_id = I->scope_cache_counter;
     set_scope_legacy_implicit_typing(I->global_scope);
     I->current_scope = I->global_scope;
     I->node_pool = NULL;
