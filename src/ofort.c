@@ -22157,11 +22157,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         I->returning = 0;
 
         int pointer_copyback[OFORT_MAX_PARAMS] = {0};
-        char pointer_copyback_target[OFORT_MAX_PARAMS][256];
+        char (*pointer_copyback_target)[256] =
+            (char (*)[256])calloc(OFORT_MAX_PARAMS, sizeof(*pointer_copyback_target));
         int pointer_copyback_has_slice[OFORT_MAX_PARAMS] = {0};
         int pointer_copyback_slice_start[OFORT_MAX_PARAMS] = {0};
         int pointer_copyback_slice_end[OFORT_MAX_PARAMS] = {0};
         int pointer_copyback_slice_stride[OFORT_MAX_PARAMS] = {0};
+        if (!pointer_copyback_target) ofort_error(I, "Out of memory");
 
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             OfortVar *pv = find_var(I, fn->param_names[i]);
@@ -22364,6 +22366,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
         }
         for (int i = 0; i < nargs; i++) free_value(&args[i]);
+        free(pointer_copyback_target);
         free(args);
 unresolved_external_call_done:
         break;
