@@ -1693,6 +1693,29 @@ static void require_procedure_pointer_interface_compatible(OfortInterpreter *I,
             ofort_error(I, "Interface mismatch in procedure pointer assignment: argument '%s' has incompatible type",
                         target->param_names[i]);
         }
+        if (iface->param_types[i] != FVAL_VOID && target->param_types[i] != FVAL_VOID &&
+            iface->param_types[i] == target->param_types[i]) {
+            int iface_kind = iface->param_kinds[i];
+            int target_kind = target->param_kinds[i];
+            if (iface_kind == 0) {
+                if (iface->param_types[i] == FVAL_INTEGER) iface_kind = 4;
+                else if (iface->param_types[i] == FVAL_REAL) iface_kind = 4;
+                else if (iface->param_types[i] == FVAL_DOUBLE) iface_kind = 8;
+                else if (iface->param_types[i] == FVAL_COMPLEX) iface_kind = 4;
+                else if (iface->param_types[i] == FVAL_LOGICAL) iface_kind = 4;
+            }
+            if (target_kind == 0) {
+                if (target->param_types[i] == FVAL_INTEGER) target_kind = 4;
+                else if (target->param_types[i] == FVAL_REAL) target_kind = 4;
+                else if (target->param_types[i] == FVAL_DOUBLE) target_kind = 8;
+                else if (target->param_types[i] == FVAL_COMPLEX) target_kind = 4;
+                else if (target->param_types[i] == FVAL_LOGICAL) target_kind = 4;
+            }
+            if (iface_kind != target_kind) {
+                ofort_error(I, "Interface mismatch in procedure pointer assignment: argument '%s' has incompatible kind",
+                            target->param_names[i]);
+            }
+        }
         if (iface->param_n_dims[i] != target->param_n_dims[i]) {
             ofort_error(I, "Interface mismatch in procedure pointer assignment: argument '%s' has incompatible rank",
                         target->param_names[i]);
@@ -3650,6 +3673,7 @@ static OfortNode *parse_statement_function(OfortInterpreter *I) {
         arg = expect(I, FTOK_IDENT);
         copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), arg->str_val);
         n->param_types[n->n_params] = FVAL_VOID;
+        n->param_kinds[n->n_params] = 0;
         n->param_type_names[n->n_params][0] = '\0';
         n->param_optional[n->n_params] = 0;
         n->n_params++;
@@ -3705,6 +3729,7 @@ static OfortNode *parse_statement_function_from_call(OfortInterpreter *I, OfortN
     for (int i = 0; i < call->n_stmts && i < OFORT_MAX_PARAMS; i++) {
         copy_cstr(n->param_names[i], sizeof(n->param_names[i]), call->stmts[i]->name);
         n->param_types[i] = FVAL_VOID;
+        n->param_kinds[i] = 0;
         n->param_optional[i] = 0;
         n->n_params++;
     }
@@ -7304,6 +7329,7 @@ static OfortNode *parse_subroutine(OfortInterpreter *I) {
             OfortToken *param = advance(I);
             copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), token_name_text(param));
             n->param_types[n->n_params] = FVAL_VOID; /* resolved later */
+            n->param_kinds[n->n_params] = 0;
             n->param_type_names[n->n_params][0] = '\0';
             n->param_intents[n->n_params] = 0;
             n->param_optional[n->n_params] = 0;
@@ -7353,6 +7379,7 @@ static OfortNode *parse_function_with_type(OfortInterpreter *I, OfortValType res
             OfortToken *param = advance(I);
             copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[n->n_params]), token_name_text(param));
             n->param_types[n->n_params] = FVAL_VOID;
+            n->param_kinds[n->n_params] = 0;
             n->param_type_names[n->n_params][0] = '\0';
             n->param_intents[n->n_params] = 0;
             n->param_optional[n->n_params] = 0;
@@ -7622,6 +7649,7 @@ static OfortNode *parse_module_procedure_body(OfortInterpreter *I) {
     for (int i = 0; i < spec->n_params; i++) {
             copy_cstr(n->param_names[i], sizeof(n->param_names[i]), spec->param_names[i]);
             n->param_types[i] = spec->param_types[i];
+            n->param_kinds[i] = spec->param_kinds[i];
             copy_cstr(n->param_type_names[i], sizeof(n->param_type_names[i]), spec->param_type_names[i]);
             n->param_intents[i] = spec->param_intents[i];
             n->param_optional[i] = spec->param_optional[i];
@@ -14936,7 +14964,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             restore_saved_vars(I, func);
             const char *res_name = fn->result_name[0] ? fn->result_name : fn->name;
             if (!procedure_body_declares_name(fn->children[0], res_name)) {
-                declare_var(I, res_name, default_value(fn->val_type, 1));
+                int result_char_len = fn->val_type == FVAL_CHARACTER && fn->char_len > 0 ? fn->char_len : 1;
+                declare_var(I, res_name, default_value(fn->val_type, result_char_len));
             }
 
             /* Execute body */
@@ -15328,13 +15357,15 @@ static void annotate_procedure_params(OfortNode *n) {
             OfortNode *d = decls[j];
             if (d->type != FND_VARDECL ||
                 (d->intent == 0 && !d->is_optional && !d->is_value &&
-                 !d->is_pointer && !d->is_allocatable && d->n_dims == 0)) {
+                 !d->is_pointer && !d->is_allocatable && d->n_dims == 0 &&
+                 d->kind == 0)) {
                 continue;
             }
             for (int k = 0; k < n->n_params; k++) {
             if (str_eq_nocase(d->name, n->param_names[k])) {
                 n->param_intents[k] = d->intent;
                 n->param_types[k] = d->val_type;
+                n->param_kinds[k] = d->kind;
                 n->param_type_names[k][0] = '\0';
                 if (d->val_type == FVAL_DERIVED)
                     copy_cstr(n->param_type_names[k], sizeof(n->param_type_names[k]), d->str_val);
@@ -22314,7 +22345,8 @@ unresolved_external_call_done:
                         OfortNode *d = s->stmts[j];
                         if (d->type == FND_VARDECL &&
                             (d->intent != 0 || d->is_optional || d->is_value ||
-                             d->is_pointer || d->is_allocatable || d->n_dims > 0)) {
+                             d->is_pointer || d->is_allocatable || d->n_dims > 0 ||
+                             d->kind != 0)) {
                             /* Match parameter name */
                             char du[256];
                             str_upper(du, d->name, 256);
@@ -22324,6 +22356,7 @@ unresolved_external_call_done:
                                 if (strcmp(du, pu) == 0) {
                                     n->param_intents[k] = d->intent;
                                     n->param_types[k] = d->val_type;
+                                    n->param_kinds[k] = d->kind;
                                     n->param_type_names[k][0] = '\0';
                                     if (d->val_type == FVAL_DERIVED)
                                         copy_cstr(n->param_type_names[k], sizeof(n->param_type_names[k]), d->str_val);
@@ -22339,7 +22372,8 @@ unresolved_external_call_done:
                     }
                 } else if (s->type == FND_VARDECL &&
                            (s->intent != 0 || s->is_optional || s->is_value ||
-                            s->is_pointer || s->is_allocatable || s->n_dims > 0)) {
+                            s->is_pointer || s->is_allocatable || s->n_dims > 0 ||
+                            s->kind != 0)) {
                     char du[256];
                     str_upper(du, s->name, 256);
                     for (int k = 0; k < n->n_params; k++) {
@@ -22348,6 +22382,7 @@ unresolved_external_call_done:
                         if (strcmp(du, pu) == 0) {
                             n->param_intents[k] = s->intent;
                             n->param_types[k] = s->val_type;
+                            n->param_kinds[k] = s->kind;
                             n->param_type_names[k][0] = '\0';
                             if (s->val_type == FVAL_DERIVED)
                                 copy_cstr(n->param_type_names[k], sizeof(n->param_type_names[k]), s->str_val);
