@@ -54,6 +54,8 @@ typedef struct {
     int cap;
 } PathList;
 
+static int add_source_path_with_deps(PathList *list, const char *main_path);
+
 typedef struct {
     char *path;
     int start_line;
@@ -520,6 +522,43 @@ static void print_line_profile(OfortInterpreter *interp, const char *source) {
         if (unprofiled > 0.0000005) {
             fprintf(stderr, "%6s %8s %12.6f  %s\n", "-", "-", unprofiled, "(unprofiled interpreter overhead)");
         }
+    }
+    free(entries);
+}
+
+static int compare_procedure_profile_entries(const void *a, const void *b) {
+    const OfortProcedureProfileEntry *ea = (const OfortProcedureProfileEntry *)a;
+    const OfortProcedureProfileEntry *eb = (const OfortProcedureProfileEntry *)b;
+    if (ea->seconds < eb->seconds) return 1;
+    if (ea->seconds > eb->seconds) return -1;
+    return strcmp(ea->name, eb->name);
+}
+
+static void print_procedure_profile(OfortInterpreter *interp) {
+    int n_entries = 0;
+    OfortProcedureProfileEntry *entries;
+
+    if (!interp) return;
+    if (ofort_get_procedure_profile(interp, NULL, 0, &n_entries) != 0 || n_entries <= 0) return;
+    entries = (OfortProcedureProfileEntry *)calloc((size_t)n_entries, sizeof(*entries));
+    if (!entries) return;
+    if (ofort_get_procedure_profile(interp, entries, n_entries, &n_entries) != 0) {
+        free(entries);
+        return;
+    }
+    qsort(entries, (size_t)n_entries, sizeof(*entries), compare_procedure_profile_entries);
+
+    fprintf(stderr, "\nprocedure profile:\n");
+    fprintf(stderr, "%8s %12s  %s\n", "calls", "seconds", "procedure");
+    for (int i = 0; i < n_entries; i++) {
+        char qualified[600];
+        if (entries[i].module_name[0]) {
+            snprintf(qualified, sizeof(qualified), "%s::%s",
+                     entries[i].module_name, entries[i].name);
+        } else {
+            snprintf(qualified, sizeof(qualified), "%s", entries[i].name);
+        }
+        fprintf(stderr, "%8d %12.6f  %s\n", entries[i].count, entries[i].seconds, qualified);
     }
     free(entries);
 }
@@ -3432,6 +3471,7 @@ static int g_time_detail = 0;
 static int g_fast_mode = 0;
 static int g_specialized_fast_paths = 1;
 static int g_line_profile = 0;
+static int g_procedure_profile = 0;
 static int g_trace_assign = 0;
 static int g_check_uninitialized = 0;
 static int g_warn_unused = 1;
@@ -3468,6 +3508,7 @@ static OfortInterpreter *create_ofort_interpreter(void) {
         ofort_set_fast_mode(interp, g_fast_mode);
         ofort_set_specialized_fast_paths(interp, g_specialized_fast_paths);
         ofort_set_line_profile_enabled(interp, g_line_profile);
+        ofort_set_procedure_profile_enabled(interp, g_procedure_profile);
         ofort_set_trace_assign(interp, g_trace_assign);
         ofort_set_strict_uninitialized(interp, g_check_uninitialized);
         ofort_set_init_integer(interp, g_init_integer_enabled, g_init_integer_value);
@@ -3587,8 +3628,12 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
             }
             fputs(output, stdout);
         }
+        fflush(stdout);
         if (g_line_profile) {
             print_line_profile(interp, source);
+        }
+        if (g_procedure_profile) {
+            print_procedure_profile(interp);
         }
     } else {
         const char *error = ofort_get_error(interp);
@@ -5075,6 +5120,276 @@ static void manifest_dirname(const char *path, char *dir, size_t dir_size) {
     if (len >= dir_size) len = dir_size - 1;
     memcpy(dir, path, len);
     dir[len] = '\0';
+}
+
+static int path_string_eq(const char *a, const char *b) {
+#ifdef _WIN32
+    return _stricmp(a ? a : "", b ? b : "") == 0;
+#else
+    return strcmp(a ? a : "", b ? b : "") == 0;
+#endif
+}
+
+static int path_list_contains(const PathList *list, const char *path) {
+    if (!list || !path) return 0;
+    for (int i = 0; i < list->count; i++) {
+        if (path_string_eq(list->items[i], path)) return 1;
+    }
+    return 0;
+}
+
+static int trim_source_line_copy(const char *start, const char *end, char *out, size_t out_size) {
+    size_t len;
+
+    while (start < end && isspace((unsigned char)*start)) start++;
+    while (end > start && isspace((unsigned char)end[-1])) end--;
+    len = (size_t)(end - start);
+    if (len >= out_size) len = out_size - 1;
+    if (len > 0) memcpy(out, start, len);
+    out[len] = '\0';
+    return (int)len;
+}
+
+static void strip_inline_comment(char *line) {
+    int quote = 0;
+    for (char *p = line; *p; p++) {
+        if ((*p == '\'' || *p == '"') && (p == line || p[-1] != '\\')) {
+            if (quote == 0) quote = *p;
+            else if (quote == *p) quote = 0;
+        } else if (*p == '!' && quote == 0) {
+            *p = '\0';
+            return;
+        }
+    }
+}
+
+static int parse_use_module_name(const char *line_in, char *name, size_t name_size) {
+    char line[2048];
+    char lower[2048];
+    const char *p;
+    const char *q;
+    size_t n;
+    int i;
+
+    if (!line_in || !name || name_size == 0) return 0;
+    snprintf(line, sizeof(line), "%s", line_in);
+    strip_inline_comment(line);
+    p = skip_space(line);
+    if (!starts_with_word_nocase(p, "use")) return 0;
+    p += 3;
+    if (*p && !isspace((unsigned char)*p) && *p != ',') return 0;
+    p = skip_space(p);
+
+    snprintf(lower, sizeof(lower), "%s", p);
+    for (i = 0; lower[i]; i++) lower[i] = (char)tolower((unsigned char)lower[i]);
+    q = strstr(lower, "::");
+    if (q) {
+        if (strstr(lower, "intrinsic") && strstr(lower, "intrinsic") < q) return 0;
+        p += (q - lower) + 2;
+    } else if (*p == ',') {
+        return 0;
+    }
+
+    p = skip_space(p);
+    if (!isalpha((unsigned char)*p) && *p != '_') return 0;
+    n = 0;
+    while (identifier_char((unsigned char)*p)) {
+        if (n + 1 < name_size) name[n++] = (char)tolower((unsigned char)*p);
+        p++;
+    }
+    name[n] = '\0';
+    return n > 0;
+}
+
+static int parse_module_definition_name(const char *line_in, char *name, size_t name_size) {
+    char line[2048];
+    const char *p;
+    size_t n = 0;
+
+    if (!line_in || !name || name_size == 0) return 0;
+    snprintf(line, sizeof(line), "%s", line_in);
+    strip_inline_comment(line);
+    p = skip_space(line);
+    if (!starts_with_word_nocase(p, "module")) return 0;
+    p = skip_space(p + 6);
+    if (starts_with_word_nocase(p, "procedure")) return 0;
+    if (!isalpha((unsigned char)*p) && *p != '_') return 0;
+    while (identifier_char((unsigned char)*p)) {
+        if (n + 1 < name_size) name[n++] = (char)tolower((unsigned char)*p);
+        p++;
+    }
+    name[n] = '\0';
+    return n > 0;
+}
+
+static int source_defines_module_name(const char *source, const char *module_name) {
+    const char *line;
+
+    if (!source || !module_name) return 0;
+    line = source;
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        char buf[2048];
+        char defined[128];
+        if (!end) end = line + strlen(line);
+        trim_source_line_copy(line, end, buf, sizeof(buf));
+        if (parse_module_definition_name(buf, defined, sizeof(defined)) &&
+            string_eq_nocase(defined, module_name)) {
+            return 1;
+        }
+        line = *end ? end + 1 : end;
+    }
+    return 0;
+}
+
+static int dep_module_seen(const PathList *seen_modules, const char *module_name) {
+    return path_list_contains(seen_modules, module_name);
+}
+
+static int dep_is_builtin_module(const char *module_name) {
+    return string_eq_nocase(module_name, "iso_fortran_env") ||
+           string_eq_nocase(module_name, "iso_c_binding") ||
+           string_eq_nocase(module_name, "ieee_arithmetic") ||
+           string_eq_nocase(module_name, "ieee_exceptions") ||
+           string_eq_nocase(module_name, "ieee_features");
+}
+
+static void dep_module_file_stem(const char *module_name, char *stem, size_t stem_size) {
+    size_t len;
+
+    if (!stem || stem_size == 0) return;
+    snprintf(stem, stem_size, "%s", module_name ? module_name : "");
+    len = strlen(stem);
+    if (len > 4 && string_eq_nocase(stem + len - 4, "_mod")) {
+        stem[len - 4] = '\0';
+    } else if (len > 7 && string_eq_nocase(stem + len - 7, "_module")) {
+        stem[len - 7] = '\0';
+    }
+}
+
+static int dep_try_module_stem(const char *dir, const char *stem, char *out, size_t out_size) {
+    const char *suffixes[] = {".f90", "_mod.f90", "_module.f90"};
+
+    if (!stem || stem[0] == '\0') return 0;
+    for (int i = 0; i < 3; i++) {
+        if (snprintf(out, out_size, "%s%s%s", dir ? dir : "", stem, suffixes[i]) >= (int)out_size) {
+            continue;
+        }
+        if (path_is_file(out)) return 1;
+    }
+    return 0;
+}
+
+static int dep_find_module_path(const char *dir, const char *module_name, char *out, size_t out_size) {
+    char stem[128];
+
+    dep_module_file_stem(module_name, stem, sizeof(stem));
+    if (!string_eq_nocase(stem, module_name)) {
+        if (dep_try_module_stem(dir, stem, out, out_size)) return 1;
+    }
+    return dep_try_module_stem(dir, module_name, out, out_size);
+}
+
+static void dep_print_missing_module_error(const char *dir, const char *module_name) {
+    char stem[128];
+
+    dep_module_file_stem(module_name, stem, sizeof(stem));
+    if (!string_eq_nocase(stem, module_name)) {
+        fprintf(stderr,
+                "--dep: module '%s' not found; tried %s%s.f90, %s%s_mod.f90, %s%s_module.f90, %s%s.f90, %s%s_mod.f90, %s%s_module.f90\n",
+                module_name,
+                dir ? dir : "", stem,
+                dir ? dir : "", stem,
+                dir ? dir : "", stem,
+                dir ? dir : "", module_name,
+                dir ? dir : "", module_name,
+                dir ? dir : "", module_name);
+    } else {
+        fprintf(stderr, "--dep: module '%s' not found; tried %s%s.f90, %s%s_mod.f90, %s%s_module.f90\n",
+                module_name, dir ? dir : "", module_name, dir ? dir : "", module_name,
+                dir ? dir : "", module_name);
+    }
+}
+
+static int dep_resolve_module(PathList *ordered_paths, PathList *seen_modules,
+                              const char *dir, const char *module_name);
+
+static int dep_scan_source_uses(PathList *ordered_paths, PathList *seen_modules,
+                                const char *dir, const char *source) {
+    const char *line;
+
+    line = source ? source : "";
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        char buf[2048];
+        char used[128];
+        if (!end) end = line + strlen(line);
+        trim_source_line_copy(line, end, buf, sizeof(buf));
+        if (parse_use_module_name(buf, used, sizeof(used))) {
+            if (!dep_resolve_module(ordered_paths, seen_modules, dir, used)) return 0;
+        }
+        line = *end ? end + 1 : end;
+    }
+    return 1;
+}
+
+static int dep_resolve_module(PathList *ordered_paths, PathList *seen_modules,
+                              const char *dir, const char *module_name) {
+    char module_path[2048];
+    char *source;
+
+    if (dep_is_builtin_module(module_name)) return 1;
+    if (dep_module_seen(seen_modules, module_name)) return 1;
+    if (!path_list_add(seen_modules, module_name)) return 0;
+
+    if (!dep_find_module_path(dir, module_name, module_path, sizeof(module_path))) {
+        dep_print_missing_module_error(dir, module_name);
+        return 0;
+    }
+
+    source = read_source_file(module_path);
+    if (!source) return 0;
+    if (!source_defines_module_name(source, module_name)) {
+        fprintf(stderr, "--dep: %s does not define module '%s'\n", module_path, module_name);
+        free(source);
+        return 0;
+    }
+    if (!dep_scan_source_uses(ordered_paths, seen_modules, dir, source)) {
+        free(source);
+        return 0;
+    }
+    free(source);
+
+    if (!path_list_contains(ordered_paths, module_path) &&
+        !path_list_add(ordered_paths, module_path)) {
+        return 0;
+    }
+    return 1;
+}
+
+static int add_source_path_with_deps(PathList *list, const char *main_path) {
+    PathList seen_modules = {0};
+    char *resolved;
+    char *source;
+    char dir[1024];
+    int ok;
+
+    resolved = resolve_source_path_shortcut(main_path);
+    if (!resolved) return 0;
+    source = read_source_file(resolved);
+    if (!source) {
+        free(resolved);
+        return 0;
+    }
+    manifest_dirname(resolved, dir, sizeof(dir));
+    ok = dep_scan_source_uses(list, &seen_modules, dir, source);
+    if (ok && !path_list_contains(list, resolved)) {
+        ok = path_list_add(list, resolved);
+    }
+    free(source);
+    free(resolved);
+    path_list_free(&seen_modules);
+    return ok;
 }
 
 static int path_list_add_manifest(PathList *list, const char *manifest_path) {
@@ -6755,7 +7070,7 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--cache] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--time|--time-detail] [--profile-lines] [--trace-assign] [--warn-unused|--no-warn-unused] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--cache] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--dep] [--time|--time-detail] [--profile-lines|--profile-procs] [--trace-assign] [--warn-unused|--no-warn-unused] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
     fprintf(stderr, "       %s --each [--check] [--quiet] [--limit n] [--max-fail n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
@@ -6778,6 +7093,7 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --time prints elapsed time for the requested operation\n");
     fprintf(stderr, "       --time-detail prints setup, lex, parse, register, execute, and total times\n");
     fprintf(stderr, "       --profile-lines prints elapsed execution time by source line\n");
+    fprintf(stderr, "       --profile-procs prints elapsed execution time by user procedure\n");
     fprintf(stderr, "       --trace-assign prints assignment trace diagnostics\n");
     fprintf(stderr, "       --warn-unused warns about simple declarations whose variables are never read (default unless --fast or -w)\n");
     fprintf(stderr, "       --no-warn-unused disables declared-but-unused variable warnings\n");
@@ -6787,6 +7103,7 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --init-char text initializes otherwise uninitialized CHARACTER variables with repeated/truncated text\n");
     fprintf(stderr, "       --fixed-form treats input as fixed source form; --free-form forces free source form\n");
     fprintf(stderr, "       --save-free saves converted fixed-form input beside the source as .f90\n");
+    fprintf(stderr, "       --dep resolves USEd modules from the main source directory before running one main file\n");
     fprintf(stderr, "       --each treats each file or Windows glob match as a separate program\n");
     fprintf(stderr, "       --limit n checks at most n files in --each mode\n");
     fprintf(stderr, "       --max-fail n stops --each mode after n failed files; 0 means no limit\n");
@@ -6863,6 +7180,7 @@ int main(int argc, char **argv) {
     int each_max_fail = 0;
     int quiet = 0;
     int force_interactive = 0;
+    int dep_mode = 0;
     double setup_start = 0.0;
     int i;
     if (ISATTY(FILENO(stdout))) {
@@ -6935,6 +7253,8 @@ int main(int argc, char **argv) {
             g_time_detail = 1;
         } else if (strcmp(argv[i], "--profile-lines") == 0) {
             g_line_profile = 1;
+        } else if (strcmp(argv[i], "--profile-procs") == 0) {
+            g_procedure_profile = 1;
         } else if (strcmp(argv[i], "--trace-assign") == 0) {
             g_trace_assign = 1;
             g_specialized_fast_paths = 0;
@@ -6995,6 +7315,8 @@ int main(int argc, char **argv) {
             g_source_form = SOURCE_FORM_FREE;
         } else if (strcmp(argv[i], "--save-free") == 0) {
             g_save_free_form = 1;
+        } else if (strcmp(argv[i], "--dep") == 0 || strcmp(argv[i], "--deps") == 0) {
+            dep_mode = 1;
         } else if (strcmp(argv[i], "--each") == 0) {
             each_mode = 1;
         } else if (strcmp(argv[i], "--limit") == 0) {
@@ -7092,11 +7414,27 @@ int main(int argc, char **argv) {
                     path_list_free(&source_paths);
                     return 2;
                 }
+            } else if (dep_mode) {
+                if (source_paths.count > 0) {
+                    fprintf(stderr, "--dep requires exactly one main source file\n");
+                    path_list_free(&source_paths);
+                    return 2;
+                }
+                if (!add_source_path_with_deps(&source_paths, argv[i])) {
+                    path_list_free(&source_paths);
+                    return 2;
+                }
             } else if (!add_source_path_arg(&source_paths, argv[i], 0)) {
                 path_list_free(&source_paths);
                 return 2;
             }
         }
+    }
+
+    if (dep_mode && (each_mode || load_path || syntax_check_path || check_path || source_paths.count == 0)) {
+        fprintf(stderr, "--dep requires exactly one main source file and cannot be combined with --each, --load, --load-run, --check, or --check-gfortran\n");
+        path_list_free(&source_paths);
+        return 2;
     }
 
     if (!each_mode && each_limit >= 0) {
