@@ -1744,6 +1744,30 @@ static void require_procedure_pointer_interface_compatible(OfortInterpreter *I,
                     target_name);
     }
     if (iface->type == FND_FUNCTION &&
+        iface->val_type != FVAL_VOID && target->val_type != FVAL_VOID &&
+        iface->val_type == target->val_type) {
+        int iface_kind = iface->kind;
+        int target_kind = target->kind;
+        if (iface_kind == 0) {
+            if (iface->val_type == FVAL_INTEGER) iface_kind = 4;
+            else if (iface->val_type == FVAL_REAL) iface_kind = 4;
+            else if (iface->val_type == FVAL_DOUBLE) iface_kind = 8;
+            else if (iface->val_type == FVAL_COMPLEX) iface_kind = 4;
+            else if (iface->val_type == FVAL_LOGICAL) iface_kind = 4;
+        }
+        if (target_kind == 0) {
+            if (target->val_type == FVAL_INTEGER) target_kind = 4;
+            else if (target->val_type == FVAL_REAL) target_kind = 4;
+            else if (target->val_type == FVAL_DOUBLE) target_kind = 8;
+            else if (target->val_type == FVAL_COMPLEX) target_kind = 4;
+            else if (target->val_type == FVAL_LOGICAL) target_kind = 4;
+        }
+        if (iface_kind != target_kind) {
+            ofort_error(I, "Interface mismatch in procedure pointer assignment: '%s' has incompatible result kind",
+                        target_name);
+        }
+    }
+    if (iface->type == FND_FUNCTION &&
         iface->val_type == FVAL_CHARACTER && target->val_type == FVAL_CHARACTER &&
         iface->char_len > 0 && target->char_len > 0 &&
         iface->char_len != target->char_len) {
@@ -7431,6 +7455,7 @@ static OfortNode *parse_function(OfortInterpreter *I) {
 static OfortNode *parse_typed_function(OfortInterpreter *I) {
     OfortToken *type_tok = advance(I);
     OfortValType result_type = token_to_valtype(type_tok->type);
+    int result_kind = 0;
     int result_char_len = 0;
     char derived_type_name[256];
     derived_type_name[0] = '\0';
@@ -7465,10 +7490,27 @@ static OfortNode *parse_typed_function(OfortInterpreter *I) {
                     break;
                 }
             }
+        } else if (result_type == FVAL_INTEGER || result_type == FVAL_REAL ||
+                   result_type == FVAL_COMPLEX || result_type == FVAL_LOGICAL) {
+            for (int p = selector_start + 1; p <= selector_end && p < I->n_tokens; p++) {
+                if (token_ident_upper(&I->tokens[p], "KIND") &&
+                    p + 2 < I->n_tokens &&
+                    I->tokens[p + 1].type == FTOK_ASSIGN &&
+                    I->tokens[p + 2].type == FTOK_INT_LIT) {
+                    result_kind = (int)I->tokens[p + 2].int_val;
+                    break;
+                }
+                if (I->tokens[p].type == FTOK_INT_LIT) {
+                    result_kind = (int)I->tokens[p].int_val;
+                    break;
+                }
+            }
+            if (result_type == FVAL_REAL && result_kind == 8) result_type = FVAL_DOUBLE;
         }
     }
 
     OfortNode *fn = parse_function_with_type(I, result_type, 1);
+    if (result_kind > 0) fn->kind = result_kind;
     if (result_type == FVAL_CHARACTER && result_char_len > 0) fn->char_len = result_char_len;
     if (derived_type_name[0]) copy_cstr(fn->str_val, sizeof(fn->str_val), derived_type_name);
     return fn;
