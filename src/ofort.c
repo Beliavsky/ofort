@@ -194,6 +194,10 @@ struct OfortInterpreter {
     double *line_profile_seconds;
     int *line_profile_counts;
     int line_profile_nlines;
+    int procedure_profile_enabled;
+    OfortProcedureProfileEntry *procedure_profile_entries;
+    int procedure_profile_n_entries;
+    int procedure_profile_cap;
     OfortTiming timing;
     /* tokens */
     OfortToken *tokens;
@@ -265,6 +269,7 @@ struct OfortInterpreter {
     char decl_init_name[256];
     OfortValType decl_init_type;
     int decl_init_kind;
+    char active_module_name[256];
     /* node pool for memory management */
     OfortNode **node_pool;
     int node_pool_len;
@@ -278,6 +283,9 @@ struct OfortInterpreter {
 static char fast_local_array_cache_tag;
 static char fast_numeric_loop_plan_tag;
 static char fast_array_expr_program_tag;
+
+static void copy_cstr(char *dst, size_t dst_size, const char *src);
+static int str_eq_nocase(const char *a, const char *b);
 
 typedef struct FastNumericLoopPlan FastNumericLoopPlan;
 
@@ -487,6 +495,58 @@ static void add_line_profile_time(OfortInterpreter *I, int line, double seconds)
     if (!I->line_profile_seconds || !I->line_profile_counts) return;
     I->line_profile_seconds[line] += seconds;
     I->line_profile_counts[line]++;
+}
+
+static void clear_procedure_profile(OfortInterpreter *I) {
+    if (!I) return;
+    free(I->procedure_profile_entries);
+    I->procedure_profile_entries = NULL;
+    I->procedure_profile_n_entries = 0;
+    I->procedure_profile_cap = 0;
+}
+
+static OfortProcedureProfileEntry *procedure_profile_entry(OfortInterpreter *I, OfortFunc *func) {
+    OfortProcedureProfileEntry *entries;
+    int new_cap;
+    if (!I || !I->procedure_profile_enabled || !func) return NULL;
+    for (int i = 0; i < I->procedure_profile_n_entries; i++) {
+        OfortProcedureProfileEntry *entry = &I->procedure_profile_entries[i];
+        if (str_eq_nocase(entry->name, func->name) &&
+            str_eq_nocase(entry->module_name, func->module_name)) {
+            return entry;
+        }
+    }
+    if (I->procedure_profile_n_entries >= I->procedure_profile_cap) {
+        new_cap = I->procedure_profile_cap ? I->procedure_profile_cap * 2 : 32;
+        entries = (OfortProcedureProfileEntry *)realloc(
+            I->procedure_profile_entries, (size_t)new_cap * sizeof(*entries));
+        if (!entries) return NULL;
+        memset(entries + I->procedure_profile_cap, 0,
+               (size_t)(new_cap - I->procedure_profile_cap) * sizeof(*entries));
+        I->procedure_profile_entries = entries;
+        I->procedure_profile_cap = new_cap;
+    }
+    entries = I->procedure_profile_entries;
+    entries += I->procedure_profile_n_entries++;
+    memset(entries, 0, sizeof(*entries));
+    copy_cstr(entries->name, sizeof(entries->name), func->name);
+    copy_cstr(entries->module_name, sizeof(entries->module_name), func->module_name);
+    entries->is_function = func->is_function ? 1 : 0;
+    return entries;
+}
+
+static double begin_procedure_profile(OfortInterpreter *I, OfortFunc *func) {
+    if (!I || !I->procedure_profile_enabled || !func) return 0.0;
+    return ofort_monotonic_seconds();
+}
+
+static void end_procedure_profile(OfortInterpreter *I, OfortFunc *func, double start) {
+    OfortProcedureProfileEntry *entry;
+    if (!I || !I->procedure_profile_enabled || !func || start <= 0.0) return;
+    entry = procedure_profile_entry(I, func);
+    if (!entry) return;
+    entry->count++;
+    entry->seconds += ofort_monotonic_seconds() - start;
 }
 
 /* â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
@@ -1312,16 +1372,28 @@ static OfortVar *declare_absent_optional_var(OfortInterpreter *I, const char *na
     return v;
 }
 
-static OfortFunc *find_func(OfortInterpreter *I, const char *name) {
+static OfortFunc *find_func_in_module(OfortInterpreter *I, const char *name, const char *module_name) {
     char upper[256];
     str_upper(upper, name, 256);
-    int i;
-    for (i = 0; i < I->n_funcs; i++) {
+    for (int i = 0; i < I->n_funcs; i++) {
         char fu[256];
+        if (module_name && module_name[0] &&
+            !str_eq_nocase(I->funcs[i].module_name, module_name)) {
+            continue;
+        }
         str_upper(fu, I->funcs[i].name, 256);
         if (strcmp(upper, fu) == 0) return &I->funcs[i];
     }
     return NULL;
+}
+
+static OfortFunc *find_func(OfortInterpreter *I, const char *name) {
+    OfortFunc *func;
+    if (I->active_module_name[0]) {
+        func = find_func_in_module(I, name, I->active_module_name);
+        if (func) return func;
+    }
+    return find_func_in_module(I, name, NULL);
 }
 
 static OfortGeneric *find_generic(OfortInterpreter *I, const char *name);
@@ -1624,9 +1696,11 @@ static void register_generic_procedure(OfortInterpreter *I, const char *generic_
 
 static void annotate_procedure_params(OfortNode *n);
 
-static OfortFunc *register_func(OfortInterpreter *I, const char *name, OfortNode *node, int is_function) {
+static OfortFunc *register_func_with_module(OfortInterpreter *I, const char *name, OfortNode *node,
+                                            int is_function, const char *module_name) {
     for (int i = 0; i < I->n_funcs; i++) {
-        if (str_eq_nocase(I->funcs[i].name, name)) {
+        if (str_eq_nocase(I->funcs[i].name, name) &&
+            str_eq_nocase(I->funcs[i].module_name, module_name ? module_name : "")) {
             I->funcs[i].node = node;
             I->funcs[i].is_function = is_function;
             return &I->funcs[i];
@@ -1637,9 +1711,13 @@ static OfortFunc *register_func(OfortInterpreter *I, const char *name, OfortNode
     copy_cstr(f->name, sizeof(f->name), name);
     f->node = node;
     f->is_function = is_function;
-    f->module_name[0] = '\0';
+    copy_cstr(f->module_name, sizeof(f->module_name), module_name ? module_name : "");
     f->n_saved_vars = 0;
     return f;
+}
+
+static OfortFunc *register_func(OfortInterpreter *I, const char *name, OfortNode *node, int is_function) {
+    return register_func_with_module(I, name, node, is_function, "");
 }
 
 static void register_contained_procedures(OfortInterpreter *I, OfortNode *body, const char *module_name) {
@@ -1649,10 +1727,9 @@ static void register_contained_procedures(OfortInterpreter *I, OfortNode *body, 
         if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
                   s->type == FND_STMT_FUNCTION)) {
             annotate_procedure_params(s);
-            OfortFunc *func = register_func(I, s->name, s,
-                                            s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
-            if (module_name && module_name[0])
-                copy_cstr(func->module_name, sizeof(func->module_name), module_name);
+            (void)register_func_with_module(I, s->name, s,
+                                            s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION,
+                                            module_name);
         }
     }
 }
@@ -14050,9 +14127,15 @@ static OfortValue execute_user_function_with_args(OfortInterpreter *I, OfortFunc
     if (!procedure_body_declares_name(fn->children[0], res_name)) {
         declare_var(I, res_name, default_value(fn->val_type, 1));
     }
+    double proc_profile_start = begin_procedure_profile(I, func);
+    char prev_module_name[256];
+    copy_cstr(prev_module_name, sizeof(prev_module_name), I->active_module_name);
+    copy_cstr(I->active_module_name, sizeof(I->active_module_name), func->module_name);
     I->procedure_depth++;
     exec_node(I, fn->children[0]);
     I->procedure_depth--;
+    copy_cstr(I->active_module_name, sizeof(I->active_module_name), prev_module_name);
+    end_procedure_profile(I, func, proc_profile_start);
     if (I->goto_active) {
         ofort_error(I, "GOTO target label %d not found", I->goto_label);
     }
@@ -15059,10 +15142,16 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             }
 
             /* Execute body */
+            double proc_profile_start = begin_procedure_profile(I, func);
+            char prev_module_name[256];
+            copy_cstr(prev_module_name, sizeof(prev_module_name), I->active_module_name);
+            copy_cstr(I->active_module_name, sizeof(I->active_module_name), func->module_name);
             I->procedure_depth++;
             register_contained_procedures(I, fn->children[0], func->module_name);
             exec_node(I, fn->children[0]);
             I->procedure_depth--;
+            copy_cstr(I->active_module_name, sizeof(I->active_module_name), prev_module_name);
+            end_procedure_profile(I, func, proc_profile_start);
             if (I->goto_active) {
                 ofort_error(I, "GOTO target label %d not found", I->goto_label);
             }
@@ -15577,9 +15666,15 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
             pv->is_optional = fn->param_optional[i];
         }
         restore_saved_vars(I, func);
+        double proc_profile_start = begin_procedure_profile(I, func);
+        char prev_module_name[256];
+        copy_cstr(prev_module_name, sizeof(prev_module_name), I->active_module_name);
+        copy_cstr(I->active_module_name, sizeof(I->active_module_name), func->module_name);
         I->procedure_depth++;
         exec_node(I, fn->children[0]);
         I->procedure_depth--;
+        copy_cstr(I->active_module_name, sizeof(I->active_module_name), prev_module_name);
+        end_procedure_profile(I, func, proc_profile_start);
         I->returning = 0;
 
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
@@ -15644,10 +15739,16 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
             declare_var(I, res_name, default_value(fn->val_type, 1));
         }
 
+        double proc_profile_start = begin_procedure_profile(I, func);
+        char prev_module_name[256];
+        copy_cstr(prev_module_name, sizeof(prev_module_name), I->active_module_name);
+        copy_cstr(I->active_module_name, sizeof(I->active_module_name), func->module_name);
         I->procedure_depth++;
         register_contained_procedures(I, fn->children[0], func->module_name);
         exec_node(I, fn->children[0]);
         I->procedure_depth--;
+        copy_cstr(I->active_module_name, sizeof(I->active_module_name), prev_module_name);
+        end_procedure_profile(I, func, proc_profile_start);
         if (I->goto_active) {
             ofort_error(I, "GOTO target label %d not found", I->goto_label);
         }
@@ -18998,10 +19099,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 OfortNode *s = body->stmts[i];
                 if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
                     s->type == FND_STMT_FUNCTION) {
-                    OfortFunc *func;
                     annotate_procedure_params(s);
-                    func = register_func(I, s->name, s, s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION);
-                    copy_cstr(func->module_name, sizeof(func->module_name), mod->name);
+                    (void)register_func_with_module(I, s->name, s,
+                                                    s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION,
+                                                    mod->name);
                 }
             }
             for (int i = 0; i < body->n_stmts; i++) {
@@ -22336,9 +22437,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 pv->is_optional = fn->param_optional[i];
             }
             restore_saved_vars(I, func);
+            double proc_profile_start = begin_procedure_profile(I, func);
+            char prev_module_name[256];
+            copy_cstr(prev_module_name, sizeof(prev_module_name), I->active_module_name);
+            copy_cstr(I->active_module_name, sizeof(I->active_module_name), func->module_name);
             I->procedure_depth++;
             exec_node(I, fn->children[0]);
             I->procedure_depth--;
+            copy_cstr(I->active_module_name, sizeof(I->active_module_name), prev_module_name);
+            end_procedure_profile(I, func, proc_profile_start);
             I->returning = 0;
             store_saved_vars(I, func, I->current_scope);
             pop_scope(I);
@@ -22485,10 +22592,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         restore_saved_vars(I, func);
 
+        double proc_profile_start = begin_procedure_profile(I, func);
+        char prev_module_name[256];
+        copy_cstr(prev_module_name, sizeof(prev_module_name), I->active_module_name);
+        copy_cstr(I->active_module_name, sizeof(I->active_module_name), func->module_name);
         I->procedure_depth++;
         register_contained_procedures(I, fn->children[0], func->module_name);
         exec_node(I, fn->children[0]);
         I->procedure_depth--;
+        copy_cstr(I->active_module_name, sizeof(I->active_module_name), prev_module_name);
+        end_procedure_profile(I, func, proc_profile_start);
         I->returning = 0;
 
         int pointer_copyback[OFORT_MAX_PARAMS] = {0};
@@ -28702,6 +28815,11 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                 free_value(&result.v.arr.data[out]);
                 result.v.arr.data[out] = make_integer(found_pos);
             }
+            if (nd == 1) {
+                OfortValue scalar = array_element_value(&result, 0);
+                free_value(&result);
+                return scalar;
+            }
             return result;
         } else {
             int nd = array->v.arr.n_dims;
@@ -28826,6 +28944,11 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                 free_value(&best);
                 free_value(&result.v.arr.data[out]);
                 result.v.arr.data[out] = make_integer(found ? best_pos : 0);
+            }
+            if (nd == 1) {
+                OfortValue scalar = array_element_value(&result, 0);
+                free_value(&result);
+                return scalar;
             }
             return result;
             if (array->v.arr.n_dims == 1) {
@@ -29841,6 +29964,7 @@ OfortInterpreter *ofort_create(void) {
 void ofort_destroy(OfortInterpreter *interp) {
     if (!interp) return;
     clear_line_profile(interp);
+    clear_procedure_profile(interp);
     /* Free node pool */
     if (interp->node_pool) {
         for (int i = 0; i < interp->node_pool_len; i++) {
@@ -29914,7 +30038,9 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     interp->warnings[0] = '\0';
     interp->warn_len = 0;
     interp->procedure_depth = 0;
+    interp->active_module_name[0] = '\0';
     interp->consumed_bare_end = 0;
+    if (interp->procedure_profile_enabled) clear_procedure_profile(interp);
     if (prepare_line_profile(interp, source) != 0) {
         snprintf(interp->error, sizeof(interp->error), "Out of memory for line profiler");
         interp->has_error = 1;
@@ -30036,6 +30162,7 @@ int ofort_check(OfortInterpreter *interp, const char *source) {
     interp->warnings[0] = '\0';
     interp->warn_len = 0;
     interp->procedure_depth = 0;
+    interp->active_module_name[0] = '\0';
     interp->consumed_bare_end = 0;
 
     if (setjmp(interp->err_jmp) != 0) {
@@ -30163,6 +30290,13 @@ void ofort_set_line_profile_enabled(OfortInterpreter *interp, int enabled) {
     if (interp) {
         interp->line_profile_enabled = enabled ? 1 : 0;
         if (!enabled) clear_line_profile(interp);
+    }
+}
+
+void ofort_set_procedure_profile_enabled(OfortInterpreter *interp, int enabled) {
+    if (interp) {
+        interp->procedure_profile_enabled = enabled ? 1 : 0;
+        if (!enabled) clear_procedure_profile(interp);
     }
 }
 
@@ -31207,6 +31341,20 @@ int ofort_get_line_profile(OfortInterpreter *interp, OfortLineProfileEntry *entr
     return 0;
 }
 
+int ofort_get_procedure_profile(OfortInterpreter *interp, OfortProcedureProfileEntry *entries,
+                                int max_entries, int *n_entries) {
+    int count = 0;
+    if (!interp || !n_entries) return -1;
+    for (int i = 0; i < interp->procedure_profile_n_entries; i++) {
+        OfortProcedureProfileEntry *entry = &interp->procedure_profile_entries[i];
+        if (entry->count <= 0) continue;
+        if (entries && count < max_entries) entries[count] = *entry;
+        count++;
+    }
+    *n_entries = count;
+    return 0;
+}
+
 int ofort_call_real1(OfortInterpreter *interp, const char *name, double x, double *result) {
     OfortFunc *func;
     OfortValue args[1];
@@ -31259,6 +31407,7 @@ void ofort_reset(OfortInterpreter *interp) {
     interp->consumed_bare_end = 0;
     clear_timing(interp);
     clear_line_profile(interp);
+    clear_procedure_profile(interp);
 }
 
 
