@@ -23395,7 +23395,7 @@ static const char *intrinsic_names[] = {
     "SIND", "COSD", "TAND", "ASIND", "ACOSD", "ATAND", "ATAN2D",
     "BESSEL_J0", "BESSEL_J1", "BESSEL_Y0", "BESSEL_Y1", "BESSEL_JN", "BESSEL_YN",
     "SINH", "COSH", "TANH", "ASINH", "ACOSH", "ATANH",
-    "EXP", "LOG", "LOG10", "GAMMA", "LOG_GAMMA", "ERFC_SCALED", "MOD", "AMOD", "MODULO", "DIM", "MAX", "MIN", "MIN1", "AMIN0", "FLOOR", "CEILING", "AINT", "ANINT", "NINT",
+    "EXP", "LOG", "LOG10", "GAMMA", "LOG_GAMMA", "ERF", "ERFC", "ERFC_SCALED", "MOD", "AMOD", "MODULO", "DIM", "MAX", "MIN", "MIN1", "AMIN0", "FLOOR", "CEILING", "AINT", "ANINT", "NINT",
     "DACOS", "DASIN",
     "CSQRT", "CEXP", "CSIN", "CCOS", "CABS",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "TRANSFER",
@@ -23472,6 +23472,8 @@ static int is_elemental_unary_intrinsic(const char *upper) {
            strcmp(upper, "LOG10") == 0 ||
            strcmp(upper, "GAMMA") == 0 ||
            strcmp(upper, "LOG_GAMMA") == 0 ||
+           strcmp(upper, "ERF") == 0 ||
+           strcmp(upper, "ERFC") == 0 ||
            strcmp(upper, "FRACTION") == 0 ||
            strcmp(upper, "RRSPACING") == 0 ||
            strcmp(upper, "SPACING") == 0 ||
@@ -27420,7 +27422,16 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (nargs < 1) ofort_error(I, "LOG_GAMMA requires 1 argument");
         return make_real(lgamma(val_to_real(args[0])));
     }
+    if (strcmp(upper, "ERF") == 0) {
+        if (nargs < 1) ofort_error(I, "ERF requires 1 argument");
+        return make_real(erf(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "ERFC") == 0) {
+        if (nargs < 1) ofort_error(I, "ERFC requires 1 argument");
+        return make_real(erfc(val_to_real(args[0])));
+    }
     if (strcmp(upper, "ERFC_SCALED") == 0) {
+        if (nargs < 1) ofort_error(I, "ERFC_SCALED requires 1 argument");
         double x = val_to_real(args[0]);
         return make_real(exp(x * x) * erfc(x));
     }
