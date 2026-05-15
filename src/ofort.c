@@ -1697,6 +1697,10 @@ static void require_procedure_pointer_interface_compatible(OfortInterpreter *I,
             ofort_error(I, "Interface mismatch in procedure pointer assignment: argument '%s' has incompatible INTENT",
                         target->param_names[i]);
         }
+        if (iface->param_optional[i] != target->param_optional[i]) {
+            ofort_error(I, "Interface mismatch in procedure pointer assignment: argument '%s' has incompatible OPTIONAL attribute",
+                        target->param_names[i]);
+        }
     }
     if (iface->type == FND_FUNCTION &&
         iface->val_type != FVAL_VOID && target->val_type != FVAL_VOID &&
