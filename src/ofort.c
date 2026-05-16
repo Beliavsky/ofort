@@ -26,6 +26,7 @@
 #include <sys/stat.h>
 #ifndef _WIN32
 #include <unistd.h>
+#include <sys/wait.h>
 #endif
 
 #define OFORT_ALLOC_TARGET_CHILD (OFORT_MAX_CHILDREN - 1)
@@ -12734,6 +12735,41 @@ static void inquire_assign_target(OfortInterpreter *I, OfortNode *target, OfortV
     set_var(I, target->name, val);
 }
 
+static void assign_intrinsic_output_target(OfortInterpreter *I, const char *proc_name,
+                                           const char *arg_name, OfortNode *target,
+                                           OfortValue val) {
+    OfortValue *slot;
+    if (!target) {
+        free_value(&val);
+        return;
+    }
+    if (target->type == FND_IDENT) {
+        set_var(I, target->name, val);
+        return;
+    }
+    slot = member_lvalue(I, target);
+    if (!slot) {
+        free_value(&val);
+        ofort_error(I, "%s %s argument must be a variable", proc_name, arg_name);
+    }
+    if (slot->type == FVAL_CHARACTER && val.type == FVAL_CHARACTER && slot->v.s) {
+        val = resize_character_value(val, (int)strlen(slot->v.s));
+    } else if (slot->type != FVAL_VOID) {
+        val = coerce_assignment_value(I, arg_name, slot->type, val);
+    }
+    free_value(slot);
+    *slot = val;
+}
+
+static int command_exit_status(int rc) {
+    if (rc == -1) return -1;
+#ifndef _WIN32
+    if (WIFEXITED(rc)) return WEXITSTATUS(rc);
+    if (WIFSIGNALED(rc)) return 128 + WTERMSIG(rc);
+#endif
+    return rc;
+}
+
 static int inquire_iolength_value(OfortValue v) {
     if (v.type == FVAL_CHARACTER) return v.v.s ? (int)strlen(v.v.s) : 0;
     if (v.type == FVAL_DOUBLE) return 8;
@@ -22947,6 +22983,96 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 } else if (str_eq_nocase(n->param_names[i], "count_max")) {
                     set_var(I, n->stmts[i]->name, make_integer(count_max));
                 }
+            }
+            break;
+        }
+        if (strcmp(call_upper, "EXECUTE_COMMAND_LINE") == 0) {
+            int command_idx = -1;
+            int wait_idx = -1;
+            int exitstat_idx = -1;
+            int cmdstat_idx = -1;
+            int cmdmsg_idx = -1;
+            OfortValue command_val;
+            OfortValue wait_val;
+            char command_buf[OFORT_MAX_STRLEN];
+            int rc;
+            int exit_code;
+            int cmdstat = 0;
+            const char *cmdmsg = "";
+
+            for (int i = 0; i < n->n_stmts; i++) {
+                const char *pname = n->param_names[i];
+                if (str_eq_nocase(pname, "command")) {
+                    command_idx = i;
+                } else if (str_eq_nocase(pname, "wait")) {
+                    wait_idx = i;
+                } else if (str_eq_nocase(pname, "exitstat")) {
+                    exitstat_idx = i;
+                } else if (str_eq_nocase(pname, "cmdstat")) {
+                    cmdstat_idx = i;
+                } else if (str_eq_nocase(pname, "cmdmsg")) {
+                    cmdmsg_idx = i;
+                } else if (pname[0] != '\0') {
+                    ofort_error(I, "Unknown EXECUTE_COMMAND_LINE keyword '%s'", pname);
+                } else if (command_idx < 0) {
+                    command_idx = i;
+                } else if (wait_idx < 0) {
+                    wait_idx = i;
+                } else if (exitstat_idx < 0) {
+                    exitstat_idx = i;
+                } else if (cmdstat_idx < 0) {
+                    cmdstat_idx = i;
+                } else if (cmdmsg_idx < 0) {
+                    cmdmsg_idx = i;
+                } else {
+                    ofort_error(I, "Too many arguments to EXECUTE_COMMAND_LINE");
+                }
+            }
+            if (command_idx < 0)
+                ofort_error(I, "EXECUTE_COMMAND_LINE requires COMMAND");
+
+            if (wait_idx >= 0) {
+                wait_val = eval_node(I, n->stmts[wait_idx]);
+                if (wait_val.type != FVAL_LOGICAL) {
+                    free_value(&wait_val);
+                    ofort_error(I, "EXECUTE_COMMAND_LINE WAIT must be LOGICAL");
+                }
+                if (!val_to_logical(wait_val)) {
+                    ofort_warning(I, n->line,
+                                  "warning: EXECUTE_COMMAND_LINE WAIT=.FALSE. is executed synchronously");
+                }
+                free_value(&wait_val);
+            }
+
+            command_val = eval_node(I, n->stmts[command_idx]);
+            if (command_val.type != FVAL_CHARACTER) {
+                free_value(&command_val);
+                ofort_error(I, "EXECUTE_COMMAND_LINE COMMAND must be CHARACTER");
+            }
+            copy_trimmed_path(command_buf, sizeof(command_buf), command_val.v.s ? command_val.v.s : "");
+            free_value(&command_val);
+
+            rc = system(command_buf);
+            exit_code = command_exit_status(rc);
+            if (rc == -1) {
+                cmdstat = 1;
+                cmdmsg = "failed to execute command";
+            }
+
+            if (exitstat_idx >= 0) {
+                assign_intrinsic_output_target(I, "EXECUTE_COMMAND_LINE", "EXITSTAT",
+                                               n->stmts[exitstat_idx], make_integer(exit_code));
+            }
+            if (cmdstat_idx >= 0) {
+                assign_intrinsic_output_target(I, "EXECUTE_COMMAND_LINE", "CMDSTAT",
+                                               n->stmts[cmdstat_idx], make_integer(cmdstat));
+            }
+            if (cmdmsg_idx >= 0) {
+                assign_intrinsic_output_target(I, "EXECUTE_COMMAND_LINE", "CMDMSG",
+                                               n->stmts[cmdmsg_idx], make_character(cmdmsg));
+            }
+            if (cmdstat != 0 && cmdstat_idx < 0) {
+                ofort_error(I, "EXECUTE_COMMAND_LINE failed to execute command");
             }
             break;
         }
