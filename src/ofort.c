@@ -8139,6 +8139,7 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
     int decl_lower_bounds[7] = {0};
     int decl_has_lower_bound[7] = {0};
     OfortNode *decl_lower_bound_exprs[7] = {0};
+    OfortNode *decl_dim_exprs[7] = {0};
     int n_decl_dims = 0;
     OfortNode *type_param_exprs[OFORT_MAX_PARAMS] = {0};
     char type_param_actual_names[OFORT_MAX_PARAMS][256] = {{0}};
@@ -8192,17 +8193,22 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
             while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
                 if (check(I, FTOK_COLON)) {
                     advance(I);
+                    if (n_decl_dims >= 7) ofort_error(I, "Too many DIMENSION dimensions");
                     decl_dims[n_decl_dims++] = 0;
                 } else if (check(I, FTOK_STAR)) {
                     advance(I);
+                    if (n_decl_dims >= 7) ofort_error(I, "Too many DIMENSION dimensions");
                     decl_dims[n_decl_dims++] = 0;
                 } else {
                     OfortNode *dim_expr = parse_dimension_bound_expr(I);
                     int dim_index = n_decl_dims;
+                    if (n_decl_dims >= 7) ofort_error(I, "Too many DIMENSION dimensions");
                     if (dim_expr->type == FND_INT_LIT)
                         decl_dims[n_decl_dims++] = (int)dim_expr->int_val;
-                    else
+                    else {
                         decl_dims[n_decl_dims++] = 0;
+                        decl_dim_exprs[dim_index] = dim_expr;
+                    }
                     if (check(I, FTOK_COLON)) {
                         advance(I);
                         int lower_value = 0;
@@ -8224,8 +8230,10 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
                             int hi_value = 0;
                             if (int_constant_node(hi, &hi_value)) {
                                 decl_dims[dim_index] = hi_value;
+                                decl_dim_exprs[dim_index] = NULL;
                             } else {
                                 decl_dims[dim_index] = 0;
+                                decl_dim_exprs[dim_index] = hi;
                             }
                         }
                     }
@@ -8310,10 +8318,17 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
         memcpy(decl->has_lower_bound, decl_has_lower_bound, sizeof(decl_has_lower_bound));
         memcpy(decl->lower_bound_exprs, decl_lower_bound_exprs, sizeof(decl_lower_bound_exprs));
         decl->n_dims = n_decl_dims;
+        if (n_decl_dims > 0) {
+            decl->stmts = (OfortNode **)calloc((size_t)n_decl_dims, sizeof(OfortNode *));
+            if (!decl->stmts) ofort_error(I, "Out of memory");
+            decl->n_stmts = n_decl_dims;
+            for (int di = 0; di < n_decl_dims; di++) decl->stmts[di] = decl_dim_exprs[di];
+        }
 
         if (check(I, FTOK_LPAREN)) {
             advance(I);
             decl->n_dims = 0;
+            decl->n_stmts = 0;
             memset(decl->dims, 0, sizeof(decl->dims));
             memset(decl->lower_bounds, 0, sizeof(decl->lower_bounds));
             memset(decl->has_lower_bound, 0, sizeof(decl->has_lower_bound));
@@ -14451,6 +14466,21 @@ static int write_to_internal_target(OfortInterpreter *I, OfortNode *target_node,
         text = resize_character_value(text, target->char_len);
         assign_array_ref(I, target, target_node, &text);
         free_value(&text);
+        return 1;
+    }
+
+    if (target_node->type == FND_MEMBER || target_node->type == FND_ARRAY_REF) {
+        OfortValue *target = member_lvalue(I, target_node);
+        int char_len;
+        if (!target || target->type != FVAL_CHARACTER) return 0;
+        char_len = target->kind > 0 ? target->kind :
+                   (target->v.s ? (int)strlen(target->v.s) : 1);
+        render_write_to_string(I, fmt, vals, nvals, text_buf, sizeof(text_buf), 0);
+        text = make_character(text_buf);
+        text = resize_character_value(text, char_len);
+        text.kind = char_len;
+        free_value(target);
+        *target = text;
         return 1;
     }
 
