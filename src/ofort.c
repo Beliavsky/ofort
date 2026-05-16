@@ -4552,15 +4552,75 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
             }
             if (has_type_spec) {
                 n->has_explicit_result_type = 1;
-                {
-                    int scan = I->tok_pos;
-                    while (scan < I->n_tokens && I->tokens[scan].type != FTOK_DCOLON &&
-                           I->tokens[scan].type != FTOK_RBRACKET && I->tokens[scan].type != FTOK_EOF) {
-                        if (I->tokens[scan].type == FTOK_INT_LIT) {
-                            n->char_len = (int)I->tokens[scan].int_val;
-                            break;
+                if (check(I, FTOK_CHARACTER)) {
+                    n->val_type = FVAL_CHARACTER;
+                    n->char_len = 1;
+                    advance(I);
+                    if (check(I, FTOK_STAR)) {
+                        advance(I);
+                        if (check(I, FTOK_LPAREN)) {
+                            advance(I);
+                            if (check(I, FTOK_STAR)) {
+                                advance(I);
+                                n->char_len = OFORT_MAX_STRLEN - 1;
+                            } else if (check(I, FTOK_COLON)) {
+                                advance(I);
+                                n->char_len = 0;
+                            } else if (!check(I, FTOK_RPAREN)) {
+                                n->char_len_expr = parse_expr(I);
+                                if (n->char_len_expr->type == FND_INT_LIT)
+                                    n->char_len = (int)n->char_len_expr->int_val;
+                            }
+                            expect(I, FTOK_RPAREN);
+                        } else if (check(I, FTOK_COLON)) {
+                            advance(I);
+                            n->char_len = 0;
+                        } else if (!check(I, FTOK_DCOLON)) {
+                            n->char_len_expr = parse_expr(I);
+                            if (n->char_len_expr->type == FND_INT_LIT)
+                                n->char_len = (int)n->char_len_expr->int_val;
                         }
-                        scan++;
+                    } else if (check(I, FTOK_LPAREN)) {
+                        int positional_selector = 0;
+                        advance(I);
+                        while (!check(I, FTOK_RPAREN) && !check(I, FTOK_EOF)) {
+                            int is_len_selector = 0;
+                            int is_kind_selector = 0;
+                            if (check(I, FTOK_IDENT) && peek_ahead(I, 1)->type == FTOK_ASSIGN) {
+                                is_len_selector = check_ident_upper(I, "LEN");
+                                is_kind_selector = check_ident_upper(I, "KIND");
+                                advance(I);
+                                expect(I, FTOK_ASSIGN);
+                            } else {
+                                positional_selector++;
+                                is_len_selector = positional_selector == 1;
+                                is_kind_selector = positional_selector == 2;
+                            }
+
+                            if (is_len_selector) {
+                                if (check(I, FTOK_STAR)) {
+                                    advance(I);
+                                    n->char_len = OFORT_MAX_STRLEN - 1;
+                                } else if (check(I, FTOK_COLON)) {
+                                    advance(I);
+                                    n->char_len = 0;
+                                } else {
+                                    n->char_len_expr = parse_expr(I);
+                                    if (n->char_len_expr->type == FND_INT_LIT)
+                                        n->char_len = (int)n->char_len_expr->int_val;
+                                }
+                            } else if (is_kind_selector) {
+                                n->kind_expr = parse_expr(I);
+                                if (n->kind_expr->type == FND_INT_LIT)
+                                    n->kind = (int)n->kind_expr->int_val;
+                            } else {
+                                parse_expr(I);
+                            }
+
+                            if (check(I, FTOK_COMMA)) advance(I);
+                            else break;
+                        }
+                        expect(I, FTOK_RPAREN);
                     }
                 }
                 while (!check(I, FTOK_DCOLON) && !check(I, FTOK_RBRACKET) && !check(I, FTOK_EOF)) {
@@ -10841,11 +10901,11 @@ static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, in
 
 static int array_character_len(const OfortValue *v) {
     if (!v || v->type != FVAL_ARRAY || v->v.arr.elem_type != FVAL_CHARACTER) return 0;
-    if (v->kind > 0) return v->kind;
     if (v->v.arr.data && v->v.arr.len > 0 && v->v.arr.data[0].type == FVAL_CHARACTER &&
         v->v.arr.data[0].v.s) {
         return (int)strlen(v->v.arr.data[0].v.s);
     }
+    if (v->kind > 0) return v->kind;
     return 0;
 }
 
@@ -15540,7 +15600,10 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         int char_len = 1;
         if (nelem > 0) etype = elems[0].type;
         if (etype == FVAL_CHARACTER && elems[0].v.s) char_len = (int)strlen(elems[0].v.s);
-        if (etype == FVAL_CHARACTER && n->has_explicit_result_type && n->char_len > 0) char_len = n->char_len;
+        if (etype == FVAL_CHARACTER && n->has_explicit_result_type &&
+            (n->char_len > 0 || n->char_len_expr)) {
+            char_len = eval_character_length(I, n);
+        }
         if (n->line > 0 && !n->has_explicit_result_type && etype == FVAL_CHARACTER) {
             for (int i = 1; i < nelem; i++) {
                 int elem_len = elems[i].type == FVAL_CHARACTER && elems[i].v.s ? (int)strlen(elems[i].v.s) : 0;
