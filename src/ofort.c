@@ -10130,6 +10130,8 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
                 copy_cstr(v.v.dt.fields[i].v.arr.elem_type_name,
                           sizeof(v.v.dt.fields[i].v.arr.elem_type_name),
                           td->field_type_names[i]);
+            if (field_type == FVAL_CHARACTER && field_char_len > 0)
+                v.v.dt.fields[i].kind = field_char_len;
             v.v.dt.fields[i].v.arr.allocated = 0;
         } else if (td->field_is_allocatable[i]) {
             if (td->field_n_dims[i] > 0) {
@@ -12756,8 +12758,10 @@ static void write_values_to_stream_file(OfortInterpreter *I, const char *path, O
         if (vals[i].type == FVAL_ARRAY) {
             for (int j = 0; j < vals[i].v.arr.len; j++) {
                 char buf[4096];
-                value_to_string(I, vals[i].v.arr.data[j], buf, sizeof(buf));
+                OfortValue elem = array_element_value(&vals[i], j);
+                value_to_string(I, elem, buf, sizeof(buf));
                 fprintf(fp, "%s\n", buf);
+                free_value(&elem);
             }
         } else {
             char buf[4096];
@@ -12765,6 +12769,100 @@ static void write_values_to_stream_file(OfortInterpreter *I, const char *path, O
             fprintf(fp, "%s\n", buf);
         }
     }
+    fclose(fp);
+}
+
+static void write_one_binary_value_to_stream(FILE *fp, OfortValue *val) {
+    if (!val) return;
+    if (val->type == FVAL_INTEGER) {
+        fwrite(&val->v.i, sizeof(val->v.i), 1, fp);
+    } else if (val->type == FVAL_REAL || val->type == FVAL_DOUBLE) {
+        fwrite(&val->v.r, sizeof(val->v.r), 1, fp);
+    } else if (val->type == FVAL_LOGICAL) {
+        fwrite(&val->v.b, sizeof(val->v.b), 1, fp);
+    } else if (val->type == FVAL_CHARACTER) {
+        const char *s = val->v.s ? val->v.s : "";
+        fwrite(s, 1, strlen(s), fp);
+    }
+}
+
+static void write_binary_character_field(FILE *fp, const char *s, int len) {
+    if (len <= 0) len = s ? (int)strlen(s) : 0;
+    for (int i = 0; i < len; i++) {
+        char c = (s && i < (int)strlen(s)) ? s[i] : ' ';
+        fwrite(&c, 1, 1, fp);
+    }
+}
+
+static void write_one_value_to_stream(OfortInterpreter *I, FILE *fp, OfortValue *val, int binary) {
+    if (val && val->type == FVAL_ARRAY) {
+        int fixed_char_len = 0;
+        if (binary && val->v.arr.elem_type == FVAL_CHARACTER)
+            fixed_char_len = val->kind > 0 ? val->kind : array_character_len(val);
+        for (int j = 0; j < val->v.arr.len; j++) {
+            OfortValue elem = array_element_value(val, j);
+            if (binary && val->v.arr.elem_type == FVAL_CHARACTER) {
+                write_binary_character_field(fp, elem.v.s ? elem.v.s : "", fixed_char_len);
+            } else if (binary) {
+                write_one_binary_value_to_stream(fp, &elem);
+            } else {
+                char buf[4096];
+                value_to_string(I, elem, buf, sizeof(buf));
+                fprintf(fp, "%s\n", buf);
+            }
+            free_value(&elem);
+        }
+    } else if (val) {
+        if (binary) {
+            write_one_binary_value_to_stream(fp, val);
+        } else {
+            char buf[4096];
+            value_to_string(I, *val, buf, sizeof(buf));
+            fprintf(fp, "%s\n", buf);
+        }
+    }
+}
+
+static void write_node_to_stream(OfortInterpreter *I, FILE *fp, OfortNode *node, int binary) {
+    OfortValue *target;
+    if (!node) return;
+    if (node->type == FND_IMPLIED_DO) {
+        OfortValue start_v = eval_node(I, node->children[0]);
+        OfortValue end_v = eval_node(I, node->children[1]);
+        OfortValue step_v = eval_node(I, node->children[2]);
+        long long start = val_to_int(start_v);
+        long long end = val_to_int(end_v);
+        long long step = val_to_int(step_v);
+        free_value(&start_v);
+        free_value(&end_v);
+        free_value(&step_v);
+        if (step == 0) ofort_error(I, "Implied DO step cannot be zero");
+        for (long long iter = start; step > 0 ? iter <= end : iter >= end; iter += step) {
+            set_var(I, node->name, make_integer(iter));
+            for (int i = 0; i < node->n_stmts; i++) write_node_to_stream(I, fp, node->stmts[i], binary);
+        }
+        return;
+    }
+    target = member_lvalue(I, node);
+    if (target) {
+        write_one_value_to_stream(I, fp, target, binary);
+    } else {
+        OfortValue val = eval_node(I, node);
+        write_one_value_to_stream(I, fp, &val, binary);
+        free_value(&val);
+    }
+}
+
+static void write_nodes_to_stream_file(OfortInterpreter *I, OfortUnitFile *entry, OfortNode *n) {
+    FILE *fp;
+    if (!entry) ofort_error(I, "Stream unit is not open");
+    fp = fopen(entry->path, "r+b");
+    if (!fp) fp = fopen(entry->path, "w+b");
+    if (!fp) ofort_error(I, "Cannot open '%s' for stream writing", entry->path);
+    fseek(fp, entry->stream_pos, SEEK_SET);
+    for (int i = 0; i < n->n_stmts; i++)
+        write_node_to_stream(I, fp, n->stmts[i], !entry->is_formatted);
+    entry->stream_pos = (int)ftell(fp);
     fclose(fp);
 }
 
@@ -13522,24 +13620,155 @@ static int read_stream_token_at(FILE *fp, int *stream_pos, char *buf, int bufsiz
     return 0;
 }
 
+static int read_stream_target(OfortInterpreter *I, FILE *fp, int *stream_pos,
+                              OfortNode *target, char *tok, int tok_size) {
+    int status = 0;
+    if (target->type == FND_IMPLIED_DO) {
+        OfortValue start_v = eval_node(I, target->children[0]);
+        OfortValue end_v = eval_node(I, target->children[1]);
+        OfortValue step_v = eval_node(I, target->children[2]);
+        long long start = val_to_int(start_v);
+        long long end = val_to_int(end_v);
+        long long step = val_to_int(step_v);
+        free_value(&start_v);
+        free_value(&end_v);
+        free_value(&step_v);
+        if (step == 0) ofort_error(I, "Implied DO step cannot be zero");
+        for (long long iter = start; step > 0 ? iter <= end : iter >= end; iter += step) {
+            set_var(I, target->name, make_integer(iter));
+            for (int i = 0; i < target->n_stmts; i++) {
+                if (read_stream_target(I, fp, stream_pos, target->stmts[i], tok, tok_size) != 0)
+                    status = 1;
+            }
+            if (status) break;
+        }
+        return status;
+    }
+
+    if (target->type == FND_IDENT || target->type == FND_MEMBER || target->type == FND_ARRAY_REF ||
+        target->type == FND_FUNC_CALL) {
+        OfortValue *dest = member_lvalue(I, target);
+        if (dest && dest->type == FVAL_ARRAY) {
+            for (int j = 0; j < dest->v.arr.len; j++) {
+                if (!read_stream_token_at(fp, stream_pos, tok, tok_size)) return 1;
+                assign_token_to_array_element(dest, j, tok);
+            }
+            return 0;
+        }
+        if (dest) {
+            if (!read_stream_token_at(fp, stream_pos, tok, tok_size)) return 1;
+            assign_token_to_value(dest, tok);
+            return 0;
+        }
+    }
+
+    if (!read_stream_token_at(fp, stream_pos, tok, tok_size)) return 1;
+    assign_token_to_read_target(I, target, tok);
+    return 0;
+}
+
+static int read_binary_value_from_stream(FILE *fp, OfortValue *dest, int char_len) {
+    if (!dest) return 1;
+    if (dest->type == FVAL_INTEGER) {
+        return fread(&dest->v.i, sizeof(dest->v.i), 1, fp) == 1 ? 0 : 1;
+    }
+    if (dest->type == FVAL_REAL || dest->type == FVAL_DOUBLE) {
+        return fread(&dest->v.r, sizeof(dest->v.r), 1, fp) == 1 ? 0 : 1;
+    }
+    if (dest->type == FVAL_LOGICAL) {
+        return fread(&dest->v.b, sizeof(dest->v.b), 1, fp) == 1 ? 0 : 1;
+    }
+    if (dest->type == FVAL_CHARACTER) {
+        char *buf;
+        if (char_len <= 0) char_len = dest->v.s ? (int)strlen(dest->v.s) : 1;
+        buf = (char *)calloc((size_t)char_len + 1, 1);
+        if (!buf) return 1;
+        if (fread(buf, 1, (size_t)char_len, fp) != (size_t)char_len) {
+            free(buf);
+            return 1;
+        }
+        free_value(dest);
+        *dest = make_character(buf);
+        free(buf);
+        return 0;
+    }
+    return 1;
+}
+
+static int read_binary_array_element_from_stream(FILE *fp, OfortValue *arr, int index) {
+    OfortValue tmp;
+    int char_len;
+    if (!arr || arr->type != FVAL_ARRAY || index < 0 || index >= arr->v.arr.len) return 1;
+    if (arr->v.arr.elem_type == FVAL_INTEGER && arr->v.arr.int_data) {
+        return fread(&arr->v.arr.int_data[index], sizeof(arr->v.arr.int_data[index]), 1, fp) == 1 ? 0 : 1;
+    }
+    if ((arr->v.arr.elem_type == FVAL_REAL || arr->v.arr.elem_type == FVAL_DOUBLE) && arr->v.arr.real_data) {
+        return fread(&arr->v.arr.real_data[index], sizeof(arr->v.arr.real_data[index]), 1, fp) == 1 ? 0 : 1;
+    }
+    char_len = arr->v.arr.elem_type == FVAL_CHARACTER ? array_character_len(arr) : 1;
+    tmp = default_value(arr->v.arr.elem_type, char_len);
+    if (read_binary_value_from_stream(fp, &tmp, char_len) != 0) {
+        free_value(&tmp);
+        return 1;
+    }
+    if (assign_packed_array_element(arr, index, tmp)) {
+        free_value(&tmp);
+    } else {
+        free_value(&arr->v.arr.data[index]);
+        arr->v.arr.data[index] = tmp;
+    }
+    return 0;
+}
+
+static int read_binary_stream_target(OfortInterpreter *I, FILE *fp, OfortNode *target) {
+    OfortValue *dest;
+    if (target->type == FND_IMPLIED_DO) {
+        int status = 0;
+        OfortValue start_v = eval_node(I, target->children[0]);
+        OfortValue end_v = eval_node(I, target->children[1]);
+        OfortValue step_v = eval_node(I, target->children[2]);
+        long long start = val_to_int(start_v);
+        long long end = val_to_int(end_v);
+        long long step = val_to_int(step_v);
+        free_value(&start_v);
+        free_value(&end_v);
+        free_value(&step_v);
+        if (step == 0) ofort_error(I, "Implied DO step cannot be zero");
+        for (long long iter = start; step > 0 ? iter <= end : iter >= end; iter += step) {
+            set_var(I, target->name, make_integer(iter));
+            for (int i = 0; i < target->n_stmts; i++) {
+                if (read_binary_stream_target(I, fp, target->stmts[i]) != 0) status = 1;
+            }
+            if (status) break;
+        }
+        return status;
+    }
+    dest = member_lvalue(I, target);
+    if (!dest) return 1;
+    if (dest->type == FVAL_ARRAY) {
+        for (int j = 0; j < dest->v.arr.len; j++) {
+            if (read_binary_array_element_from_stream(fp, dest, j) != 0) return 1;
+        }
+        return 0;
+    }
+    return read_binary_value_from_stream(fp, dest, 0);
+}
+
 static void read_values_from_stream_file(OfortInterpreter *I, OfortUnitFile *entry, OfortNode *n) {
     FILE *fp = fopen(entry->path, "rb");
     char tok[1024];
     if (!fp) ofort_error(I, "Cannot open '%s' for stream reading", entry->path);
 
-    for (int i = 0; i < n->n_stmts; i++) {
-        if (n->stmts[i]->type != FND_IDENT) continue;
-        OfortVar *v = find_var(I, n->stmts[i]->name);
-        if (!v) ofort_error(I, "Undefined variable '%s'", n->stmts[i]->name);
-        if (v->val.type == FVAL_ARRAY) {
-            for (int j = 0; j < v->val.v.arr.len; j++) {
-                if (!read_stream_token_at(fp, &entry->stream_pos, tok, sizeof(tok))) break;
-                assign_token_to_array_element(&v->val, j, tok);
-            }
-        } else {
-            if (read_stream_token_at(fp, &entry->stream_pos, tok, sizeof(tok))) {
-                assign_token_to_value(&v->val, tok);
-            }
+    if (!entry->is_formatted) {
+        fseek(fp, entry->stream_pos, SEEK_SET);
+        for (int i = 0; i < n->n_stmts; i++) {
+            if (read_binary_stream_target(I, fp, n->stmts[i]) != 0) break;
+        }
+        entry->stream_pos = (int)ftell(fp);
+    } else {
+        for (int i = 0; i < n->n_stmts; i++) {
+            if (read_stream_target(I, fp, &entry->stream_pos, n->stmts[i], tok, sizeof(tok)) != 0)
+                break;
         }
     }
     fclose(fp);
@@ -18592,6 +18821,32 @@ static int type_extends_or_same(OfortInterpreter *I, const char *actual_name,
     return 0;
 }
 
+static int expr_references_type_param(OfortNode *expr, OfortTypeDef *td) {
+    if (!expr || !td) return 0;
+    if (expr->type == FND_IDENT) {
+        for (int i = 0; i < td->n_type_params; i++) {
+            if (str_eq_nocase(expr->name, td->type_param_names[i])) return 1;
+        }
+    }
+    for (int i = 0; i < expr->n_children; i++) {
+        if (expr_references_type_param(expr->children[i], td)) return 1;
+    }
+    for (int i = 0; i < expr->n_stmts; i++) {
+        if (expr_references_type_param(expr->stmts[i], td)) return 1;
+    }
+    return 0;
+}
+
+static void resolve_non_type_param_char_len(OfortInterpreter *I, OfortNode *decl, OfortTypeDef *td) {
+    if (!decl || !td || !decl->char_len_expr) return;
+    if (!expr_references_type_param(decl->char_len_expr, td)) {
+        OfortValue cv = eval_node(I, decl->char_len_expr);
+        decl->char_len = (int)val_to_int(cv);
+        free_value(&cv);
+        decl->char_len_expr = NULL;
+    }
+}
+
 static void register_namelist(OfortInterpreter *I, OfortNode *n) {
     OfortNamelist *nl = find_namelist(I, n->name);
     if (!nl) {
@@ -20322,6 +20577,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             d->val_type = field_type;
                             d->kind = rk;
                         }
+                        resolve_non_type_param_char_len(I, d, td);
                         copy_cstr(td->field_names[td->n_fields], sizeof(td->field_names[td->n_fields]), d->name);
                         td->field_types[td->n_fields] = field_type;
                         if (d->val_type == FVAL_DERIVED)
@@ -20398,6 +20654,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     s->val_type = field_type;
                     s->kind = rk;
                 }
+                resolve_non_type_param_char_len(I, s, td);
                 copy_cstr(td->field_names[td->n_fields], sizeof(td->field_names[td->n_fields]), s->name);
                 td->field_types[td->n_fields] = field_type;
                 if (s->val_type == FVAL_DERIVED)
@@ -21895,14 +22152,31 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
     case FND_WRITE: {
         int nvals = 0;
-        OfortValue *vals = eval_io_list(I, n, &nvals);
+        OfortValue *vals = NULL;
         char fmt_buf[OFORT_MAX_STRLEN];
-        const char *fmt = write_format_string(I, n, fmt_buf, sizeof(fmt_buf));
+        const char *fmt = NULL;
         const char *nml_name = n->name;
         int wrote_stdout = 0;
         int status = 0;
         int rec_no = 0;
         int has_rec = 0;
+
+        if (n->bool_val && n->children[0]) {
+            OfortValue uv = eval_node(I, n->children[0]);
+            int unit = (int)val_to_int(uv);
+            OfortUnitFile *entry = find_unit_file(I, unit);
+            free_value(&uv);
+            if (!entry) entry = ensure_unit_file(I, unit, 1);
+            if (!entry) ofort_error(I, "Unit %d is not open", unit);
+            write_nodes_to_stream_file(I, entry, n);
+            if (n->children[4] && n->children[4]->type == FND_IDENT) {
+                set_var(I, n->children[4]->name, make_integer(0));
+            }
+            break;
+        }
+
+        vals = eval_io_list(I, n, &nvals);
+        fmt = write_format_string(I, n, fmt_buf, sizeof(fmt_buf));
 
         if (!nml_name[0] && n->children[1] && n->children[1]->type == FND_IDENT &&
             find_namelist(I, n->children[1]->name)) {
@@ -23799,6 +24073,8 @@ unresolved_external_call_done:
             if (elem_type == FVAL_CHARACTER) {
                 if (n->val_type == FVAL_CHARACTER) {
                     alloc_char_len = eval_character_length(I, n);
+                } else if (target->type == FVAL_ARRAY && target->v.arr.elem_type == FVAL_CHARACTER) {
+                    alloc_char_len = array_character_len(target);
                 } else if (target->type == FVAL_CHARACTER && target->v.s) {
                     alloc_char_len = (int)strlen(target->v.s);
                 }
@@ -23851,7 +24127,7 @@ unresolved_external_call_done:
                 else if (elem_type == FVAL_CHARACTER)
                     *target = make_array_with_char_len(elem_type, dims, ndims, alloc_char_len);
                 else
-                    *target = make_array(elem_type, dims, ndims);
+                    *target = make_array_with_char_len_options(elem_type, dims, ndims, 1, 1);
                 set_array_lower_bounds(target, lower_bounds, ndims);
                 if (n->children[0]) {
                     OfortValue source = eval_node(I, n->children[0]);
@@ -23890,7 +24166,7 @@ unresolved_external_call_done:
                     if (elem_type == FVAL_CHARACTER)
                         *target = make_array_with_char_len(elem_type, dims, ndims, alloc_char_len);
                     else
-                        *target = make_array(elem_type, dims, ndims);
+                        *target = make_array_with_char_len_options(elem_type, dims, ndims, 1, 1);
                     set_array_lower_bounds(target, lower_bounds, ndims);
                 } else {
                     free_value(target);
