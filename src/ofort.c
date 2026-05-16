@@ -18837,6 +18837,63 @@ static int procedure_param_index(OfortNode *proc, const char *name) {
     return -1;
 }
 
+static int actual_argument_is_definable(OfortInterpreter *I, OfortNode *actual) {
+    OfortVar *v;
+    if (!actual) return 0;
+    if (actual->type == FND_IDENT) {
+        v = find_var(I, actual->name);
+        return v && !v->is_parameter;
+    }
+    if (actual->type == FND_MEMBER || actual->type == FND_ARRAY_REF) {
+        return actual_argument_is_definable(I, actual->children[0]);
+    }
+    if (actual->type == FND_FUNC_CALL) {
+        v = find_var(I, actual->name);
+        return v && v->val.type == FVAL_ARRAY && !v->is_parameter;
+    }
+    return 0;
+}
+
+static int procedure_param_may_be_defined_tree(OfortNode *proc, int param_index, OfortNode *n) {
+    const char *target_name;
+
+    if (!proc || param_index < 0 || param_index >= proc->n_params || !n) return 0;
+    if ((n->type == FND_SUBROUTINE || n->type == FND_FUNCTION || n->type == FND_STMT_FUNCTION) &&
+        n != proc) {
+        return 0;
+    }
+    if (n->type == FND_ASSIGN) {
+        target_name = extract_forall_lhs_name(n->children[0]);
+        if (target_name && str_eq_nocase(target_name, proc->param_names[param_index])) return 1;
+    }
+    if (n->type == FND_READ_STMT) {
+        for (int i = 0; i < n->n_stmts; i++) {
+            target_name = extract_forall_lhs_name(n->stmts[i]);
+            if (target_name && str_eq_nocase(target_name, proc->param_names[param_index])) return 1;
+        }
+    }
+    if ((n->type == FND_ALLOCATE || n->type == FND_DEALLOCATE) &&
+        n->children[OFORT_ALLOC_TARGET_CHILD]) {
+        target_name = extract_forall_lhs_name(n->children[OFORT_ALLOC_TARGET_CHILD]);
+        if (target_name && str_eq_nocase(target_name, proc->param_names[param_index])) return 1;
+    }
+    for (int i = 0; i < n->n_children; i++) {
+        if (procedure_param_may_be_defined_tree(proc, param_index, n->children[i])) return 1;
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        if (procedure_param_may_be_defined_tree(proc, param_index, n->stmts[i])) return 1;
+    }
+    return 0;
+}
+
+static int procedure_param_may_be_defined(OfortNode *proc, int param_index) {
+    if (!proc || param_index < 0 || param_index >= proc->n_params) return 0;
+    if (proc->param_values[param_index] || proc->param_intents[param_index] == 1) return 0;
+    if (proc->param_intents[param_index] == 2 || proc->param_intents[param_index] == 3) return 1;
+    if (!proc->children[0]) return 0;
+    return procedure_param_may_be_defined_tree(proc, param_index, proc->children[0]);
+}
+
 static void validate_intent_in_assignment_tree(OfortInterpreter *I, OfortNode *proc, OfortNode *n) {
     const char *target_name;
     int param_index;
@@ -23342,6 +23399,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         if (func->is_function) {
             ofort_error(I, "'%s' is a function, not a subroutine", n->name);
+        }
+        for (int i = 0; fn && i < fn->n_params && i < nargs; i++) {
+            if (procedure_param_may_be_defined(fn, i) &&
+                !actual_argument_is_definable(I, n->stmts[i])) {
+                ofort_error(I, "Actual argument for dummy argument '%s' of '%s' is not definable",
+                            fn->param_names[i], fn->name);
+            }
         }
         if (execute_elemental_subroutine_call(I, n, func, fn, args, nargs,
                                               arg_alias, arg_alias_var)) {
