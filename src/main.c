@@ -1462,16 +1462,29 @@ static int source_has_terminal_end(const char *source) {
     }
 
     end = source + strlen(source);
-    while (end > source && isspace((unsigned char)end[-1])) {
-        end--;
-    }
-    if (end == source) {
-        return 0;
-    }
+    for (;;) {
+        const char *p;
+        while (end > source && isspace((unsigned char)end[-1])) {
+            end--;
+        }
+        if (end == source) {
+            return 0;
+        }
 
-    line_start = end;
-    while (line_start > source && line_start[-1] != '\n') {
-        line_start--;
+        line_start = end;
+        while (line_start > source && line_start[-1] != '\n') {
+            line_start--;
+        }
+
+        p = line_start;
+        while (p < end && isspace((unsigned char)*p)) {
+            p++;
+        }
+        if (p < end && *p == '!') {
+            end = line_start;
+            continue;
+        }
+        break;
     }
 
     return line_is_terminal_end(line_start, end);
@@ -7679,9 +7692,22 @@ int main(int argc, char **argv) {
                     path_list_free(&source_paths);
                     return 2;
                 }
-            } else if (!add_source_path_arg(&source_paths, argv[i], 0)) {
-                path_list_free(&source_paths);
-                return 2;
+            } else {
+                if (source_paths.count > 0 &&
+                    argv[i][0] != '@' && !has_glob_wildcard(argv[i]) && !path_has_extension(argv[i])) {
+                    char *maybe_source = resolve_source_path_shortcut(argv[i]);
+                    int is_source = maybe_source && path_is_file(maybe_source);
+                    free(maybe_source);
+                    if (!is_source) {
+                        program_args = &argv[i];
+                        program_argc = argc - i;
+                        break;
+                    }
+                }
+                if (!add_source_path_arg(&source_paths, argv[i], 0)) {
+                    path_list_free(&source_paths);
+                    return 2;
+                }
             }
         }
     }
