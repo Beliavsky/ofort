@@ -250,6 +250,7 @@ struct OfortInterpreter {
     int print_expr_statements;
     int suppress_output;
     int live_stdout;
+    int preserve_format_trailing_blanks;
     int command_argc;
     char command_args[OFORT_MAX_PARAMS][OFORT_MAX_STRLEN];
     int procedure_depth;
@@ -321,7 +322,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n);
 static void format_output(OfortInterpreter *I, const char *fmt, OfortValue *vals, int nvals);
 static void render_write_to_string(OfortInterpreter *I, const char *fmt,
                                    OfortValue *vals, int nvals,
-                                   char *buf, int bufsize);
+                                   char *buf, int bufsize,
+                                   int preserve_trailing_blanks);
 static void read_values_from_string(OfortInterpreter *I, const char *text, OfortNode *n);
 static int read_direct_record_as_string(OfortInterpreter *I, OfortUnitFile *entry, int rec, char *buf, int bufsize);
 static int read_direct_from_file(OfortInterpreter *I, OfortUnitFile *entry, OfortNode *n, int rec);
@@ -12609,7 +12611,10 @@ static int inquire_iolength_value(OfortValue v) {
 static void format_output_with_advance(OfortInterpreter *I, const char *fmt,
                                        OfortValue *vals, int nvals,
                                        int no_advance) {
+    int old_preserve = I->preserve_format_trailing_blanks;
+    I->preserve_format_trailing_blanks = no_advance;
     format_output(I, fmt, vals, nvals);
+    I->preserve_format_trailing_blanks = old_preserve;
     if (no_advance) {
         while (I->out_len > 0 &&
                (I->output[I->out_len - 1] == '\n' || I->output[I->out_len - 1] == '\r')) {
@@ -12624,7 +12629,7 @@ static void write_formatted_to_file(OfortInterpreter *I, const char *path,
     char text_buf[OFORT_MAX_OUTPUT];
     FILE *fp;
 
-    render_write_to_string(I, fmt, vals, nvals, text_buf, sizeof(text_buf));
+    render_write_to_string(I, fmt, vals, nvals, text_buf, sizeof(text_buf), no_advance);
     fp = fopen(path, "a");
     if (!fp) ofort_error(I, "Cannot open '%s' for writing", path);
     fputs(text_buf, fp);
@@ -13436,7 +13441,7 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
         char fc;
 
         while (*p == ' ' || *p == ',') p++;
-        if (nvals > 0 && *vidx >= nvals) {
+        if (nvals > 0 && *vidx >= nvals && (!I || !I->preserve_format_trailing_blanks)) {
             while (*p == ' ' || *p == ',') p++;
             if (*p != '\'' && *p != '"') return;
         }
@@ -13857,8 +13862,10 @@ static void format_output(OfortInterpreter *I, const char *fmt, OfortValue *vals
     }
 
     do {
+        int before = vidx;
         format_descriptors(I, p, end, vals, nvals, &vidx);
         if (vidx < nvals) out_append(I, "\n");
+        if (vidx == before) break;
     } while (vidx < nvals);
     out_append(I, "\n");
 }
@@ -13884,13 +13891,17 @@ static const char *write_format_string(OfortInterpreter *I, OfortNode *n,
 
 static void render_write_to_string(OfortInterpreter *I, const char *fmt,
                                    OfortValue *vals, int nvals,
-                                   char *buf, int bufsize) {
+                                   char *buf, int bufsize,
+                                   int preserve_trailing_blanks) {
     int saved_len = I->out_len;
+    int old_preserve = I->preserve_format_trailing_blanks;
     char saved_output[OFORT_MAX_OUTPUT];
     copy_cstr(saved_output, sizeof(saved_output), I->output);
     I->out_len = 0;
     I->output[0] = '\0';
+    I->preserve_format_trailing_blanks = preserve_trailing_blanks;
     format_output(I, fmt, vals, nvals);
+    I->preserve_format_trailing_blanks = old_preserve;
     while (I->out_len > 0 &&
            (I->output[I->out_len - 1] == '\n' || I->output[I->out_len - 1] == '\r')) {
         I->output[--I->out_len] = '\0';
@@ -13910,7 +13921,7 @@ static int write_to_internal_target(OfortInterpreter *I, OfortNode *target_node,
     if (target_node->type == FND_IDENT) {
         OfortVar *target = find_var(I, target_node->name);
         if (!target || target->val.type != FVAL_CHARACTER) return 0;
-        render_write_to_string(I, fmt, vals, nvals, text_buf, sizeof(text_buf));
+        render_write_to_string(I, fmt, vals, nvals, text_buf, sizeof(text_buf), 0);
         text = make_character(text_buf);
         text = resize_character_value(text, target->char_len);
         free_value(&target->val);
@@ -13924,7 +13935,7 @@ static int write_to_internal_target(OfortInterpreter *I, OfortNode *target_node,
             target->val.v.arr.elem_type != FVAL_CHARACTER) {
             return 0;
         }
-        render_write_to_string(I, fmt, vals, nvals, text_buf, sizeof(text_buf));
+        render_write_to_string(I, fmt, vals, nvals, text_buf, sizeof(text_buf), 0);
         text = make_character(text_buf);
         text = resize_character_value(text, target->char_len);
         assign_array_ref(I, target, target_node, &text);
