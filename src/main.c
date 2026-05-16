@@ -54,6 +54,7 @@ typedef struct {
     int cap;
 } PathList;
 
+static void path_list_free(PathList *list);
 static int add_source_path_with_deps(PathList *list, const char *main_path);
 
 typedef struct {
@@ -67,6 +68,8 @@ typedef struct {
     int count;
     int cap;
 } SourceMap;
+
+static char *read_files_concatenated(const char *const *paths, int npaths, SourceMap *source_map);
 
 typedef enum {
     SOURCE_FORM_AUTO = 0,
@@ -3609,7 +3612,6 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
     if (rc == 0) {
         const char *warnings = ofort_get_warnings(interp);
         const char *output = ofort_get_output(interp);
-        int emitted_unused_warning = 0;
         if (g_time_detail) {
             OfortTiming timing;
             if (ofort_get_timing(interp, &timing) == 0) {
@@ -3617,15 +3619,12 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
             }
         }
         if (g_warn_unused && g_warnings_enabled) {
-            emitted_unused_warning = warn_unused_declarations_in_source(source) > 0;
+            warn_unused_declarations_in_source(source);
         }
         if (warnings && warnings[0] != '\0') {
             fputs(warnings, stderr);
         }
         if (output && output[0] != '\0') {
-            if (emitted_unused_warning) {
-                fputc('\n', stdout);
-            }
             fputs(output, stdout);
         }
         fflush(stdout);
@@ -3797,8 +3796,58 @@ static int check_ofort_file(const char *source_path, int quiet, int label_failur
     return rc == 0 ? 0 : 1;
 }
 
+static int check_ofort_source_text(const char *source_label, const char *text, int quiet,
+                                   int label_failures, double setup_start,
+                                   const SourceMap *source_map) {
+    char *source = copy_string(text);
+    OfortInterpreter *interp;
+    int rc;
+    double setup_elapsed;
+
+    if (!source) {
+        return 2;
+    }
+    normalize_newlines(source);
+    source = maybe_wrap_loose_source(source);
+    if (!source) {
+        return 2;
+    }
+    setup_elapsed = monotonic_seconds() - setup_start;
+
+    interp = create_ofort_interpreter();
+    if (!interp) {
+        free(source);
+        fprintf(stderr, "failed to create Fortran interpreter\n");
+        return 2;
+    }
+
+    rc = ofort_check(interp, source);
+    if (g_time_detail) {
+        OfortTiming timing;
+        if (ofort_get_timing(interp, &timing) == 0) {
+            print_detailed_time(setup_elapsed, &timing);
+        }
+    }
+    if (rc == 0 && !quiet) {
+        printf("ofort check passed\n");
+    } else if (rc != 0) {
+        const char *error = ofort_get_error(interp);
+        if (label_failures) {
+            fprintf(stderr, "%s:\n", source_label);
+        }
+        print_source_mapped_error((error && error[0] != '\0') ? error : "ofort check failed", source_map);
+        if (label_failures) {
+            fprintf(stderr, "\n");
+        }
+    }
+
+    ofort_destroy(interp);
+    free(source);
+    return rc == 0 ? 0 : 1;
+}
+
 static int run_each_file(const char *const *paths, int npaths, int limit, int max_fail, int syntax_check,
-                         int command_argc, char **command_args, int time_operation,
+                         int dep_mode, int command_argc, char **command_args, int time_operation,
                          int quiet) {
     int failures = 0;
     int checked = 0;
@@ -3829,7 +3878,29 @@ static int run_each_file(const char *const *paths, int npaths, int limit, int ma
             fflush(stdout);
         }
 
-        if (syntax_check) {
+        if (dep_mode) {
+            PathList dep_paths = {0};
+            SourceMap source_map = {0};
+            char *source = NULL;
+
+            if (!add_source_path_with_deps(&dep_paths, paths[i])) {
+                rc = 2;
+            } else {
+                source = read_files_concatenated(dep_paths.items, dep_paths.count, &source_map);
+                if (!source) {
+                    rc = 2;
+                } else if (!validate_source_file_terminal_end(paths[i], source)) {
+                    rc = 1;
+                } else if (syntax_check) {
+                    rc = check_ofort_source_text(paths[i], source, quiet, quiet, start, &source_map);
+                } else {
+                    rc = execute_source_text(source, 0, 0, command_argc, command_args, start, &source_map);
+                }
+            }
+            free(source);
+            source_map_free(&source_map);
+            path_list_free(&dep_paths);
+        } else if (syntax_check) {
             rc = check_ofort_file(paths[i], quiet, quiet);
         } else {
             char *source = read_source_file(paths[i]);
@@ -3934,6 +4005,16 @@ static void print_file_with_header(const char *header, const char *path) {
     fprintf(stderr, "\n");
 }
 
+static int append_shell_quoted(char *buf, size_t buf_size, size_t *used, const char *text) {
+    int n;
+
+    if (!buf || !used || !text || *used >= buf_size) return 0;
+    n = snprintf(buf + *used, buf_size - *used, "\"%s\"", text);
+    if (n < 0 || (size_t)n >= buf_size - *used) return 0;
+    *used += (size_t)n;
+    return 1;
+}
+
 static int check_with_gfortran(const char *source_path) {
     char stem[128];
     char exe_path[512];
@@ -3954,7 +4035,7 @@ static int check_with_gfortran(const char *source_path) {
         return rc;
     }
 
-    snprintf(compile_cmd, sizeof(compile_cmd), "gfortran \"%s\" -o \"%s\"", source_path, exe_path);
+    snprintf(compile_cmd, sizeof(compile_cmd), "gfortran -fno-range-check \"%s\" -o \"%s\"", source_path, exe_path);
     rc = system(compile_cmd);
     if (rc != 0) {
         fprintf(stderr, "gfortran compile failed\n");
@@ -3964,6 +4045,173 @@ static int check_with_gfortran(const char *source_path) {
     }
 
     snprintf(run_cmd, sizeof(run_cmd), ".\\%s > \"%s\"", exe_path, gfortran_out);
+    rc = system(run_cmd);
+    if (rc != 0) {
+        fprintf(stderr, "gfortran run failed\n");
+        remove(ofort_out);
+        remove(gfortran_out);
+        remove(exe_path);
+        return 1;
+    }
+
+    if (files_equal_normalized(ofort_out, gfortran_out)) {
+        printf("ofort output matches gfortran\n");
+        remove(ofort_out);
+        remove(gfortran_out);
+        remove(exe_path);
+        return 0;
+    }
+
+    fprintf(stderr, "ofort output differs from gfortran\n");
+    print_file_with_header("--- ofort stdout ---", ofort_out);
+    print_file_with_header("--- gfortran stdout ---", gfortran_out);
+    remove(ofort_out);
+    remove(gfortran_out);
+    remove(exe_path);
+    return 1;
+}
+
+static int run_ofort_paths_to_path(const char *const *paths, int npaths, const char *out_path,
+                                   int command_argc, char **command_args) {
+    SourceMap source_map = {0};
+    char *source;
+    FILE *fp;
+    OfortInterpreter *interp;
+    int rc;
+
+    source = read_files_concatenated(paths, npaths, &source_map);
+    source_map_free(&source_map);
+    if (!source) return 2;
+    normalize_newlines(source);
+    if (!validate_source_file_terminal_end(npaths == 1 ? paths[0] : "combined source", source)) {
+        free(source);
+        return 1;
+    }
+    source = maybe_wrap_loose_source(source);
+    if (!source) return 2;
+
+    interp = create_ofort_interpreter();
+    if (!interp) {
+        free(source);
+        fprintf(stderr, "failed to create Fortran interpreter\n");
+        return 2;
+    }
+
+    ofort_set_command_args(interp, command_argc, (const char *const *)command_args);
+    rc = ofort_execute(interp, source);
+    if (rc == 0) {
+        const char *warnings = ofort_get_warnings(interp);
+        if (warnings && warnings[0] != '\0') fputs(warnings, stderr);
+        fp = fopen(out_path, "wb");
+        if (!fp) {
+            fprintf(stderr, "failed to open %s\n", out_path);
+            ofort_destroy(interp);
+            free(source);
+            return 2;
+        }
+        fputs(ofort_get_output(interp), fp);
+        fclose(fp);
+    } else {
+        const char *error = ofort_get_error(interp);
+        fprintf(stderr, "ofort failed: %s\n", (error && error[0] != '\0') ? error : "Fortran execution failed");
+    }
+
+    ofort_destroy(interp);
+    free(source);
+    return rc == 0 ? 0 : 1;
+}
+
+static int check_with_gfortran_paths(const char *const *paths, int npaths,
+                                     int command_argc, char **command_args) {
+    char stem[128];
+    char exe_path[512];
+    char ofort_out[512];
+    char gfortran_out[512];
+    char compile_cmd[8192];
+    char run_cmd[4096];
+    size_t used;
+    int rc;
+
+    if (npaths <= 0) return 2;
+    snprintf(stem, sizeof(stem), "ofort_check_%ld_%ld", (long)time(NULL), (long)GETPID());
+    snprintf(exe_path, sizeof(exe_path), "%s.exe", stem);
+    snprintf(ofort_out, sizeof(ofort_out), "%s.ofort.out", stem);
+    snprintf(gfortran_out, sizeof(gfortran_out), "%s.gfortran.out", stem);
+
+    rc = run_ofort_paths_to_path(paths, npaths, ofort_out, command_argc, command_args);
+    if (rc != 0) {
+        remove(ofort_out);
+        return rc;
+    }
+
+    used = 0;
+    if (snprintf(compile_cmd, sizeof(compile_cmd), "gfortran -fno-range-check") >= (int)sizeof(compile_cmd)) return 2;
+    used = strlen(compile_cmd);
+    for (int i = 0; i < npaths; i++) {
+        if (used + 1 >= sizeof(compile_cmd)) {
+            fprintf(stderr, "gfortran command is too long\n");
+            remove(ofort_out);
+            return 2;
+        }
+        compile_cmd[used++] = ' ';
+        compile_cmd[used] = '\0';
+        if (!append_shell_quoted(compile_cmd, sizeof(compile_cmd), &used, paths[i])) {
+            fprintf(stderr, "gfortran command is too long\n");
+            remove(ofort_out);
+            return 2;
+        }
+    }
+    if (used + 4 >= sizeof(compile_cmd)) {
+        fprintf(stderr, "gfortran command is too long\n");
+        remove(ofort_out);
+        return 2;
+    }
+    snprintf(compile_cmd + used, sizeof(compile_cmd) - used, " -o ");
+    used += strlen(compile_cmd + used);
+    if (!append_shell_quoted(compile_cmd, sizeof(compile_cmd), &used, exe_path)) {
+        fprintf(stderr, "gfortran command is too long\n");
+        remove(ofort_out);
+        return 2;
+    }
+
+    rc = system(compile_cmd);
+    if (rc != 0) {
+        fprintf(stderr, "gfortran compile failed\n");
+        remove(ofort_out);
+        remove(exe_path);
+        return 1;
+    }
+
+    used = 0;
+    {
+        char exe_run_path[640];
+        snprintf(exe_run_path, sizeof(exe_run_path), ".\\%s", exe_path);
+        if (snprintf(run_cmd, sizeof(run_cmd), "%s", exe_run_path) >= (int)sizeof(run_cmd)) {
+            fprintf(stderr, "gfortran run command is too long\n");
+            remove(ofort_out);
+            remove(exe_path);
+            return 2;
+        }
+        used = strlen(run_cmd);
+    }
+    for (int i = 0; i < command_argc; i++) {
+        if (used + 1 >= sizeof(run_cmd)) {
+            fprintf(stderr, "gfortran run command is too long\n");
+            remove(ofort_out);
+            remove(exe_path);
+            return 2;
+        }
+        run_cmd[used++] = ' ';
+        run_cmd[used] = '\0';
+        if (!append_shell_quoted(run_cmd, sizeof(run_cmd), &used, command_args[i])) {
+            fprintf(stderr, "gfortran run command is too long\n");
+            remove(ofort_out);
+            remove(exe_path);
+            return 2;
+        }
+    }
+    snprintf(run_cmd + used, sizeof(run_cmd) - used, " > \"%s\"", gfortran_out);
+
     rc = system(run_cmd);
     if (rc != 0) {
         fprintf(stderr, "gfortran run failed\n");
@@ -4283,7 +4531,6 @@ static int run_repl_source_with_ofort(OfortInterpreter **interp, const char *sou
     char *effective = make_effective_source(source ? source : "", footer);
     char *exec_source;
     int rc;
-    int emitted_unused_warning = 0;
 
     if (!effective) {
         return 2;
@@ -4314,7 +4561,7 @@ static int run_repl_source_with_ofort(OfortInterpreter **interp, const char *sou
     ofort_set_fast_mode(*interp, fast_mode);
     ofort_set_specialized_fast_paths(*interp, specialized_fast_paths);
     ofort_set_live_stdout(*interp, 1);
-    emitted_unused_warning = warn_unused_repl_source_if_enabled(exec_source, fast_mode, 1) > 0;
+    warn_unused_repl_source_if_enabled(exec_source, fast_mode, 1);
     rc = ofort_execute(*interp, exec_source);
     if (rc == 0) {
         const char *warnings = ofort_get_warnings(*interp);
@@ -4323,9 +4570,6 @@ static int run_repl_source_with_ofort(OfortInterpreter **interp, const char *sou
             fputs(warnings, stderr);
         }
         if (output && output[0] != '\0') {
-            if (emitted_unused_warning) {
-                fputc('\n', stdout);
-            }
             fputs(output, stdout);
         }
     } else {
@@ -7070,8 +7314,8 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--cache] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--dep] [--time|--time-detail] [--profile-lines|--profile-procs] [--trace-assign] [--warn-unused|--no-warn-unused] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
-    fprintf(stderr, "       %s --each [--check] [--quiet] [--limit n] [--max-fail n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--cache] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--dep] [--check-gfortran] [--time|--time-detail] [--profile-lines|--profile-procs] [--trace-assign] [--warn-unused|--no-warn-unused] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "       %s --each [--dep] [--check] [--quiet] [--limit n] [--max-fail n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --check file.f90\n", program);
@@ -7103,7 +7347,8 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --init-char text initializes otherwise uninitialized CHARACTER variables with repeated/truncated text\n");
     fprintf(stderr, "       --fixed-form treats input as fixed source form; --free-form forces free source form\n");
     fprintf(stderr, "       --save-free saves converted fixed-form input beside the source as .f90\n");
-    fprintf(stderr, "       --dep resolves USEd modules from the main source directory before running one main file\n");
+    fprintf(stderr, "       --dep resolves USEd modules from the main source directory before running one main file; with --each, resolves each main file separately\n");
+    fprintf(stderr, "       --check-gfortran after source files also compiles/runs the same file list with gfortran and compares output\n");
     fprintf(stderr, "       --each treats each file or Windows glob match as a separate program\n");
     fprintf(stderr, "       --limit n checks at most n files in --each mode\n");
     fprintf(stderr, "       --max-fail n stops --each mode after n failed files; 0 means no limit\n");
@@ -7181,6 +7426,7 @@ int main(int argc, char **argv) {
     int quiet = 0;
     int force_interactive = 0;
     int dep_mode = 0;
+    int check_gfortran_after = 0;
     double setup_start = 0.0;
     int i;
     if (ISATTY(FILENO(stdout))) {
@@ -7357,10 +7603,25 @@ int main(int argc, char **argv) {
             break;
         } else if (each_mode && strcmp(argv[i], "--check") == 0) {
             each_check = 1;
+        } else if (strcmp(argv[i], "--check-gfortran") == 0) {
+            if (!each_mode && !dep_mode && source_paths.count == 0 &&
+                i + 1 < argc && strcmp(argv[i + 1], "--") != 0 && argv[i + 1][0] != '-') {
+                if (load_path || syntax_check_path || check_path) {
+                    print_usage(argv[0]);
+                    path_list_free(&source_paths);
+                    return 2;
+                }
+                check_path = resolve_source_path_shortcut(argv[++i]);
+                if (!check_path) {
+                    path_list_free(&source_paths);
+                    return 2;
+                }
+            } else {
+                check_gfortran_after = 1;
+            }
         } else if (strcmp(argv[i], "--load") == 0 ||
                    strcmp(argv[i], "--load-run") == 0 ||
-                   (!each_mode && strcmp(argv[i], "--check") == 0) ||
-                   strcmp(argv[i], "--check-gfortran") == 0) {
+                   (!each_mode && strcmp(argv[i], "--check") == 0)) {
             const char *opt = argv[i];
             if (++i >= argc) {
                 print_usage(argv[0]);
@@ -7379,18 +7640,12 @@ int main(int argc, char **argv) {
                 run_after_load = 1;
             } else if (strcmp(opt, "--check") == 0) {
                 syntax_check_path = resolve_source_path_shortcut(argv[i]);
-            } else {
-                check_path = resolve_source_path_shortcut(argv[i]);
             }
             if ((strcmp(opt, "--load") == 0 || strcmp(opt, "--load-run") == 0) && !load_path) {
                 path_list_free(&source_paths);
                 return 2;
             }
             if (strcmp(opt, "--check") == 0 && !syntax_check_path) {
-                path_list_free(&source_paths);
-                return 2;
-            }
-            if (strcmp(opt, "--check-gfortran") == 0 && !check_path) {
                 path_list_free(&source_paths);
                 return 2;
             }
@@ -7431,8 +7686,14 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (dep_mode && (each_mode || load_path || syntax_check_path || check_path || source_paths.count == 0)) {
-        fprintf(stderr, "--dep requires exactly one main source file and cannot be combined with --each, --load, --load-run, --check, or --check-gfortran\n");
+    if (dep_mode && (load_path || syntax_check_path || check_path || source_paths.count == 0)) {
+        fprintf(stderr, "--dep requires source files and cannot be combined with --load, --load-run, or --check\n");
+        path_list_free(&source_paths);
+        return 2;
+    }
+
+    if (check_gfortran_after && source_paths.count == 0) {
+        fprintf(stderr, "--check-gfortran requires source files when used as a flag\n");
         path_list_free(&source_paths);
         return 2;
     }
@@ -7480,7 +7741,7 @@ int main(int argc, char **argv) {
             path_list_free(&source_paths);
             return 2;
         }
-        rc = run_each_file(source_paths.items, source_paths.count, each_limit, each_max_fail, each_check,
+        rc = run_each_file(source_paths.items, source_paths.count, each_limit, each_max_fail, each_check, dep_mode,
                            program_argc, program_args, time_operation, quiet);
         path_list_free(&source_paths);
         return rc;
@@ -7519,6 +7780,10 @@ int main(int argc, char **argv) {
         double start = setup_start > 0.0 ? setup_start : monotonic_seconds();
         int rc = execute_source_text(source, 0, 0, program_argc, program_args, start,
                                      source_paths.count > 0 ? &source_map : NULL);
+        if (rc == 0 && check_gfortran_after) {
+            rc = check_with_gfortran_paths(source_paths.items, source_paths.count,
+                                           program_argc, program_args);
+        }
         if (time_operation && !g_time_detail) print_elapsed_time(start);
         free(source);
         source_map_free(&source_map);
