@@ -198,6 +198,7 @@ struct OfortInterpreter {
     OfortProcedureProfileEntry *procedure_profile_entries;
     int procedure_profile_n_entries;
     int procedure_profile_cap;
+    int c_pointer_counter;
     OfortTiming timing;
     /* tokens */
     OfortToken *tokens;
@@ -2014,6 +2015,18 @@ static OfortValue make_named_derived_scalar(const char *type_name, long long tag
     }
     copy_cstr(v.v.dt.field_names[0], sizeof(v.v.dt.field_names[0]), "tag");
     v.v.dt.fields[0] = make_integer(tag);
+    return v;
+}
+
+static OfortValue make_c_pointer_value(const char *target_name) {
+    OfortValue v;
+    memset(&v, 0, sizeof(v));
+    v.type = FVAL_DERIVED;
+    copy_cstr(v.v.dt.type_name, sizeof(v.v.dt.type_name), "c_ptr");
+    if (target_name && target_name[0]) {
+        v.is_pointer_ref = 1;
+        copy_cstr(v.pointer_target, sizeof(v.pointer_target), target_name);
+    }
     return v;
 }
 
@@ -10068,6 +10081,10 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
     OfortTypeDef *td = find_type_def(I, type_name);
     OfortValue v;
     memset(&v, 0, sizeof(v));
+    if (type_name && (str_eq_nocase(type_name, "c_ptr") ||
+                      str_eq_nocase(type_name, "c_funptr"))) {
+        return make_c_pointer_value(NULL);
+    }
     if (!td) return make_void_val();
     v.type = FVAL_DERIVED;
     v.v.dt.n_fields = td->n_fields;
@@ -19007,6 +19024,8 @@ static void declare_iso_c_binding_name(OfortInterpreter *I, const char *local, c
     else if (strcmp(ru, "C_CARRIAGE_RETURN") == 0) { ch[0] = '\r'; declare_var(I, local, make_character(ch)); }
     else if (strcmp(ru, "C_HORIZONTAL_TAB") == 0) { ch[0] = '\t'; declare_var(I, local, make_character(ch)); }
     else if (strcmp(ru, "C_VERTICAL_TAB") == 0) { ch[0] = '\v'; declare_var(I, local, make_character(ch)); }
+    else if (strcmp(ru, "C_NULL_PTR") == 0 || strcmp(ru, "C_NULL_FUNPTR") == 0)
+        declare_var(I, local, make_c_pointer_value(NULL));
 }
 
 static void declare_default_iso_c_binding_names(OfortInterpreter *I) {
@@ -19019,7 +19038,7 @@ static void declare_default_iso_c_binding_names(OfortInterpreter *I) {
         "c_float_complex", "c_double_complex", "c_long_double_complex",
         "c_bool", "c_char", "c_null_char", "c_alert", "c_backspace",
         "c_form_feed", "c_new_line", "c_carriage_return", "c_horizontal_tab",
-        "c_vertical_tab", NULL
+        "c_vertical_tab", "c_null_ptr", "c_null_funptr", NULL
     };
     for (int i = 0; names[i]; i++) declare_iso_c_binding_name(I, names[i], names[i]);
 }
@@ -23047,6 +23066,135 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             break;
         }
 
+        if (strcmp(call_upper, "C_F_POINTER") == 0) {
+            OfortValue cptr;
+            OfortValue shape = make_void_val();
+            OfortVar *fptr;
+            OfortVar *target;
+            const char *target_name;
+            int dims[7] = {1, 1, 1, 1, 1, 1, 1};
+            int n_dims = 1;
+            int total = 1;
+            OfortValType elem_type = FVAL_INTEGER;
+            int elem_kind = 4;
+            if (nargs < 2 || nargs > 3)
+                ofort_error(I, "C_F_POINTER requires C_PTR, FPTR, and optional SHAPE");
+            if (n->stmts[1]->type != FND_IDENT)
+                ofort_error(I, "C_F_POINTER second argument must be a pointer variable");
+            fptr = find_var(I, n->stmts[1]->name);
+            if (!fptr || !fptr->is_pointer)
+                ofort_error(I, "'%s' is not a pointer", n->stmts[1]->name);
+            cptr = eval_node(I, n->stmts[0]);
+            target_name = cptr.is_pointer_ref && cptr.pointer_target[0] ? cptr.pointer_target : NULL;
+            if (!target_name) {
+                free_value(&fptr->val);
+                fptr->val = make_void_val();
+                fptr->pointer_associated = 0;
+                fptr->is_initialized = 1;
+                fptr->pointer_target[0] = '\0';
+                free_value(&cptr);
+                break;
+            }
+            if (nargs == 3) {
+                shape = eval_node(I, n->stmts[2]);
+                if (shape.type == FVAL_ARRAY) {
+                    n_dims = shape.v.arr.len;
+                    if (n_dims < 1 || n_dims > 7) {
+                        free_value(&cptr);
+                        free_value(&shape);
+                        ofort_error(I, "C_F_POINTER SHAPE rank is out of range");
+                    }
+                    total = 1;
+                    for (int i = 0; i < n_dims; i++) {
+                        OfortValue sv = array_element_value(&shape, i);
+                        dims[i] = (int)val_to_int(sv);
+                        free_value(&sv);
+                        if (dims[i] < 0) {
+                            free_value(&cptr);
+                            free_value(&shape);
+                            ofort_error(I, "C_F_POINTER SHAPE values must be nonnegative");
+                        }
+                        total *= dims[i];
+                    }
+                } else {
+                    dims[0] = (int)val_to_int(shape);
+                    if (dims[0] < 0) {
+                        free_value(&cptr);
+                        free_value(&shape);
+                        ofort_error(I, "C_F_POINTER SHAPE values must be nonnegative");
+                    }
+                    total = dims[0];
+                }
+            } else if (fptr->val.type == FVAL_ARRAY && fptr->val.v.arr.n_dims > 0) {
+                n_dims = fptr->val.v.arr.n_dims;
+                total = 1;
+                for (int i = 0; i < n_dims; i++) {
+                    dims[i] = fptr->val.v.arr.dims[i];
+                    total *= dims[i];
+                }
+            }
+            if (fptr->declared_type != FVAL_VOID) elem_type = fptr->declared_type;
+            else if (fptr->val.type == FVAL_ARRAY && fptr->val.v.arr.elem_type != FVAL_VOID)
+                elem_type = fptr->val.v.arr.elem_type;
+            elem_kind = fptr->declared_kind ? fptr->declared_kind :
+                        (elem_type == FVAL_DOUBLE ? 8 : elem_type == FVAL_CHARACTER ? 1 : 4);
+            target = find_var(I, target_name);
+            if (!target) {
+                free_value(&cptr);
+                free_value(&shape);
+                ofort_error(I, "C_F_POINTER target is not allocated");
+            }
+            if (target->val.type != FVAL_ARRAY || target->val.v.arr.len != total ||
+                target->val.v.arr.elem_type != elem_type) {
+                free_value(&target->val);
+                target->val = make_array(elem_type, dims, n_dims);
+            } else {
+                for (int i = 0; i < n_dims; i++) {
+                    target->val.v.arr.dims[i] = dims[i];
+                    target->val.v.arr.lower_bounds[i] = 1;
+                }
+                target->val.v.arr.n_dims = n_dims;
+            }
+            target->val.kind = elem_kind;
+            if (target->val.v.arr.data) {
+                for (int i = 0; i < target->val.v.arr.len; i++) {
+                    if (target->val.v.arr.data[i].type == FVAL_VOID)
+                        target->val.v.arr.data[i] = default_value(elem_type, 1);
+                    target->val.v.arr.data[i].kind = elem_kind;
+                }
+            }
+            target->is_initialized = 1;
+            free_value(&fptr->val);
+            fptr->val = pointer_referenced_value(I, target_name, 0, 0, 0, 1);
+            fptr->pointer_associated = 1;
+            fptr->is_initialized = 1;
+            copy_cstr(fptr->pointer_target, sizeof(fptr->pointer_target), target_name);
+            fptr->pointer_has_slice = 0;
+            fptr->pointer_slice_start = 0;
+            fptr->pointer_slice_end = 0;
+            fptr->pointer_slice_stride = 1;
+            free_value(&cptr);
+            free_value(&shape);
+            break;
+        }
+
+        if (strcmp(call_upper, "C_FREE") == 0) {
+            OfortValue cptr;
+            if (nargs != 1)
+                ofort_error(I, "C_FREE requires one argument");
+            cptr = eval_node(I, n->stmts[0]);
+            if (cptr.is_pointer_ref && cptr.pointer_target[0]) {
+                OfortVar *target = find_var(I, cptr.pointer_target);
+                if (target) {
+                    free_value(&target->val);
+                    target->val = make_void_val();
+                    target->is_initialized = 0;
+                }
+            }
+            free_value(&cptr);
+            break;
+        }
+
         /* Check for intrinsic subroutines */
         /* (none currently â€” user subroutines only) */
 
@@ -24029,7 +24177,7 @@ static const char *intrinsic_names[] = {
     "FLOAT", "DFLOAT", "SNGL", "LOGICAL",
     /* Command line */
     "COMMAND_ARGUMENT_COUNT", "COMPILER_VERSION", "COMPILER_OPTIONS",
-    "C_SIZEOF", "C_LOC", "C_FUNLOC", "C_ASSOCIATED", "C_F_POINTER", "C_F_PROCPOINTER",
+    "C_SIZEOF", "C_LOC", "C_FUNLOC", "C_ASSOCIATED", "C_F_POINTER", "C_F_PROCPOINTER", "C_MALLOC",
     "IS_IOSTAT_END", "IS_IOSTAT_EOR",
     NULL
 };
@@ -28345,6 +28493,29 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         bytes = storage_size_bits(&args[0]) / 8;
         if (args[0].type == FVAL_ARRAY) bytes *= args[0].v.arr.len;
         return make_integer_kind(bytes, 8);
+    }
+    if (strcmp(upper, "C_MALLOC") == 0) {
+        long long bytes;
+        long long elems;
+        int dims[1];
+        char target_name[256];
+        OfortScope *save_scope;
+        OfortVar *target;
+        if (nargs < 1) ofort_error(I, "C_MALLOC requires SIZE argument");
+        bytes = val_to_int(args[0]);
+        if (bytes <= 0) return make_c_pointer_value(NULL);
+        elems = (bytes + 3) / 4;
+        if (elems > INT_MAX)
+            ofort_error(I, "C_MALLOC request is too large");
+        dims[0] = (int)elems;
+        snprintf(target_name, sizeof(target_name), "__ofort_cptr_%d", ++I->c_pointer_counter);
+        save_scope = I->current_scope;
+        I->current_scope = I->global_scope;
+        target = declare_var(I, target_name, make_array(FVAL_INTEGER, dims, 1));
+        target->is_target = 1;
+        target->is_initialized = 1;
+        I->current_scope = save_scope;
+        return make_c_pointer_value(target_name);
     }
     if (strcmp(upper, "C_FUNLOC") == 0) {
         if (nargs < 1) ofort_error(I, "C_FUNLOC requires one argument");
