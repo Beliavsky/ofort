@@ -23017,6 +23017,36 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         /* Evaluate arguments */
         int nargs = n->n_stmts;
 
+        if (strcmp(call_upper, "C_F_PROCPOINTER") == 0) {
+            OfortValue cptr;
+            OfortVar *fptr;
+            const char *target_name;
+            if (nargs != 2)
+                ofort_error(I, "C_F_PROCPOINTER requires two arguments");
+            if (n->stmts[1]->type != FND_IDENT)
+                ofort_error(I, "C_F_PROCPOINTER second argument must be a procedure pointer");
+            fptr = find_var(I, n->stmts[1]->name);
+            if (!fptr || !fptr->is_pointer)
+                ofort_error(I, "'%s' is not a procedure pointer", n->stmts[1]->name);
+            cptr = eval_node(I, n->stmts[0]);
+            target_name = procedure_ref_name(&cptr);
+            if (!target_name) {
+                free_value(&cptr);
+                ofort_error(I, "C_F_PROCPOINTER first argument is not a C function pointer");
+            }
+            require_procedure_pointer_interface_compatible(I, fptr, target_name);
+            free_value(&fptr->val);
+            fptr->val = cptr;
+            fptr->pointer_associated = 1;
+            fptr->is_initialized = 1;
+            copy_cstr(fptr->pointer_target, sizeof(fptr->pointer_target), target_name);
+            fptr->pointer_has_slice = 0;
+            fptr->pointer_slice_start = 0;
+            fptr->pointer_slice_end = 0;
+            fptr->pointer_slice_stride = 1;
+            break;
+        }
+
         /* Check for intrinsic subroutines */
         /* (none currently â€” user subroutines only) */
 
@@ -28316,7 +28346,12 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (args[0].type == FVAL_ARRAY) bytes *= args[0].v.arr.len;
         return make_integer_kind(bytes, 8);
     }
-    if (strcmp(upper, "C_LOC") == 0 || strcmp(upper, "C_FUNLOC") == 0) {
+    if (strcmp(upper, "C_FUNLOC") == 0) {
+        if (nargs < 1) ofort_error(I, "C_FUNLOC requires one argument");
+        if (procedure_ref_name(&args[0])) return copy_value(args[0]);
+        return make_integer_kind(0, 8);
+    }
+    if (strcmp(upper, "C_LOC") == 0) {
         return make_integer_kind(0, 8);
     }
     if (strcmp(upper, "C_ASSOCIATED") == 0) {
