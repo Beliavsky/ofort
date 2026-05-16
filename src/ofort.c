@@ -2197,6 +2197,17 @@ static int ieee_name_kind(const char *name, const char **type_name, long long *t
     if (strcmp(upper, "IEEE_TO_ZERO") == 0) { *type_name = "ieee_round_type"; *tag = 12; return 1; }
     if (strcmp(upper, "IEEE_UP") == 0) { *type_name = "ieee_round_type"; *tag = 13; return 1; }
     if (strcmp(upper, "IEEE_DOWN") == 0) { *type_name = "ieee_round_type"; *tag = 14; return 1; }
+    if (strcmp(upper, "IEEE_SIGNALING_NAN") == 0) { *type_name = "ieee_class_type"; *tag = 101; return 1; }
+    if (strcmp(upper, "IEEE_QUIET_NAN") == 0) { *type_name = "ieee_class_type"; *tag = 102; return 1; }
+    if (strcmp(upper, "IEEE_NEGATIVE_INF") == 0) { *type_name = "ieee_class_type"; *tag = 103; return 1; }
+    if (strcmp(upper, "IEEE_NEGATIVE_NORMAL") == 0) { *type_name = "ieee_class_type"; *tag = 104; return 1; }
+    if (strcmp(upper, "IEEE_NEGATIVE_DENORMAL") == 0) { *type_name = "ieee_class_type"; *tag = 105; return 1; }
+    if (strcmp(upper, "IEEE_NEGATIVE_ZERO") == 0) { *type_name = "ieee_class_type"; *tag = 106; return 1; }
+    if (strcmp(upper, "IEEE_POSITIVE_ZERO") == 0) { *type_name = "ieee_class_type"; *tag = 107; return 1; }
+    if (strcmp(upper, "IEEE_POSITIVE_DENORMAL") == 0) { *type_name = "ieee_class_type"; *tag = 108; return 1; }
+    if (strcmp(upper, "IEEE_POSITIVE_NORMAL") == 0) { *type_name = "ieee_class_type"; *tag = 109; return 1; }
+    if (strcmp(upper, "IEEE_POSITIVE_INF") == 0) { *type_name = "ieee_class_type"; *tag = 110; return 1; }
+    if (strcmp(upper, "IEEE_OTHER_VALUE") == 0) { *type_name = "ieee_class_type"; *tag = 111; return 1; }
     return 0;
 }
 
@@ -2214,7 +2225,11 @@ static void declare_ieee_name(OfortInterpreter *I, const char *local_name, const
 static void declare_default_ieee_names(OfortInterpreter *I) {
     const char *names[] = {
         "ieee_invalid", "ieee_overflow", "ieee_divide_by_zero", "ieee_underflow", "ieee_inexact",
-        "ieee_usual", "ieee_nearest", "ieee_to_zero", "ieee_up", "ieee_down", "ieee_other", NULL
+        "ieee_usual", "ieee_nearest", "ieee_to_zero", "ieee_up", "ieee_down", "ieee_other",
+        "ieee_signaling_nan", "ieee_quiet_nan", "ieee_negative_inf", "ieee_negative_normal",
+        "ieee_negative_denormal", "ieee_negative_zero", "ieee_positive_zero",
+        "ieee_positive_denormal", "ieee_positive_normal", "ieee_positive_inf",
+        "ieee_other_value", NULL
     };
     for (int i = 0; names[i]; i++) declare_ieee_name(I, names[i], names[i]);
 }
@@ -12427,6 +12442,14 @@ static void append_to_buffer(char *buf, int bufsize, const char *text) {
 static void ofort_format_list_real(char *buf, int bufsize, double value, int precision) {
     int has_decimal = 0;
     if (!buf || bufsize <= 0) return;
+    if (isnan(value)) {
+        snprintf(buf, bufsize, "NaN");
+        return;
+    }
+    if (isinf(value)) {
+        snprintf(buf, bufsize, "%sInfinity", value < 0.0 ? "-" : "");
+        return;
+    }
     snprintf(buf, bufsize, precision > 7 ? "%.15g" : "%.7g", value);
     for (int i = 0; buf[i]; i++) {
         if (buf[i] == '.' || buf[i] == 'e' || buf[i] == 'E' ||
@@ -12768,6 +12791,14 @@ static int command_exit_status(int rc) {
     if (WIFSIGNALED(rc)) return 128 + WTERMSIG(rc);
 #endif
     return rc;
+}
+
+static int derived_tag_value(const OfortValue *v, const char *type_name, long long *tag) {
+    if (!v || v->type != FVAL_DERIVED || !tag) return 0;
+    if (type_name && type_name[0] && !str_eq_nocase(v->v.dt.type_name, type_name)) return 0;
+    if (v->v.dt.n_fields < 1 || !v->v.dt.fields || v->v.dt.fields[0].type != FVAL_INTEGER) return 0;
+    *tag = v->v.dt.fields[0].v.i;
+    return 1;
 }
 
 static int inquire_iolength_value(OfortValue v) {
@@ -23245,6 +23276,80 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (harvest) harvest->is_initialized = 1;
             break;
         }
+        if (strcmp(call_upper, "GET_COMMAND") == 0) {
+            int command_idx = -1;
+            int length_idx = -1;
+            int status_idx = -1;
+            char command_text[OFORT_MAX_STRLEN];
+            size_t used = 0;
+            int command_len;
+            int status = 0;
+
+            for (int i = 0; i < n->n_stmts; i++) {
+                const char *pname = n->param_names[i];
+                if (str_eq_nocase(pname, "command")) {
+                    command_idx = i;
+                } else if (str_eq_nocase(pname, "length")) {
+                    length_idx = i;
+                } else if (str_eq_nocase(pname, "status")) {
+                    status_idx = i;
+                } else if (pname[0] != '\0') {
+                    ofort_error(I, "Unknown GET_COMMAND keyword '%s'", pname);
+                } else if (command_idx < 0) {
+                    command_idx = i;
+                } else if (length_idx < 0) {
+                    length_idx = i;
+                } else if (status_idx < 0) {
+                    status_idx = i;
+                } else {
+                    ofort_error(I, "Too many arguments to GET_COMMAND");
+                }
+            }
+
+            command_text[0] = '\0';
+            if (used + strlen("ofort") + 1 >= sizeof(command_text))
+                ofort_error(I, "GET_COMMAND command line is too long");
+            strcpy(command_text, "ofort");
+            used = strlen(command_text);
+            for (int i = 0; i < I->command_argc; i++) {
+                const char *arg = I->command_args[i];
+                size_t narg = strlen(arg);
+                if (used + 1 + narg + 1 >= sizeof(command_text))
+                    ofort_error(I, "GET_COMMAND command line is too long");
+                command_text[used++] = ' ';
+                memcpy(command_text + used, arg, narg + 1);
+                used += narg;
+            }
+            command_len = (int)used;
+
+            if (command_idx >= 0) {
+                OfortVar *command_var = NULL;
+                if (n->stmts[command_idx]->type != FND_IDENT)
+                    ofort_error(I, "GET_COMMAND COMMAND must be a variable");
+                command_var = find_var(I, n->stmts[command_idx]->name);
+                if (!command_var)
+                    ofort_error(I, "Undefined variable '%s' in GET_COMMAND", n->stmts[command_idx]->name);
+                if (command_var->val.type != FVAL_CHARACTER)
+                    ofort_error(I, "GET_COMMAND COMMAND must be CHARACTER");
+                if (command_var->char_len == 0) {
+                    status = 42;
+                } else if (command_var->char_len > 0 && command_len > command_var->char_len) {
+                    status = -1;
+                }
+                set_var(I, n->stmts[command_idx]->name, make_character(command_text));
+            }
+            if (length_idx >= 0) {
+                if (n->stmts[length_idx]->type != FND_IDENT)
+                    ofort_error(I, "GET_COMMAND LENGTH must be a variable");
+                set_var(I, n->stmts[length_idx]->name, make_integer(command_len));
+            }
+            if (status_idx >= 0) {
+                if (n->stmts[status_idx]->type != FND_IDENT)
+                    ofort_error(I, "GET_COMMAND STATUS must be a variable");
+                set_var(I, n->stmts[status_idx]->name, make_integer(status));
+            }
+            break;
+        }
         if (strcmp(call_upper, "GET_COMMAND_ARGUMENT") == 0 || strcmp(call_upper, "GETARG") == 0) {
             int is_getarg = strcmp(call_upper, "GETARG") == 0;
             const char *diag_name = is_getarg ? "GETARG" : "GET_COMMAND_ARGUMENT";
@@ -24721,7 +24826,7 @@ static const char *intrinsic_names[] = {
     "SIND", "COSD", "TAND", "ASIND", "ACOSD", "ATAND", "ATAN2D",
     "BESSEL_J0", "BESSEL_J1", "BESSEL_Y0", "BESSEL_Y1", "BESSEL_JN", "BESSEL_YN",
     "SINH", "COSH", "TANH", "ASINH", "ACOSH", "ATANH",
-    "EXP", "LOG", "LOG10", "GAMMA", "LOG_GAMMA", "ERF", "ERFC", "ERFC_SCALED", "ISNAN", "IEEE_IS_NAN", "MOD", "AMOD", "MODULO", "DIM", "MAX", "MIN", "MIN1", "AMIN0", "FLOOR", "CEILING", "AINT", "ANINT", "NINT",
+    "EXP", "LOG", "LOG10", "GAMMA", "LOG_GAMMA", "ERF", "ERFC", "ERFC_SCALED", "ISNAN", "IEEE_VALUE", "IEEE_IS_NAN", "IEEE_IS_NEGATIVE", "IEEE_IS_FINITE", "IEEE_IS_NORMAL", "MOD", "AMOD", "MODULO", "DIM", "MAX", "MIN", "MIN1", "AMIN0", "FLOOR", "CEILING", "AINT", "ANINT", "NINT",
     "DACOS", "DASIN",
     "CSQRT", "CEXP", "CSIN", "CCOS", "CABS",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "TRANSFER",
@@ -24796,6 +24901,9 @@ static int is_elemental_unary_intrinsic(const char *upper) {
            strcmp(upper, "ERFC_SCALED") == 0 ||
            strcmp(upper, "ISNAN") == 0 ||
            strcmp(upper, "IEEE_IS_NAN") == 0 ||
+           strcmp(upper, "IEEE_IS_NEGATIVE") == 0 ||
+           strcmp(upper, "IEEE_IS_FINITE") == 0 ||
+           strcmp(upper, "IEEE_IS_NORMAL") == 0 ||
            strcmp(upper, "LOG") == 0 ||
            strcmp(upper, "LOG10") == 0 ||
            strcmp(upper, "GAMMA") == 0 ||
@@ -24870,7 +24978,10 @@ static OfortValType elemental_result_type(const char *upper, OfortValType input_
         strcmp(upper, "CCOS") == 0) return FVAL_COMPLEX;
     if (strcmp(upper, "LOGICAL") == 0 ||
         strcmp(upper, "ISNAN") == 0 ||
-        strcmp(upper, "IEEE_IS_NAN") == 0) return FVAL_LOGICAL;
+        strcmp(upper, "IEEE_IS_NAN") == 0 ||
+        strcmp(upper, "IEEE_IS_NEGATIVE") == 0 ||
+        strcmp(upper, "IEEE_IS_FINITE") == 0 ||
+        strcmp(upper, "IEEE_IS_NORMAL") == 0) return FVAL_LOGICAL;
     return FVAL_REAL;
 }
 
@@ -28916,6 +29027,50 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         double x = val_to_real(args[0]);
         return make_real(exp(x * x) * erfc(x));
     }
+    if (strcmp(upper, "IEEE_VALUE") == 0) {
+        long long tag = 0;
+        double value = 0.0;
+        if (nargs < 2) ofort_error(I, "IEEE_VALUE requires X and CLASS arguments");
+        if (!is_numeric_type(args[0].type))
+            ofort_error(I, "IEEE_VALUE X argument must be real or numeric");
+        if (!derived_tag_value(&args[1], "ieee_class_type", &tag))
+            ofort_error(I, "IEEE_VALUE CLASS argument must be IEEE_CLASS_TYPE");
+        switch (tag) {
+        case 101:
+        case 102:
+            value = NAN;
+            break;
+        case 103:
+            value = -INFINITY;
+            break;
+        case 104:
+            value = -1.0;
+            break;
+        case 105:
+            value = -nextafter(0.0, 1.0);
+            break;
+        case 106:
+            value = -0.0;
+            break;
+        case 107:
+            value = 0.0;
+            break;
+        case 108:
+            value = nextafter(0.0, 1.0);
+            break;
+        case 109:
+            value = 1.0;
+            break;
+        case 110:
+            value = INFINITY;
+            break;
+        default:
+            value = NAN;
+            break;
+        }
+        if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(value);
+        return make_real(value);
+    }
     if (strcmp(upper, "ISNAN") == 0 || strcmp(upper, "IEEE_IS_NAN") == 0) {
         if (nargs < 1) ofort_error(I, "%s requires 1 argument", upper);
         if (!is_numeric_type(args[0].type))
@@ -28923,6 +29078,31 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (args[0].type == FVAL_COMPLEX)
             return make_logical(isnan(args[0].v.cx.re) || isnan(args[0].v.cx.im));
         return make_logical(isnan(val_to_real(args[0])));
+    }
+    if (strcmp(upper, "IEEE_IS_NEGATIVE") == 0 ||
+        strcmp(upper, "IEEE_IS_FINITE") == 0 ||
+        strcmp(upper, "IEEE_IS_NORMAL") == 0) {
+        double x;
+        if (nargs < 1) ofort_error(I, "%s requires 1 argument", upper);
+        if (!is_numeric_type(args[0].type) || args[0].type == FVAL_COMPLEX)
+            ofort_error(I, "%s requires a real argument", upper);
+        x = val_to_real(args[0]);
+        if (strcmp(upper, "IEEE_IS_NEGATIVE") == 0) {
+            if (args[0].type == FVAL_REAL && args[0].kind != 8) {
+                float xf = (float)x;
+                return make_logical(!isnan(xf) && signbit(xf) != 0);
+            }
+            return make_logical(!isnan(x) && signbit(x) != 0);
+        }
+        if (strcmp(upper, "IEEE_IS_FINITE") == 0) {
+            if (args[0].type == FVAL_REAL && args[0].kind != 8) return make_logical(isfinite((float)x) != 0);
+            return make_logical(isfinite(x) != 0);
+        }
+        if (args[0].type == FVAL_REAL && args[0].kind != 8) {
+            float xf = (float)x;
+            return make_logical(isfinite(xf) && (xf == 0.0f || isnormal(xf)));
+        }
+        return make_logical(isfinite(x) && (x == 0.0 || isnormal(x)));
     }
     if (strcmp(upper, "MOD") == 0 || strcmp(upper, "AMOD") == 0) {
         if (nargs < 2) ofort_error(I, "MOD requires 2 arguments");
