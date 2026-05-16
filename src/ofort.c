@@ -10764,6 +10764,40 @@ static OfortComplexPair ofort_complex_sub(OfortComplexPair a, OfortComplexPair b
     return r;
 }
 
+static OfortComplexPair ofort_complex_pow(OfortComplexPair base, OfortComplexPair exponent) {
+    OfortComplexPair r;
+    if (exponent.im == 0.0) {
+        double rounded = round(exponent.re);
+        if (fabs(exponent.re - rounded) < 1e-12 && fabs(rounded) < 1000000.0) {
+            long long n = (long long)rounded;
+            OfortComplexPair result = {1.0, 0.0};
+            long long exp = n < 0 ? -n : n;
+            for (long long i = 0; i < exp; i++) {
+                result = ofort_complex_mul(result, base);
+            }
+            if (n < 0) {
+                OfortComplexPair one = {1.0, 0.0};
+                result = ofort_complex_div(one, result);
+            }
+            return result;
+        }
+    }
+    double radius = hypot(base.re, base.im);
+    double theta = atan2(base.im, base.re);
+    if (radius == 0.0) {
+        r.re = 0.0;
+        r.im = 0.0;
+        return r;
+    }
+    double a = exponent.re;
+    double b = exponent.im;
+    double magnitude = exp(a * log(radius) - b * theta);
+    double angle = a * theta + b * log(radius);
+    r.re = magnitude * cos(angle);
+    r.im = magnitude * sin(angle);
+    return r;
+}
+
 static int fast_complex_square_matrix_det(OfortInterpreter *I, const OfortValue *matrix,
                                           double *re_out, double *im_out) {
     int n;
@@ -14647,6 +14681,14 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     double d = rre*rre + rim*rim;
                     re = (lre*rre + lim*rim) / d;
                     im = (lim*rre - lre*rim) / d;
+                    break;
+                }
+                case FND_POWER: {
+                    OfortComplexPair base = {lre, lim};
+                    OfortComplexPair exponent = {rre, rim};
+                    OfortComplexPair result = ofort_complex_pow(base, exponent);
+                    re = result.re;
+                    im = result.im;
                     break;
                 }
                 default: re = 0; im = 0; break;
