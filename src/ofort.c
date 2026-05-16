@@ -27367,12 +27367,15 @@ static OfortValue minmaxval_dim_result(OfortInterpreter *I, OfortValue *array, i
     return result;
 }
 
-static OfortValue sum_product_dim_result(OfortInterpreter *I, OfortValue *array, int dim, int want_product) {
+static OfortValue sum_product_dim_result(OfortInterpreter *I, OfortValue *array, int dim, int want_product,
+                                         OfortValue *mask) {
     int rank = array->v.arr.n_dims;
     int result_dims[7];
     int result_rank = 0;
     int dim_extent, stride;
     OfortValType result_type = array->v.arr.elem_type == FVAL_INTEGER ? FVAL_INTEGER : FVAL_REAL;
+    if (mask && mask->type == FVAL_ARRAY && mask->v.arr.len != array->v.arr.len)
+        ofort_error(I, "MASK must be scalar or conform to ARRAY");
     if (dim < 1 || dim > rank) ofort_error(I, "%s DIM is out of range", want_product ? "PRODUCT" : "SUM");
     for (int i = 0; i < rank; i++) {
         if (i != dim - 1) result_dims[result_rank++] = array->v.arr.dims[i];
@@ -27385,7 +27388,10 @@ static OfortValue sum_product_dim_result(OfortInterpreter *I, OfortValue *array,
         long long isum = want_product ? 1 : 0;
         double rsum = want_product ? 1.0 : 0.0;
         for (int k = 0; k < dim_extent; k++) {
-            OfortValue elem = array_element_value(array, k * stride);
+            int flat = k * stride;
+            OfortValue elem;
+            if (!reduction_mask_takes(I, mask, flat, array->v.arr.len)) continue;
+            elem = array_element_value(array, flat);
             if (result_type == FVAL_INTEGER) {
                 long long v = val_to_int(elem);
                 if (want_product) isum *= v;
@@ -27419,7 +27425,9 @@ static OfortValue sum_product_dim_result(OfortInterpreter *I, OfortValue *array,
         }
         for (int k = 0; k < dim_extent; k++) {
             int flat = base + k * stride;
-            OfortValue elem = array_element_value(array, flat);
+            OfortValue elem;
+            if (!reduction_mask_takes(I, mask, flat, array->v.arr.len)) continue;
+            elem = array_element_value(array, flat);
             if (result_type == FVAL_INTEGER) {
                 long long v = val_to_int(elem);
                 if (want_product) isum *= v;
@@ -29049,10 +29057,28 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     }
     if (strcmp(upper, "SUM") == 0) {
         int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
-        if (dim_idx < 0 && nargs >= 2 && (!arg_names || arg_names[1][0] == '\0')) dim_idx = 1;
+        int mask_idx = intrinsic_arg_index(arg_names, nargs, "mask");
+        if (dim_idx < 0 && mask_idx < 0 && nargs >= 2 && (!arg_names || arg_names[1][0] == '\0')) {
+            if (args[1].type == FVAL_LOGICAL ||
+                (args[1].type == FVAL_ARRAY && args[1].v.arr.elem_type == FVAL_LOGICAL))
+                mask_idx = 1;
+            else
+                dim_idx = 1;
+        }
+        if (mask_idx < 0 && dim_idx >= 0) {
+            for (int i = 1; i < nargs; i++) {
+                if (i != dim_idx && (!arg_names || arg_names[i][0] == '\0') &&
+                    (args[i].type == FVAL_LOGICAL ||
+                     (args[i].type == FVAL_ARRAY && args[i].v.arr.elem_type == FVAL_LOGICAL))) {
+                    mask_idx = i;
+                    break;
+                }
+            }
+        }
         if (args[0].type != FVAL_ARRAY) return copy_value(args[0]);
         if (dim_idx >= 0) {
-            return sum_product_dim_result(I, &args[0], (int)val_to_int(args[dim_idx]), 0);
+            return sum_product_dim_result(I, &args[0], (int)val_to_int(args[dim_idx]), 0,
+                                          (mask_idx >= 0 && mask_idx < nargs) ? &args[mask_idx] : NULL);
         }
         if (dim_idx >= 0 && args[0].v.arr.n_dims == 2) {
             int dim = (int)val_to_int(args[dim_idx]);
@@ -29094,12 +29120,18 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         double sum = 0;
         if (args[0].v.arr.int_data && args[0].v.arr.elem_type == FVAL_INTEGER) {
             long long isum = 0;
-            for (int i = 0; i < args[0].v.arr.len; i++) isum += args[0].v.arr.int_data[i];
+            for (int i = 0; i < args[0].v.arr.len; i++) {
+                if (mask_idx >= 0 && !reduction_mask_takes(I, &args[mask_idx], i, args[0].v.arr.len)) continue;
+                isum += args[0].v.arr.int_data[i];
+            }
             return make_integer(isum);
         }
         if (args[0].v.arr.real_data &&
             (args[0].v.arr.elem_type == FVAL_REAL || args[0].v.arr.elem_type == FVAL_DOUBLE)) {
-            for (int i = 0; i < args[0].v.arr.len; i++) sum += args[0].v.arr.real_data[i];
+            for (int i = 0; i < args[0].v.arr.len; i++) {
+                if (mask_idx >= 0 && !reduction_mask_takes(I, &args[mask_idx], i, args[0].v.arr.len)) continue;
+                sum += args[0].v.arr.real_data[i];
+            }
             return make_real(sum);
         }
         if (I->fast_mode &&
@@ -29107,37 +29139,71 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
              args[0].v.arr.elem_type == FVAL_INTEGER)) {
             if (args[0].v.arr.elem_type == FVAL_INTEGER) {
                 long long isum = 0;
-                for (int i = 0; i < args[0].v.arr.len; i++) isum += args[0].v.arr.data[i].v.i;
+                for (int i = 0; i < args[0].v.arr.len; i++) {
+                    if (mask_idx >= 0 && !reduction_mask_takes(I, &args[mask_idx], i, args[0].v.arr.len)) continue;
+                    isum += args[0].v.arr.data[i].v.i;
+                }
                 return make_integer(isum);
             }
-            for (int i = 0; i < args[0].v.arr.len; i++) sum += args[0].v.arr.data[i].v.r;
+            for (int i = 0; i < args[0].v.arr.len; i++) {
+                if (mask_idx >= 0 && !reduction_mask_takes(I, &args[mask_idx], i, args[0].v.arr.len)) continue;
+                sum += args[0].v.arr.data[i].v.r;
+            }
             return make_real(sum);
         }
-        for (int i = 0; i < args[0].v.arr.len; i++)
+        for (int i = 0; i < args[0].v.arr.len; i++) {
+            if (mask_idx >= 0 && !reduction_mask_takes(I, &args[mask_idx], i, args[0].v.arr.len)) continue;
             sum += val_to_real(args[0].v.arr.data[i]);
+        }
         if (args[0].v.arr.elem_type == FVAL_INTEGER) return make_integer((long long)sum);
         return make_real(sum);
     }
     if (strcmp(upper, "PRODUCT") == 0) {
         int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
-        if (dim_idx < 0 && nargs >= 2 && (!arg_names || arg_names[1][0] == '\0')) dim_idx = 1;
+        int mask_idx = intrinsic_arg_index(arg_names, nargs, "mask");
+        if (dim_idx < 0 && mask_idx < 0 && nargs >= 2 && (!arg_names || arg_names[1][0] == '\0')) {
+            if (args[1].type == FVAL_LOGICAL ||
+                (args[1].type == FVAL_ARRAY && args[1].v.arr.elem_type == FVAL_LOGICAL))
+                mask_idx = 1;
+            else
+                dim_idx = 1;
+        }
+        if (mask_idx < 0 && dim_idx >= 0) {
+            for (int i = 1; i < nargs; i++) {
+                if (i != dim_idx && (!arg_names || arg_names[i][0] == '\0') &&
+                    (args[i].type == FVAL_LOGICAL ||
+                     (args[i].type == FVAL_ARRAY && args[i].v.arr.elem_type == FVAL_LOGICAL))) {
+                    mask_idx = i;
+                    break;
+                }
+            }
+        }
         if (args[0].type != FVAL_ARRAY) return copy_value(args[0]);
         if (dim_idx >= 0) {
-            return sum_product_dim_result(I, &args[0], (int)val_to_int(args[dim_idx]), 1);
+            return sum_product_dim_result(I, &args[0], (int)val_to_int(args[dim_idx]), 1,
+                                          (mask_idx >= 0 && mask_idx < nargs) ? &args[mask_idx] : NULL);
         }
         double prod = 1;
         if (args[0].v.arr.int_data && args[0].v.arr.elem_type == FVAL_INTEGER) {
             long long iprod = 1;
-            for (int i = 0; i < args[0].v.arr.len; i++) iprod *= args[0].v.arr.int_data[i];
+            for (int i = 0; i < args[0].v.arr.len; i++) {
+                if (mask_idx >= 0 && !reduction_mask_takes(I, &args[mask_idx], i, args[0].v.arr.len)) continue;
+                iprod *= args[0].v.arr.int_data[i];
+            }
             return make_integer(iprod);
         }
         if (args[0].v.arr.real_data &&
             (args[0].v.arr.elem_type == FVAL_REAL || args[0].v.arr.elem_type == FVAL_DOUBLE)) {
-            for (int i = 0; i < args[0].v.arr.len; i++) prod *= args[0].v.arr.real_data[i];
+            for (int i = 0; i < args[0].v.arr.len; i++) {
+                if (mask_idx >= 0 && !reduction_mask_takes(I, &args[mask_idx], i, args[0].v.arr.len)) continue;
+                prod *= args[0].v.arr.real_data[i];
+            }
             return make_real(prod);
         }
-        for (int i = 0; i < args[0].v.arr.len; i++)
+        for (int i = 0; i < args[0].v.arr.len; i++) {
+            if (mask_idx >= 0 && !reduction_mask_takes(I, &args[mask_idx], i, args[0].v.arr.len)) continue;
             prod *= val_to_real(args[0].v.arr.data[i]);
+        }
         if (args[0].v.arr.elem_type == FVAL_INTEGER) return make_integer((long long)prod);
         return make_real(prod);
     }
