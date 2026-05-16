@@ -335,6 +335,7 @@ static int storage_size_bits(OfortValue *v);
 static int is_intrinsic(const char *name);
 static void check_semantics_node(OfortInterpreter *I, OfortNode *n);
 static int ofort_extension_module_exists(const char *module_name);
+static OfortValue shift_scalar_value(const char *upper, OfortValue value_arg, OfortValue shift_arg);
 static int ofort_extension_module_exports(const char *module_name, const char *name);
 static void import_ofort_extension_intrinsic(OfortInterpreter *I, const char *local_name,
                                              const char *target_name);
@@ -14329,7 +14330,22 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 
     case FND_NOT: {
         OfortValue v = eval_node(I, n->children[0]);
-        return make_logical(!val_to_logical(v));
+        if (v.type == FVAL_ARRAY) {
+            OfortValue result = make_array(FVAL_LOGICAL, v.v.arr.dims, v.v.arr.n_dims);
+            for (int i = 0; i < v.v.arr.len; i++) {
+                OfortValue elem = array_element_value(&v, i);
+                free_value(&result.v.arr.data[i]);
+                result.v.arr.data[i] = make_logical(!val_to_logical(elem));
+                free_value(&elem);
+            }
+            free_value(&v);
+            return result;
+        }
+        {
+            OfortValue result = make_logical(!val_to_logical(v));
+            free_value(&v);
+            return result;
+        }
     }
 
     case FND_CONDITIONAL: {
@@ -23859,7 +23875,7 @@ static const char *intrinsic_names[] = {
     "DACOS", "DASIN",
     "CSQRT", "CEXP", "CSIN", "CCOS", "CABS",
     "REAL", "INT", "DBLE", "DPROD", "CMPLX", "AIMAG", "CONJG", "SIGN", "KIND", "TRANSFER",
-    "BIT_SIZE", "STORAGE_SIZE", "BTEST", "POPCNT", "POPPAR", "LEADZ", "TRAILZ", "IAND", "IEOR", "IOR", "IALL", "IANY", "IPARITY", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC", "SHIFTA", "SHIFTL", "SHIFTR", "DSHIFTL", "DSHIFTR", "MASKL", "MASKR",
+    "BIT_SIZE", "STORAGE_SIZE", "BTEST", "POPCNT", "POPPAR", "LEADZ", "TRAILZ", "IAND", "IEOR", "IOR", "NOT", "IALL", "IANY", "IPARITY", "IBCLR", "IBITS", "IBSET", "ISHFT", "ISHFTC", "SHIFTA", "SHIFTL", "SHIFTR", "DSHIFTL", "DSHIFTR", "MASKL", "MASKR",
     "MERGE_BITS", "BGE", "BGT", "BLE", "BLT",
     "LGE", "LGT", "LLE", "LLT",
     "DIGITS", "EPSILON", "FRACTION", "EXPONENT", "RADIX", "HUGE", "TINY", "NEAREST", "PRECISION", "RANGE", "RRSPACING", "SPACING", "SCALE",
@@ -24106,6 +24122,164 @@ static long long signed_mask_value(unsigned long long value, int bits) {
     sign_bit = 1ULL << (unsigned int)(bits - 1);
     if (value & sign_bit) value |= ~mask;
     return (long long)value;
+}
+
+static OfortValue bit_unary_scalar_value(OfortInterpreter *I, const char *upper, OfortValue arg) {
+    int kind;
+    if (arg.type != FVAL_INTEGER) ofort_error(I, "%s requires integer argument", upper);
+    if (strcmp(upper, "POPCNT") == 0 || strcmp(upper, "POPPAR") == 0 ||
+        strcmp(upper, "LEADZ") == 0 || strcmp(upper, "TRAILZ") == 0) {
+        return bit_count_intrinsic_value(upper, arg);
+    }
+    if (strcmp(upper, "NOT") == 0) {
+        kind = arg.kind ? arg.kind : 4;
+        return make_integer_kind(~arg.v.i, kind);
+    }
+    ofort_error(I, "Unsupported unary bit intrinsic %s", upper);
+    return make_void_val();
+}
+
+static OfortValue bit_binary_scalar_value(OfortInterpreter *I, const char *upper,
+                                          OfortValue a, OfortValue b) {
+    int kind, bits;
+    long long pos;
+    unsigned long long value;
+    if (a.type != FVAL_INTEGER || b.type != FVAL_INTEGER)
+        ofort_error(I, "%s requires integer arguments", upper);
+    kind = a.kind ? a.kind : 4;
+    bits = integer_kind_bits(kind);
+    if (strcmp(upper, "IAND") == 0) return make_integer_kind(a.v.i & b.v.i, kind);
+    if (strcmp(upper, "IEOR") == 0) return make_integer_kind(a.v.i ^ b.v.i, kind);
+    if (strcmp(upper, "IOR") == 0) return make_integer_kind(a.v.i | b.v.i, kind);
+    if (strcmp(upper, "ISHFT") == 0) {
+        long long shift = b.v.i;
+        value = (unsigned long long)a.v.i;
+        if (shift <= -bits || shift >= bits) return make_integer_kind(0, kind);
+        if (shift > 0) value <<= (unsigned int)shift;
+        else if (shift < 0) value >>= (unsigned int)(-shift);
+        return make_integer_kind(signed_mask_value(value, bits), kind);
+    }
+    if (strcmp(upper, "SHIFTA") == 0 || strcmp(upper, "SHIFTL") == 0 || strcmp(upper, "SHIFTR") == 0)
+        return shift_scalar_value(upper, a, b);
+    pos = b.v.i;
+    if (pos < 0 || pos >= bits) ofort_error(I, "%s bit position out of range", upper);
+    value = (unsigned long long)a.v.i;
+    if (strcmp(upper, "IBCLR") == 0) {
+        value &= ~(1ULL << (unsigned int)pos);
+    } else if (strcmp(upper, "IBSET") == 0) {
+        value |= 1ULL << (unsigned int)pos;
+    } else {
+        ofort_error(I, "Unsupported binary bit intrinsic %s", upper);
+    }
+    return make_integer_kind(signed_mask_value(value, bits), kind);
+}
+
+static OfortValue bit_ternary_scalar_value(OfortInterpreter *I, const char *upper,
+                                           OfortValue a, OfortValue b, OfortValue c) {
+    int kind, bits;
+    if (a.type != FVAL_INTEGER || b.type != FVAL_INTEGER || c.type != FVAL_INTEGER)
+        ofort_error(I, "%s requires integer arguments", upper);
+    kind = a.kind ? a.kind : 4;
+    bits = integer_kind_bits(kind);
+    if (strcmp(upper, "IBITS") == 0) {
+        long long pos = b.v.i;
+        long long len = c.v.i;
+        unsigned long long value, mask;
+        if (pos < 0 || len < 0 || pos > bits || len > bits || pos + len > bits)
+            ofort_error(I, "IBITS bit range out of range");
+        if (len == 0) return make_integer_kind(0, kind);
+        value = ((unsigned long long)a.v.i) >> (unsigned int)pos;
+        mask = len == 64 ? ~0ULL : ((1ULL << (unsigned int)len) - 1ULL);
+        return make_integer_kind((long long)(value & mask), kind);
+    }
+    if (strcmp(upper, "ISHFTC") == 0) {
+        int size = (int)c.v.i;
+        long long shift = b.v.i;
+        long long smod;
+        unsigned int rshift;
+        unsigned long long value, mask, field, rest, rotated;
+        if (size <= 0 || size > bits) ofort_error(I, "ISHFTC size out of range");
+        smod = shift % size;
+        if (smod < 0) smod += size;
+        rshift = (unsigned int)smod;
+        mask = size == 64 ? ~0ULL : ((1ULL << (unsigned int)size) - 1ULL);
+        value = (unsigned long long)a.v.i;
+        field = value & mask;
+        rest = value & ~mask;
+        if (rshift == 0) rotated = field;
+        else rotated = ((field << rshift) | (field >> ((unsigned int)size - rshift))) & mask;
+        return make_integer_kind(signed_mask_value(rest | rotated, bits), kind);
+    }
+    ofort_error(I, "Unsupported ternary bit intrinsic %s", upper);
+    return make_void_val();
+}
+
+static OfortValue *bit_shape_arg(OfortInterpreter *I, const char *upper, OfortValue *args,
+                                 const int *idxs, int nidxs) {
+    OfortValue *shape = NULL;
+    for (int i = 0; i < nidxs; i++) {
+        OfortValue *arg = &args[idxs[i]];
+        if (arg->type == FVAL_ARRAY) {
+            if (!shape) shape = arg;
+            else if (arg->v.arr.len != shape->v.arr.len)
+                ofort_error(I, "%s array arguments have different sizes", upper);
+        }
+    }
+    return shape;
+}
+
+static OfortValue bit_unary_elemental_value(OfortInterpreter *I, const char *upper, OfortValue *args,
+                                            int arg_idx) {
+    int idxs[1] = {arg_idx};
+    OfortValue *shape = bit_shape_arg(I, upper, args, idxs, 1);
+    if (!shape) return bit_unary_scalar_value(I, upper, args[arg_idx]);
+    OfortValue result = make_array(FVAL_INTEGER, shape->v.arr.dims, shape->v.arr.n_dims);
+    for (int i = 0; i < result.v.arr.len; i++) {
+        OfortValue av = array_element_value(&args[arg_idx], i);
+        OfortValue rv = bit_unary_scalar_value(I, upper, av);
+        free_value(&result.v.arr.data[i]);
+        result.v.arr.data[i] = rv;
+        free_value(&av);
+    }
+    return result;
+}
+
+static OfortValue bit_binary_elemental_value(OfortInterpreter *I, const char *upper, OfortValue *args,
+                                             int a_idx, int b_idx) {
+    int idxs[2] = {a_idx, b_idx};
+    OfortValue *shape = bit_shape_arg(I, upper, args, idxs, 2);
+    if (!shape) return bit_binary_scalar_value(I, upper, args[a_idx], args[b_idx]);
+    OfortValue result = make_array(FVAL_INTEGER, shape->v.arr.dims, shape->v.arr.n_dims);
+    for (int i = 0; i < result.v.arr.len; i++) {
+        OfortValue av = args[a_idx].type == FVAL_ARRAY ? array_element_value(&args[a_idx], i) : copy_value(args[a_idx]);
+        OfortValue bv = args[b_idx].type == FVAL_ARRAY ? array_element_value(&args[b_idx], i) : copy_value(args[b_idx]);
+        OfortValue rv = bit_binary_scalar_value(I, upper, av, bv);
+        free_value(&result.v.arr.data[i]);
+        result.v.arr.data[i] = rv;
+        free_value(&av);
+        free_value(&bv);
+    }
+    return result;
+}
+
+static OfortValue bit_ternary_elemental_value(OfortInterpreter *I, const char *upper, OfortValue *args,
+                                              int a_idx, int b_idx, int c_idx) {
+    int idxs[3] = {a_idx, b_idx, c_idx};
+    OfortValue *shape = bit_shape_arg(I, upper, args, idxs, 3);
+    if (!shape) return bit_ternary_scalar_value(I, upper, args[a_idx], args[b_idx], args[c_idx]);
+    OfortValue result = make_array(FVAL_INTEGER, shape->v.arr.dims, shape->v.arr.n_dims);
+    for (int i = 0; i < result.v.arr.len; i++) {
+        OfortValue av = args[a_idx].type == FVAL_ARRAY ? array_element_value(&args[a_idx], i) : copy_value(args[a_idx]);
+        OfortValue bv = args[b_idx].type == FVAL_ARRAY ? array_element_value(&args[b_idx], i) : copy_value(args[b_idx]);
+        OfortValue cv = args[c_idx].type == FVAL_ARRAY ? array_element_value(&args[c_idx], i) : copy_value(args[c_idx]);
+        OfortValue rv = bit_ternary_scalar_value(I, upper, av, bv, cv);
+        free_value(&result.v.arr.data[i]);
+        result.v.arr.data[i] = rv;
+        free_value(&av);
+        free_value(&bv);
+        free_value(&cv);
+    }
+    return result;
 }
 
 static int transfer_type_size(OfortValType type, int char_len) {
@@ -27010,21 +27184,6 @@ static OfortValue shift_scalar_value(const char *upper, OfortValue value_arg, Of
     return make_integer_kind(value_arg.v.i >> (unsigned int)shift, kind);
 }
 
-static OfortValue shift_array_result(OfortInterpreter *I, const char *upper, OfortValue *value_arg, OfortValue *shift_arg) {
-    OfortValue result = make_array(FVAL_INTEGER, value_arg->v.arr.dims, value_arg->v.arr.n_dims);
-    for (int i = 0; i < value_arg->v.arr.len; i++) {
-        OfortValue xv = array_element_value(value_arg, i);
-        OfortValue sv = shift_arg->type == FVAL_ARRAY ? array_element_value(shift_arg, i) : copy_value(*shift_arg);
-        OfortValue rv = shift_scalar_value(upper, xv, sv);
-        free_value(&result.v.arr.data[i]);
-        result.v.arr.data[i] = rv;
-        free_value(&xv);
-        free_value(&sv);
-    }
-    (void)I;
-    return result;
-}
-
 static OfortValue minmaxval_dim_result(OfortInterpreter *I, OfortValue *array, int dim, int want_max, OfortValue *mask) {
     int rank = array->v.arr.n_dims;
     int result_dims[7];
@@ -28088,24 +28247,24 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "POPCNT") == 0 || strcmp(upper, "POPPAR") == 0 ||
         strcmp(upper, "LEADZ") == 0 || strcmp(upper, "TRAILZ") == 0) {
         if (nargs < 1) ofort_error(I, "%s requires 1 argument", upper);
-        if (args[0].type != FVAL_INTEGER) ofort_error(I, "%s requires integer argument", upper);
-        return bit_count_intrinsic_value(upper, args[0]);
+        return bit_unary_elemental_value(I, upper, args, 0);
     }
     if (strcmp(upper, "BTEST") == 0) {
         int kind, bits;
         long long pos;
         unsigned long long value;
         if (nargs < 2) ofort_error(I, "BTEST requires 2 arguments");
-        if (args[0].type == FVAL_ARRAY) {
-            OfortValue result = make_array(FVAL_LOGICAL, args[0].v.arr.dims, args[0].v.arr.n_dims);
-            if (args[1].type == FVAL_ARRAY && args[1].v.arr.len != args[0].v.arr.len)
+        if (args[0].type == FVAL_ARRAY || args[1].type == FVAL_ARRAY) {
+            OfortValue *shape_arg = args[0].type == FVAL_ARRAY ? &args[0] : &args[1];
+            OfortValue result = make_array(FVAL_LOGICAL, shape_arg->v.arr.dims, shape_arg->v.arr.n_dims);
+            if (args[0].type == FVAL_ARRAY && args[1].type == FVAL_ARRAY && args[1].v.arr.len != args[0].v.arr.len)
                 ofort_error(I, "BTEST arguments must conform");
-            for (int i = 0; i < args[0].v.arr.len; i++) {
-                OfortValue xv = array_element_value(&args[0], i);
+            for (int i = 0; i < shape_arg->v.arr.len; i++) {
+                OfortValue xv = args[0].type == FVAL_ARRAY ? array_element_value(&args[0], i) : copy_value(args[0]);
                 OfortValue pv = args[1].type == FVAL_ARRAY ? array_element_value(&args[1], i) : copy_value(args[1]);
                 OfortValue rv;
                 if (xv.type != FVAL_INTEGER || pv.type != FVAL_INTEGER) {
-                    rv = make_logical(0);
+                    ofort_error(I, "BTEST requires integer arguments");
                 } else {
                     int k = xv.kind ? xv.kind : 4;
                     int b = integer_kind_bits(k);
@@ -28130,130 +28289,65 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         return make_logical(((value >> (unsigned int)pos) & 1ULL) != 0);
     }
     if (strcmp(upper, "IAND") == 0) {
-        int kind;
         if (nargs < 2) ofort_error(I, "IAND requires 2 arguments");
-        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER)
-            ofort_error(I, "IAND requires integer arguments");
-        kind = args[0].kind ? args[0].kind : 4;
-        return make_integer_kind(args[0].v.i & args[1].v.i, kind);
+        return bit_binary_elemental_value(I, upper, args, 0, 1);
+    }
+    if (strcmp(upper, "NOT") == 0) {
+        if (nargs < 1) ofort_error(I, "NOT requires 1 argument");
+        return bit_unary_elemental_value(I, upper, args, 0);
     }
     if (strcmp(upper, "IEOR") == 0) {
-        int kind;
         if (nargs < 2) ofort_error(I, "IEOR requires 2 arguments");
-        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER)
-            ofort_error(I, "IEOR requires integer arguments");
-        kind = args[0].kind ? args[0].kind : 4;
-        return make_integer_kind(args[0].v.i ^ args[1].v.i, kind);
+        return bit_binary_elemental_value(I, upper, args, 0, 1);
     }
     if (strcmp(upper, "IOR") == 0) {
-        int kind;
         if (nargs < 2) ofort_error(I, "IOR requires 2 arguments");
-        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER)
-            ofort_error(I, "IOR requires integer arguments");
-        kind = args[0].kind ? args[0].kind : 4;
-        return make_integer_kind(args[0].v.i | args[1].v.i, kind);
+        return bit_binary_elemental_value(I, upper, args, 0, 1);
     }
     if (strcmp(upper, "IBCLR") == 0) {
-        int kind, bits;
-        long long pos;
-        unsigned long long value;
         if (nargs < 2) ofort_error(I, "IBCLR requires 2 arguments");
-        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER)
-            ofort_error(I, "IBCLR requires integer arguments");
-        kind = args[0].kind ? args[0].kind : 4;
-        bits = kind == 1 ? 8 : kind == 2 ? 16 : kind == 8 ? 64 : 32;
-        pos = args[1].v.i;
-        if (pos < 0 || pos >= bits) ofort_error(I, "IBCLR bit position out of range");
-        value = (unsigned long long)args[0].v.i;
-        value &= ~(1ULL << (unsigned int)pos);
-        return make_integer_kind((long long)value, kind);
+        return bit_binary_elemental_value(I, upper, args, 0, 1);
     }
     if (strcmp(upper, "IBITS") == 0) {
-        int kind, bits;
-        long long pos, len;
-        unsigned long long value, mask;
         if (nargs < 3) ofort_error(I, "IBITS requires 3 arguments");
-        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER || args[2].type != FVAL_INTEGER)
-            ofort_error(I, "IBITS requires integer arguments");
-        kind = args[0].kind ? args[0].kind : 4;
-        bits = kind == 1 ? 8 : kind == 2 ? 16 : kind == 8 ? 64 : 32;
-        pos = args[1].v.i;
-        len = args[2].v.i;
-        if (pos < 0 || len < 0 || pos > bits || len > bits || pos + len > bits)
-            ofort_error(I, "IBITS bit range out of range");
-        if (len == 0) return make_integer_kind(0, kind);
-        value = ((unsigned long long)args[0].v.i) >> (unsigned int)pos;
-        mask = len == 64 ? ~0ULL : ((1ULL << (unsigned int)len) - 1ULL);
-        return make_integer_kind((long long)(value & mask), kind);
+        return bit_ternary_elemental_value(I, upper, args, 0, 1, 2);
     }
     if (strcmp(upper, "IBSET") == 0) {
-        int kind, bits;
-        long long pos;
-        unsigned long long value;
         if (nargs < 2) ofort_error(I, "IBSET requires 2 arguments");
-        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER)
-            ofort_error(I, "IBSET requires integer arguments");
-        kind = args[0].kind ? args[0].kind : 4;
-        bits = kind == 1 ? 8 : kind == 2 ? 16 : kind == 8 ? 64 : 32;
-        pos = args[1].v.i;
-        if (pos < 0 || pos >= bits) ofort_error(I, "IBSET bit position out of range");
-        value = (unsigned long long)args[0].v.i;
-        value |= 1ULL << (unsigned int)pos;
-        return make_integer_kind((long long)value, kind);
+        return bit_binary_elemental_value(I, upper, args, 0, 1);
     }
     if (strcmp(upper, "ISHFT") == 0) {
-        int kind, bits;
-        long long shift;
-        unsigned long long value;
         if (nargs < 2) ofort_error(I, "ISHFT requires 2 arguments");
-        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER)
-            ofort_error(I, "ISHFT requires integer arguments");
-        kind = args[0].kind ? args[0].kind : 4;
-        bits = kind == 1 ? 8 : kind == 2 ? 16 : kind == 8 ? 64 : 32;
-        shift = args[1].v.i;
-        if (shift <= -bits || shift >= bits) return make_integer_kind(0, kind);
-        value = (unsigned long long)args[0].v.i;
-        if (shift > 0) value <<= (unsigned int)shift;
-        else if (shift < 0) value >>= (unsigned int)(-shift);
-        return make_integer_kind((long long)value, kind);
+        return bit_binary_elemental_value(I, upper, args, 0, 1);
     }
     if (strcmp(upper, "SHIFTA") == 0 || strcmp(upper, "SHIFTL") == 0 || strcmp(upper, "SHIFTR") == 0) {
         if (nargs < 2) ofort_error(I, "%s requires 2 arguments", upper);
-        if (args[0].type == FVAL_ARRAY) {
-            if (args[1].type == FVAL_ARRAY && args[1].v.arr.len != args[0].v.arr.len)
-                ofort_error(I, "%s arguments must conform", upper);
-            return shift_array_result(I, upper, &args[0], &args[1]);
-        }
-        return shift_scalar_value(upper, args[0], args[1]);
+        return bit_binary_elemental_value(I, upper, args, 0, 1);
     }
     if (strcmp(upper, "ISHFTC") == 0) {
-        int kind, bits, size;
-        long long shift;
-        long long smod;
-        unsigned int rshift;
-        unsigned long long value, mask, field, rest, rotated;
         if (nargs < 2) ofort_error(I, "ISHFTC requires at least 2 arguments");
-        if (args[0].type != FVAL_INTEGER || args[1].type != FVAL_INTEGER)
-            ofort_error(I, "ISHFTC requires integer arguments");
-        kind = args[0].kind ? args[0].kind : 4;
-        bits = kind == 1 ? 8 : kind == 2 ? 16 : kind == 8 ? 64 : 32;
-        size = bits;
-        if (nargs >= 3) {
-            if (args[2].type != FVAL_INTEGER) ofort_error(I, "ISHFTC SIZE must be integer");
-            size = (int)args[2].v.i;
+        if (nargs >= 3) return bit_ternary_elemental_value(I, upper, args, 0, 1, 2);
+        {
+            int idxs[2] = {0, 1};
+            OfortValue *shape = bit_shape_arg(I, upper, args, idxs, 2);
+            if (!shape) {
+                OfortValue size_arg = make_integer(integer_kind_bits(args[0].kind ? args[0].kind : 4));
+                return bit_ternary_scalar_value(I, upper, args[0], args[1], size_arg);
+            }
+            OfortValue result = make_array(FVAL_INTEGER, shape->v.arr.dims, shape->v.arr.n_dims);
+            for (int ri = 0; ri < result.v.arr.len; ri++) {
+                OfortValue av = args[0].type == FVAL_ARRAY ? array_element_value(&args[0], ri) : copy_value(args[0]);
+                OfortValue bv = args[1].type == FVAL_ARRAY ? array_element_value(&args[1], ri) : copy_value(args[1]);
+                OfortValue cv = make_integer(integer_kind_bits(av.kind ? av.kind : 4));
+                OfortValue rv = bit_ternary_scalar_value(I, upper, av, bv, cv);
+                free_value(&result.v.arr.data[ri]);
+                result.v.arr.data[ri] = rv;
+                free_value(&av);
+                free_value(&bv);
+                free_value(&cv);
+            }
+            return result;
         }
-        if (size <= 0 || size > bits) ofort_error(I, "ISHFTC size out of range");
-        shift = args[1].v.i;
-        smod = shift % size;
-        if (smod < 0) smod += size;
-        rshift = (unsigned int)smod;
-        mask = size == 64 ? ~0ULL : ((1ULL << (unsigned int)size) - 1ULL);
-        value = (unsigned long long)args[0].v.i;
-        field = value & mask;
-        rest = value & ~mask;
-        if (rshift == 0) rotated = field;
-        else rotated = ((field << rshift) | (field >> ((unsigned int)size - rshift))) & mask;
-        return make_integer_kind((long long)(rest | rotated), kind);
     }
     if (strcmp(upper, "MASKL") == 0 || strcmp(upper, "MASKR") == 0) {
         int kind = 4;
