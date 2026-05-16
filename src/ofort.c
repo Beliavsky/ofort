@@ -326,7 +326,7 @@ static void render_write_to_string(OfortInterpreter *I, const char *fmt,
                                    OfortValue *vals, int nvals,
                                    char *buf, int bufsize,
                                    int preserve_trailing_blanks);
-static void read_values_from_string(OfortInterpreter *I, const char *text, OfortNode *n);
+static int read_values_from_string(OfortInterpreter *I, const char *text, OfortNode *n, char *iomsg, size_t iomsg_size);
 static int read_direct_record_as_string(OfortInterpreter *I, OfortUnitFile *entry, int rec, char *buf, int bufsize);
 static int read_direct_from_file(OfortInterpreter *I, OfortUnitFile *entry, OfortNode *n, int rec);
 static void write_direct_record_from_node(OfortInterpreter *I, OfortUnitFile *entry, int rec, const char *fmt,
@@ -6702,6 +6702,9 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
                 } else if (str_eq_nocase(name, "iostat")) {
                     n->children[4] = parse_expr(I);
                     if (n->n_children < 5) n->n_children = 5;
+                } else if (str_eq_nocase(name, "iomsg")) {
+                    n->children[6] = parse_expr(I);
+                    if (n->n_children < 7) n->n_children = 7;
                 } else {
                     parse_expr(I);
                 }
@@ -6709,9 +6712,14 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
                 if (positional > 0) saw_fmt = 1;
                 advance(I);
             } else if (check(I, FTOK_STRING_LIT)) {
-                if (positional > 0) saw_fmt = 1;
-                copy_cstr(n->format_str, sizeof(n->format_str), peek(I)->str_val);
-                advance(I);
+                if (positional == 0) {
+                    n->children[0] = parse_expr(I);
+                    n->n_children = 1;
+                } else {
+                    saw_fmt = 1;
+                    copy_cstr(n->format_str, sizeof(n->format_str), peek(I)->str_val);
+                    advance(I);
+                }
             } else if (positional == 0) {
                 n->children[0] = parse_expr(I);
                 n->n_children = 1;
@@ -13238,7 +13246,7 @@ static int read_direct_from_file(OfortInterpreter *I, OfortUnitFile *entry, Ofor
         return status;
     }
     if (status == 0) {
-        read_values_from_string(I, recbuf, n);
+        status = read_values_from_string(I, recbuf, n, NULL, 0);
     }
     return status;
 }
@@ -13261,6 +13269,44 @@ static void flush_stdout_for_read(OfortInterpreter *I) {
     fflush(stdout);
     I->out_len = 0;
     I->output[0] = '\0';
+}
+
+static int token_valid_for_type(OfortValType type, const char *token) {
+    char *endptr;
+    if (!token) return 0;
+    if (type == FVAL_INTEGER) {
+        (void)strtoll(token, &endptr, 10);
+        return endptr != token && *endptr == '\0';
+    }
+    if (type == FVAL_REAL || type == FVAL_DOUBLE) {
+        (void)strtod(token, &endptr);
+        return endptr != token && *endptr == '\0';
+    }
+    if (type == FVAL_LOGICAL) {
+        return token[0] == 'T' || token[0] == 't' ||
+               token[0] == 'F' || token[0] == 'f' ||
+               str_eq_nocase(token, ".true.") || str_eq_nocase(token, ".false.");
+    }
+    return 1;
+}
+
+static OfortValType read_target_scalar_type(OfortInterpreter *I, OfortNode *target) {
+    if (target->type == FND_IDENT) {
+        OfortVar *v = find_var(I, target->name);
+        if (!v) ofort_error(I, "Undefined variable '%s'", target->name);
+        return v->val.type == FVAL_ARRAY ? v->val.v.arr.elem_type : v->val.type;
+    }
+    if (target->type == FND_ARRAY_REF && target->children[0] &&
+        target->children[0]->type == FND_IDENT) {
+        OfortVar *v = find_var(I, target->children[0]->name);
+        if (!v) ofort_error(I, "Undefined variable '%s'", target->children[0]->name);
+        return v->val.type == FVAL_ARRAY ? v->val.v.arr.elem_type : v->val.type;
+    }
+    if (target->type == FND_FUNC_CALL) {
+        OfortVar *v = find_var(I, target->name);
+        if (v && v->val.type == FVAL_ARRAY) return v->val.v.arr.elem_type;
+    }
+    return FVAL_VOID;
 }
 
 static int read_values_from_stdin(OfortInterpreter *I, OfortNode *n, int is_stream) {
@@ -13396,7 +13442,9 @@ static int read_file_target(OfortInterpreter *I, FILE *fp, OfortNode *target, ch
     return 0;
 }
 
-static void read_string_target(OfortInterpreter *I, const char **p, OfortNode *target, char *tok, int tok_size) {
+static int read_string_target(OfortInterpreter *I, const char **p, OfortNode *target,
+                              char *tok, int tok_size, int *item_index,
+                              char *iomsg, size_t iomsg_size) {
     if (target->type == FND_IMPLIED_DO) {
         OfortValue start_v = eval_node(I, target->children[0]);
         OfortValue end_v = eval_node(I, target->children[1]);
@@ -13411,10 +13459,12 @@ static void read_string_target(OfortInterpreter *I, const char **p, OfortNode *t
         for (long long iter = start; step > 0 ? iter <= end : iter >= end; iter += step) {
             set_var(I, target->name, make_integer(iter));
             for (int i = 0; i < target->n_stmts; i++) {
-                read_string_target(I, p, target->stmts[i], tok, tok_size);
+                int status = read_string_target(I, p, target->stmts[i], tok, tok_size,
+                                                item_index, iomsg, iomsg_size);
+                if (status) return status;
             }
         }
-        return;
+        return 0;
     }
 
     if (target->type == FND_IDENT) {
@@ -13422,16 +13472,37 @@ static void read_string_target(OfortInterpreter *I, const char **p, OfortNode *t
         if (!v) ofort_error(I, "Undefined variable '%s'", target->name);
         if (v->val.type == FVAL_ARRAY) {
             for (int j = 0; j < v->val.v.arr.len; j++) {
-                if (!read_next_string_token(p, tok, tok_size)) return;
+                int item = ++(*item_index);
+                if (!read_next_string_token(p, tok, tok_size)) {
+                    if (iomsg && iomsg_size) copy_cstr(iomsg, iomsg_size, "End of file");
+                    return -1;
+                }
+                if (!token_valid_for_type(v->val.v.arr.elem_type, tok)) {
+                    if (iomsg && iomsg_size) {
+                        snprintf(iomsg, iomsg_size, "Bad integer for item %d in list input", item);
+                    }
+                    return 1;
+                }
                 assign_token_to_array_element(&v->val, j, tok);
             }
-            return;
+            return 0;
         }
     }
 
     if (read_next_string_token(p, tok, tok_size)) {
+        int item = ++(*item_index);
+        OfortValType target_type = read_target_scalar_type(I, target);
+        if (!token_valid_for_type(target_type, tok)) {
+            if (iomsg && iomsg_size) {
+                snprintf(iomsg, iomsg_size, "Bad integer for item %d in list input", item);
+            }
+            return 1;
+        }
         assign_token_to_read_target(I, target, tok);
+        return 0;
     }
+    if (iomsg && iomsg_size) copy_cstr(iomsg, iomsg_size, "End of file");
+    return -1;
 }
 
 static int read_values_from_file(OfortInterpreter *I, OfortUnitFile *entry, OfortNode *n) {
@@ -13442,7 +13513,7 @@ static int read_values_from_file(OfortInterpreter *I, OfortUnitFile *entry, Ofor
     fseek(fp, entry->stream_pos, SEEK_SET);
 
     if (n->n_stmts == 0) {
-        if (!fgets(tok, sizeof(tok), fp)) status = 1;
+        if (!fgets(tok, sizeof(tok), fp)) status = -1;
         entry->stream_pos = (int)ftell(fp);
         fclose(fp);
         return status;
@@ -13452,7 +13523,7 @@ static int read_values_from_file(OfortInterpreter *I, OfortUnitFile *entry, Ofor
         char line[OFORT_MAX_STRLEN];
         if (!fgets(line, sizeof(line), fp)) {
             line[0] = '\0';
-            status = 1;
+            status = -1;
         }
         line[strcspn(line, "\r\n")] = '\0';
         assign_line_to_character_target(I, n->stmts[0], line);
@@ -13472,13 +13543,15 @@ static int read_values_from_file(OfortInterpreter *I, OfortUnitFile *entry, Ofor
     return status;
 }
 
-static void read_values_from_string(OfortInterpreter *I, const char *text, OfortNode *n) {
+static int read_values_from_string(OfortInterpreter *I, const char *text, OfortNode *n,
+                                   char *iomsg, size_t iomsg_size) {
     const char *p = text ? text : "";
     char tok[1024];
+    int item_index = 0;
 
     if (format_is_character_line_read(n->format_str) && n->n_stmts > 0) {
         assign_line_to_character_target(I, n->stmts[0], p);
-        return;
+        return 0;
     }
 
     if (n->format_str[0]) {
@@ -13489,12 +13562,15 @@ static void read_values_from_string(OfortInterpreter *I, const char *text, Ofort
                 assign_token_to_read_target(I, n->stmts[i], tok);
             }
         }
-        return;
+        return 0;
     }
 
     for (int i = 0; i < n->n_stmts; i++) {
-        read_string_target(I, &p, n->stmts[i], tok, sizeof(tok));
+        int status = read_string_target(I, &p, n->stmts[i], tok, sizeof(tok),
+                                        &item_index, iomsg, iomsg_size);
+        if (status) return status;
     }
+    return 0;
 }
 
 static void namelist_emit(OfortInterpreter *I, FILE *fp, const char *text) {
@@ -20376,6 +20452,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         else if (strcmp(ru, "LOGICAL16") == 0) declare_var(I, local, make_integer(2));
                         else if (strcmp(ru, "LOGICAL32") == 0) declare_var(I, local, make_integer(4));
                         else if (strcmp(ru, "LOGICAL64") == 0) declare_var(I, local, make_integer(8));
+                        else if (strcmp(ru, "IOSTAT_END") == 0) declare_var(I, local, make_integer(-1));
+                        else if (strcmp(ru, "IOSTAT_EOR") == 0) declare_var(I, local, make_integer(-2));
                     }
                 } else {
                     declare_var(I, "output_unit", make_integer(6));
@@ -20388,6 +20466,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     declare_var(I, "logical16", make_integer(2));
                     declare_var(I, "logical32", make_integer(4));
                     declare_var(I, "logical64", make_integer(8));
+                    declare_var(I, "iostat_end", make_integer(-1));
+                    declare_var(I, "iostat_eor", make_integer(-2));
                 }
                 break;
             }
@@ -22444,10 +22524,18 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             int status = 0;
             int rec_no = 0;
             int has_rec = 0;
+            char iomsg[OFORT_MAX_STRLEN];
+            iomsg[0] = '\0';
 
             if (uv.type == FVAL_CHARACTER) {
-                read_values_from_string(I, uv.v.s ? uv.v.s : "", n);
+                status = read_values_from_string(I, uv.v.s ? uv.v.s : "", n, iomsg, sizeof(iomsg));
                 free_value(&uv);
+                if (n->children[4] && n->children[4]->type == FND_IDENT) {
+                    set_var(I, n->children[4]->name, make_integer(status));
+                }
+                if (n->children[6] && n->children[6]->type == FND_IDENT) {
+                    set_var(I, n->children[6]->name, make_character(iomsg));
+                }
             } else {
                 int unit = (int)val_to_int(uv);
                 OfortUnitFile *entry = find_unit_file(I, unit);
@@ -22475,6 +22563,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 if (n->children[4] && n->children[4]->type == FND_IDENT) {
                     set_var(I, n->children[4]->name, make_integer(status));
+                }
+                if (n->children[6] && n->children[6]->type == FND_IDENT) {
+                    set_var(I, n->children[6]->name, make_character(status == -1 ? "End of file" : ""));
                 }
             }
             break;
