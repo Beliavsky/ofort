@@ -14469,7 +14469,9 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
     case FND_ADD: case FND_SUB: case FND_MUL: case FND_DIV: case FND_POWER: {
         OfortValue left = eval_node(I, n->children[0]);
         OfortValue right = eval_node(I, n->children[1]);
-        if (left.type == FVAL_DERIVED || right.type == FVAL_DERIVED) {
+        if (left.type == FVAL_DERIVED || right.type == FVAL_DERIVED ||
+            (left.type == FVAL_ARRAY && left.v.arr.elem_type == FVAL_DERIVED) ||
+            (right.type == FVAL_ARRAY && right.v.arr.elem_type == FVAL_DERIVED)) {
             const char *op_name = NULL;
             OfortValue args[2];
             OfortFunc *func;
@@ -14485,6 +14487,13 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             args[1] = right;
             func = op_name ? find_matching_generic_func(I, op_name, args, 2) : NULL;
             if (func) {
+                OfortNode *fn = func->node;
+                OfortValue elemental_result;
+                if (execute_elemental_function_call(I, n, func, fn, args, 2, &elemental_result)) {
+                    free_value(&left);
+                    free_value(&right);
+                    return elemental_result;
+                }
                 OfortValue result = execute_user_function_with_args(I, func, args, 2);
                 free_value(&left);
                 free_value(&right);
@@ -14809,6 +14818,36 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         OfortValue left = eval_node(I, n->children[0]);
         OfortValue right = eval_node(I, n->children[1]);
         int result = 0;
+        {
+            const char *op_name = NULL;
+            OfortValue args[2];
+            OfortFunc *func;
+            switch (n->type) {
+                case FND_EQ: op_name = "=="; break;
+                case FND_NEQ: op_name = "/="; break;
+                case FND_LT: op_name = "<"; break;
+                case FND_GT: op_name = ">"; break;
+                case FND_LE: op_name = "<="; break;
+                case FND_GE: op_name = ">="; break;
+                default: break;
+            }
+            args[0] = left;
+            args[1] = right;
+            func = op_name ? find_matching_generic_func(I, op_name, args, 2) : NULL;
+            if (func) {
+                OfortNode *fn = func->node;
+                OfortValue elemental_result;
+                if (execute_elemental_function_call(I, n, func, fn, args, 2, &elemental_result)) {
+                    free_value(&left);
+                    free_value(&right);
+                    return elemental_result;
+                }
+                OfortValue generic_result = execute_user_function_with_args(I, func, args, 2);
+                free_value(&left);
+                free_value(&right);
+                return generic_result;
+            }
+        }
 
         if (left.type == FVAL_ARRAY || right.type == FVAL_ARRAY) {
             OfortValue *array_arg = left.type == FVAL_ARRAY ? &left : &right;
@@ -15673,6 +15712,10 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             }
         }
         OfortValue arr = make_array_with_char_len(etype, dims, 1, char_len);
+        if (etype == FVAL_DERIVED && nelem > 0 && elems[0].v.dt.type_name[0]) {
+            copy_cstr(arr.v.arr.elem_type_name, sizeof(arr.v.arr.elem_type_name),
+                      elems[0].v.dt.type_name);
+        }
         for (int i = 0; i < nelem; i++) {
             free_value(&arr.v.arr.data[i]);
             if (etype == FVAL_CHARACTER) elems[i] = resize_character_value(elems[i], char_len);
@@ -18678,6 +18721,33 @@ static void collect_pure_local_names(OfortNode *n, char names[][256], int *n_nam
     }
 }
 
+static OfortValType pure_local_decl_type(OfortNode *n, const char *name) {
+    if (!n || !name || !name[0]) return FVAL_VOID;
+    if (n->type == FND_SUBROUTINE || n->type == FND_FUNCTION || n->type == FND_STMT_FUNCTION)
+        return FVAL_VOID;
+    if ((n->type == FND_VARDECL || n->type == FND_PARAMDECL) &&
+        str_eq_nocase(n->name, name)) {
+        return n->val_type;
+    }
+    for (int i = 0; i < n->n_children; i++) {
+        OfortValType t = pure_local_decl_type(n->children[i], name);
+        if (t != FVAL_VOID) return t;
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        OfortValType t = pure_local_decl_type(n->stmts[i], name);
+        if (t != FVAL_VOID) return t;
+    }
+    return FVAL_VOID;
+}
+
+static int is_pure_internal_write(OfortNode *proc, OfortNode *n) {
+    const char *target_name;
+    if (!proc || !n || n->type != FND_WRITE || !n->children[0]) return 0;
+    target_name = extract_forall_lhs_name(n->children[0]);
+    if (!target_name || !target_name[0]) return 0;
+    return pure_local_decl_type(proc->children[0], target_name) == FVAL_CHARACTER;
+}
+
 static void validate_pure_assignment_target(OfortInterpreter *I, OfortNode *proc, OfortNode *n,
                                             char local_names[][256], int n_local_names) {
     const char *target_name;
@@ -18698,7 +18768,7 @@ static void validate_pure_procedure_tree(OfortInterpreter *I, OfortNode *proc, O
 
     if (!n) return;
     io_name = io_statement_name(n->type);
-    if (io_name) {
+    if (io_name && !is_pure_internal_write(proc, n)) {
         ofort_append_error(I, n->line > 0 ? n->line : proc->line,
                            "%s statement is not allowed in PURE procedure '%s'",
                            io_name, proc->name);
@@ -20042,7 +20112,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 I->n_type_defs++;
             }
             OfortGeneric *src = find_generic(I, remote);
-            if (src && local[0] == '.') {
+            if (src) {
                 OfortGeneric *dst = find_generic(I, local);
                 if (!dst) {
                     ensure_generic_capacity(I, 1);
@@ -21126,6 +21196,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         for (int i = 0; i < rhs.v.arr.n_dims; i++) dims[i] = rhs.v.arr.dims[i];
                         free_value(&v->val);
                         v->val = make_array(rhs.v.arr.elem_type, dims, rhs.v.arr.n_dims);
+                        if (rhs.v.arr.elem_type == FVAL_DERIVED && rhs.v.arr.elem_type_name[0]) {
+                            copy_cstr(v->val.v.arr.elem_type_name, sizeof(v->val.v.arr.elem_type_name),
+                                      rhs.v.arr.elem_type_name);
+                        }
                     }
                     if (rhs.v.arr.len != v->val.v.arr.len)
                         ofort_error(I, "Array assignment shape mismatch assigning to '%s' (lhs %d, rhs %d)",
