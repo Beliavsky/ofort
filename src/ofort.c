@@ -6362,7 +6362,8 @@ static OfortNode *parse_print(OfortInterpreter *I) {
         n->int_val = peek(I)->int_val;
         advance(I);
     } else {
-        n->format_str[0] = '\0';
+        n->children[1] = parse_expr(I);
+        n->n_children = 2;
     }
 
     /* consume comma after format */
