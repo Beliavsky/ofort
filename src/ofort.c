@@ -7645,6 +7645,9 @@ static OfortNode *parse_typed_function(OfortInterpreter *I) {
     OfortValType result_type = token_to_valtype(type_tok->type);
     int result_kind = 0;
     int result_char_len = 0;
+    int is_elemental = 0;
+    int is_pure = 0;
+    int is_impure = 0;
     char derived_type_name[256];
     derived_type_name[0] = '\0';
 
@@ -7697,10 +7700,23 @@ static OfortNode *parse_typed_function(OfortInterpreter *I) {
         }
     }
 
+    while (is_procedure_prefix_token(peek(I))) {
+        if (token_ident_upper(peek(I), "ELEMENTAL")) is_elemental = 1;
+        if (token_ident_upper(peek(I), "PURE")) is_pure = 1;
+        if (token_ident_upper(peek(I), "IMPURE")) is_impure = 1;
+        advance(I);
+    }
+    if (is_elemental && !is_impure) is_pure = 1;
+    if (check(I, FTOK_MODULE) && peek_ahead(I, 1)->type == FTOK_FUNCTION) {
+        advance(I);
+    }
+
     OfortNode *fn = parse_function_with_type(I, result_type, 1);
     if (result_kind > 0) fn->kind = result_kind;
     if (result_type == FVAL_CHARACTER && result_char_len > 0) fn->char_len = result_char_len;
     if (derived_type_name[0]) copy_cstr(fn->str_val, sizeof(fn->str_val), derived_type_name);
+    if (is_elemental) fn->is_elemental = 1;
+    if (is_pure || is_impure) fn->is_pure = is_pure && !is_impure;
     return fn;
 }
 
@@ -8781,6 +8797,11 @@ static int is_procedure_prefix_token(OfortToken *t) {
 
 static int typed_function_follows_type_prefix(OfortInterpreter *I) {
     int pos = I->tok_pos + 1;
+    while (pos < I->n_tokens && is_procedure_prefix_token(&I->tokens[pos])) pos++;
+    if (I->tokens[pos].type == FTOK_MODULE && pos + 1 < I->n_tokens &&
+        I->tokens[pos + 1].type == FTOK_FUNCTION) {
+        return 1;
+    }
     if (I->tokens[pos].type == FTOK_FUNCTION) return 1;
     if (I->tokens[pos].type != FTOK_LPAREN) return 0;
     int depth = 0;
@@ -8791,7 +8812,13 @@ static int typed_function_follows_type_prefix(OfortInterpreter *I) {
         } else if (type == FTOK_RPAREN) {
             depth--;
             if (depth == 0) {
-                return pos + 1 < I->n_tokens && I->tokens[pos + 1].type == FTOK_FUNCTION;
+                pos++;
+                while (pos < I->n_tokens && is_procedure_prefix_token(&I->tokens[pos])) pos++;
+                if (I->tokens[pos].type == FTOK_MODULE && pos + 1 < I->n_tokens &&
+                    I->tokens[pos + 1].type == FTOK_FUNCTION) {
+                    return 1;
+                }
+                return pos < I->n_tokens && I->tokens[pos].type == FTOK_FUNCTION;
             }
         } else if (type == FTOK_NEWLINE || type == FTOK_EOF) {
             return 0;
