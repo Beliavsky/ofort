@@ -10668,6 +10668,8 @@ static int assign_derived_array_member(OfortInterpreter *I, OfortNode *lhs, Ofor
         OfortValue *field = &array_obj->v.arr.data[i].v.dt.fields[field_idx];
         OfortValue elem = rhs->type == FVAL_ARRAY ? array_element_value(rhs, i) : copy_value(*rhs);
         elem = coerce_assignment_value(I, lhs->name, first_field->type, elem);
+        if (first_field->type == FVAL_CHARACTER && first_field->v.s)
+            elem = resize_character_value(elem, (int)strlen(first_field->v.s));
         free_value(field);
         *field = elem;
     }
@@ -14968,6 +14970,40 @@ static void render_write_to_string(OfortInterpreter *I, const char *fmt,
     copy_cstr(I->output, sizeof(I->output), saved_output);
 }
 
+static int declared_character_member_length(OfortInterpreter *I, OfortNode *node) {
+    OfortValue obj;
+    int field_idx;
+    int len = 0;
+
+    if (!node) return 0;
+    if (node->type == FND_ARRAY_REF && node->children[0])
+        return declared_character_member_length(I, node->children[0]);
+    if (node->type != FND_MEMBER || !node->children[0])
+        return 0;
+
+    obj = eval_node(I, node->children[0]);
+    if (obj.type == FVAL_ARRAY && obj.v.arr.data && obj.v.arr.len > 0 &&
+        obj.v.arr.data[0].type == FVAL_DERIVED) {
+        field_idx = derived_field_index(&obj.v.arr.data[0], node->name);
+        if (field_idx >= 0 && obj.v.arr.data[0].v.dt.fields[field_idx].type == FVAL_CHARACTER) {
+            OfortTypeDef *td = find_type_def(I, obj.v.arr.data[0].v.dt.type_name);
+            if (td && field_idx < td->n_fields) len = td->field_char_lens[field_idx];
+            if (len <= 0 && obj.v.arr.data[0].v.dt.fields[field_idx].v.s)
+                len = (int)strlen(obj.v.arr.data[0].v.dt.fields[field_idx].v.s);
+        }
+    } else if (obj.type == FVAL_DERIVED) {
+        field_idx = derived_field_index(&obj, node->name);
+        if (field_idx >= 0 && obj.v.dt.fields[field_idx].type == FVAL_CHARACTER) {
+            OfortTypeDef *td = find_type_def(I, obj.v.dt.type_name);
+            if (td && field_idx < td->n_fields) len = td->field_char_lens[field_idx];
+            if (len <= 0 && obj.v.dt.fields[field_idx].v.s)
+                len = (int)strlen(obj.v.dt.fields[field_idx].v.s);
+        }
+    }
+    free_value(&obj);
+    return len;
+}
+
 static int write_to_internal_target(OfortInterpreter *I, OfortNode *target_node,
                                     const char *fmt, OfortValue *vals, int nvals,
                                     int *status_out) {
@@ -15026,8 +15062,10 @@ static int write_to_internal_target(OfortInterpreter *I, OfortNode *target_node,
         OfortValue *target = member_lvalue(I, target_node);
         int char_len;
         if (!target || target->type != FVAL_CHARACTER) return 0;
-        char_len = target->kind > 0 ? target->kind :
-                   (target->v.s ? (int)strlen(target->v.s) : 1);
+        char_len = declared_character_member_length(I, target_node);
+        if (char_len <= 0 && target->kind > 1) char_len = target->kind;
+        if (char_len <= 0 && target->v.s) char_len = (int)strlen(target->v.s);
+        if (char_len <= 0) char_len = target->kind > 0 ? target->kind : 1;
         render_write_to_string(I, fmt, vals, nvals, text_buf, sizeof(text_buf), 0);
         if ((int)strlen(text_buf) > char_len) {
             if (status_out) {
@@ -16505,6 +16543,12 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                         }
                     } else {
                         v.v.dt.fields[i] = copy_value(args[i]);
+                        v.v.dt.fields[i] = coerce_assignment_value(I, td->field_names[i],
+                                                                   td->field_types[i],
+                                                                   v.v.dt.fields[i]);
+                        if (td->field_types[i] == FVAL_CHARACTER && td->field_char_lens[i] > 0)
+                            v.v.dt.fields[i] = resize_character_value(v.v.dt.fields[i],
+                                                                      td->field_char_lens[i]);
                     }
                 } else if (td->field_is_allocatable[i]) {
                     if (td->field_n_dims[i] > 0) {
