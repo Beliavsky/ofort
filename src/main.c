@@ -3649,11 +3649,19 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
         }
     } else {
         const char *error = ofort_get_error(interp);
+        const char *warnings = ofort_get_warnings(interp);
+        const char *output = ofort_get_output(interp);
         if (g_time_detail) {
             OfortTiming timing;
             if (ofort_get_timing(interp, &timing) == 0) {
                 print_detailed_time(setup_elapsed, &timing);
             }
+        }
+        if (rc == -3 && warnings && warnings[0] != '\0') {
+            fputs(warnings, stderr);
+        }
+        if (rc == -3 && output && output[0] != '\0') {
+            fputs(output, stdout);
         }
         print_source_mapped_error(error, source_map);
     }
