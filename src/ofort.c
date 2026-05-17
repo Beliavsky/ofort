@@ -26095,16 +26095,20 @@ static OfortValue bit_ternary_elemental_value(OfortInterpreter *I, const char *u
     return result;
 }
 
-static int transfer_type_size(OfortValType type, int char_len) {
+static int transfer_type_size_kind(OfortValType type, int kind, int char_len) {
     switch (type) {
     case FVAL_INTEGER:
-    case FVAL_REAL:
-    case FVAL_LOGICAL:
+        if (kind == 16) return 16;
+        if (kind == 8) return 8;
         return 4;
+    case FVAL_LOGICAL:
+        return kind == 8 ? 8 : 4;
+    case FVAL_REAL:
+        return kind == 8 ? 8 : 4;
     case FVAL_DOUBLE:
         return 8;
     case FVAL_COMPLEX:
-        return 8;
+        return kind == 8 ? 16 : 8;
     case FVAL_CHARACTER:
         return char_len > 0 ? char_len : 1;
     default:
@@ -26120,25 +26124,66 @@ static int transfer_mold_char_len(OfortValue mold) {
     return 1;
 }
 
+static int transfer_value_size(OfortValue value) {
+    if (value.type == FVAL_ARRAY) {
+        int total = 0;
+        for (int i = 0; i < value.v.arr.len; i++) {
+            OfortValue elem = array_element_value(&value, i);
+            total += transfer_value_size(elem);
+            free_value(&elem);
+        }
+        return total;
+    }
+    if (value.type == FVAL_DERIVED) {
+        int total = 0;
+        for (int i = 0; i < value.v.dt.n_fields; i++)
+            total += transfer_value_size(value.v.dt.fields[i]);
+        return total;
+    }
+    return transfer_type_size_kind(value.type, value.kind, transfer_mold_char_len(value));
+}
+
 static int transfer_append_bytes_from_value(OfortValue value, unsigned char *bytes, int max_bytes) {
     int used = 0;
     if (max_bytes <= 0) return 0;
     if (value.type == FVAL_ARRAY) {
         for (int i = 0; i < value.v.arr.len && used < max_bytes; i++) {
-            used += transfer_append_bytes_from_value(value.v.arr.data[i], bytes + used, max_bytes - used);
+            OfortValue elem = array_element_value(&value, i);
+            used += transfer_append_bytes_from_value(elem, bytes + used, max_bytes - used);
+            free_value(&elem);
         }
         return used;
     }
+    if (value.type == FVAL_DERIVED) {
+        for (int i = 0; i < value.v.dt.n_fields && used < max_bytes; i++)
+            used += transfer_append_bytes_from_value(value.v.dt.fields[i], bytes + used, max_bytes - used);
+        return used;
+    }
     if (value.type == FVAL_INTEGER) {
-        uint32_t u = (uint32_t)value.v.i;
-        int n = max_bytes < 4 ? max_bytes : 4;
-        memcpy(bytes, &u, (size_t)n);
+        int size = transfer_type_size_kind(FVAL_INTEGER, value.kind, 1);
+        int n = max_bytes < size ? max_bytes : size;
+        if (size == 16) {
+            __int128 v = value.kind == 16 ? value.v.i128 : (__int128)value.v.i;
+            memcpy(bytes, &v, (size_t)n);
+        } else if (size == 8) {
+            int64_t v = (int64_t)value.v.i;
+            memcpy(bytes, &v, (size_t)n);
+        } else {
+            int32_t v = (int32_t)value.v.i;
+            memcpy(bytes, &v, (size_t)n);
+        }
         return n;
     }
     if (value.type == FVAL_REAL) {
-        float f = (float)value.v.r;
-        int n = max_bytes < 4 ? max_bytes : 4;
-        memcpy(bytes, &f, (size_t)n);
+        int size = transfer_type_size_kind(FVAL_REAL, value.kind, 1);
+        int n = max_bytes < size ? max_bytes : size;
+        if (size == 8) {
+            double d = value.v.r;
+            memcpy(bytes, &d, (size_t)n);
+        } else {
+            float f = (float)value.v.r;
+            memcpy(bytes, &f, (size_t)n);
+        }
         return n;
     }
     if (value.type == FVAL_DOUBLE) {
@@ -26148,17 +26193,31 @@ static int transfer_append_bytes_from_value(OfortValue value, unsigned char *byt
         return n;
     }
     if (value.type == FVAL_LOGICAL) {
-        uint32_t u = value.v.b ? 1U : 0U;
-        int n = max_bytes < 4 ? max_bytes : 4;
-        memcpy(bytes, &u, (size_t)n);
+        int size = transfer_type_size_kind(FVAL_LOGICAL, value.kind, 1);
+        int n = max_bytes < size ? max_bytes : size;
+        if (size == 8) {
+            int64_t v = value.v.b ? 1 : 0;
+            memcpy(bytes, &v, (size_t)n);
+        } else {
+            int32_t v = value.v.b ? 1 : 0;
+            memcpy(bytes, &v, (size_t)n);
+        }
         return n;
     }
     if (value.type == FVAL_COMPLEX) {
-        float parts[2];
-        int n = max_bytes < 8 ? max_bytes : 8;
-        parts[0] = (float)value.v.cx.re;
-        parts[1] = (float)value.v.cx.im;
-        memcpy(bytes, parts, (size_t)n);
+        int size = transfer_type_size_kind(FVAL_COMPLEX, value.kind, 1);
+        int n = max_bytes < size ? max_bytes : size;
+        if (size == 16) {
+            double parts[2];
+            parts[0] = value.v.cx.re;
+            parts[1] = value.v.cx.im;
+            memcpy(bytes, parts, (size_t)n);
+        } else {
+            float parts[2];
+            parts[0] = (float)value.v.cx.re;
+            parts[1] = (float)value.v.cx.im;
+            memcpy(bytes, parts, (size_t)n);
+        }
         return n;
     }
     if (value.type == FVAL_CHARACTER) {
@@ -26170,10 +26229,13 @@ static int transfer_append_bytes_from_value(OfortValue value, unsigned char *byt
     return 0;
 }
 
+static OfortValue transfer_value_from_bytes_like_mold(OfortValue mold,
+                                                      const unsigned char *bytes, int nbytes, int offset);
+
 static OfortValue transfer_value_from_bytes(OfortValType type, int kind, int char_len,
-                                           const unsigned char *bytes, int nbytes, int offset) {
+                                            const unsigned char *bytes, int nbytes, int offset) {
     unsigned char tmp[16];
-    int size = transfer_type_size(type, char_len);
+    int size = transfer_type_size_kind(type, kind, char_len);
     memset(tmp, 0, sizeof(tmp));
     if (size > (int)sizeof(tmp)) size = (int)sizeof(tmp);
     for (int i = 0; i < size; i++) {
@@ -26182,14 +26244,30 @@ static OfortValue transfer_value_from_bytes(OfortValType type, int kind, int cha
     }
     switch (type) {
     case FVAL_INTEGER: {
-        uint32_t u = 0;
-        memcpy(&u, tmp, sizeof(u));
-        return make_integer_kind(signed_mask_value(u, 32), kind > 0 ? kind : 4);
+        if (kind == 16) {
+            __int128 v = 0;
+            memcpy(&v, tmp, sizeof(v));
+            return make_integer128(v);
+        } else if (kind == 8) {
+            int64_t v = 0;
+            memcpy(&v, tmp, sizeof(v));
+            return make_integer_kind((long long)v, 8);
+        } else {
+            int32_t v = 0;
+            memcpy(&v, tmp, sizeof(v));
+            return make_integer_kind((long long)v, kind > 0 ? kind : 4);
+        }
     }
     case FVAL_REAL: {
-        float f = 0.0f;
-        memcpy(&f, tmp, sizeof(f));
-        return make_real((double)f);
+        if (kind == 8) {
+            double d = 0.0;
+            memcpy(&d, tmp, sizeof(d));
+            return make_double(d);
+        } else {
+            float f = 0.0f;
+            memcpy(&f, tmp, sizeof(f));
+            return make_real((double)f);
+        }
     }
     case FVAL_DOUBLE: {
         double d = 0.0;
@@ -26197,9 +26275,15 @@ static OfortValue transfer_value_from_bytes(OfortValType type, int kind, int cha
         return make_double(d);
     }
     case FVAL_LOGICAL: {
-        uint32_t u = 0;
-        memcpy(&u, tmp, sizeof(u));
-        return make_logical(u != 0);
+        if (kind == 8) {
+            int64_t v = 0;
+            memcpy(&v, tmp, sizeof(v));
+            return make_logical(v != 0);
+        } else {
+            int32_t v = 0;
+            memcpy(&v, tmp, sizeof(v));
+            return make_logical(v != 0);
+        }
     }
     case FVAL_CHARACTER: {
         char buf[OFORT_MAX_STRLEN];
@@ -26212,6 +26296,38 @@ static OfortValue transfer_value_from_bytes(OfortValType type, int kind, int cha
     default:
         return make_void_val();
     }
+}
+
+static OfortValue transfer_value_from_bytes_like_mold(OfortValue mold,
+                                                      const unsigned char *bytes, int nbytes, int offset) {
+    if (mold.type == FVAL_DERIVED) {
+        OfortValue result = copy_value(mold);
+        int pos = offset;
+        for (int i = 0; i < result.v.dt.n_fields; i++) {
+            OfortValue field_mold = result.v.dt.fields[i];
+            OfortValue field_value = transfer_value_from_bytes_like_mold(field_mold, bytes, nbytes, pos);
+            pos += transfer_value_size(field_mold);
+            free_value(&result.v.dt.fields[i]);
+            result.v.dt.fields[i] = field_value;
+        }
+        return result;
+    }
+    if (mold.type == FVAL_ARRAY) {
+        OfortValue result = make_array_with_char_len(mold.v.arr.elem_type, mold.v.arr.dims,
+                                                     mold.v.arr.n_dims, transfer_mold_char_len(mold));
+        int pos = offset;
+        for (int i = 0; i < result.v.arr.len; i++) {
+            OfortValue elem_mold = array_element_value(&mold, i);
+            OfortValue elem_value = transfer_value_from_bytes_like_mold(elem_mold, bytes, nbytes, pos);
+            pos += transfer_value_size(elem_mold);
+            free_value(&result.v.arr.data[i]);
+            result.v.arr.data[i] = elem_value;
+            free_value(&elem_mold);
+        }
+        return result;
+    }
+    return transfer_value_from_bytes(mold.type, mold.kind, transfer_mold_char_len(mold),
+                                     bytes, nbytes, offset);
 }
 
 static int ofort_rnorm_method(OfortInterpreter *I, OfortValue *arg) {
@@ -29548,7 +29664,13 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         result_type = args[1].type == FVAL_ARRAY ? args[1].v.arr.elem_type : args[1].type;
         result_kind = args[1].type == FVAL_ARRAY && args[1].v.arr.len > 0 ? args[1].v.arr.data[0].kind : args[1].kind;
         char_len = transfer_mold_char_len(args[1]);
-        elem_size = transfer_type_size(result_type, char_len);
+        if (args[1].type == FVAL_ARRAY && args[1].v.arr.len > 0) {
+            OfortValue elem_mold = array_element_value(&args[1], 0);
+            elem_size = transfer_value_size(elem_mold);
+            free_value(&elem_mold);
+        } else {
+            elem_size = transfer_value_size(args[1]);
+        }
         if (elem_size <= 0) ofort_error(I, "TRANSFER mold type is not supported");
         memset(bytes, 0, sizeof(bytes));
         nbytes = transfer_append_bytes_from_value(args[0], bytes, (int)sizeof(bytes));
@@ -29560,20 +29682,27 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             dims[0] = result_len;
             result = make_array_with_char_len(result_type, dims, 1, char_len);
             for (int i = 0; i < result.v.arr.len; i++) {
+                OfortValue elem_mold = args[1].type == FVAL_ARRAY && args[1].v.arr.len > 0 ?
+                                       array_element_value(&args[1], 0) : copy_value(args[1]);
                 free_value(&result.v.arr.data[i]);
-                result.v.arr.data[i] = transfer_value_from_bytes(result_type, result_kind, char_len, bytes, nbytes, i * elem_size);
+                result.v.arr.data[i] = transfer_value_from_bytes_like_mold(elem_mold, bytes, nbytes, i * elem_size);
+                free_value(&elem_mold);
             }
             return result;
         }
         if (args[1].type == FVAL_ARRAY) {
             OfortValue result = make_array_with_char_len(result_type, args[1].v.arr.dims, args[1].v.arr.n_dims, char_len);
             for (int i = 0; i < result.v.arr.len; i++) {
+                OfortValue elem_mold = array_element_value(&args[1], i);
                 free_value(&result.v.arr.data[i]);
-                result.v.arr.data[i] = transfer_value_from_bytes(result_type, result_kind, char_len, bytes, nbytes, i * elem_size);
+                result.v.arr.data[i] = transfer_value_from_bytes_like_mold(elem_mold, bytes, nbytes, i * elem_size);
+                free_value(&elem_mold);
             }
             return result;
         }
-        return transfer_value_from_bytes(result_type, result_kind, char_len, bytes, nbytes, 0);
+        (void)result_kind;
+        (void)char_len;
+        return transfer_value_from_bytes_like_mold(args[1], bytes, nbytes, 0);
     }
 
     if (strcmp(upper, "ABS") == 0) {
