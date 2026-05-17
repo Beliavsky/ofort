@@ -34,6 +34,10 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
+#include <direct.h>
+#define OFORT_GETCWD _getcwd
+#else
+#define OFORT_GETCWD getcwd
 #endif
 
 /* â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -762,11 +766,27 @@ static int str_eq_nocase(const char *a, const char *b) {
     return *a == *b;
 }
 
-static int name_in_list_nocase(const char *name, char names[OFORT_MAX_PARAMS][256], int n_names) {
+static int name_in_list_nocase(const char *name, char (*names)[256], int n_names) {
     for (int i = 0; i < n_names; i++) {
         if (str_eq_nocase(name, names[i])) return 1;
     }
     return 0;
+}
+
+static void add_name_to_dynamic_list(OfortInterpreter *I, char (**names)[256],
+                                     int *n_names, int *cap, const char *name) {
+    char (*new_names)[256];
+
+    if (!names || !n_names || !cap || !name || !name[0]) return;
+    if (*n_names >= *cap) {
+        int new_cap = *cap ? *cap * 2 : OFORT_MAX_PARAMS;
+        new_names = (char (*)[256])realloc(*names, (size_t)new_cap * sizeof(**names));
+        if (!new_names) ofort_error(I, "Out of memory");
+        *names = new_names;
+        *cap = new_cap;
+    }
+    copy_cstr((*names)[*n_names], sizeof((*names)[0]), name);
+    (*n_names)++;
 }
 
 /* â”€â”€ Value constructors â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
@@ -1529,6 +1549,74 @@ static OfortFunc *find_matching_generic_func(OfortInterpreter *I, const char *na
 static OfortFunc *find_matching_generic_subroutine(OfortInterpreter *I, const char *name,
                                                    OfortValue *args, int nargs) {
     return find_matching_generic_proc(I, name, args, nargs, 0);
+}
+
+static int call_has_named_actuals(OfortNode *call, int nargs) {
+    if (!call) return 0;
+    for (int i = 0; i < nargs && i < OFORT_MAX_PARAMS; i++) {
+        if (call->param_names[i][0]) return 1;
+    }
+    return 0;
+}
+
+static int procedure_dummy_index(OfortNode *fn, const char *name) {
+    if (!fn || !name || !name[0]) return -1;
+    for (int i = 0; i < fn->n_params; i++) {
+        if (str_eq_nocase(fn->param_names[i], name)) return i;
+    }
+    return -1;
+}
+
+static void reorder_named_function_actuals(OfortInterpreter *I, OfortNode *call,
+                                           OfortNode *fn, OfortValue **args_ptr,
+                                           int *nargs_ptr) {
+    OfortValue *old_args;
+    OfortValue *new_args;
+    int old_nargs;
+    int used[OFORT_MAX_PARAMS] = {0};
+    int next_pos = 0;
+    int max_index = -1;
+
+    if (!call || !fn || !args_ptr || !*args_ptr || !nargs_ptr) return;
+    old_args = *args_ptr;
+    old_nargs = *nargs_ptr;
+    if (!call_has_named_actuals(call, old_nargs)) return;
+
+    new_args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*new_args));
+    if (!new_args) ofort_error(I, "Out of memory");
+    for (int i = 0; i < OFORT_MAX_PARAMS; i++) new_args[i].type = FVAL_VOID;
+
+    for (int i = 0; i < old_nargs; i++) {
+        int target = -1;
+        if (call->param_names[i][0]) {
+            target = procedure_dummy_index(fn, call->param_names[i]);
+            if (target < 0) {
+                free_call_args(new_args, OFORT_MAX_PARAMS);
+                ofort_error(I, "Unknown keyword argument '%s' in call to '%s'",
+                            call->param_names[i], fn->name);
+            }
+        } else {
+            while (next_pos < fn->n_params && used[next_pos]) next_pos++;
+            target = next_pos++;
+        }
+        if (target < 0 || target >= OFORT_MAX_PARAMS) {
+            free_call_args(new_args, OFORT_MAX_PARAMS);
+            ofort_error(I, "Too many function arguments");
+        }
+        if (used[target]) {
+            free_call_args(new_args, OFORT_MAX_PARAMS);
+            ofort_error(I, "Duplicate argument '%s' in call to '%s'",
+                        fn->param_names[target], fn->name);
+        }
+        used[target] = 1;
+        new_args[target] = old_args[i];
+        old_args[i].type = FVAL_VOID;
+        if (target > max_index) max_index = target;
+    }
+
+    free_call_args(old_args, old_nargs);
+    *args_ptr = new_args;
+    *nargs_ptr = max_index + 1;
 }
 
 static OfortGeneric *find_generic(OfortInterpreter *I, const char *name) {
@@ -9094,6 +9182,37 @@ static OfortNode *parse_implicit_stmt(OfortInterpreter *I) {
     return n;
 }
 
+static void access_stmt_add_name(OfortInterpreter *I, OfortNode *n, const char *name) {
+    OfortNode *item;
+
+    if (!I || !n || !name || !name[0]) return;
+    item = alloc_node(I, FND_IDENT);
+    item->line = n->line;
+    copy_cstr(item->name, sizeof(item->name), name);
+    n->stmts = (OfortNode **)realloc(n->stmts, (size_t)(n->n_stmts + 1) * sizeof(*n->stmts));
+    if (!n->stmts) ofort_error(I, "Out of memory");
+    n->stmts[n->n_stmts++] = item;
+    if (n->n_params < OFORT_MAX_PARAMS) {
+        copy_cstr(n->param_names[n->n_params], sizeof(n->param_names[0]), name);
+    }
+    n->n_params++;
+}
+
+static int access_stmt_name_count(const OfortNode *n) {
+    if (!n) return 0;
+    return n->n_stmts > 0 ? n->n_stmts : n->n_params;
+}
+
+static const char *access_stmt_name_at(const OfortNode *n, int index) {
+    if (!n || index < 0) return "";
+    if (n->n_stmts > 0) {
+        if (index >= n->n_stmts || !n->stmts[index]) return "";
+        return n->stmts[index]->name;
+    }
+    if (index >= n->n_params || index >= OFORT_MAX_PARAMS) return "";
+    return n->param_names[index];
+}
+
 static OfortNode *parse_access_stmt(OfortInterpreter *I) {
     OfortToken *t = advance(I);
     OfortNode *n = alloc_node(I, FND_ACCESS);
@@ -9110,17 +9229,15 @@ static OfortNode *parse_access_stmt(OfortInterpreter *I) {
     if (token_ident_upper(peek(I), "OPERATOR")) {
         char op_name[256];
         if (parse_operator_designator(I, op_name, sizeof(op_name))) {
-            if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "access specifiers");
-            copy_cstr(n->param_names[n->n_params++], sizeof(n->param_names[0]), op_name);
+            access_stmt_add_name(I, n, op_name);
         } else {
             advance(I);
         }
         continue;
     }
         if (check(I, FTOK_IDENT)) {
-            if (n->n_params >= OFORT_MAX_PARAMS) too_many_params_error(I, "access specifiers");
             OfortToken *name = advance(I);
-            copy_cstr(n->param_names[n->n_params++], sizeof(n->param_names[0]), name->str_val);
+            access_stmt_add_name(I, n, name->str_val);
         } else {
             advance(I);
         }
@@ -14852,16 +14969,28 @@ static void render_write_to_string(OfortInterpreter *I, const char *fmt,
 }
 
 static int write_to_internal_target(OfortInterpreter *I, OfortNode *target_node,
-                                    const char *fmt, OfortValue *vals, int nvals) {
+                                    const char *fmt, OfortValue *vals, int nvals,
+                                    int *status_out) {
     char text_buf[OFORT_MAX_STRLEN];
     OfortValue text;
+    int target_len;
 
+    if (status_out) *status_out = 0;
     if (!target_node) return 0;
 
     if (target_node->type == FND_IDENT) {
         OfortVar *target = find_var(I, target_node->name);
         if (!target || target->val.type != FVAL_CHARACTER) return 0;
         render_write_to_string(I, fmt, vals, nvals, text_buf, sizeof(text_buf), 0);
+        target_len = target->char_len > 0 ? target->char_len :
+                     (target->val.v.s ? (int)strlen(target->val.v.s) : 0);
+        if ((int)strlen(text_buf) > target_len) {
+            if (status_out) {
+                *status_out = -2;
+                return 1;
+            }
+            ofort_error(I, "End of record");
+        }
         text = make_character(text_buf);
         text = resize_character_value(text, target->char_len);
         free_value(&target->val);
@@ -14876,6 +15005,16 @@ static int write_to_internal_target(OfortInterpreter *I, OfortNode *target_node,
             return 0;
         }
         render_write_to_string(I, fmt, vals, nvals, text_buf, sizeof(text_buf), 0);
+        target_len = target->char_len > 0 ? target->char_len : array_character_len(&target->val);
+        if (target_len <= 0 && target->val.v.arr.len > 0 && target->val.v.arr.data[0].type == FVAL_CHARACTER)
+            target_len = target->val.v.arr.data[0].v.s ? (int)strlen(target->val.v.arr.data[0].v.s) : 0;
+        if ((int)strlen(text_buf) > target_len) {
+            if (status_out) {
+                *status_out = -2;
+                return 1;
+            }
+            ofort_error(I, "End of record");
+        }
         text = make_character(text_buf);
         text = resize_character_value(text, target->char_len);
         assign_array_ref(I, target, target_node, &text);
@@ -14890,6 +15029,13 @@ static int write_to_internal_target(OfortInterpreter *I, OfortNode *target_node,
         char_len = target->kind > 0 ? target->kind :
                    (target->v.s ? (int)strlen(target->v.s) : 1);
         render_write_to_string(I, fmt, vals, nvals, text_buf, sizeof(text_buf), 0);
+        if ((int)strlen(text_buf) > char_len) {
+            if (status_out) {
+                *status_out = -2;
+                return 1;
+            }
+            ofort_error(I, "End of record");
+        }
         text = make_character(text_buf);
         text = resize_character_value(text, char_len);
         text.kind = char_len;
@@ -15101,6 +15247,11 @@ static OfortValue execute_user_function_with_args(OfortInterpreter *I, OfortFunc
     for (int i = 0; i < fn->n_params; i++) {
         if (i < nargs && args[i].type != FVAL_VOID) {
             OfortVar *pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
+            if (args[i].type == FVAL_CHARACTER && args[i].v.s) {
+                pv->char_len = (int)strlen(args[i].v.s);
+            } else if (args[i].type == FVAL_ARRAY && args[i].v.arr.elem_type == FVAL_CHARACTER) {
+                pv->char_len = array_character_len(&args[i]);
+            }
             pv->is_optional = fn->param_optional[i];
         } else if (fn->param_optional[i]) {
             declare_absent_optional_var(I, fn->param_names[i]);
@@ -16151,6 +16302,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         if (!func) func = find_matching_generic_func(I, procedure_call_name[0] ? procedure_call_name : n->name, args, nargs);
         if (func && func->is_function) {
             OfortNode *fn = func->node;
+            reorder_named_function_actuals(I, n, fn, &args, &nargs);
             if (fn && fn->type == FND_STMT_FUNCTION) {
                 OfortValue result;
                 if (nargs != fn->n_params) {
@@ -16457,6 +16609,45 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_ARRAY_REF: {
+        if (n->children[0] &&
+            (n->children[0]->type == FND_IDENT || n->children[0]->type == FND_FUNC_CALL) &&
+            (find_func(I, n->children[0]->name) || find_generic(I, n->children[0]->name))) {
+            const char *call_name = n->children[0]->name;
+            int nargs = n->n_stmts;
+            OfortValue *args;
+            OfortFunc *func;
+
+            if (nargs > OFORT_MAX_PARAMS) too_many_params_error(I, "function arguments");
+            args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
+            if (!args) ofort_error(I, "Out of memory");
+            for (int i = 0; i < nargs; i++) {
+                if (n->stmts[i]->type == FND_IDENT) {
+                    OfortVar *actual = find_var(I, n->stmts[i]->name);
+                    if (actual && actual->is_optional && !actual->present) {
+                        args[i] = make_void_val();
+                        continue;
+                    }
+                    if (actual && procedure_ref_name(&actual->val)) {
+                        args[i] = copy_value(actual->val);
+                        continue;
+                    }
+                }
+                args[i] = eval_node(I, n->stmts[i]);
+            }
+
+            func = find_func(I, call_name);
+            if (!func) func = find_matching_generic_func(I, call_name, args, nargs);
+            if (func && func->is_function) {
+                OfortValue result;
+                reorder_named_function_actuals(I, n, func->node, &args, &nargs);
+                if (!execute_elemental_function_call(I, n, func, func->node, args, nargs, &result)) {
+                    result = execute_user_function_with_args(I, func, args, nargs);
+                }
+                free_call_args(args, nargs);
+                return result;
+            }
+            free_call_args(args, nargs);
+        }
         if (n->children[0] && n->children[0]->type == FND_MEMBER) {
             OfortNode *member = n->children[0];
             OfortValue receiver = eval_node(I, member->children[0]);
@@ -19694,7 +19885,7 @@ static void validate_pure_procedure_tree(OfortInterpreter *I, OfortNode *proc, O
                            "Impure intrinsic subroutine '%s' is not allowed in PURE procedure '%s'",
                            n->name, proc->name);
     }
-    if (n->type == FND_FUNC_CALL) {
+    if (n->type == FND_FUNC_CALL && pure_local_name_index(local_names, n_local_names, n->name) < 0) {
         OfortFunc *func = find_func(I, n->name);
         if (func && func->node && !func->node->is_pure) {
             ofort_append_error(I, n->line > 0 ? n->line : proc->line,
@@ -20677,11 +20868,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (I->n_modules >= OFORT_MAX_MODULES) ofort_error(I, "Too many modules");
         if (find_module(I, n->name)) break;
         OfortModule *mod = &I->modules[I->n_modules++];
-        char (*public_names)[256] = (char (*)[256])calloc(OFORT_MAX_PARAMS, sizeof(*public_names));
-        char (*private_names)[256] = (char (*)[256])calloc(OFORT_MAX_PARAMS, sizeof(*private_names));
+        char (*public_names)[256] = NULL;
+        char (*private_names)[256] = NULL;
         int n_public_names = 0;
         int n_private_names = 0;
-        if (!public_names || !private_names) ofort_error(I, "Out of memory");
+        int public_names_cap = 0;
+        int private_names_cap = 0;
         copy_cstr(mod->name, sizeof(mod->name), n->name);
         mod->n_vars = 0;
         mod->n_namelists = 0;
@@ -20703,13 +20895,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     mod->default_private = s->bool_val ? 0 : 1;
                     continue;
                 }
-                for (int j = 0; j < s->n_params; j++) {
+                for (int j = 0; j < access_stmt_name_count(s); j++) {
+                    const char *access_name = access_stmt_name_at(s, j);
                     if (s->bool_val) {
-                        if (n_public_names < OFORT_MAX_PARAMS)
-                            copy_cstr(public_names[n_public_names++], sizeof(public_names[0]), s->param_names[j]);
+                        add_name_to_dynamic_list(I, &public_names, &n_public_names,
+                                                 &public_names_cap, access_name);
                     } else {
-                        if (n_private_names < OFORT_MAX_PARAMS)
-                            copy_cstr(private_names[n_private_names++], sizeof(private_names[0]), s->param_names[j]);
+                        add_name_to_dynamic_list(I, &private_names, &n_private_names,
+                                                 &private_names_cap, access_name);
                     }
                 }
             }
@@ -23039,11 +23232,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 wrote_stdout = 1;
                 status = 0;
             }
-        } else if (n->children[0] && write_to_internal_target(I, n->children[0], fmt, vals, nvals)) {
+        } else if (n->children[0] &&
+                   write_to_internal_target(I, n->children[0], fmt, vals, nvals,
+                                            n->children[4] ? &status : NULL)) {
             /* Internal character WRITE completed. */
-            status = 0;
             if (n->children[4] && n->children[4]->type == FND_IDENT) {
-                set_var(I, n->children[4]->name, make_integer(0));
+                set_var(I, n->children[4]->name, make_integer(status));
             }
         } else if (n->children[0] && n->children[0]->type == FND_IDENT) {
             OfortVar *target = find_var(I, n->children[0]->name);
@@ -24101,6 +24295,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (harvest) harvest->is_initialized = 1;
             break;
         }
+        if (strcmp(call_upper, "GETCWD") == 0) {
+            char cwd[OFORT_MAX_STRLEN];
+            if (n->n_stmts != 1)
+                ofort_error(I, "GETCWD requires one CHARACTER variable argument");
+            if (!OFORT_GETCWD(cwd, sizeof(cwd)))
+                ofort_error(I, "GETCWD failed");
+            assign_intrinsic_output_target(I, "GETCWD", "DIRECTORY",
+                                           n->stmts[0], make_character(cwd));
+            break;
+        }
         if (strcmp(call_upper, "GET_COMMAND") == 0) {
             int command_idx = -1;
             int length_idx = -1;
@@ -24692,8 +24896,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int arg_alias[OFORT_MAX_PARAMS] = {0};
         int arg_present[OFORT_MAX_PARAMS] = {0};
         OfortVar *arg_alias_var[OFORT_MAX_PARAMS] = {0};
+        int actual_for_param[OFORT_MAX_PARAMS] = {0};
         OfortFunc *func = find_func(I, n->name);
         OfortNode *fn = func ? func->node : NULL;
+        for (int i = 0; i < OFORT_MAX_PARAMS; i++) actual_for_param[i] = i;
         for (int i = 0; i < nargs; i++) {
             args[i] = make_void_val();
             if (n->stmts[i]->type == FND_IDENT) {
@@ -24762,14 +24968,67 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (func->is_function) {
             ofort_error(I, "'%s' is a function, not a subroutine", n->name);
         }
+        if (fn && call_has_named_actuals(n, n->n_stmts)) {
+            OfortValue *new_args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*new_args));
+            int new_arg_present[OFORT_MAX_PARAMS] = {0};
+            int new_arg_alias[OFORT_MAX_PARAMS] = {0};
+            OfortVar *new_arg_alias_var[OFORT_MAX_PARAMS] = {0};
+            int new_actual_for_param[OFORT_MAX_PARAMS];
+            int used[OFORT_MAX_PARAMS] = {0};
+            int next_pos = 0;
+            int max_index = -1;
+            if (!new_args) ofort_error(I, "Out of memory");
+            for (int i = 0; i < OFORT_MAX_PARAMS; i++) {
+                new_args[i] = make_void_val();
+                new_actual_for_param[i] = -1;
+            }
+            for (int i = 0; i < n->n_stmts; i++) {
+                int target = -1;
+                if (n->param_names[i][0]) {
+                    target = procedure_dummy_index(fn, n->param_names[i]);
+                    if (target < 0)
+                        ofort_error(I, "Unknown keyword argument '%s' in call to '%s'",
+                                    n->param_names[i], fn->name);
+                } else {
+                    while (next_pos < fn->n_params && used[next_pos]) next_pos++;
+                    target = next_pos++;
+                }
+                if (target < 0 || target >= OFORT_MAX_PARAMS)
+                    ofort_error(I, "Too many subroutine arguments");
+                if (used[target])
+                    ofort_error(I, "Duplicate argument '%s' in call to '%s'",
+                                fn->param_names[target], fn->name);
+                used[target] = 1;
+                new_args[target] = args[i];
+                args[i].type = FVAL_VOID;
+                new_arg_present[target] = arg_present[i];
+                new_arg_alias[target] = arg_alias[i];
+                new_arg_alias_var[target] = arg_alias_var[i];
+                new_actual_for_param[target] = i;
+                if (target > max_index) max_index = target;
+            }
+            for (int i = 0; i < OFORT_MAX_PARAMS; i++) {
+                free_value(&args[i]);
+                args[i] = new_args[i];
+                arg_present[i] = new_arg_present[i];
+                arg_alias[i] = new_arg_alias[i];
+                arg_alias_var[i] = new_arg_alias_var[i];
+                actual_for_param[i] = new_actual_for_param[i];
+            }
+            free(new_args);
+            nargs = max_index + 1;
+        }
         for (int i = 0; fn && i < fn->n_params && i < nargs; i++) {
+            int actual_i = actual_for_param[i];
+            if (!arg_present[i] || actual_i < 0) continue;
             if (procedure_param_may_be_defined(fn, i) &&
-                !actual_argument_is_definable(I, n->stmts[i])) {
+                !actual_argument_is_definable(I, n->stmts[actual_i])) {
                 ofort_error(I, "Actual argument for dummy argument '%s' of '%s' is not definable",
                             fn->param_names[i], fn->name);
             }
         }
-        if (execute_elemental_subroutine_call(I, n, func, fn, args, nargs,
+        if (!call_has_named_actuals(n, n->n_stmts) &&
+            execute_elemental_subroutine_call(I, n, func, fn, args, nargs,
                                               arg_alias, arg_alias_var)) {
             for (int i = 0; i < nargs; i++) free_value(&args[i]);
             free(args);
@@ -24793,6 +25052,22 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             } else if (i < nargs && arg_present[i] &&
                        (args[i].type != FVAL_VOID || fn->param_allocatables[i] || fn->param_pointers[i])) {
                 pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
+                if (args[i].type == FVAL_CHARACTER && args[i].v.s) {
+                    pv->char_len = (int)strlen(args[i].v.s);
+                } else if (args[i].type == FVAL_ARRAY && args[i].v.arr.elem_type == FVAL_CHARACTER) {
+                    pv->char_len = array_character_len(&args[i]);
+                }
+                if (actual_for_param[i] >= 0 && actual_for_param[i] < n->n_stmts &&
+                    n->stmts[actual_for_param[i]]->type == FND_IDENT) {
+                    OfortVar *actual_var = find_var(I, n->stmts[actual_for_param[i]]->name);
+                    if (actual_var && actual_var->char_len > 0 &&
+                        (actual_var->declared_type == FVAL_CHARACTER ||
+                         actual_var->val.type == FVAL_CHARACTER ||
+                         (actual_var->val.type == FVAL_ARRAY &&
+                          actual_var->val.v.arr.elem_type == FVAL_CHARACTER))) {
+                        pv->char_len = actual_var->char_len;
+                    }
+                }
                 if (fn->param_pointers[i] && procedure_ref_name(&args[i])) {
                     pv->is_pointer = 1;
                     pv->present = 1;
@@ -24864,9 +25139,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 OfortValue *val = vals[vi];
                 if (!val->is_pointer_ref || !val->pointer_target[0]) continue;
                 for (int j = 0; j < fn->n_params && j < nargs; j++) {
-                    if (!str_eq_nocase(val->pointer_target, fn->param_names[j])) continue;
-                    if (n->stmts[j]->type != FND_IDENT) continue;
-                    copy_cstr(val->pointer_target, sizeof(val->pointer_target), n->stmts[j]->name);
+                if (!str_eq_nocase(val->pointer_target, fn->param_names[j])) continue;
+                    {
+                        int actual_j = actual_for_param[j];
+                        if (actual_j < 0 || actual_j >= n->n_stmts ||
+                            n->stmts[actual_j]->type != FND_IDENT) continue;
+                        copy_cstr(val->pointer_target, sizeof(val->pointer_target), n->stmts[actual_j]->name);
+                    }
                     break;
                 }
             }
@@ -24874,14 +25153,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 for (int j = 0; j < fn->n_params && j < nargs; j++) {
                     int saved_lower_bounds[7] = {1, 1, 1, 1, 1, 1, 1};
                     int saved_rank = 0;
+                    int actual_j = actual_for_param[j];
                     if (!str_eq_nocase(pv->pointer_target, fn->param_names[j])) continue;
-                    if (n->stmts[j]->type != FND_IDENT) continue;
+                    if (actual_j < 0 || actual_j >= n->n_stmts ||
+                        n->stmts[actual_j]->type != FND_IDENT) continue;
                     if (pv->val.type == FVAL_ARRAY) {
                         saved_rank = pv->val.v.arr.n_dims;
                         for (int lb_i = 0; lb_i < saved_rank && lb_i < 7; lb_i++)
                             saved_lower_bounds[lb_i] = pv->val.v.arr.lower_bounds[lb_i];
                     }
-                    copy_cstr(pv->pointer_target, sizeof(pv->pointer_target), n->stmts[j]->name);
+                    copy_cstr(pv->pointer_target, sizeof(pv->pointer_target), n->stmts[actual_j]->name);
                     free_value(&pv->val);
                     pv->val = pointer_referenced_value(I, pv->pointer_target, pv->pointer_has_slice,
                                                         pv->pointer_slice_start, pv->pointer_slice_end,
@@ -24897,10 +25178,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
         /* Handle INTENT(OUT/INOUT) â€” copy back */
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
+            int actual_i = actual_for_param[i];
+            OfortNode *actual_node = (actual_i >= 0 && actual_i < n->n_stmts) ? n->stmts[actual_i] : NULL;
+            if (!actual_node && !arg_present[i]) continue;
             if (!arg_alias[i] && fn->param_intents[i] != 1) {
                 if (procedure_ref_name(&args[i]) && !fn->param_pointers[i]) continue;
                 OfortVar *pv = find_var(I, fn->param_names[i]);
-                if (pv && pv->present && n->stmts[i]->type == FND_FUNC_CALL) {
+                if (pv && pv->present && actual_node && actual_node->type == FND_FUNC_CALL) {
                     for (int vi = 0; vi < I->current_scope->n_vars; vi++) {
                         OfortVar *candidate = &I->current_scope->vars[vi];
                         if (candidate->is_pointer && candidate->pointer_associated) {
@@ -24909,11 +25193,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         }
                     }
                 }
-                if (pv && pv->present &&
-                    (n->stmts[i]->type == FND_IDENT || n->stmts[i]->type == FND_MEMBER ||
-                     n->stmts[i]->type == FND_FUNC_CALL || n->stmts[i]->type == FND_ARRAY_REF)) {
-                    if (n->stmts[i]->type == FND_IDENT) {
-                        OfortVar *actual = find_var(I, n->stmts[i]->name);
+                if (pv && pv->present && actual_node &&
+                    (actual_node->type == FND_IDENT || actual_node->type == FND_MEMBER ||
+                     actual_node->type == FND_FUNC_CALL || actual_node->type == FND_ARRAY_REF)) {
+                    if (actual_node->type == FND_IDENT) {
+                        OfortVar *actual = find_var(I, actual_node->name);
                         if (actual && actual->is_pointer && pv->is_pointer) {
                             if (procedure_ref_name(&pv->val)) {
                                 pointer_copyback[i] = 1;
@@ -24931,7 +25215,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                                 pointer_copyback_slice_stride[i] = pv->pointer_slice_stride;
                             }
                         }
-                    } else if (n->stmts[i]->type == FND_MEMBER && pv->is_pointer) {
+                    } else if (actual_node->type == FND_MEMBER && pv->is_pointer) {
                         if (procedure_ref_name(&pv->val)) {
                             pointer_copyback[i] = 1;
                             pointer_copyback_target[i][0] = '\0';
@@ -24951,8 +25235,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     free_value(&args[i]);
                     args[i] = copy_value(pv->val);
                 }
-                if (pv && pv->present && fn->param_allocatables[i] &&
-                    (n->stmts[i]->type == FND_IDENT || n->stmts[i]->type == FND_MEMBER)) {
+                if (pv && pv->present && fn->param_allocatables[i] && actual_node &&
+                    (actual_node->type == FND_IDENT || actual_node->type == FND_MEMBER)) {
                     free_value(&args[i]);
                     args[i] = copy_value(pv->val);
                 }
@@ -24964,9 +25248,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         pop_scope(I);
         sync_module_vars_to_scope(I, func->module_name);
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
-            if (!arg_alias[i] && n->stmts[i]->type == FND_IDENT && fn->param_intents[i] != 1 &&
+            int actual_i = actual_for_param[i];
+            OfortNode *actual_node = (actual_i >= 0 && actual_i < n->n_stmts) ? n->stmts[actual_i] : NULL;
+            if (!actual_node && !arg_present[i]) continue;
+            if (!arg_alias[i] && actual_node && actual_node->type == FND_IDENT && fn->param_intents[i] != 1 &&
                 fn->param_pointers[i]) {
-                OfortVar *actual = find_var(I, n->stmts[i]->name);
+                OfortVar *actual = find_var(I, actual_node->name);
                 if (actual && actual->is_pointer) {
                     if (pointer_copyback[i]) {
                         free_value(&actual->val);
@@ -25000,9 +25287,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     continue;
                 }
             }
-            if (!arg_alias[i] && n->stmts[i]->type == FND_IDENT && fn->param_intents[i] != 1 &&
+            if (!arg_alias[i] && actual_node && actual_node->type == FND_IDENT && fn->param_intents[i] != 1 &&
                 args[i].type != FVAL_VOID && !procedure_ref_name(&args[i])) {
-                OfortVar *actual = find_var(I, n->stmts[i]->name);
+                OfortVar *actual = find_var(I, actual_node->name);
                 if (actual && actual->is_parameter) continue;
                 if (actual && actual->is_pointer && pointer_copyback[i]) {
                     free_value(&actual->val);
@@ -25025,8 +25312,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                                              (actual->val.type == FVAL_ARRAY && actual->val.v.arr.allocated);
                     continue;
                 }
-                set_var(I, n->stmts[i]->name, copy_value(args[i]));
-            } else if (!arg_alias[i] && n->stmts[i]->type == FND_MEMBER && fn->param_intents[i] != 1 &&
+                set_var(I, actual_node->name, copy_value(args[i]));
+            } else if (!arg_alias[i] && actual_node && actual_node->type == FND_MEMBER && fn->param_intents[i] != 1 &&
                        (args[i].type != FVAL_VOID || fn->param_allocatables[i] ||
                         fn->param_pointers[i]) &&
                        (!procedure_ref_name(&args[i]) || fn->param_pointers[i])) {
@@ -25059,21 +25346,22 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     }
                 }
             } else if (!arg_alias[i] &&
-                       (n->stmts[i]->type == FND_FUNC_CALL || n->stmts[i]->type == FND_ARRAY_REF) &&
+                       actual_node &&
+                       (actual_node->type == FND_FUNC_CALL || actual_node->type == FND_ARRAY_REF) &&
                        fn->param_intents[i] != 1 &&
                        args[i].type != FVAL_VOID && !procedure_ref_name(&args[i])) {
-                OfortValue *target = member_lvalue(I, n->stmts[i]);
+                OfortValue *target = member_lvalue(I, actual_node);
                 if (target) {
                     free_value(target);
                     *target = copy_value(args[i]);
-                } else if (n->stmts[i]->type == FND_FUNC_CALL) {
-                    OfortVar *actual = find_var(I, n->stmts[i]->name);
+                } else if (actual_node->type == FND_FUNC_CALL) {
+                    OfortVar *actual = find_var(I, actual_node->name);
                     if (actual && actual->val.type == FVAL_ARRAY && !actual->is_parameter)
-                        assign_array_ref(I, actual, n->stmts[i], &args[i]);
-                } else if (n->stmts[i]->type == FND_ARRAY_REF && n->stmts[i]->children[0]) {
-                    OfortValue *array_target = member_lvalue(I, n->stmts[i]->children[0]);
+                        assign_array_ref(I, actual, actual_node, &args[i]);
+                } else if (actual_node->type == FND_ARRAY_REF && actual_node->children[0]) {
+                    OfortValue *array_target = member_lvalue(I, actual_node->children[0]);
                     if (array_target && array_target->type == FVAL_ARRAY)
-                        assign_array_ref_value(I, array_target, n->stmts[i], &args[i]);
+                        assign_array_ref_value(I, array_target, actual_node, &args[i]);
                 }
             }
         }
@@ -33017,6 +33305,145 @@ int ofort_check(OfortInterpreter *interp, const char *source) {
         free(processed_source);
         return rc;
     }
+}
+
+static int unused_proc_func_index(OfortInterpreter *I, const OfortFunc *func) {
+    if (!I || !func) return -1;
+    for (int i = 0; i < I->n_funcs; i++) {
+        if (&I->funcs[i] == func) return i;
+    }
+    return -1;
+}
+
+static int unused_proc_name_matches(const char *a, const char *b) {
+    return a && b && a[0] && b[0] && str_eq_nocase(a, b);
+}
+
+static void unused_proc_mark_name(OfortInterpreter *I, const char *name, unsigned char *reachable);
+
+static void unused_proc_scan_node(OfortInterpreter *I, OfortNode *n, unsigned char *reachable) {
+    if (!I || !n || !reachable) return;
+    if (n->type == FND_SUBROUTINE || n->type == FND_FUNCTION || n->type == FND_STMT_FUNCTION ||
+        n->type == FND_MODULE || n->type == FND_BLOCK_DATA) {
+        return;
+    }
+    if ((n->type == FND_CALL || n->type == FND_FUNC_CALL ||
+         n->type == FND_ARRAY_REF || n->type == FND_IDENT) && n->name[0]) {
+        unused_proc_mark_name(I, n->name, reachable);
+    }
+    for (int i = 0; i < n->n_children; i++) {
+        unused_proc_scan_node(I, n->children[i], reachable);
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        unused_proc_scan_node(I, n->stmts[i], reachable);
+    }
+}
+
+static void unused_proc_mark_func(OfortInterpreter *I, int index, unsigned char *reachable) {
+    OfortFunc *func;
+    if (!I || !reachable || index < 0 || index >= I->n_funcs) return;
+    if (reachable[index]) return;
+    reachable[index] = 1;
+    func = &I->funcs[index];
+    if (func->node) {
+        for (int i = 0; i < func->node->n_children; i++) {
+            unused_proc_scan_node(I, func->node->children[i], reachable);
+        }
+        for (int i = 0; i < func->node->n_stmts; i++) {
+            unused_proc_scan_node(I, func->node->stmts[i], reachable);
+        }
+    }
+}
+
+static void unused_proc_mark_generic(OfortInterpreter *I, const char *name, unsigned char *reachable) {
+    OfortGeneric *generic;
+    if (!I || !name || !name[0]) return;
+    generic = find_generic(I, name);
+    if (!generic) return;
+    for (int i = 0; i < generic->n_procedures; i++) {
+        for (int j = 0; j < I->n_funcs; j++) {
+            if (unused_proc_name_matches(I->funcs[j].name, generic->procedures[i])) {
+                unused_proc_mark_func(I, j, reachable);
+            }
+        }
+    }
+}
+
+static void unused_proc_mark_name(OfortInterpreter *I, const char *name, unsigned char *reachable) {
+    if (!I || !name || !name[0] || !reachable) return;
+    for (int i = 0; i < I->n_funcs; i++) {
+        if (unused_proc_name_matches(I->funcs[i].name, name)) {
+            unused_proc_mark_func(I, i, reachable);
+        }
+    }
+    unused_proc_mark_generic(I, name, reachable);
+}
+
+static void unused_proc_scan_roots(OfortInterpreter *I, unsigned char *reachable) {
+    if (!I || !I->ast || !reachable) return;
+    if (I->ast->type != FND_BLOCK) {
+        unused_proc_scan_node(I, I->ast, reachable);
+        return;
+    }
+    for (int i = 0; i < I->ast->n_stmts; i++) {
+        OfortNode *s = I->ast->stmts[i];
+        if (!s) continue;
+        if (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
+            s->type == FND_STMT_FUNCTION || s->type == FND_MODULE ||
+            s->type == FND_BLOCK_DATA) {
+            continue;
+        }
+        unused_proc_scan_node(I, s, reachable);
+    }
+}
+
+static const char *unused_proc_kind(const OfortFunc *func) {
+    if (!func || !func->node) return "procedure";
+    if (func->node->type == FND_STMT_FUNCTION) return "statement-function";
+    if (func->node->type == FND_FUNCTION) return "function";
+    if (func->node->type == FND_SUBROUTINE) return "subroutine";
+    return func->is_function ? "function" : "subroutine";
+}
+
+int ofort_analyze_unused_procs(OfortInterpreter *interp, const char *source,
+                               OfortUnusedProcedureEntry *entries,
+                               int max_entries, int *n_entries) {
+    unsigned char *reachable;
+    int count = 0;
+    int rc;
+
+    if (!interp || !source || !n_entries) return -1;
+    *n_entries = 0;
+    rc = ofort_check(interp, source);
+    if (rc != 0) return rc;
+    if (interp->n_funcs <= 0) return 0;
+    reachable = (unsigned char *)calloc((size_t)interp->n_funcs, sizeof(*reachable));
+    if (!reachable) {
+        snprintf(interp->error, sizeof(interp->error), "Out of memory analyzing procedures");
+        interp->has_error = 1;
+        return -1;
+    }
+
+    unused_proc_scan_roots(interp, reachable);
+
+    for (int i = 0; i < interp->n_funcs; i++) {
+        OfortFunc *func = &interp->funcs[i];
+        int func_index = unused_proc_func_index(interp, func);
+        if (func_index < 0 || reachable[func_index]) continue;
+        if (entries && count < max_entries) {
+            memset(&entries[count], 0, sizeof(entries[count]));
+            copy_cstr(entries[count].status, sizeof(entries[count].status), "unused");
+            copy_cstr(entries[count].name, sizeof(entries[count].name), func->name);
+            copy_cstr(entries[count].module_name, sizeof(entries[count].module_name), func->module_name);
+            copy_cstr(entries[count].kind, sizeof(entries[count].kind), unused_proc_kind(func));
+            entries[count].line = func->node ? func->node->line : 0;
+        }
+        count++;
+    }
+
+    free(reachable);
+    *n_entries = count;
+    return 0;
 }
 
 void ofort_set_print_expr_statements(OfortInterpreter *interp, int enabled) {
