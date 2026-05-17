@@ -5139,6 +5139,34 @@ static void reject_nonstandard_star_kind(OfortInterpreter *I, const char *type_n
     }
 }
 
+static int supported_kind_for_type(OfortValType type, int kind) {
+    if (kind == 0) return 1;
+    if (kind < 0) return 0;
+    switch (type) {
+        case FVAL_INTEGER:
+            return kind == 1 || kind == 2 || kind == 4 || kind == 8 || kind == 16;
+        case FVAL_REAL:
+            return kind == 4 || kind == 8;
+        case FVAL_DOUBLE:
+            return kind == 8;
+        case FVAL_COMPLEX:
+            return kind == 4 || kind == 8 || kind == 16;
+        case FVAL_LOGICAL:
+            return kind == 1 || kind == 2 || kind == 4 || kind == 8;
+        case FVAL_CHARACTER:
+            return kind == 1 || kind == 4;
+        default:
+            return 1;
+    }
+}
+
+static void reject_unsupported_kind(OfortInterpreter *I, OfortValType type, int kind) {
+    if (!supported_kind_for_type(type, kind)) {
+        ofort_error(I, "Unsupported %s kind %d",
+                    valtype_standard_name(type), kind);
+    }
+}
+
 static int parse_kind_selector_ex(OfortInterpreter *I, OfortNode **kind_expr_out) {
     int kind = 0;
     expect(I, FTOK_LPAREN);
@@ -14861,6 +14889,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             OfortValue kv = eval_node(I, n->kind_expr);
             int runtime_kind = (int)val_to_int(kv);
             free_value(&kv);
+            reject_unsupported_kind(I, runtime_kind == 8 ? FVAL_DOUBLE : FVAL_REAL, runtime_kind);
             if (runtime_kind == 8) return make_double(n->num_val);
             OfortValue r = make_real(n->num_val);
             r.kind = runtime_kind;
@@ -20616,8 +20645,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         if (strcmp(ru, "OUTPUT_UNIT") == 0) declare_var(I, local, make_integer(6));
                         else if (strcmp(ru, "INPUT_UNIT") == 0) declare_var(I, local, make_integer(5));
                         else if (strcmp(ru, "ERROR_UNIT") == 0) declare_var(I, local, make_integer(0));
+                        else if (strcmp(ru, "REAL16") == 0) declare_var(I, local, make_integer(-1));
+                        else if (strcmp(ru, "REAL32") == 0) declare_var(I, local, make_integer(4));
                         else if (strcmp(ru, "REAL64") == 0) declare_var(I, local, make_integer(8));
-                        else if (strcmp(ru, "REAL16") == 0) declare_var(I, local, make_integer(-2));
+                        else if (strcmp(ru, "REAL128") == 0) declare_var(I, local, make_integer(-1));
                         else if (strcmp(ru, "INT64") == 0) declare_var(I, local, make_integer(8));
                         else if (strcmp(ru, "LOGICAL8") == 0) declare_var(I, local, make_integer(1));
                         else if (strcmp(ru, "LOGICAL16") == 0) declare_var(I, local, make_integer(2));
@@ -20630,8 +20661,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     declare_var(I, "output_unit", make_integer(6));
                     declare_var(I, "input_unit", make_integer(5));
                     declare_var(I, "error_unit", make_integer(0));
+                    declare_var(I, "real16", make_integer(-1));
+                    declare_var(I, "real32", make_integer(4));
                     declare_var(I, "real64", make_integer(8));
-                    declare_var(I, "real16", make_integer(-2));
+                    declare_var(I, "real128", make_integer(-1));
                     declare_var(I, "int64", make_integer(8));
                     declare_var(I, "logical8", make_integer(1));
                     declare_var(I, "logical16", make_integer(2));
@@ -21096,6 +21129,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             effective_kind = (int)val_to_int(kv);
             free_value(&kv);
         }
+        if (effective_type == FVAL_DOUBLE && effective_kind == 0) {
+            effective_kind = 8;
+        }
+        reject_unsupported_kind(I, effective_type, effective_kind);
         n->val_type = effective_type;
         n->kind = effective_kind;
         int decl_char_len = n->val_type == FVAL_CHARACTER ? eval_character_length(I, n) : 0;
@@ -23463,20 +23500,61 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             break;
         }
         if (strcmp(call_upper, "CPU_TIME") == 0) {
-            OfortVar *time_var;
+            OfortNode *target_node;
+            OfortValue *time_slot;
             OfortValType time_type;
             double seconds;
-            if (n->n_stmts != 1 || n->stmts[0]->type != FND_IDENT)
+            OfortValue val;
+            if (n->n_stmts != 1)
                 ofort_error(I, "CPU_TIME requires a variable argument");
-            time_var = find_var(I, n->stmts[0]->name);
-            if (!time_var)
-                ofort_error(I, "Undefined variable '%s' in CPU_TIME", n->stmts[0]->name);
-            if (time_var->val.type != FVAL_REAL && time_var->val.type != FVAL_DOUBLE)
-                ofort_error(I, "CPU_TIME argument must be REAL");
-            time_type = time_var->val.type;
+            target_node = n->stmts[0];
+            time_slot = member_lvalue(I, target_node);
             seconds = (double)clock() / (double)CLOCKS_PER_SEC;
-            free_value(&time_var->val);
-            time_var->val = time_type == FVAL_DOUBLE ? make_double(seconds) : make_real(seconds);
+            if (!time_slot &&
+                (target_node->type == FND_FUNC_CALL || target_node->type == FND_ARRAY_REF)) {
+                OfortVar *array_var = NULL;
+                OfortSubscriptRange ranges[7];
+                int has_slice = 0;
+                int subscripts[7];
+                int index;
+                if (target_node->type == FND_FUNC_CALL) {
+                    array_var = find_var(I, target_node->name);
+                } else if (target_node->children[0] &&
+                           target_node->children[0]->type == FND_IDENT) {
+                    array_var = find_var(I, target_node->children[0]->name);
+                }
+                if (array_var && array_var->val.type == FVAL_ARRAY &&
+                    array_var->val.v.arr.real_data &&
+                    (array_var->val.v.arr.elem_type == FVAL_REAL ||
+                     array_var->val.v.arr.elem_type == FVAL_DOUBLE)) {
+                    for (int i = 0; i < target_node->n_stmts; i++) {
+                        int extent = i < array_var->val.v.arr.n_dims ?
+                                     array_var->val.v.arr.dims[i] :
+                                     array_var->val.v.arr.len;
+                        int lower = i < array_var->val.v.arr.n_dims ?
+                                    array_var->val.v.arr.lower_bounds[i] : 1;
+                        if (eval_subscript_range(I, target_node->stmts[i], lower, extent, &ranges[i]))
+                            has_slice = 1;
+                    }
+                    if (!has_slice) {
+                        for (int i = 0; i < target_node->n_stmts; i++) subscripts[i] = ranges[i].start;
+                        index = section_linear_index(&array_var->val, subscripts, target_node->n_stmts);
+                        if (index < 0 || index >= array_var->val.v.arr.len)
+                            ofort_error(I, "Array index out of bounds: %d (size %d)",
+                                        index + 1, array_var->val.v.arr.len);
+                        array_var->val.v.arr.real_data[index] = seconds;
+                        break;
+                    }
+                }
+            }
+            if (!time_slot)
+                ofort_error(I, "CPU_TIME requires a variable argument");
+            if (time_slot->type != FVAL_REAL && time_slot->type != FVAL_DOUBLE)
+                ofort_error(I, "CPU_TIME argument must be REAL");
+            time_type = time_slot->type;
+            val = time_type == FVAL_DOUBLE ? make_double(seconds) : make_real(seconds);
+            free_value(time_slot);
+            *time_slot = val;
             break;
         }
         if (strcmp(call_upper, "DATE_AND_TIME") == 0) {
