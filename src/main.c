@@ -3622,7 +3622,7 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
     ofort_set_live_stdout(interp, ISATTY(FILENO(stdin)) && ISATTY(FILENO(stdout)));
 
     rc = ofort_execute(interp, source);
-    if (rc == 0) {
+    if (rc == 0 || rc == -2) {
         const char *warnings = ofort_get_warnings(interp);
         const char *output = ofort_get_output(interp);
         if (g_time_detail) {
@@ -3687,7 +3687,7 @@ static int execute_source_text_on_interpreter(OfortInterpreter *interp, const ch
     ofort_set_command_args(interp, command_argc, (const char *const *)command_args);
 
     rc = ofort_execute(interp, source);
-    if (rc == 0) {
+    if (rc == 0 || rc == -2) {
         const char *warnings = ofort_get_warnings(interp);
         const char *output = ofort_get_output(interp);
         if (warnings && warnings[0] != '\0') {
@@ -3732,7 +3732,7 @@ static int run_ofort_file_to_path(const char *source_path, const char *out_path)
     }
 
     rc = ofort_execute(interp, source);
-    if (rc == 0) {
+    if (rc == 0 || rc == -2) {
         const char *warnings = ofort_get_warnings(interp);
         if (warnings && warnings[0] != '\0') {
             fputs(warnings, stderr);
@@ -4112,7 +4112,7 @@ static int run_ofort_paths_to_path(const char *const *paths, int npaths, const c
 
     ofort_set_command_args(interp, command_argc, (const char *const *)command_args);
     rc = ofort_execute(interp, source);
-    if (rc == 0) {
+    if (rc == 0 || rc == -2) {
         const char *warnings = ofort_get_warnings(interp);
         if (warnings && warnings[0] != '\0') fputs(warnings, stderr);
         fp = fopen(out_path, "wb");
@@ -4576,7 +4576,7 @@ static int run_repl_source_with_ofort(OfortInterpreter **interp, const char *sou
     ofort_set_live_stdout(*interp, 1);
     warn_unused_repl_source_if_enabled(exec_source, fast_mode, 1);
     rc = ofort_execute(*interp, exec_source);
-    if (rc == 0) {
+    if (rc == 0 || rc == -2) {
         const char *warnings = ofort_get_warnings(*interp);
         const char *output = ofort_get_output(*interp);
         if (warnings && warnings[0] != '\0') {
