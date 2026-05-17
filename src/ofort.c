@@ -266,6 +266,7 @@ struct OfortInterpreter {
     char pending_construct_name[256];
     int stop_expr_at_slash;
     int stop_expr_at_colon;
+    int io_eval_depth;
     OfortValue *where_mask;
     int where_mask_invert;
     int where_mask_index;
@@ -14763,13 +14764,30 @@ static void collect_io_values(OfortInterpreter *I, OfortNode *node,
     append_io_value(I, vals, nvals, cap, eval_node(I, node));
 }
 
+static int is_internal_write_target_node(OfortInterpreter *I, OfortNode *target) {
+    OfortVar *v = NULL;
+    if (!I || !target) return 0;
+    if (target->type == FND_IDENT) {
+        v = find_var(I, target->name);
+    } else if ((target->type == FND_FUNC_CALL || target->type == FND_ARRAY_REF) &&
+               target->name[0]) {
+        v = find_var(I, target->name);
+    }
+    if (!v) return 0;
+    if (v->val.type == FVAL_CHARACTER || v->declared_type == FVAL_CHARACTER) return 1;
+    if (v->val.type == FVAL_ARRAY && v->val.v.arr.elem_type == FVAL_CHARACTER) return 1;
+    return 0;
+}
+
 static OfortValue *eval_io_list(OfortInterpreter *I, OfortNode *n, int *nvals_out) {
     OfortValue *vals = NULL;
     int nvals = 0;
     int cap = 0;
+    I->io_eval_depth++;
     for (int i = 0; i < n->n_stmts; i++) {
         collect_io_values(I, n->stmts[i], &vals, &nvals, &cap);
     }
+    I->io_eval_depth--;
     if (!vals) vals = (OfortValue *)calloc(1, sizeof(OfortValue));
     *nvals_out = nvals;
     return vals;
@@ -22718,6 +22736,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_PRINT: {
+        if (I->io_eval_depth > 0)
+            ofort_error(I, "Recursive I/O not allowed");
         int nvals = 0;
         OfortValue *vals = eval_io_list(I, n, &nvals);
         char fmt_buf[OFORT_MAX_STRLEN];
@@ -22738,6 +22758,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         break;
 
     case FND_WRITE: {
+        if (I->io_eval_depth > 0 &&
+            (!n->children[0] || !is_internal_write_target_node(I, n->children[0])))
+            ofort_error(I, "Recursive I/O not allowed");
         int nvals = 0;
         OfortValue *vals = NULL;
         char fmt_buf[OFORT_MAX_STRLEN];
@@ -32368,6 +32391,7 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     interp->procedure_depth = 0;
     interp->active_module_name[0] = '\0';
     interp->consumed_bare_end = 0;
+    interp->io_eval_depth = 0;
     if (interp->procedure_profile_enabled) clear_procedure_profile(interp);
     if (prepare_line_profile(interp, source) != 0) {
         snprintf(interp->error, sizeof(interp->error), "Out of memory for line profiler");
@@ -32376,6 +32400,7 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     }
 
     if (setjmp(interp->err_jmp) != 0) {
+        interp->io_eval_depth = 0;
         if (processed_source && processed_source != interp->cached_processed_source) free(processed_source);
         return interp->preserve_output_on_error ? -3 : -1;
     }
@@ -32494,8 +32519,10 @@ int ofort_check(OfortInterpreter *interp, const char *source) {
     interp->procedure_depth = 0;
     interp->active_module_name[0] = '\0';
     interp->consumed_bare_end = 0;
+    interp->io_eval_depth = 0;
 
     if (setjmp(interp->err_jmp) != 0) {
+        interp->io_eval_depth = 0;
         return -1;
     }
 
