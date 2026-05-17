@@ -116,6 +116,7 @@ typedef struct {
     int field_char_lens[OFORT_MAX_FIELDS];
     OfortNode *field_char_len_exprs[OFORT_MAX_FIELDS];
     OfortNode *field_kind_exprs[OFORT_MAX_FIELDS];
+    int field_kinds[OFORT_MAX_FIELDS];
     OfortNode *field_init_exprs[OFORT_MAX_FIELDS];
     OfortNode *field_type_param_exprs[OFORT_MAX_FIELDS][OFORT_MAX_TYPE_ACTUALS];
     int field_n_type_param_exprs[OFORT_MAX_FIELDS];
@@ -6595,6 +6596,9 @@ static OfortNode *parse_write(OfortInterpreter *I) {
             } else if (str_eq_nocase(name, "rec")) {
                 n->children[5] = parse_expr(I);
                 if (n->n_children < 6) n->n_children = 6;
+            } else if (str_eq_nocase(name, "pos")) {
+                n->children[7] = parse_expr(I);
+                if (n->n_children < 8) n->n_children = 8;
             } else if (str_eq_nocase(name, "iostat")) {
                 n->children[4] = parse_expr(I);
                 if (n->n_children < 5) n->n_children = 5;
@@ -6679,7 +6683,7 @@ static OfortNode *parse_write(OfortInterpreter *I) {
         }
     }
     expect(I, FTOK_RPAREN);
-    if (n->children[0] && !saw_fmt && positional == 1) {
+    if (n->children[0] && !saw_fmt) {
         n->bool_val = 1;
     }
     if (check(I, FTOK_COMMA)) {
@@ -6732,6 +6736,9 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
                 } else if (str_eq_nocase(name, "rec")) {
                     n->children[5] = parse_expr(I);
                     if (n->n_children < 6) n->n_children = 6;
+                } else if (str_eq_nocase(name, "pos")) {
+                    n->children[7] = parse_expr(I);
+                    if (n->n_children < 8) n->n_children = 8;
                 } else if (str_eq_nocase(name, "fmt")) {
                     saw_fmt = 1;
                     if (check(I, FTOK_STAR)) advance(I);
@@ -6780,7 +6787,7 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
             else break;
         }
         expect(I, FTOK_RPAREN);
-        if (n->children[0] && !saw_fmt && positional == 1) {
+        if (n->children[0] && !saw_fmt) {
             n->bool_val = 1;
         }
     } else if (check(I, FTOK_STAR)) {
@@ -10211,7 +10218,7 @@ static OfortValue default_derived_value(OfortInterpreter *I, const char *type_na
         return make_void_val();
     }
     for (int i = 0; i < td->n_fields; i++) {
-        int field_kind = 0;
+        int field_kind = td->field_kinds[i];
         int field_char_len = td->field_char_lens[i];
         int field_dims[7];
         int field_lower_bounds[7] = {1, 1, 1, 1, 1, 1, 1};
@@ -12572,6 +12579,70 @@ static int fill_random_number_array_section(OfortInterpreter *I, OfortVar *var, 
     return 1;
 }
 
+static int fill_random_number_derived_array_component_element(OfortInterpreter *I,
+                                                              OfortNode *ref) {
+    OfortNode *member;
+    OfortNode *base;
+    OfortVar *var;
+    int field_idx;
+    OfortSubscriptRange range;
+    int has_range;
+    uint64_t rng_state = 0;
+
+    if (!ref || ref->type != FND_ARRAY_REF || ref->n_stmts != 1 ||
+        !ref->children[0] || ref->children[0]->type != FND_MEMBER) {
+        return 0;
+    }
+    member = ref->children[0];
+    base = member->children[0];
+    if (!base || base->type != FND_IDENT) return 0;
+    var = find_var(I, base->name);
+    if (!var || var->val.type != FVAL_ARRAY || !var->val.v.arr.data ||
+        var->val.v.arr.len <= 0 || var->val.v.arr.data[0].type != FVAL_DERIVED) {
+        return 0;
+    }
+    field_idx = derived_field_index(&var->val.v.arr.data[0], member->name);
+    if (field_idx < 0) ofort_error(I, "Unknown member '%s'", member->name);
+
+    if (I->fast_mode) {
+        seed_fast_rng_if_needed(I);
+        rng_state = I->fast_rng_state;
+    }
+
+    for (int i = 0; i < var->val.v.arr.len; i++) {
+        OfortValue *field = &var->val.v.arr.data[i].v.dt.fields[field_idx];
+        int subscripts[1];
+        int index;
+        double value;
+
+        if (field->type != FVAL_ARRAY)
+            ofort_error(I, "RANDOM_NUMBER harvest component is not an array");
+        if (field->v.arr.elem_type != FVAL_REAL && field->v.arr.elem_type != FVAL_DOUBLE)
+            ofort_error(I, "RANDOM_NUMBER harvest array must be REAL");
+        has_range = eval_subscript_range(I, ref->stmts[0],
+                                         field->v.arr.lower_bounds[0],
+                                         field->v.arr.dims[0], &range);
+        if (has_range)
+            ofort_error(I, "RANDOM_NUMBER component array section is not implemented");
+        subscripts[0] = range.start;
+        index = section_linear_index(field, subscripts, 1);
+        if (index < 0 || index >= field->v.arr.len)
+            ofort_error(I, "Array index out of bounds");
+        value = random_number_next(I, &rng_state);
+        if (field->v.arr.real_data) {
+            field->v.arr.real_data[index] = value;
+        } else if (field->v.arr.data) {
+            OfortValue elem = field->v.arr.elem_type == FVAL_DOUBLE ?
+                              make_double(value) : make_real(value);
+            free_value(&field->v.arr.data[index]);
+            field->v.arr.data[index] = elem;
+        }
+    }
+    if (I->fast_mode) I->fast_rng_state = rng_state;
+    var->is_initialized = 1;
+    return 1;
+}
+
 static void append_to_buffer(char *buf, int bufsize, const char *text) {
     size_t used;
     size_t avail;
@@ -13012,17 +13083,36 @@ static void write_values_to_stream_file(OfortInterpreter *I, const char *path, O
     fclose(fp);
 }
 
+static void write_one_value_to_stream(OfortInterpreter *I, FILE *fp, OfortValue *val, int binary);
+
 static void write_one_binary_value_to_stream(FILE *fp, OfortValue *val) {
     if (!val) return;
     if (val->type == FVAL_INTEGER) {
-        fwrite(&val->v.i, sizeof(val->v.i), 1, fp);
+        if (val->kind == 8) {
+            int64_t x = (int64_t)val->v.i;
+            fwrite(&x, sizeof(x), 1, fp);
+        } else {
+            int32_t x = (int32_t)val->v.i;
+            fwrite(&x, sizeof(x), 1, fp);
+        }
     } else if (val->type == FVAL_REAL || val->type == FVAL_DOUBLE) {
-        fwrite(&val->v.r, sizeof(val->v.r), 1, fp);
+        if (val->type == FVAL_DOUBLE || val->kind == 8) {
+            double x = val->v.r;
+            fwrite(&x, sizeof(x), 1, fp);
+        } else {
+            float x = (float)val->v.r;
+            fwrite(&x, sizeof(x), 1, fp);
+        }
     } else if (val->type == FVAL_LOGICAL) {
-        fwrite(&val->v.b, sizeof(val->v.b), 1, fp);
+        int32_t x = val->v.b ? 1 : 0;
+        fwrite(&x, sizeof(x), 1, fp);
     } else if (val->type == FVAL_CHARACTER) {
         const char *s = val->v.s ? val->v.s : "";
         fwrite(s, 1, strlen(s), fp);
+    } else if (val->type == FVAL_DERIVED) {
+        for (int i = 0; i < val->v.dt.n_fields; i++) {
+            write_one_value_to_stream(NULL, fp, &val->v.dt.fields[i], 1);
+        }
     }
 }
 
@@ -14093,16 +14183,39 @@ static int read_stream_target(OfortInterpreter *I, FILE *fp, int *stream_pos,
     return 0;
 }
 
+static int read_binary_array_element_from_stream(FILE *fp, OfortValue *arr, int index);
+
 static int read_binary_value_from_stream(FILE *fp, OfortValue *dest, int char_len) {
     if (!dest) return 1;
     if (dest->type == FVAL_INTEGER) {
-        return fread(&dest->v.i, sizeof(dest->v.i), 1, fp) == 1 ? 0 : 1;
+        if (dest->kind == 8) {
+            int64_t x;
+            if (fread(&x, sizeof(x), 1, fp) != 1) return 1;
+            dest->v.i = (long long)x;
+        } else {
+            int32_t x;
+            if (fread(&x, sizeof(x), 1, fp) != 1) return 1;
+            dest->v.i = (long long)x;
+        }
+        return 0;
     }
     if (dest->type == FVAL_REAL || dest->type == FVAL_DOUBLE) {
-        return fread(&dest->v.r, sizeof(dest->v.r), 1, fp) == 1 ? 0 : 1;
+        if (dest->type == FVAL_DOUBLE || dest->kind == 8) {
+            double x;
+            if (fread(&x, sizeof(x), 1, fp) != 1) return 1;
+            dest->v.r = x;
+        } else {
+            float x;
+            if (fread(&x, sizeof(x), 1, fp) != 1) return 1;
+            dest->v.r = (double)x;
+        }
+        return 0;
     }
     if (dest->type == FVAL_LOGICAL) {
-        return fread(&dest->v.b, sizeof(dest->v.b), 1, fp) == 1 ? 0 : 1;
+        int32_t x;
+        if (fread(&x, sizeof(x), 1, fp) != 1) return 1;
+        dest->v.b = x != 0;
+        return 0;
     }
     if (dest->type == FVAL_CHARACTER) {
         char *buf;
@@ -14118,6 +14231,19 @@ static int read_binary_value_from_stream(FILE *fp, OfortValue *dest, int char_le
         free(buf);
         return 0;
     }
+    if (dest->type == FVAL_DERIVED) {
+        for (int i = 0; i < dest->v.dt.n_fields; i++) {
+            OfortValue *field = &dest->v.dt.fields[i];
+            if (field->type == FVAL_ARRAY) {
+                for (int j = 0; j < field->v.arr.len; j++) {
+                    if (read_binary_array_element_from_stream(fp, field, j) != 0) return 1;
+                }
+            } else if (read_binary_value_from_stream(fp, field, 0) != 0) {
+                return 1;
+            }
+        }
+        return 0;
+    }
     return 1;
 }
 
@@ -14125,11 +14251,26 @@ static int read_binary_array_element_from_stream(FILE *fp, OfortValue *arr, int 
     OfortValue tmp;
     int char_len;
     if (!arr || arr->type != FVAL_ARRAY || index < 0 || index >= arr->v.arr.len) return 1;
+    if (arr->v.arr.elem_type == FVAL_DERIVED && arr->v.arr.data) {
+        return read_binary_value_from_stream(fp, &arr->v.arr.data[index], 0);
+    }
     if (arr->v.arr.elem_type == FVAL_INTEGER && arr->v.arr.int_data) {
-        return fread(&arr->v.arr.int_data[index], sizeof(arr->v.arr.int_data[index]), 1, fp) == 1 ? 0 : 1;
+        int32_t x;
+        if (fread(&x, sizeof(x), 1, fp) != 1) return 1;
+        arr->v.arr.int_data[index] = (long long)x;
+        return 0;
     }
     if ((arr->v.arr.elem_type == FVAL_REAL || arr->v.arr.elem_type == FVAL_DOUBLE) && arr->v.arr.real_data) {
-        return fread(&arr->v.arr.real_data[index], sizeof(arr->v.arr.real_data[index]), 1, fp) == 1 ? 0 : 1;
+        if (arr->v.arr.elem_type == FVAL_DOUBLE) {
+            double x;
+            if (fread(&x, sizeof(x), 1, fp) != 1) return 1;
+            arr->v.arr.real_data[index] = x;
+        } else {
+            float x;
+            if (fread(&x, sizeof(x), 1, fp) != 1) return 1;
+            arr->v.arr.real_data[index] = (double)x;
+        }
+        return 0;
     }
     char_len = arr->v.arr.elem_type == FVAL_CHARACTER ? array_character_len(arr) : 1;
     tmp = default_value(arr->v.arr.elem_type, char_len);
@@ -14435,6 +14576,26 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
             if (*p == '.') { p++; while (isdigit((unsigned char)*p)) { dec = dec * 10 + (*p - '0'); p++; } }
             if (*vidx >= nvals) break;
             for (int r = 0; r < repeat && *vidx < nvals; r++, (*vidx)++) {
+                if (vals[*vidx].type == FVAL_CHARACTER) {
+                    char buf[1024];
+                    value_to_string(I, vals[*vidx], buf, sizeof(buf));
+                    if (width > 0) {
+                        int slen = (int)strlen(buf);
+                        if (slen < width) {
+                            char padded[1024];
+                            memset(padded, ' ', width);
+                            memcpy(padded, buf, slen);
+                            padded[width] = '\0';
+                            out_append(I, padded);
+                        } else {
+                            buf[width] = '\0';
+                            out_append(I, buf);
+                        }
+                    } else {
+                        out_append(I, buf);
+                    }
+                    continue;
+                }
                 double rv = val_to_real(vals[*vidx]);
                 char buf[128];
                 if (!isfinite(rv)) {
@@ -20749,6 +20910,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         else if (strcmp(ru, "REAL32") == 0) declare_var(I, local, make_integer(4));
                         else if (strcmp(ru, "REAL64") == 0) declare_var(I, local, make_integer(8));
                         else if (strcmp(ru, "REAL128") == 0) declare_var(I, local, make_integer(-1));
+                        else if (strcmp(ru, "FILE_STORAGE_SIZE") == 0) declare_var(I, local, make_integer(8));
                         else if (strcmp(ru, "INT64") == 0) declare_var(I, local, make_integer(8));
                         else if (strcmp(ru, "LOGICAL8") == 0) declare_var(I, local, make_integer(1));
                         else if (strcmp(ru, "LOGICAL16") == 0) declare_var(I, local, make_integer(2));
@@ -20765,6 +20927,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     declare_var(I, "real32", make_integer(4));
                     declare_var(I, "real64", make_integer(8));
                     declare_var(I, "real128", make_integer(-1));
+                    declare_var(I, "file_storage_size", make_integer(8));
                     declare_var(I, "int64", make_integer(8));
                     declare_var(I, "logical8", make_integer(1));
                     declare_var(I, "logical16", make_integer(2));
@@ -20964,6 +21127,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 td->field_char_lens[i] = parent->field_char_lens[i];
                 td->field_char_len_exprs[i] = parent->field_char_len_exprs[i];
                 td->field_kind_exprs[i] = parent->field_kind_exprs[i];
+                td->field_kinds[i] = parent->field_kinds[i];
                 td->field_init_exprs[i] = parent->field_init_exprs[i];
                 td->field_n_dims[i] = parent->field_n_dims[i];
                 td->field_is_pointer[i] = parent->field_is_pointer[i];
@@ -21070,7 +21234,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                                       sizeof(td->field_type_names[td->n_fields]), d->str_val);
                         td->field_char_lens[td->n_fields] = d->char_len;
                         td->field_char_len_exprs[td->n_fields] = d->char_len_expr;
-                        td->field_kind_exprs[td->n_fields] = d->kind_expr;
+                        td->field_kind_exprs[td->n_fields] = kind_is_type_param ? d->kind_expr : NULL;
+                        td->field_kinds[td->n_fields] = d->kind;
                         td->field_n_type_param_exprs[td->n_fields] =
                             d->n_type_param_exprs < OFORT_MAX_TYPE_ACTUALS ? d->n_type_param_exprs : OFORT_MAX_TYPE_ACTUALS;
                         for (int pi = 0; pi < d->n_type_param_exprs && pi < OFORT_MAX_TYPE_ACTUALS; pi++) {
@@ -21147,7 +21312,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                               sizeof(td->field_type_names[td->n_fields]), s->str_val);
                 td->field_char_lens[td->n_fields] = s->char_len;
                 td->field_char_len_exprs[td->n_fields] = s->char_len_expr;
-                td->field_kind_exprs[td->n_fields] = s->kind_expr;
+                td->field_kind_exprs[td->n_fields] = kind_is_type_param ? s->kind_expr : NULL;
+                td->field_kinds[td->n_fields] = s->kind;
                 td->field_n_type_param_exprs[td->n_fields] =
                     s->n_type_param_exprs < OFORT_MAX_TYPE_ACTUALS ? s->n_type_param_exprs : OFORT_MAX_TYPE_ACTUALS;
                 for (int pi = 0; pi < s->n_type_param_exprs && pi < OFORT_MAX_TYPE_ACTUALS; pi++) {
@@ -22785,6 +22951,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             free_value(&uv);
             if (!entry) entry = ensure_unit_file(I, unit, 1);
             if (!entry) ofort_error(I, "Unit %d is not open", unit);
+            if (n->children[7]) {
+                OfortValue pv = eval_node(I, n->children[7]);
+                long long pos = val_to_int(pv);
+                entry->stream_pos = pos > 0 ? (int)(pos - 1) : 0;
+                free_value(&pv);
+            }
             write_nodes_to_stream_file(I, entry, n);
             if (n->children[4] && n->children[4]->type == FND_IDENT) {
                 set_var(I, n->children[4]->name, make_integer(0));
@@ -22988,6 +23160,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 } else {
                     if (!entry) entry = ensure_unit_file(I, unit, 0);
                     if (!entry) ofort_error(I, "Unit %d is not open", unit);
+                    if (n->children[7]) {
+                        OfortValue pv = eval_node(I, n->children[7]);
+                        long long pos = val_to_int(pv);
+                        entry->stream_pos = pos > 0 ? (int)(pos - 1) : 0;
+                        free_value(&pv);
+                    }
                     if (n->children[5]) {
                         OfortValue rv = eval_node(I, n->children[5]);
                         rec_no = (int)val_to_int(rv);
@@ -23798,6 +23976,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             } else if (n->stmts[0]->type == FND_ARRAY_REF) {
                 OfortNode *ref = n->stmts[0];
                 int full_section = ref->children[0] != NULL && ref->n_stmts > 0;
+                if (fill_random_number_derived_array_component_element(I, ref)) break;
                 for (int si = 0; si < ref->n_stmts; si++) {
                     OfortNode *sub = ref->stmts[si];
                     if (!sub || sub->type != FND_SLICE ||
@@ -25717,8 +25896,16 @@ static int storage_size_bits(OfortValue *v) {
         total = 0; max_align = 1;
         for (int i = 0; i < v->v.dt.n_fields; i++) {
             fbits  = storage_size_bits(&v->v.dt.fields[i]);
+            if (v->v.dt.fields[i].type == FVAL_ARRAY)
+                fbits *= v->v.dt.fields[i].v.arr.len;
             fbytes = (fbits + 7) / 8;
-            align  = fbytes > 0 ? (fbytes < 8 ? fbytes : 8) : 1;
+            if (v->v.dt.fields[i].type == FVAL_ARRAY) {
+                int elem_bits = storage_size_bits(&v->v.dt.fields[i]);
+                int elem_bytes = (elem_bits + 7) / 8;
+                align = elem_bytes > 0 ? (elem_bytes < 8 ? elem_bytes : 8) : 1;
+            } else {
+                align  = fbytes > 0 ? (fbytes < 8 ? fbytes : 8) : 1;
+            }
             total  = ((total + align - 1) / align) * align;
             total += fbytes;
             if (align > max_align) max_align = align;
