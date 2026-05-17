@@ -11806,20 +11806,22 @@ static OfortValue eval_array_section_value(OfortInterpreter *I, OfortValue *arra
 }
 
 static int array_ref_scalar_linear_index(OfortInterpreter *I, OfortValue *array, OfortNode *n, int *index_out) {
-    OfortSubscriptRange ranges[7];
     int subscripts[7];
-    int has_slice = 0;
     int nargs;
     if (!array || array->type != FVAL_ARRAY || !n || !index_out) return 0;
     nargs = n->n_stmts;
     if (nargs <= 0 || nargs > 7) return 0;
     for (int i = 0; i < nargs; i++) {
-        int extent = i < array->v.arr.n_dims ? array->v.arr.dims[i] : array->v.arr.len;
-        int lower = i < array->v.arr.n_dims ? array->v.arr.lower_bounds[i] : 1;
-        if (eval_subscript_range(I, n->stmts[i], lower, extent, &ranges[i])) has_slice = 1;
+        OfortValue v;
+        if (!n->stmts[i] || n->stmts[i]->type == FND_SLICE) return 0;
+        v = eval_node(I, n->stmts[i]);
+        if (v.type == FVAL_ARRAY) {
+            free_value(&v);
+            return 0;
+        }
+        subscripts[i] = (int)val_to_int(v);
+        free_value(&v);
     }
-    if (has_slice) return 0;
-    for (int i = 0; i < nargs; i++) subscripts[i] = ranges[i].start;
     *index_out = section_linear_index(array, subscripts, nargs);
     return 1;
 }
