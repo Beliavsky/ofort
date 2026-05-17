@@ -241,6 +241,7 @@ struct OfortInterpreter {
     int exiting;     /* EXIT from DO loop */
     int cycling;     /* CYCLE in DO loop */
     int stopping;    /* STOP statement */
+    int error_stopping; /* ERROR STOP statement */
     int goto_active;
     int goto_label;
     /* error recovery */
@@ -251,6 +252,7 @@ struct OfortInterpreter {
     int current_line;
     int print_expr_statements;
     int suppress_output;
+    int preserve_output_on_error;
     int live_stdout;
     int preserve_format_trailing_blanks;
     int command_argc;
@@ -9698,9 +9700,11 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
     }
 
     /* ERROR STOP */
+    int is_error_stop = 0;
     if (token_ident_upper(t, "ERROR") && peek_ahead(I, 1)->type == FTOK_STOP) {
         advance(I);
         t = peek(I);
+        is_error_stop = 1;
     }
 
     /* STOP */
@@ -9709,6 +9713,7 @@ static OfortNode *parse_statement(OfortInterpreter *I) {
         leave_spec_section(I);
         OfortNode *n = alloc_node(I, FND_STOP);
         n->line = t->line;
+        n->bool_val = is_error_stop;
         /* optional stop message */
         if (check(I, FTOK_STRING_LIT)) {
             copy_cstr(n->str_val, sizeof(n->str_val), peek(I)->str_val);
@@ -13080,6 +13085,8 @@ static void assign_token_to_value(OfortValue *dest, const char *token) {
     }
 }
 
+static int token_valid_for_type(OfortValType type, const char *token);
+
 static void assign_token_to_array_element(OfortValue *arr, int index, const char *token) {
     OfortValue tmp;
     if (!arr || arr->type != FVAL_ARRAY || index < 0 || index >= arr->v.arr.len) return;
@@ -13090,6 +13097,94 @@ static void assign_token_to_array_element(OfortValue *arr, int index, const char
         arr->v.arr.data[index] = copy_value(tmp);
     }
     free_value(&tmp);
+}
+
+static int read_file_array_ref_recursive(OfortInterpreter *I, OfortValue *arr,
+                                         OfortSubscriptSpec *specs, int nargs,
+                                         int dim, int *subscripts,
+                                         FILE *fp, char *tok, int tok_size) {
+    if (dim < 0) {
+        int index = section_linear_index(arr, subscripts, nargs);
+        if (index < 0 || index >= arr->v.arr.len)
+            ofort_error(I, "Array section index out of bounds");
+        if (!read_next_token(fp, tok, tok_size)) return 1;
+        assign_token_to_array_element(arr, index, tok);
+        return 0;
+    }
+    for (int pos = 0; pos < specs[dim].count; pos++) {
+        subscripts[dim] = subscript_spec_value(&specs[dim], pos);
+        if (read_file_array_ref_recursive(I, arr, specs, nargs, dim - 1,
+                                          subscripts, fp, tok, tok_size) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int read_file_array_ref_target(OfortInterpreter *I, FILE *fp, OfortVar *v,
+                                      OfortNode *target, char *tok, int tok_size) {
+    int nargs = target->n_stmts;
+    OfortSubscriptSpec specs[7];
+    int subscripts[7] = {0};
+    if (!v || v->val.type != FVAL_ARRAY) return 1;
+    for (int i = 0; i < nargs; i++) {
+        int extent = i < v->val.v.arr.n_dims ? v->val.v.arr.dims[i] : v->val.v.arr.len;
+        int lower = i < v->val.v.arr.n_dims ? v->val.v.arr.lower_bounds[i] : 1;
+        eval_subscript_spec(I, target->stmts[i], lower, extent, &specs[i]);
+    }
+    return read_file_array_ref_recursive(I, &v->val, specs, nargs, nargs - 1,
+                                         subscripts, fp, tok, tok_size);
+}
+
+static int read_string_array_ref_recursive(OfortInterpreter *I, OfortValue *arr,
+                                           OfortSubscriptSpec *specs, int nargs,
+                                           int dim, int *subscripts,
+                                           const char **p, char *tok, int tok_size,
+                                           int *item_index,
+                                           char *iomsg, size_t iomsg_size) {
+    if (dim < 0) {
+        int item = ++(*item_index);
+        int index = section_linear_index(arr, subscripts, nargs);
+        if (index < 0 || index >= arr->v.arr.len)
+            ofort_error(I, "Array section index out of bounds");
+        if (!read_next_string_token(p, tok, tok_size)) {
+            if (iomsg && iomsg_size) copy_cstr(iomsg, iomsg_size, "End of file");
+            return -1;
+        }
+        if (!token_valid_for_type(arr->v.arr.elem_type, tok)) {
+            if (iomsg && iomsg_size)
+                snprintf(iomsg, iomsg_size, "Bad item %d in list input", item);
+            return 1;
+        }
+        assign_token_to_array_element(arr, index, tok);
+        return 0;
+    }
+    for (int pos = 0; pos < specs[dim].count; pos++) {
+        subscripts[dim] = subscript_spec_value(&specs[dim], pos);
+        int status = read_string_array_ref_recursive(I, arr, specs, nargs, dim - 1,
+                                                     subscripts, p, tok, tok_size,
+                                                     item_index, iomsg, iomsg_size);
+        if (status) return status;
+    }
+    return 0;
+}
+
+static int read_string_array_ref_target(OfortInterpreter *I, const char **p, OfortVar *v,
+                                        OfortNode *target, char *tok, int tok_size,
+                                        int *item_index,
+                                        char *iomsg, size_t iomsg_size) {
+    int nargs = target->n_stmts;
+    OfortSubscriptSpec specs[7];
+    int subscripts[7] = {0};
+    if (!v || v->val.type != FVAL_ARRAY) return 1;
+    for (int i = 0; i < nargs; i++) {
+        int extent = i < v->val.v.arr.n_dims ? v->val.v.arr.dims[i] : v->val.v.arr.len;
+        int lower = i < v->val.v.arr.n_dims ? v->val.v.arr.lower_bounds[i] : 1;
+        eval_subscript_spec(I, target->stmts[i], lower, extent, &specs[i]);
+    }
+    return read_string_array_ref_recursive(I, &v->val, specs, nargs, nargs - 1,
+                                           subscripts, p, tok, tok_size,
+                                           item_index, iomsg, iomsg_size);
 }
 
 static int format_is_character_line_read(const char *fmt) {
@@ -13452,6 +13547,19 @@ static int read_file_target(OfortInterpreter *I, FILE *fp, OfortNode *target, ch
         }
     }
 
+    if (target->type == FND_FUNC_CALL) {
+        OfortVar *v = find_var(I, target->name);
+        if (v && v->val.type == FVAL_ARRAY)
+            return read_file_array_ref_target(I, fp, v, target, tok, tok_size);
+    }
+
+    if (target->type == FND_ARRAY_REF && target->children[0] &&
+        target->children[0]->type == FND_IDENT) {
+        OfortVar *v = find_var(I, target->children[0]->name);
+        if (v && v->val.type == FVAL_ARRAY)
+            return read_file_array_ref_target(I, fp, v, target, tok, tok_size);
+    }
+
     if (!read_next_token(fp, tok, tok_size)) return 1;
     assign_token_to_read_target(I, target, tok);
     return 0;
@@ -13502,6 +13610,21 @@ static int read_string_target(OfortInterpreter *I, const char **p, OfortNode *ta
             }
             return 0;
         }
+    }
+
+    if (target->type == FND_FUNC_CALL) {
+        OfortVar *v = find_var(I, target->name);
+        if (v && v->val.type == FVAL_ARRAY)
+            return read_string_array_ref_target(I, p, v, target, tok, tok_size,
+                                                item_index, iomsg, iomsg_size);
+    }
+
+    if (target->type == FND_ARRAY_REF && target->children[0] &&
+        target->children[0]->type == FND_IDENT) {
+        OfortVar *v = find_var(I, target->children[0]->name);
+        if (v && v->val.type == FVAL_ARRAY)
+            return read_string_array_ref_target(I, p, v, target, tok, tok_size,
+                                                item_index, iomsg, iomsg_size);
     }
 
     if (read_next_string_token(p, tok, tok_size)) {
@@ -21325,6 +21448,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             apply_debug_decl_initializer(I, &val, n->val_type);
         }
 
+        if (n->val_type == FVAL_CHARACTER &&
+            (n->type == FND_PARAMDECL || n->is_parameter) &&
+            decl_char_len >= OFORT_MAX_STRLEN - 1 &&
+            val.type == FVAL_CHARACTER && val.v.s) {
+            decl_char_len = (int)strlen(val.v.s);
+        }
+
         if (n->val_type == FVAL_CHARACTER)
             val = resize_character_value(val, decl_char_len);
 
@@ -22621,6 +22751,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         char form_opt[64];
         char action_opt[64];
         char position_opt[64];
+        char status_opt[64];
         int recl = 0;
         int is_direct = 0;
         int is_formatted = 1;
@@ -22629,6 +22760,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         form_opt[0] = '\0';
         action_opt[0] = '\0';
         position_opt[0] = '\0';
+        status_opt[0] = '\0';
         if (n->children[5]) {
             OfortValue av = eval_node(I, n->children[5]);
             if (av.type == FVAL_CHARACTER) {
@@ -22664,6 +22796,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             free_value(&pv);
         }
+        if (n->children[2]) {
+            OfortValue sv = eval_node(I, n->children[2]);
+            if (sv.type == FVAL_CHARACTER) {
+                copy_trimmed_fortran_identifier(sv.v.s ? sv.v.s : "", status_opt, sizeof(status_opt));
+            }
+            free_value(&sv);
+        }
         if (n->bool_val) {
             unit = next_newunit(I);
             if (n->children[0]->type == FND_IDENT) {
@@ -22687,6 +22826,24 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                           "warning: OPEN without FILE= uses legacy default file '%s'",
                           open_path);
         }
+        if (strcmp(status_opt, "new") == 0 && file_size_bytes(open_path, NULL)) {
+            if (n->children[4] && n->children[4]->type == FND_IDENT) {
+                set_var(I, n->children[4]->name, make_integer(1));
+                free_value(&fv);
+                break;
+            }
+            I->preserve_output_on_error = 1;
+            ofort_error(I, "Cannot open file '%s': File exists", open_path);
+        }
+        if (strcmp(status_opt, "old") == 0 && !file_size_bytes(open_path, NULL)) {
+            if (n->children[4] && n->children[4]->type == FND_IDENT) {
+                set_var(I, n->children[4]->name, make_integer(1));
+                free_value(&fv);
+                break;
+            }
+            I->preserve_output_on_error = 1;
+            ofort_error(I, "Cannot open file '%s': No such file", open_path);
+        }
         set_unit_file(I, unit, open_path);
         entry = find_unit_file(I, unit);
         if (entry) {
@@ -22698,13 +22855,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             copy_cstr(entry->action, sizeof(entry->action), action_opt[0] ? action_opt : "readwrite");
             copy_cstr(entry->position, sizeof(entry->position), position_opt[0] ? position_opt : "asis");
         }
-        if (n->children[2]) {
-            OfortValue sv = eval_node(I, n->children[2]);
-            if (sv.type == FVAL_CHARACTER && sv.v.s && str_eq_nocase(sv.v.s, "replace")) {
-                FILE *fp = fopen(open_path, "w");
-                if (fp) fclose(fp);
-            }
-            free_value(&sv);
+        if (strcmp(status_opt, "replace") == 0) {
+            FILE *fp = fopen(open_path, "w");
+            if (fp) fclose(fp);
         }
         if (n->children[4] && n->children[4]->type == FND_IDENT) {
             set_var(I, n->children[4]->name, make_integer(0));
@@ -24201,7 +24354,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     }
                 }
                 if (pv && pv->present &&
-                    (n->stmts[i]->type == FND_IDENT || n->stmts[i]->type == FND_MEMBER)) {
+                    (n->stmts[i]->type == FND_IDENT || n->stmts[i]->type == FND_MEMBER ||
+                     n->stmts[i]->type == FND_FUNC_CALL || n->stmts[i]->type == FND_ARRAY_REF)) {
                     if (n->stmts[i]->type == FND_IDENT) {
                         OfortVar *actual = find_var(I, n->stmts[i]->name);
                         if (actual && actual->is_pointer && pv->is_pointer) {
@@ -24338,6 +24492,23 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             target->pointer_slice_stride = pointer_copyback_slice_stride[i] ? pointer_copyback_slice_stride[i] : 1;
                         }
                     }
+                }
+            } else if (!arg_alias[i] &&
+                       (n->stmts[i]->type == FND_FUNC_CALL || n->stmts[i]->type == FND_ARRAY_REF) &&
+                       fn->param_intents[i] != 1 &&
+                       args[i].type != FVAL_VOID && !procedure_ref_name(&args[i])) {
+                OfortValue *target = member_lvalue(I, n->stmts[i]);
+                if (target) {
+                    free_value(target);
+                    *target = copy_value(args[i]);
+                } else if (n->stmts[i]->type == FND_FUNC_CALL) {
+                    OfortVar *actual = find_var(I, n->stmts[i]->name);
+                    if (actual && actual->val.type == FVAL_ARRAY && !actual->is_parameter)
+                        assign_array_ref(I, actual, n->stmts[i], &args[i]);
+                } else if (n->stmts[i]->type == FND_ARRAY_REF && n->stmts[i]->children[0]) {
+                    OfortValue *array_target = member_lvalue(I, n->stmts[i]->children[0]);
+                    if (array_target && array_target->type == FVAL_ARRAY)
+                        assign_array_ref_value(I, array_target, n->stmts[i], &args[i]);
                 }
             }
         }
@@ -24863,6 +25034,7 @@ unresolved_external_call_done:
 
     case FND_STOP:
         I->stopping = 1;
+        if (n->bool_val) I->error_stopping = 1;
         if (n->str_val[0]) {
             out_appendf(I, "STOP %s\n", n->str_val);
         }
@@ -31852,11 +32024,13 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     interp->exiting = 0;
     interp->cycling = 0;
     interp->stopping = 0;
+    interp->error_stopping = 0;
     interp->goto_active = 0;
     interp->goto_label = 0;
     interp->goto_active = 0;
     interp->goto_label = 0;
     interp->current_line = 0;
+    interp->preserve_output_on_error = 0;
     interp->warnings[0] = '\0';
     interp->warn_len = 0;
     interp->procedure_depth = 0;
@@ -31871,7 +32045,7 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
 
     if (setjmp(interp->err_jmp) != 0) {
         if (processed_source && processed_source != interp->cached_processed_source) free(processed_source);
-        return -1;
+        return interp->preserve_output_on_error ? -3 : -1;
     }
 
     use_cached_ast = interp->cached_ast && interp->cached_source_text &&
@@ -31958,7 +32132,7 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     interp->timing.total = ofort_monotonic_seconds() - total_start;
 
     {
-        int rc = interp->has_error ? -1 : 0;
+        int rc = interp->has_error ? -1 : (interp->error_stopping ? -2 : 0);
         if (processed_source && processed_source != interp->cached_processed_source) free(processed_source);
         return rc;
     }
@@ -31978,9 +32152,11 @@ int ofort_check(OfortInterpreter *interp, const char *source) {
     interp->exiting = 0;
     interp->cycling = 0;
     interp->stopping = 0;
+    interp->error_stopping = 0;
     interp->goto_active = 0;
     interp->goto_label = 0;
     interp->current_line = 0;
+    interp->preserve_output_on_error = 0;
     interp->warnings[0] = '\0';
     interp->warn_len = 0;
     interp->procedure_depth = 0;
@@ -33190,9 +33366,11 @@ int ofort_call_real1(OfortInterpreter *interp, const char *name, double x, doubl
     interp->exiting = 0;
     interp->cycling = 0;
     interp->stopping = 0;
+    interp->error_stopping = 0;
     interp->goto_active = 0;
     interp->goto_label = 0;
     interp->current_line = 0;
+    interp->preserve_output_on_error = 0;
 
     if (setjmp(interp->err_jmp) != 0) {
         return -1;
@@ -33224,7 +33402,9 @@ void ofort_reset(OfortInterpreter *interp) {
     interp->exiting = 0;
     interp->cycling = 0;
     interp->stopping = 0;
+    interp->error_stopping = 0;
     interp->current_line = 0;
+    interp->preserve_output_on_error = 0;
     interp->procedure_depth = 0;
     interp->consumed_bare_end = 0;
     clear_timing(interp);
