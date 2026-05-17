@@ -58,6 +58,7 @@ typedef struct {
     int is_pointer;
     int is_target;
     int is_protected;
+    char protected_module[128];
     int is_save;
     int is_implicit_save;
     int is_alias;
@@ -341,6 +342,7 @@ static void check_semantics_node(OfortInterpreter *I, OfortNode *n);
 static int ofort_extension_module_exists(const char *module_name);
 static OfortValue shift_scalar_value(const char *upper, OfortValue value_arg, OfortValue shift_arg);
 static int ofort_extension_module_exports(const char *module_name, const char *name);
+static int protected_assignment_allowed(OfortInterpreter *I, const char *name);
 static void import_ofort_extension_intrinsic(OfortInterpreter *I, const char *local_name,
                                              const char *target_name);
 static int find_imported_extension_intrinsic(OfortInterpreter *I, const char *name);
@@ -1058,7 +1060,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
             }
             if (s->vars[i].is_parameter)
                 ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
-            if (s->vars[i].is_protected)
+            if (s->vars[i].is_protected && !protected_assignment_allowed(I, name))
                 ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
             if (s->vars[i].intent == 1)
                 ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", name);
@@ -1134,7 +1136,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 int assign_char_len = ps->vars[i].char_len;
                 if (ps->vars[i].is_parameter)
                     ofort_error(I, "Cannot assign to PARAMETER '%s'", name);
-                if (ps->vars[i].is_protected)
+                if (ps->vars[i].is_protected && !protected_assignment_allowed(I, name))
                     ofort_error(I, "Cannot assign to PROTECTED variable '%s'", name);
                 if (ps->vars[i].intent == 1)
                     ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", name);
@@ -1902,6 +1904,8 @@ static void restore_saved_vars(OfortInterpreter *I, OfortFunc *func) {
         v->is_pointer = func->saved_vars[i].is_pointer;
         v->is_target = func->saved_vars[i].is_target;
         v->is_protected = func->saved_vars[i].is_protected;
+        copy_cstr(v->protected_module, sizeof(v->protected_module),
+                  func->saved_vars[i].protected_module);
         v->is_save = 1;
         v->is_implicit_save = func->saved_vars[i].is_implicit_save;
         v->pointer_associated = func->saved_vars[i].pointer_associated;
@@ -1922,6 +1926,15 @@ static int module_defines_var(OfortInterpreter *I, const char *module_name, cons
         if (str_eq_nocase(mod->vars[i].name, name)) return 1;
     }
     return 0;
+}
+
+static int protected_assignment_allowed(OfortInterpreter *I, const char *name) {
+    OfortVar *v;
+    if (!I || !I->active_module_name[0] || !name || !name[0]) return 0;
+    v = find_var(I, name);
+    if (v && v->protected_module[0])
+        return str_eq_nocase(v->protected_module, I->active_module_name);
+    return module_defines_var(I, I->active_module_name, name);
 }
 
 static void store_saved_vars(OfortInterpreter *I, OfortFunc *func, OfortScope *scope) {
@@ -1956,6 +1969,7 @@ static void store_saved_vars(OfortInterpreter *I, OfortFunc *func, OfortScope *s
         dst->is_pointer = src->is_pointer;
         dst->is_target = src->is_target;
         dst->is_protected = src->is_protected;
+        copy_cstr(dst->protected_module, sizeof(dst->protected_module), src->protected_module);
         dst->is_save = 1;
         dst->is_implicit_save = src->is_implicit_save;
         dst->pointer_associated = src->pointer_associated;
@@ -1986,6 +2000,7 @@ static void copy_imported_var_attrs(OfortVar *dst, const OfortVar *src) {
     dst->is_pointer = src->is_pointer;
     dst->is_target = src->is_target;
     dst->is_protected = src->is_protected;
+    copy_cstr(dst->protected_module, sizeof(dst->protected_module), src->protected_module);
     dst->is_save = src->is_save;
     dst->is_implicit_save = src->is_implicit_save;
     dst->is_alias = src->is_alias;
@@ -20009,7 +20024,8 @@ static void check_semantics_node(OfortInterpreter *I, OfortNode *n) {
                 if (v && v->is_parameter) {
                     ofort_error(I, "Cannot assign to PARAMETER '%s'", n->children[0]->name);
                 }
-                if (v && v->is_protected) {
+                if (v && v->is_protected &&
+                    !protected_assignment_allowed(I, n->children[0]->name)) {
                     ofort_error(I, "Cannot assign to PROTECTED variable '%s'", n->children[0]->name);
                 }
                 if (v && v->intent == 1) {
@@ -20455,6 +20471,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         push_scope(I);
         OfortNode *body = n->children[0];
         int namelist_start = I->n_namelists;
+        char prev_module_name[256];
+        copy_cstr(prev_module_name, sizeof(prev_module_name), I->active_module_name);
+        copy_cstr(I->active_module_name, sizeof(I->active_module_name), mod->name);
         if (body) {
             for (int i = 0; i < body->n_stmts; i++) {
                 OfortNode *s = body->stmts[i];
@@ -20509,6 +20528,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (name_in_list_nocase(ms->vars[i].name, public_names, n_public_names)) is_public = 1;
                 if (name_in_list_nocase(ms->vars[i].name, private_names, n_private_names)) is_public = 0;
                 mod->var_public[mod->n_vars] = is_public;
+                if (ms->vars[i].is_protected && !ms->vars[i].protected_module[0])
+                    copy_cstr(ms->vars[i].protected_module, sizeof(ms->vars[i].protected_module),
+                              mod->name);
                 mod->vars[mod->n_vars++] = ms->vars[i];
                 ms->vars[i].val = make_void_val(); /* prevent double-free */
             }
@@ -20528,6 +20550,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             I->n_namelists = namelist_start;
         }
+        copy_cstr(I->active_module_name, sizeof(I->active_module_name), prev_module_name);
         pop_scope(I);
         free(public_names);
         free(private_names);
@@ -20560,6 +20583,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
             } else if (strcmp(attr, "PROTECTED") == 0) {
                 v->is_protected = 1;
+                if (I->active_module_name[0])
+                    copy_cstr(v->protected_module, sizeof(v->protected_module),
+                              I->active_module_name);
             }
         }
         break;
@@ -21204,6 +21230,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             existing->is_allocatable = n->is_allocatable;
             existing->is_target = n->is_target;
             existing->is_protected = n->is_protected;
+            if (existing->is_protected && I->active_module_name[0])
+                copy_cstr(existing->protected_module, sizeof(existing->protected_module),
+                          I->active_module_name);
             existing->declared_type = n->val_type;
             existing->declared_kind = n->kind;
             existing->declared_type_name[0] = '\0';
@@ -21404,6 +21433,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             existing->is_save = 1;
             existing->is_implicit_save = n->is_implicit_save;
             existing->is_protected = n->is_protected;
+            if (existing->is_protected && I->active_module_name[0])
+                copy_cstr(existing->protected_module, sizeof(existing->protected_module),
+                          I->active_module_name);
             if (n->val_type == FVAL_CHARACTER) existing->char_len = decl_char_len;
             break;
         }
@@ -21681,6 +21713,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         v->is_pointer = n->is_pointer;
         v->is_target = n->is_target;
         v->is_protected = n->is_protected;
+        if (v->is_protected && I->active_module_name[0])
+            copy_cstr(v->protected_module, sizeof(v->protected_module), I->active_module_name);
         v->is_save = n->is_save || (I->procedure_depth > 0 && n->is_implicit_save);
         v->is_implicit_save = I->procedure_depth > 0 && n->is_implicit_save;
         if (v->is_implicit_save) {
@@ -22030,7 +22064,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             /* Simple variable assignment */
             OfortVar *v = find_var(I, lhs->name);
             if (v && v->is_parameter) ofort_error(I, "Cannot assign to PARAMETER '%s'", lhs->name);
-            if (v && v->is_protected) ofort_error(I, "Cannot assign to PROTECTED variable '%s'", lhs->name);
+            if (v && v->is_protected && !protected_assignment_allowed(I, lhs->name))
+                ofort_error(I, "Cannot assign to PROTECTED variable '%s'", lhs->name);
             if (v && v->intent == 1) ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", lhs->name);
             if (v && v->is_pointer && v->pointer_associated && v->pointer_target[0]) {
                 write_through_pointer_var(I, v, &rhs);
@@ -22158,7 +22193,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 ofort_error(I, "Undefined variable '%s'", lhs->name);
             }
-            if (var->is_protected) ofort_error(I, "Cannot assign to PROTECTED variable '%s'", lhs->name);
+            if (var->is_protected && !protected_assignment_allowed(I, lhs->name))
+                ofort_error(I, "Cannot assign to PROTECTED variable '%s'", lhs->name);
             if (var->is_pointer && var->pointer_associated && var->pointer_target[0] &&
                 var->val.type == FVAL_ARRAY && lhs->n_stmts > 0) {
                 OfortVar *target_var = find_var(I, var->pointer_target);
