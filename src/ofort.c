@@ -11782,6 +11782,62 @@ static OfortValue eval_array_section_value(OfortInterpreter *I, OfortValue *arra
     return eval_subscripted_array(I, array, n);
 }
 
+static int array_ref_scalar_linear_index(OfortInterpreter *I, OfortValue *array, OfortNode *n, int *index_out) {
+    OfortSubscriptRange ranges[7];
+    int subscripts[7];
+    int has_slice = 0;
+    int nargs;
+    if (!array || array->type != FVAL_ARRAY || !n || !index_out) return 0;
+    nargs = n->n_stmts;
+    if (nargs <= 0 || nargs > 7) return 0;
+    for (int i = 0; i < nargs; i++) {
+        int extent = i < array->v.arr.n_dims ? array->v.arr.dims[i] : array->v.arr.len;
+        int lower = i < array->v.arr.n_dims ? array->v.arr.lower_bounds[i] : 1;
+        if (eval_subscript_range(I, n->stmts[i], lower, extent, &ranges[i])) has_slice = 1;
+    }
+    if (has_slice) return 0;
+    for (int i = 0; i < nargs; i++) subscripts[i] = ranges[i].start;
+    *index_out = section_linear_index(array, subscripts, nargs);
+    return 1;
+}
+
+static OfortValue sequence_actual_from_array_element(OfortInterpreter *I, OfortNode *actual) {
+    OfortVar *var = NULL;
+    OfortNode *ref = actual;
+    int index;
+    int dims[1];
+    OfortValue out;
+    if (!actual) return make_void_val();
+    if (actual->type == FND_FUNC_CALL) {
+        var = find_var(I, actual->name);
+    } else if (actual->type == FND_ARRAY_REF && actual->children[0] &&
+               actual->children[0]->type == FND_IDENT) {
+        var = find_var(I, actual->children[0]->name);
+    } else {
+        return make_void_val();
+    }
+    if (!var || var->val.type != FVAL_ARRAY) return make_void_val();
+    if (!array_ref_scalar_linear_index(I, &var->val, ref, &index)) return make_void_val();
+    if (index < 0 || index >= var->val.v.arr.len)
+        ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, var->val.v.arr.len);
+    dims[0] = var->val.v.arr.len - index;
+    out = make_array(var->val.v.arr.elem_type, dims, 1);
+    copy_cstr(out.v.arr.elem_type_name, sizeof(out.v.arr.elem_type_name), var->val.v.arr.elem_type_name);
+    out.kind = var->val.kind;
+    for (int i = 0; i < dims[0]; i++) {
+        OfortValue elem = array_element_value(&var->val, index + i);
+        if (assign_packed_array_element(&out, i, elem)) {
+            free_value(&elem);
+        } else if (out.v.arr.data) {
+            free_value(&out.v.arr.data[i]);
+            out.v.arr.data[i] = elem;
+        } else {
+            free_value(&elem);
+        }
+    }
+    return out;
+}
+
 static void assign_character_substring(OfortInterpreter *I, OfortVar *var, OfortNode *lhs, OfortValue *rhs) {
     int len;
     OfortSubscriptRange range;
@@ -21289,6 +21345,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         if (existing && existing == existing_current &&
             existing->val.type == FVAL_ARRAY && n->n_dims > 0) {
+            int has_assumed_shape = 0;
+            int new_dims[7] = {0};
+            int new_lows[7] = {0};
+            int new_total = 1;
             for (int i = 0; i < n->n_dims && i < existing->val.v.arr.n_dims && i < 7; i++) {
                 if (n->has_lower_bound[i]) {
                     int lower = n->lower_bounds[i];
@@ -21298,6 +21358,45 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         free_value(&lv);
                     }
                     existing->val.v.arr.lower_bounds[i] = lower;
+                }
+            }
+            for (int i = 0; i < n->n_dims && i < 7; i++) {
+                int lower = n->has_lower_bound[i] ? n->lower_bounds[i] : 1;
+                int extent = n->dims[i];
+                if (extent == 0 && !(n->stmts && i < n->n_stmts && n->stmts[i])) {
+                    has_assumed_shape = 1;
+                    break;
+                }
+                if (n->has_lower_bound[i] && n->lower_bound_exprs[i]) {
+                    OfortValue lv = eval_node(I, n->lower_bound_exprs[i]);
+                    lower = (int)val_to_int(lv);
+                    free_value(&lv);
+                }
+                if (extent <= 0 && n->stmts && i < n->n_stmts && n->stmts[i]) {
+                    OfortValue dv = eval_node(I, n->stmts[i]);
+                    extent = (int)val_to_int(dv);
+                    free_value(&dv);
+                }
+                if (n->has_lower_bound[i]) extent = extent - lower + 1;
+                if (extent < 0) extent = 0;
+                new_lows[i] = lower;
+                new_dims[i] = extent;
+                new_total *= extent;
+            }
+            if (!has_assumed_shape) {
+                if (new_total > existing->val.v.arr.len)
+                    ofort_error(I, "Actual argument has too few elements for explicit-shape dummy '%s'",
+                                n->name);
+                if (existing->val.v.arr.data && new_total < existing->val.v.arr.len) {
+                    for (int ei = new_total; ei < existing->val.v.arr.len; ei++) {
+                        free_value(&existing->val.v.arr.data[ei]);
+                    }
+                }
+                existing->val.v.arr.n_dims = n->n_dims;
+                existing->val.v.arr.len = new_total;
+                for (int i = 0; i < n->n_dims && i < 7; i++) {
+                    existing->val.v.arr.dims[i] = new_dims[i];
+                    existing->val.v.arr.lower_bounds[i] = new_lows[i];
                 }
             }
         }
@@ -24331,6 +24430,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                        n->stmts[i]->type == FND_MEMBER) {
                 OfortValue *actual = member_lvalue(I, n->stmts[i]);
                 args[i] = actual ? copy_value(*actual) : make_void_val();
+            } else if (fn && i < fn->n_params && fn->param_n_dims[i] > 0 &&
+                       (n->stmts[i]->type == FND_FUNC_CALL ||
+                        n->stmts[i]->type == FND_ARRAY_REF)) {
+                args[i] = sequence_actual_from_array_element(I, n->stmts[i]);
+                if (args[i].type == FVAL_VOID) args[i] = eval_node(I, n->stmts[i]);
             } else {
                 args[i] = eval_node(I, n->stmts[i]);
             }
