@@ -8168,7 +8168,7 @@ static OfortNode *parse_derived_type_declaration(OfortInterpreter *I) {
                 copy_cstr(param_name, sizeof(param_name), token_name_text(advance(I)));
                 advance(I);
             }
-            if (check(I, FTOK_COLON)) {
+            if (check(I, FTOK_COLON) || check(I, FTOK_STAR)) {
                 advance(I);
                 param_expr = alloc_node(I, FND_INT_LIT);
                 param_expr->int_val = 0;
@@ -10334,6 +10334,24 @@ static OfortValue default_derived_value_with_params(OfortInterpreter *I, const c
         }
     }
     result = default_derived_value(I, type_name);
+    if (result.type == FVAL_DERIVED && td->n_type_params > 0) {
+        int old_fields = result.v.dt.n_fields;
+        int new_fields = old_fields + td->n_type_params;
+        OfortValue *new_vals = (OfortValue *)realloc(result.v.dt.fields,
+                                                     (size_t)new_fields * sizeof(OfortValue));
+        char (*new_names)[64] = (char(*)[64])realloc(result.v.dt.field_names,
+                                                     (size_t)new_fields * sizeof(char[64]));
+        if (!new_vals || !new_names) ofort_error(I, "Out of memory");
+        result.v.dt.fields = new_vals;
+        result.v.dt.field_names = new_names;
+        for (int i = 0; i < td->n_type_params; i++) {
+            copy_cstr(result.v.dt.field_names[old_fields + i],
+                      sizeof(result.v.dt.field_names[0]),
+                      td->type_param_names[i]);
+            result.v.dt.fields[old_fields + i] = copy_value(param_vals[i]);
+        }
+        result.v.dt.n_fields = new_fields;
+    }
     if (td->n_type_params > 0) {
         pop_scope(I);
         for (int i = 0; i < td->n_type_params && i < OFORT_MAX_PARAMS; i++) free_value(&param_vals[i]);
@@ -24672,8 +24690,15 @@ unresolved_external_call_done:
                     }
                 }
                 free_value(target);
-                if (elem_type == FVAL_DERIVED && elem_type_name[0])
-                    *target = make_derived_array(I, elem_type_name, dims, ndims);
+                if (elem_type == FVAL_DERIVED && elem_type_name[0]) {
+                    if (n->n_type_param_exprs > 0)
+                        *target = make_derived_array_with_params(I, elem_type_name,
+                                                                 n->type_param_exprs, NULL,
+                                                                 n->n_type_param_exprs,
+                                                                 dims, ndims);
+                    else
+                        *target = make_derived_array(I, elem_type_name, dims, ndims);
+                }
                 else if (elem_type == FVAL_CHARACTER)
                     *target = make_array_with_char_len(elem_type, dims, ndims, alloc_char_len);
                 else
@@ -24738,8 +24763,14 @@ unresolved_external_call_done:
                     else char_len = target->type == FVAL_CHARACTER && target->v.s ? (int)strlen(target->v.s) : 1;
                 }
                 free_value(target);
-                if (target_type == FVAL_DERIVED && elem_type_name[0])
-                    *target = default_derived_value(I, elem_type_name);
+                if (target_type == FVAL_DERIVED && elem_type_name[0]) {
+                    if (n->n_type_param_exprs > 0)
+                        *target = default_derived_value_with_params(I, elem_type_name,
+                                                                    n->type_param_exprs, NULL,
+                                                                    n->n_type_param_exprs);
+                    else
+                        *target = default_derived_value(I, elem_type_name);
+                }
                 else
                     *target = default_value(target_type, char_len);
             }
@@ -24809,6 +24840,10 @@ unresolved_external_call_done:
                     new_val = default_value(mold.type, char_len);
                 }
                 free_value(&mold);
+            } else if (explicit_type == FVAL_DERIVED && elem_type_name[0]) {
+                new_val = default_derived_value_with_params(I, elem_type_name,
+                                                            n->type_param_exprs, NULL,
+                                                            n->n_type_param_exprs);
             } else if (var->declared_type == FVAL_DERIVED) {
                 const char *type_name = var->declared_type_name[0] ? var->declared_type_name :
                     (var->val.type == FVAL_DERIVED ? var->val.v.dt.type_name : "");
@@ -24891,8 +24926,15 @@ unresolved_external_call_done:
             ofort_error(I, "ALLOCATE requires dimensions, SOURCE, or MOLD");
         }
         OfortValue new_array;
-        if (elem_type == FVAL_DERIVED && elem_type_name[0])
-            new_array = make_derived_array(I, elem_type_name, dims, ndims);
+        if (elem_type == FVAL_DERIVED && elem_type_name[0]) {
+            if (n->n_type_param_exprs > 0)
+                new_array = make_derived_array_with_params(I, elem_type_name,
+                                                           n->type_param_exprs, NULL,
+                                                           n->n_type_param_exprs,
+                                                           dims, ndims);
+            else
+                new_array = make_derived_array(I, elem_type_name, dims, ndims);
+        }
         else if (elem_type == FVAL_CHARACTER)
             new_array = make_array_with_char_len(elem_type, dims, ndims, alloc_char_len);
         else
