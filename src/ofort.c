@@ -21607,6 +21607,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         const char *ptr_name = NULL;
         int remap_bounds = 0;
         int remap_lower = 1;
+        int remap_rank = 0;
+        int remap_lbounds[7] = {1, 1, 1, 1, 1, 1, 1};
+        int remap_dims[7] = {0, 0, 0, 0, 0, 0, 0};
         char target_name[256];
         int has_slice, slice_start, slice_end, slice_stride;
         OfortValue rhs;
@@ -21727,27 +21730,59 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         if (lhs->type == FND_IDENT) {
             ptr_name = lhs->name;
-        } else if (lhs->type == FND_FUNC_CALL && lhs->n_stmts == 1 &&
-                   lhs->stmts[0] && lhs->stmts[0]->type == FND_SLICE) {
-            OfortNode *sl = lhs->stmts[0];
+        } else if (lhs->type == FND_FUNC_CALL && lhs->n_stmts > 0) {
             ptr_name = lhs->name;
             remap_bounds = 1;
-            if (sl->children[0]) {
-                OfortValue lv = eval_node(I, sl->children[0]);
-                remap_lower = (int)val_to_int(lv);
-                free_value(&lv);
+            remap_rank = lhs->n_stmts;
+            for (int d = 0; d < lhs->n_stmts && d < 7; d++) {
+                OfortNode *sl = lhs->stmts[d];
+                int lower = 1;
+                int upper = 0;
+                if (!sl || sl->type != FND_SLICE) {
+                    ofort_error(I, "Pointer remapping bounds must be slices");
+                }
+                if (sl->children[0]) {
+                    OfortValue lv = eval_node(I, sl->children[0]);
+                    lower = (int)val_to_int(lv);
+                    free_value(&lv);
+                }
+                if (sl->children[1]) {
+                    OfortValue uv = eval_node(I, sl->children[1]);
+                    upper = (int)val_to_int(uv);
+                    free_value(&uv);
+                }
+                remap_lbounds[d] = lower;
+                remap_dims[d] = upper ? upper - lower + 1 : 0;
+                if (remap_dims[d] < 0) remap_dims[d] = 0;
             }
+            remap_lower = remap_lbounds[0];
         } else if (lhs->type == FND_ARRAY_REF && lhs->children[0] &&
-                   lhs->children[0]->type == FND_IDENT && lhs->n_stmts == 1 &&
-                   lhs->stmts[0] && lhs->stmts[0]->type == FND_SLICE) {
-            OfortNode *sl = lhs->stmts[0];
+                   lhs->children[0]->type == FND_IDENT && lhs->n_stmts > 0) {
             ptr_name = lhs->children[0]->name;
             remap_bounds = 1;
-            if (sl->children[0]) {
-                OfortValue lv = eval_node(I, sl->children[0]);
-                remap_lower = (int)val_to_int(lv);
-                free_value(&lv);
+            remap_rank = lhs->n_stmts;
+            for (int d = 0; d < lhs->n_stmts && d < 7; d++) {
+                OfortNode *sl = lhs->stmts[d];
+                int lower = 1;
+                int upper = 0;
+                if (!sl || sl->type != FND_SLICE) {
+                    ofort_error(I, "Pointer remapping bounds must be slices");
+                }
+                if (sl->children[0]) {
+                    OfortValue lv = eval_node(I, sl->children[0]);
+                    lower = (int)val_to_int(lv);
+                    free_value(&lv);
+                }
+                if (sl->children[1]) {
+                    OfortValue uv = eval_node(I, sl->children[1]);
+                    upper = (int)val_to_int(uv);
+                    free_value(&uv);
+                }
+                remap_lbounds[d] = lower;
+                remap_dims[d] = upper ? upper - lower + 1 : 0;
+                if (remap_dims[d] < 0) remap_dims[d] = 0;
             }
+            remap_lower = remap_lbounds[0];
         } else {
             ofort_error(I, "Pointer assignment target must be a pointer variable");
         }
@@ -21805,8 +21840,24 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         free_value(&ptr->val);
         ptr->val = rhs;
-        if (remap_bounds && ptr->val.type == FVAL_ARRAY && ptr->val.v.arr.n_dims > 0)
-            ptr->val.v.arr.lower_bounds[0] = remap_lower;
+        if (remap_bounds && ptr->val.type == FVAL_ARRAY && ptr->val.v.arr.n_dims > 0) {
+            if (remap_rank > 0) {
+                int total = 1;
+                for (int d = 0; d < remap_rank && d < 7; d++) {
+                    if (remap_dims[d] == 0 && remap_rank == 1) remap_dims[d] = ptr->val.v.arr.len;
+                    total *= remap_dims[d];
+                }
+                if (total != ptr->val.v.arr.len)
+                    ofort_error(I, "Pointer remapping shape mismatch");
+                ptr->val.v.arr.n_dims = remap_rank;
+                for (int d = 0; d < remap_rank && d < 7; d++) {
+                    ptr->val.v.arr.dims[d] = remap_dims[d];
+                    ptr->val.v.arr.lower_bounds[d] = remap_lbounds[d];
+                }
+            } else {
+                ptr->val.v.arr.lower_bounds[0] = remap_lower;
+            }
+        }
         ptr->pointer_associated = 1;
         ptr->is_initialized = 1;
         copy_cstr(ptr->pointer_target, sizeof(ptr->pointer_target), target_name);
@@ -21973,14 +22024,25 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             if (var->is_protected) ofort_error(I, "Cannot assign to PROTECTED variable '%s'", lhs->name);
             if (var->is_pointer && var->pointer_associated && var->pointer_target[0] &&
-                var->val.type == FVAL_ARRAY && lhs->n_stmts == 1) {
+                var->val.type == FVAL_ARRAY && lhs->n_stmts > 0) {
                 OfortVar *target_var = find_var(I, var->pointer_target);
-                OfortSubscriptRange prange;
-                if (target_var && target_var->val.type == FVAL_ARRAY &&
-                    !eval_subscript_range(I, lhs->stmts[0], var->val.v.arr.lower_bounds[0],
-                                          var->val.v.arr.dims[0], &prange)) {
-                    int psubs[1] = { prange.start };
-                    int pidx = section_linear_index(&var->val, psubs, 1);
+                OfortSubscriptRange pranges[7];
+                int has_pointer_section = 0;
+                if (target_var && target_var->val.type == FVAL_ARRAY) {
+                    int psubs[7] = {0};
+                    for (int d = 0; d < lhs->n_stmts && d < 7; d++) {
+                        int extent = d < var->val.v.arr.n_dims ? var->val.v.arr.dims[d] : var->val.v.arr.len;
+                        int lower = d < var->val.v.arr.n_dims ? var->val.v.arr.lower_bounds[d] : 1;
+                        if (eval_subscript_range(I, lhs->stmts[d], lower, extent, &pranges[d])) {
+                            has_pointer_section = 1;
+                            break;
+                        }
+                        psubs[d] = pranges[d].start;
+                    }
+                    if (has_pointer_section) {
+                        /* Fall through to normal section assignment handling below. */
+                    } else {
+                    int pidx = section_linear_index(&var->val, psubs, lhs->n_stmts);
                     int tidx = pidx;
                     if (var->pointer_has_slice) {
                         int target_sub = var->pointer_slice_start + pidx * var->pointer_slice_stride;
@@ -22013,6 +22075,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     trace_assignment_value(I, lhs, rhs);
                     free_value(&rhs);
                     break;
+                    }
                 }
             }
             if (var->val.type == FVAL_CHARACTER) {
