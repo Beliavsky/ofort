@@ -20924,6 +20924,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     }
                 }
             }
+            {
+                OfortFunc *src_func = find_func_in_module(I, remote, mod->name);
+                if (src_func && !find_func_in_module(I, local, "")) {
+                    (void)register_func_with_module(I, local, src_func->node,
+                                                    src_func->is_function, "");
+                }
+            }
         }
         break;
     }
