@@ -24478,6 +24478,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     actual->pointer_slice_stride = pointer_copyback_slice_stride[i] ? pointer_copyback_slice_stride[i] : 1;
                     continue;
                 }
+                if (actual && actual->is_allocatable && fn->param_allocatables[i]) {
+                    free_value(&actual->val);
+                    actual->val = copy_value(args[i]);
+                    actual->scalar_allocated = args[i].type != FVAL_VOID &&
+                                               !(args[i].type == FVAL_ARRAY && !args[i].v.arr.allocated);
+                    actual->is_initialized = actual->scalar_allocated ||
+                                             (actual->val.type == FVAL_ARRAY && actual->val.v.arr.allocated);
+                    continue;
+                }
                 set_var(I, n->stmts[i]->name, copy_value(args[i]));
             } else if (!arg_alias[i] && n->stmts[i]->type == FND_MEMBER && fn->param_intents[i] != 1 &&
                        (args[i].type != FVAL_VOID || fn->param_allocatables[i] ||
