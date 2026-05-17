@@ -19625,6 +19625,35 @@ static OfortValType pure_local_decl_type(OfortNode *n, const char *name) {
     return FVAL_VOID;
 }
 
+static OfortNode *find_procedure_dummy_declaration(OfortNode *n, const char *name) {
+    if (!n || !name || !name[0]) return NULL;
+    if (n->type == FND_SUBROUTINE || n->type == FND_FUNCTION || n->type == FND_STMT_FUNCTION)
+        return NULL;
+    if (n->type == FND_VARDECL && str_eq_nocase(n->name, name) &&
+        n->parent_type_name[0] && n->val_type == FVAL_CHARACTER) {
+        return n;
+    }
+    for (int i = 0; i < n->n_children; i++) {
+        OfortNode *found = find_procedure_dummy_declaration(n->children[i], name);
+        if (found) return found;
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        OfortNode *found = find_procedure_dummy_declaration(n->stmts[i], name);
+        if (found) return found;
+    }
+    return NULL;
+}
+
+static int pure_function_param_is_pure_procedure_dummy(OfortInterpreter *I,
+                                                       OfortNode *proc,
+                                                       const char *name) {
+    OfortNode *decl = find_procedure_dummy_declaration(proc ? proc->children[0] : NULL, name);
+    OfortNode *iface;
+    if (!decl) return 0;
+    iface = find_module_proc_spec(I, decl->parent_type_name);
+    return iface && iface->is_pure;
+}
+
 static int is_pure_internal_write(OfortNode *proc, OfortNode *n) {
     const char *target_name;
     if (!proc || !n || n->type != FND_WRITE || !n->children[0]) return 0;
@@ -19693,7 +19722,8 @@ static void validate_pure_procedure_node(OfortInterpreter *I, OfortNode *n) {
     }
     if (n->type == FND_FUNCTION) {
         for (int i = 0; i < n->n_params; i++) {
-            if (n->param_intents[i] != 1 && !n->param_values[i]) {
+            if (n->param_intents[i] != 1 && !n->param_values[i] &&
+                !pure_function_param_is_pure_procedure_dummy(I, n, n->param_names[i])) {
                 ofort_append_error(I, n->line,
                                    "Argument '%s' of PURE function '%s' must be INTENT(IN) or VALUE",
                                    n->param_names[i], n->name);
