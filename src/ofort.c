@@ -14686,10 +14686,20 @@ static void format_descriptors(OfortInterpreter *I, const char *p, const char *e
             for (int r = 0; r < repeat; r++) out_append(I, "\n");
         } else if (fc == '\'' || fc == '"') {
             char quote = *p++;
-            while (*p && *p != quote) {
-                char c[2] = {*p, '\0'};
-                out_append(I, c);
-                p++;
+            while (*p) {
+                if (*p == quote) {
+                    if (p[1] == quote) {
+                        char c[2] = {quote, '\0'};
+                        out_append(I, c);
+                        p += 2;
+                        continue;
+                    }
+                    break;
+                } else {
+                    char c[2] = {*p, '\0'};
+                    out_append(I, c);
+                    p++;
+                }
             }
             if (*p == quote) p++;
         } else {
@@ -30536,6 +30546,56 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     }
 
     /* === String intrinsics === */
+    if ((strcmp(upper, "INDEX") == 0 || strcmp(upper, "SCAN") == 0 ||
+         strcmp(upper, "VERIFY") == 0) && nargs >= 2) {
+        int string_idx = intrinsic_arg_index(arg_names, nargs, "string");
+        int second_idx = strcmp(upper, "INDEX") == 0 ?
+                         intrinsic_arg_index(arg_names, nargs, "substring") :
+                         intrinsic_arg_index(arg_names, nargs, "set");
+        int back_idx = intrinsic_arg_index(arg_names, nargs, "back");
+        OfortValue *shape_arg = NULL;
+        if (string_idx < 0) string_idx = 0;
+        if (second_idx < 0) second_idx = 1;
+        if (back_idx < 0 && nargs >= 3) back_idx = 2;
+        if (string_idx >= nargs || second_idx >= nargs)
+            ofort_error(I, "%s requires 2 character arguments", upper);
+        if (args[string_idx].type == FVAL_ARRAY) shape_arg = &args[string_idx];
+        if (args[second_idx].type == FVAL_ARRAY) {
+            if (!shape_arg) shape_arg = &args[second_idx];
+            else if (args[second_idx].v.arr.len != shape_arg->v.arr.len)
+                ofort_error(I, "%s array arguments have different sizes", upper);
+        }
+        if (back_idx >= 0 && back_idx < nargs && args[back_idx].type == FVAL_ARRAY) {
+            if (!shape_arg) shape_arg = &args[back_idx];
+            else if (args[back_idx].v.arr.len != shape_arg->v.arr.len)
+                ofort_error(I, "%s array arguments have different sizes", upper);
+        }
+        if (shape_arg) {
+            OfortValue result = make_array(FVAL_INTEGER, shape_arg->v.arr.dims, shape_arg->v.arr.n_dims);
+            for (int ri = 0; ri < result.v.arr.len; ri++) {
+                OfortValue elem_args[3];
+                OfortValue elem_result;
+                char elem_names[OFORT_MAX_PARAMS][256] = {{0}};
+                int elem_nargs = back_idx >= 0 && back_idx < nargs ? 3 : 2;
+                elem_args[0] = args[string_idx].type == FVAL_ARRAY ?
+                               array_element_value(&args[string_idx], ri) : copy_value(args[string_idx]);
+                elem_args[1] = args[second_idx].type == FVAL_ARRAY ?
+                               array_element_value(&args[second_idx], ri) : copy_value(args[second_idx]);
+                if (elem_nargs == 3) {
+                    elem_args[2] = args[back_idx].type == FVAL_ARRAY ?
+                                   array_element_value(&args[back_idx], ri) : copy_value(args[back_idx]);
+                    copy_cstr(elem_names[2], sizeof(elem_names[2]), "back");
+                }
+                elem_result = call_intrinsic(I, name, elem_args, elem_nargs, elem_names);
+                free_value(&result.v.arr.data[ri]);
+                result.v.arr.data[ri] = elem_result;
+                free_value(&elem_args[0]);
+                free_value(&elem_args[1]);
+                if (elem_nargs == 3) free_value(&elem_args[2]);
+            }
+            return result;
+        }
+    }
     if (strcmp(upper, "LEN") == 0) {
         if (args[0].type == FVAL_ARRAY && args[0].v.arr.elem_type == FVAL_CHARACTER) {
             int declared_len = array_character_len(&args[0]);
@@ -30593,9 +30653,19 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     }
     if (strcmp(upper, "ADJUSTL") == 0) {
         if (args[0].type == FVAL_CHARACTER && args[0].v.s) {
-            const char *p = args[0].v.s;
-            while (*p == ' ') p++;
-            return make_character(p);
+            char buf[OFORT_MAX_STRLEN];
+            int len, lead = 0, body_len;
+            copy_cstr(buf, sizeof(buf), args[0].v.s);
+            buf[OFORT_MAX_STRLEN - 1] = '\0';
+            len = (int)strlen(buf);
+            while (lead < len && buf[lead] == ' ') lead++;
+            if (lead > 0) {
+                body_len = len - lead;
+                memmove(buf, buf + lead, (size_t)body_len);
+                memset(buf + body_len, ' ', (size_t)lead);
+                buf[len] = '\0';
+            }
+            return make_character(buf);
         }
         return make_character("");
     }
@@ -30617,10 +30687,34 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         return make_character("");
     }
     if (strcmp(upper, "INDEX") == 0) {
+        int string_idx = intrinsic_arg_index(arg_names, nargs, "string");
+        int substring_idx = intrinsic_arg_index(arg_names, nargs, "substring");
+        int back_idx = intrinsic_arg_index(arg_names, nargs, "back");
+        int back = 0;
         if (nargs < 2) ofort_error(I, "INDEX requires 2 arguments");
-        if (args[0].type == FVAL_CHARACTER && args[1].type == FVAL_CHARACTER) {
-            const char *found = strstr(args[0].v.s, args[1].v.s);
-            if (found) return make_integer((long long)(found - args[0].v.s + 1));
+        if (string_idx < 0) string_idx = 0;
+        if (substring_idx < 0) substring_idx = 1;
+        if (back_idx < 0 && nargs >= 3) back_idx = 2;
+        if (back_idx >= 0) back = val_to_logical(args[back_idx]);
+        if (string_idx >= nargs || substring_idx >= nargs)
+            ofort_error(I, "INDEX requires STRING and SUBSTRING");
+        if (args[string_idx].type == FVAL_CHARACTER && args[substring_idx].type == FVAL_CHARACTER) {
+            const char *string = args[string_idx].v.s ? args[string_idx].v.s : "";
+            const char *substring = args[substring_idx].v.s ? args[substring_idx].v.s : "";
+            size_t slen = strlen(string);
+            size_t sublen = strlen(substring);
+            if (sublen == 0) return make_integer(back ? (long long)slen + 1 : 1);
+            if (sublen <= slen) {
+                if (back) {
+                    for (size_t pos = slen - sublen + 1; pos > 0; pos--) {
+                        if (strncmp(string + pos - 1, substring, sublen) == 0)
+                            return make_integer((long long)pos);
+                    }
+                } else {
+                    const char *found = strstr(string, substring);
+                    if (found) return make_integer((long long)(found - string + 1));
+                }
+            }
         }
         return make_integer(0);
     }
