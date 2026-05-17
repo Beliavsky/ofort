@@ -23242,8 +23242,6 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_OPEN: {
         if (!n->children[0])
             ofort_error(I, "OPEN requires UNIT");
-        if (!n->children[1] && I->standard_mode == OFORT_STD_F2023)
-            ofort_error(I, "OPEN without FILE= is a legacy extension");
         OfortValue fv = make_void_val();
         int unit;
         OfortUnitFile *entry;
@@ -23320,7 +23318,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 ofort_error(I, "OPEN FILE must be CHARACTER");
             copy_trimmed_path(open_path, sizeof(open_path), fv.v.s ? fv.v.s : "");
         } else {
-            if (unit < 0 || unit == 5 || unit == 6)
+            if (unit == 0 || unit == 5 || unit == 6) {
+                if (n->children[4] && n->children[4]->type == FND_IDENT)
+                    set_var(I, n->children[4]->name, make_integer(0));
+                free_value(&fv);
+                break;
+            }
+            if (I->standard_mode == OFORT_STD_F2023)
+                ofort_error(I, "OPEN without FILE= is a legacy extension");
+            if (unit < 0)
                 ofort_error(I, "OPEN without FILE= requires an external numeric unit");
             default_unit_path(unit, open_path, sizeof(open_path));
             ofort_warning(I, n->line,
