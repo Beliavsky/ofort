@@ -16186,6 +16186,27 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         char procedure_call_name[256];
         procedure_call_name[0] = '\0';
 
+        if (nargs == 0) {
+            OfortVar *v = find_var(I, n->name);
+            if (v) {
+                if (v->is_optional && !v->present)
+                    ofort_error(I, "Optional dummy argument '%s' is not present", n->name);
+                if (v->is_pointer) {
+                    if (!v->pointer_associated && v->val.type == FVAL_VOID) return make_void_val();
+                    if (procedure_ref_name(&v->val)) return copy_value(v->val);
+                    if (v->pointer_associated && v->pointer_target[0])
+                        return pointer_referenced_value(I, v->pointer_target, v->pointer_has_slice,
+                                                        v->pointer_slice_start, v->pointer_slice_end,
+                                                        v->pointer_slice_stride);
+                    return copy_value(v->val);
+                }
+                if (I->strict_uninitialized && !v->is_initialized) {
+                    ofort_error(I, "Variable '%s' is used before it is set at line %d", n->name, n->line);
+                }
+                return copy_value(v->val);
+            }
+        }
+
         if (str_eq_nocase(n->name, "associated")) {
             OfortVar *ptr;
             if (nargs < 1) ofort_error(I, "ASSOCIATED requires a pointer argument");
