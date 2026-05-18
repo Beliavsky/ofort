@@ -16520,7 +16520,26 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 resolve_type_field_shape(I, td, i, field_dims, field_lower_bounds);
                 strcpy(v.v.dt.field_names[i], td->field_names[i]);
                 if (i < nargs) {
-                    if (td->field_n_dims[i] > 0 && args[i].type != FVAL_ARRAY) {
+                    if (td->field_n_dims[i] > 0 && args[i].type == FVAL_ARRAY) {
+                        int field_char_len = td->field_char_lens[i];
+                        v.v.dt.fields[i] = copy_value(args[i]);
+                        v.v.dt.fields[i].v.arr.elem_type = td->field_types[i];
+                        if (td->field_types[i] == FVAL_DERIVED && td->field_type_names[i][0])
+                            copy_cstr(v.v.dt.fields[i].v.arr.elem_type_name,
+                                      sizeof(v.v.dt.fields[i].v.arr.elem_type_name),
+                                      td->field_type_names[i]);
+                        if (v.v.dt.fields[i].v.arr.data) {
+                            for (int j = 0; j < v.v.dt.fields[i].v.arr.len; j++) {
+                                OfortValue elem = v.v.dt.fields[i].v.arr.data[j];
+                                elem = coerce_assignment_value(I, td->field_names[i],
+                                                               td->field_types[i], elem);
+                                if (td->field_types[i] == FVAL_CHARACTER && field_char_len > 0)
+                                    elem = resize_character_value(elem, field_char_len);
+                                v.v.dt.fields[i].v.arr.data[j] = elem;
+                            }
+                        }
+                        if (td->field_is_allocatable[i]) v.v.dt.fields[i].v.arr.allocated = 1;
+                    } else if (td->field_n_dims[i] > 0) {
                         int field_char_len = td->field_char_lens[i];
                         if (field_char_len >= OFORT_MAX_STRLEN) field_char_len = OFORT_MAX_STRLEN - 1;
                         if (td->field_types[i] == FVAL_CHARACTER && args[i].type == FVAL_CHARACTER && args[i].v.s)
@@ -19787,6 +19806,137 @@ static int check_semantics_is_spec_node(OfortNode *n) {
         default:
             return 0;
     }
+}
+
+static int fast_main_stmt_is_self_contained_spec(OfortNode *n) {
+    if (!n) return 1;
+    switch (n->type) {
+        case FND_IMPLICIT_NONE:
+        case FND_VARDECL:
+        case FND_PARAMDECL:
+        case FND_ENUM:
+        case FND_TYPE_DEF:
+        case FND_ATTR_STMT:
+        case FND_ACCESS:
+        case FND_INTERFACE:
+        case FND_FORMAT:
+        case FND_DATA:
+        case FND_NAMELIST:
+        case FND_SUBROUTINE:
+        case FND_FUNCTION:
+        case FND_STMT_FUNCTION:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+static OfortNode *fast_find_empty_explicit_main(OfortNode *ast) {
+    OfortNode *program = NULL;
+    OfortNode *body;
+
+    if (!ast || ast->type != FND_BLOCK) return NULL;
+    for (int i = 0; i < ast->n_stmts; i++) {
+        OfortNode *s = ast->stmts[i];
+        if (!s) continue;
+        if (s->type == FND_PROGRAM) {
+            if (program) return NULL;
+            program = s;
+        }
+    }
+    if (!program) return NULL;
+    body = program->children[0];
+    if (!body) return program;
+    if (body->type != FND_BLOCK) return NULL;
+    for (int i = 0; i < body->n_stmts; i++) {
+        if (!fast_main_stmt_is_self_contained_spec(body->stmts[i])) return NULL;
+    }
+    return program;
+}
+
+static void fast_trim_lower_source_line(const char *start, size_t len, char *out, size_t out_size) {
+    size_t i = 0;
+    size_t first = 0;
+    size_t last = len;
+    int in_string = 0;
+    char quote = '\0';
+
+    while (first < len && isspace((unsigned char)start[first])) first++;
+    while (last > first && isspace((unsigned char)start[last - 1])) last--;
+    for (size_t j = first; j < last && i + 1 < out_size; j++) {
+        char c = start[j];
+        if ((c == '\'' || c == '"') && (!in_string || quote == c)) {
+            if (in_string && j + 1 < last && start[j + 1] == c) {
+                out[i++] = (char)tolower((unsigned char)c);
+                if (i + 1 < out_size) out[i++] = (char)tolower((unsigned char)start[++j]);
+                continue;
+            }
+            in_string = !in_string;
+            quote = in_string ? c : '\0';
+        }
+        if (!in_string && c == '!') break;
+        out[i++] = (char)tolower((unsigned char)c);
+    }
+    while (i > 0 && isspace((unsigned char)out[i - 1])) i--;
+    out[i] = '\0';
+}
+
+static int fast_line_is_program_start(const char *line) {
+    const char *p = line;
+    if (strncmp(p, "program", 7) != 0) return 0;
+    p += 7;
+    return *p == '\0' || isspace((unsigned char)*p);
+}
+
+static int fast_line_is_end_program(const char *line) {
+    const char *p = line;
+    if (strncmp(p, "end", 3) != 0) return 0;
+    p += 3;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p == '\0') return 1;
+    if (strncmp(p, "program", 7) != 0) return 0;
+    p += 7;
+    return *p == '\0' || isspace((unsigned char)*p);
+}
+
+static int fast_source_has_textually_empty_main(const char *source) {
+    const char *p = source;
+    int in_program = 0;
+    int found_program = 0;
+    int found_end = 0;
+
+    if (!source) return 0;
+    while (*p) {
+        const char *line_start = p;
+        const char *line_end;
+        char line[512];
+        while (*p && *p != '\n' && *p != '\r') p++;
+        line_end = p;
+        fast_trim_lower_source_line(line_start, (size_t)(line_end - line_start), line, sizeof(line));
+        if (*p == '\r' && p[1] == '\n') p += 2;
+        else if (*p) p++;
+
+        if (line[0] == '\0') continue;
+        if (!in_program) {
+            if (fast_line_is_program_start(line)) {
+                if (found_program) return 0;
+                found_program = 1;
+                in_program = 1;
+            }
+            continue;
+        }
+        if (fast_line_is_end_program(line)) {
+            found_end = 1;
+            in_program = 0;
+            continue;
+        }
+        if (strncmp(line, "implicit", 8) == 0 &&
+            (line[8] == '\0' || isspace((unsigned char)line[8]))) {
+            continue;
+        }
+        return 0;
+    }
+    return found_program && found_end && !in_program;
 }
 
 static const char *io_statement_name(OfortNodeType type) {
@@ -33156,6 +33306,7 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
     double stage_start;
     char *processed_source = NULL;
     int use_cached_ast = 0;
+    int fast_skip_unreachable_registration = 0;
     if (!interp || !source) return -1;
     total_start = ofort_monotonic_seconds();
     clear_timing(interp);
@@ -33208,6 +33359,15 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
         }
         interp->source = processed_source;
 
+        if (interp->fast_mode &&
+            !interp->line_profile_enabled &&
+            !interp->procedure_profile_enabled &&
+            fast_source_has_textually_empty_main(processed_source)) {
+            interp->timing.total = ofort_monotonic_seconds() - total_start;
+            free(processed_source);
+            return 0;
+        }
+
         /* Tokenize */
         stage_start = ofort_monotonic_seconds();
         tokenize(interp, processed_source);
@@ -33220,10 +33380,15 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
         interp->ast = parse_program(interp);
         interp->timing.parse = ofort_monotonic_seconds() - stage_start;
     }
+    fast_skip_unreachable_registration = interp->fast_mode &&
+                                         !interp->line_profile_enabled &&
+                                         !interp->procedure_profile_enabled &&
+                                         fast_find_empty_explicit_main(interp->ast) != NULL;
 
     /* First pass: register all top-level functions/subroutines/modules */
     stage_start = ofort_monotonic_seconds();
-    if (!use_cached_ast && interp->ast && interp->ast->type == FND_BLOCK) {
+    if (!fast_skip_unreachable_registration &&
+        !use_cached_ast && interp->ast && interp->ast->type == FND_BLOCK) {
         for (int i = 0; i < interp->ast->n_stmts; i++) {
             OfortNode *s = interp->ast->stmts[i];
             if (!s) continue;
