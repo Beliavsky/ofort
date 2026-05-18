@@ -343,7 +343,9 @@ static void write_direct_record_from_node(OfortInterpreter *I, OfortUnitFile *en
 static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortValue *args, int nargs,
                                 char arg_names[OFORT_MAX_PARAMS][256]);
 static int storage_size_bits(OfortValue *v);
+static int integer_kind_bits(int kind);
 static int is_intrinsic(const char *name);
+static void mark_assignment_root_initialized(OfortInterpreter *I, OfortNode *lhs);
 static void check_semantics_node(OfortInterpreter *I, OfortNode *n);
 static int ofort_extension_module_exists(const char *module_name);
 static OfortValue shift_scalar_value(const char *upper, OfortValue value_arg, OfortValue shift_arg);
@@ -10280,6 +10282,14 @@ static void apply_debug_decl_initializer(OfortInterpreter *I, OfortValue *val, O
     }
 }
 
+static int debug_decl_initializer_enabled(OfortInterpreter *I, OfortValType decl_type) {
+    if (!I) return 0;
+    if (decl_type == FVAL_INTEGER) return I->init_integer_enabled;
+    if (decl_type == FVAL_REAL || decl_type == FVAL_DOUBLE) return I->init_real_enabled;
+    if (decl_type == FVAL_CHARACTER) return I->init_character_enabled;
+    return 0;
+}
+
 static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims);
 static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, int n_dims, int char_len);
 static int assign_packed_array_element(OfortValue *arr, int index, OfortValue rhs);
@@ -10314,6 +10324,24 @@ static void resolve_type_field_shape(OfortInterpreter *I, OfortTypeDef *td, int 
         }
         lower_bounds[d] = lower;
     }
+}
+
+static int derived_type_is_default_defined(OfortInterpreter *I, const char *type_name,
+                                           int depth) {
+    OfortTypeDef *td;
+    if (!I || !type_name || !type_name[0] || depth > 32) return 0;
+    td = find_type_def(I, type_name);
+    if (!td) return 0;
+    for (int i = 0; i < td->n_fields; i++) {
+        if (td->field_init_exprs[i]) continue;
+        if (td->field_is_allocatable[i] || td->field_is_pointer[i]) continue;
+        if (td->field_types[i] == FVAL_DERIVED &&
+            derived_type_is_default_defined(I, td->field_type_names[i], depth + 1)) {
+            continue;
+        }
+        return 0;
+    }
+    return 1;
 }
 
 static OfortValue default_derived_value(OfortInterpreter *I, const char *type_name) {
@@ -10679,7 +10707,10 @@ static int assign_derived_array_member(OfortInterpreter *I, OfortNode *lhs, Ofor
 static int eval_character_length(OfortInterpreter *I, OfortNode *n) {
     int char_len = n->char_len;
     if (n->char_len_expr) {
+        int saved_strict_uninitialized = I->strict_uninitialized;
+        I->strict_uninitialized = 0;
         OfortValue v = eval_node(I, n->char_len_expr);
+        I->strict_uninitialized = saved_strict_uninitialized;
         char_len = (int)val_to_int(v);
         free_value(&v);
     }
@@ -11279,6 +11310,16 @@ static OfortValue eval_inquiry_intrinsic_for_ident(OfortInterpreter *I, OfortNod
 
     if (str_eq_nocase(name, "rank")) {
         return make_integer(val && val->type == FVAL_ARRAY ? val->v.arr.n_dims : 0);
+    }
+
+    if (str_eq_nocase(name, "bit_size")) {
+        if (!val || val->type != FVAL_INTEGER) return make_void_val();
+        return make_integer(integer_kind_bits(var->declared_kind ? var->declared_kind : value_declared_kind(val)));
+    }
+
+    if (str_eq_nocase(name, "storage_size")) {
+        if (!val) return make_void_val();
+        return make_integer(storage_size_bits(val));
     }
 
     if (str_eq_nocase(name, "size")) {
@@ -12350,7 +12391,16 @@ static int data_target_count_node(OfortInterpreter *I, OfortNode *target) {
     }
 
     {
+        OfortVar *var = NULL;
         ensure_data_target_declared(I, target);
+        if (target->type == FND_IDENT) {
+            var = find_var(I, target->name);
+            if (var && var->val.type == FVAL_ARRAY) return var->val.v.arr.len;
+            return 1;
+        }
+        if (target->type == FND_FUNC_CALL && (var = find_var(I, target->name)) != NULL &&
+            var->val.type == FVAL_ARRAY)
+            return 1;
         OfortValue value = eval_node(I, target);
         int count = (value.type == FVAL_ARRAY) ? value.v.arr.len : 1;
         free_value(&value);
@@ -13120,6 +13170,7 @@ static void assign_intrinsic_output_target(OfortInterpreter *I, const char *proc
     }
     free_value(slot);
     *slot = val;
+    mark_assignment_root_initialized(I, target);
 }
 
 static int command_exit_status(int rc) {
@@ -13536,6 +13587,7 @@ static void assign_line_to_character_target(OfortInterpreter *I, OfortNode *targ
         text = resize_character_value(text, v->char_len);
         free_value(&v->val);
         v->val = text;
+        v->is_initialized = 1;
         return;
     }
     if (target->type == FND_ARRAY_REF && target->children[0] &&
@@ -13546,6 +13598,7 @@ static void assign_line_to_character_target(OfortInterpreter *I, OfortNode *targ
             ofort_error(I, "READ '(A)' target must be CHARACTER");
         text = resize_character_value(text, v->char_len);
         assign_array_ref(I, v, target, &text);
+        v->is_initialized = 1;
         free_value(&text);
         return;
     }
@@ -13556,6 +13609,7 @@ static void assign_line_to_character_target(OfortInterpreter *I, OfortNode *targ
             ofort_error(I, "READ '(A)' target must be CHARACTER");
         text = resize_character_value(text, v->char_len);
         assign_array_ref(I, v, target, &text);
+        v->is_initialized = 1;
         free_value(&text);
         return;
     }
@@ -13785,6 +13839,7 @@ static int read_values_from_stdin(OfortInterpreter *I, OfortNode *n, int is_stre
                     }
                     assign_token_to_array_element(&v->val, j, tok);
                 }
+                v->is_initialized = 1;
                 continue;
             }
         }
@@ -13814,6 +13869,7 @@ static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, c
         } else {
             assign_token_to_value(&v->val, tok);
         }
+        v->is_initialized = 1;
         return 1;
     }
     if (target->type == FND_ARRAY_REF && target->children[0] &&
@@ -13826,6 +13882,7 @@ static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, c
         tmp = default_value(v->val.v.arr.elem_type, 1);
         assign_token_to_value(&tmp, tok);
         assign_array_ref(I, v, target, &tmp);
+        v->is_initialized = 1;
         free_value(&tmp);
         return 1;
     }
@@ -13836,6 +13893,7 @@ static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, c
         tmp = default_value(v->val.v.arr.elem_type, 1);
         assign_token_to_value(&tmp, tok);
         assign_array_ref(I, v, target, &tmp);
+        v->is_initialized = 1;
         free_value(&tmp);
         return 1;
     }
@@ -13872,6 +13930,7 @@ static int read_file_target(OfortInterpreter *I, FILE *fp, OfortNode *target, ch
                 if (!read_next_token(fp, tok, tok_size)) return 1;
                 assign_token_to_array_element(&v->val, j, tok);
             }
+            v->is_initialized = 1;
             return 0;
         }
     }
@@ -13937,6 +13996,7 @@ static int read_string_target(OfortInterpreter *I, const char **p, OfortNode *ta
                 }
                 assign_token_to_array_element(&v->val, j, tok);
             }
+            v->is_initialized = 1;
             return 0;
         }
     }
@@ -14437,9 +14497,12 @@ static int read_binary_stream_target(OfortInterpreter *I, FILE *fp, OfortNode *t
         for (int j = 0; j < dest->v.arr.len; j++) {
             if (read_binary_array_element_from_stream(fp, dest, j) != 0) return 1;
         }
+        mark_assignment_root_initialized(I, target);
         return 0;
     }
-    return read_binary_value_from_stream(fp, dest, 0);
+    if (read_binary_value_from_stream(fp, dest, 0) != 0) return 1;
+    mark_assignment_root_initialized(I, target);
+    return 0;
 }
 
 static void read_values_from_stream_file(OfortInterpreter *I, OfortUnitFile *entry, OfortNode *n) {
@@ -15031,6 +15094,7 @@ static int write_to_internal_target(OfortInterpreter *I, OfortNode *target_node,
         text = resize_character_value(text, target->char_len);
         free_value(&target->val);
         target->val = text;
+        target->is_initialized = 1;
         return 1;
     }
 
@@ -15054,15 +15118,23 @@ static int write_to_internal_target(OfortInterpreter *I, OfortNode *target_node,
         text = make_character(text_buf);
         text = resize_character_value(text, target->char_len);
         assign_array_ref(I, target, target_node, &text);
+        target->is_initialized = 1;
         free_value(&text);
         return 1;
     }
 
     if (target_node->type == FND_MEMBER || target_node->type == FND_ARRAY_REF) {
-        OfortValue *target = member_lvalue(I, target_node);
+        int saved_strict_uninitialized = I->strict_uninitialized;
+        OfortValue *target;
         int char_len;
+        I->strict_uninitialized = 0;
+        target = member_lvalue(I, target_node);
+        I->strict_uninitialized = saved_strict_uninitialized;
         if (!target || target->type != FVAL_CHARACTER) return 0;
+        saved_strict_uninitialized = I->strict_uninitialized;
+        I->strict_uninitialized = 0;
         char_len = declared_character_member_length(I, target_node);
+        I->strict_uninitialized = saved_strict_uninitialized;
         if (char_len <= 0 && target->kind > 1) char_len = target->kind;
         if (char_len <= 0 && target->v.s) char_len = (int)strlen(target->v.s);
         if (char_len <= 0) char_len = target->kind > 0 ? target->kind : 1;
@@ -15079,6 +15151,7 @@ static int write_to_internal_target(OfortInterpreter *I, OfortNode *target_node,
         text.kind = char_len;
         free_value(target);
         *target = text;
+        mark_assignment_root_initialized(I, target_node);
         return 1;
     }
 
@@ -15129,6 +15202,13 @@ static int is_internal_write_target_node(OfortInterpreter *I, OfortNode *target)
     } else if ((target->type == FND_FUNC_CALL || target->type == FND_ARRAY_REF) &&
                target->name[0]) {
         v = find_var(I, target->name);
+    } else if (target->type == FND_MEMBER) {
+        int saved_strict_uninitialized = I->strict_uninitialized;
+        OfortValue *member;
+        I->strict_uninitialized = 0;
+        member = member_lvalue(I, target);
+        I->strict_uninitialized = saved_strict_uninitialized;
+        return member && member->type == FVAL_CHARACTER;
     }
     if (!v) return 0;
     if (v->val.type == FVAL_CHARACTER || v->declared_type == FVAL_CHARACTER) return 1;
@@ -16263,7 +16343,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         if ((str_eq_nocase(n->name, "kind") || str_eq_nocase(n->name, "len") ||
              str_eq_nocase(n->name, "size") ||
              str_eq_nocase(n->name, "lbound") || str_eq_nocase(n->name, "ubound") ||
-             str_eq_nocase(n->name, "shape") || str_eq_nocase(n->name, "rank")) &&
+             str_eq_nocase(n->name, "shape") || str_eq_nocase(n->name, "rank") ||
+             str_eq_nocase(n->name, "bit_size") || str_eq_nocase(n->name, "storage_size")) &&
             !find_imported_extension_intrinsic(I, n->name) &&
             nargs >= 1 && n->stmts[0]->type == FND_IDENT) {
             OfortVar *inquiry_var = find_var(I, n->stmts[0]->name);
@@ -16305,7 +16386,17 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         /* Evaluate all args */
         args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
         if (!args) ofort_error(I, "Out of memory");
+        OfortFunc *pre_func = find_func(I, procedure_call_name[0] ? procedure_call_name : n->name);
         for (int i = 0; i < nargs; i++) {
+            if (pre_func && pre_func->is_function && pre_func->node &&
+                i < pre_func->node->n_params && pre_func->node->param_intents[i] == 2 &&
+                n->stmts[i]->type == FND_IDENT) {
+                OfortVar *actual = find_var(I, n->stmts[i]->name);
+                if (actual) {
+                    args[i] = copy_value(actual->val);
+                    continue;
+                }
+            }
             if (n->stmts[i]->type == FND_IDENT) {
                 OfortVar *actual = find_var(I, n->stmts[i]->name);
                 if (actual && actual->is_optional && !actual->present) {
@@ -16317,7 +16408,24 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     continue;
                 }
             }
-            args[i] = eval_node(I, n->stmts[i]);
+            if ((i == 0 &&
+                (str_eq_nocase(n->name, "kind") || str_eq_nocase(n->name, "len") ||
+                 str_eq_nocase(n->name, "size") || str_eq_nocase(n->name, "shape") ||
+                 str_eq_nocase(n->name, "rank") || str_eq_nocase(n->name, "lbound") ||
+                 str_eq_nocase(n->name, "ubound") || str_eq_nocase(n->name, "bit_size") ||
+                 str_eq_nocase(n->name, "storage_size") || str_eq_nocase(n->name, "huge") ||
+                 str_eq_nocase(n->name, "tiny") || str_eq_nocase(n->name, "epsilon") ||
+                 str_eq_nocase(n->name, "digits") || str_eq_nocase(n->name, "precision") ||
+                 str_eq_nocase(n->name, "range") || str_eq_nocase(n->name, "radix") ||
+                 str_eq_nocase(n->name, "minexponent") || str_eq_nocase(n->name, "maxexponent"))) ||
+                (i == 1 && str_eq_nocase(n->name, "transfer"))) {
+                int saved_strict_uninitialized = I->strict_uninitialized;
+                I->strict_uninitialized = 0;
+                args[i] = eval_node(I, n->stmts[i]);
+                I->strict_uninitialized = saved_strict_uninitialized;
+            } else {
+                args[i] = eval_node(I, n->stmts[i]);
+            }
         }
 
         if (I->fast_mode && I->specialized_fast_paths &&
@@ -16612,7 +16720,24 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_MEMBER: {
+        int saved_strict_uninitialized = I->strict_uninitialized;
+        int suppress_root_uninit = 0;
+        if (n->children[0] && n->children[0]->type == FND_IDENT) {
+            OfortVar *root_var = find_var(I, n->children[0]->name);
+            OfortTypeDef *root_td = root_var && root_var->declared_type == FVAL_DERIVED ?
+                                    find_type_def(I, root_var->declared_type_name) : NULL;
+            if (root_td) {
+                for (int ti = 0; ti < root_td->n_type_params; ti++) {
+                    if (str_eq_nocase(n->name, root_td->type_param_names[ti])) {
+                        suppress_root_uninit = 1;
+                        break;
+                    }
+                }
+            }
+        }
+        if (suppress_root_uninit) I->strict_uninitialized = 0;
         OfortValue obj = eval_node(I, n->children[0]);
+        if (suppress_root_uninit) I->strict_uninitialized = saved_strict_uninitialized;
         if (str_eq_nocase(n->name, "re") || str_eq_nocase(n->name, "im")) {
             int want_re = str_eq_nocase(n->name, "re");
             if (obj.type == FVAL_COMPLEX) {
@@ -16946,6 +17071,7 @@ static void assign_elemental_actual(OfortInterpreter *I, OfortNode *actual_node,
             } else {
                 free_value(&elem);
             }
+            actual->is_initialized = 1;
         }
         return;
     }
@@ -16956,6 +17082,7 @@ static void assign_elemental_actual(OfortInterpreter *I, OfortNode *actual_node,
         if (target) {
             free_value(target);
             *target = copy_value(*value);
+            mark_assignment_root_initialized(I, actual_node);
         }
     }
 }
@@ -17848,6 +17975,7 @@ static int exec_fast_numeric_do_loop(OfortInterpreter *I, OfortNode *n) {
         if (st < 0 && iter < e) break;
         if (loop_var && loop_var->val.type == FVAL_INTEGER && !loop_var->is_parameter && !loop_var->is_protected) {
             loop_var->val.v.i = iter;
+            loop_var->is_initialized = 1;
         } else {
             set_var(I, n->name, make_integer(iter));
             loop_var = find_var(I, n->name);
@@ -17858,6 +17986,7 @@ static int exec_fast_numeric_do_loop(OfortInterpreter *I, OfortNode *n) {
     }
     if (loop_var && loop_var->val.type == FVAL_INTEGER && !loop_var->is_parameter && !loop_var->is_protected) {
         loop_var->val.v.i = iter;
+        loop_var->is_initialized = 1;
     } else {
         set_var(I, n->name, make_integer(iter));
     }
@@ -18141,7 +18270,9 @@ static int exec_fast_scalar_affine_recurrence_loop(OfortInterpreter *I, OfortNod
         iter += st;
     }
     target->val.v.r = value;
+    target->is_initialized = 1;
     loop_var->val.v.i = iter;
+    loop_var->is_initialized = 1;
     if (I->line_profile_enabled && n->line > 0) {
         add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
     }
@@ -18463,6 +18594,7 @@ static int exec_fast_array_expr_accum_loop(OfortInterpreter *I, OfortNode *n,
     sum_var->val.v.r = sum;
     sum_var->is_initialized = 1;
     loop_var->val.v.i = iter;
+    loop_var->is_initialized = 1;
     if (I->line_profile_enabled && n->line > 0) {
         add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
     }
@@ -18530,8 +18662,11 @@ static int exec_fast_scalar_poly_accum_loop(OfortInterpreter *I, OfortNode *n,
         iter += st;
     }
     x_var->val.v.r = x;
+    x_var->is_initialized = 1;
     sum_var->val.v.r = sum;
+    sum_var->is_initialized = 1;
     loop_var->val.v.i = iter;
+    loop_var->is_initialized = 1;
     if (I->line_profile_enabled && n->line > 0) {
         add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
     }
@@ -18623,7 +18758,9 @@ static int exec_fast_affine_subroutine_loop(OfortInterpreter *I, OfortNode *n,
         iter = s;
     }
     actual_var->val.v.r = value;
+    actual_var->is_initialized = 1;
     loop_var->val.v.i = iter;
+    loop_var->is_initialized = 1;
     if (I->line_profile_enabled && n->line > 0) {
         add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
     }
@@ -18813,6 +18950,8 @@ static int exec_fast_array_affine_loop(OfortInterpreter *I, OfortNode *n,
         iter = s;
     }
     loop_var->val.v.i = iter;
+    loop_var->is_initialized = 1;
+    dst_var->is_initialized = 1;
     if (I->line_profile_enabled && n->line > 0) {
         add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
     }
@@ -18903,8 +19042,11 @@ static int exec_fast_random_sum_loop(OfortInterpreter *I, OfortNode *n,
     }
     I->fast_rng_state = rng_state;
     random_var->val.v.r = last_random;
+    random_var->is_initialized = 1;
     sum_var->val.v.r = sum;
+    sum_var->is_initialized = 1;
     loop_var->val.v.i = iter;
+    loop_var->is_initialized = 1;
     if (I->line_profile_enabled && n->line > 0) {
         add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
     }
@@ -19009,9 +19151,13 @@ static int exec_fast_random_dot_loop(OfortInterpreter *I, OfortNode *n,
     }
     I->fast_rng_state = rng_state;
     x_var->val.v.r = x;
+    x_var->is_initialized = 1;
     y_var->val.v.r = y;
+    y_var->is_initialized = 1;
     dot_var->val.v.r = dot;
+    dot_var->is_initialized = 1;
     loop_var->val.v.i = iter;
+    loop_var->is_initialized = 1;
     if (I->line_profile_enabled && n->line > 0) {
         add_line_profile_time(I, n->line, ofort_monotonic_seconds() - profile_start);
     }
@@ -19162,21 +19308,37 @@ static int exec_fast_nagarch_obj_loop(OfortInterpreter *I, OfortNode *n,
     }
 
     factor_var->val.v.r = factor;
+    factor_var->is_initialized = 1;
     f_var->val.v.r = f;
+    f_var->is_initialized = 1;
     grad_om_var->val.v.r = grad_om;
+    grad_om_var->is_initialized = 1;
     grad_al_var->val.v.r = grad_al;
+    grad_al_var->is_initialized = 1;
     grad_be_var->val.v.r = grad_be;
+    grad_be_var->is_initialized = 1;
     grad_th_var->val.v.r = grad_th;
+    grad_th_var->is_initialized = 1;
     sqrth_var->val.v.r = sqrth;
+    sqrth_var->is_initialized = 1;
     r_var->val.v.r = r;
+    r_var->is_initialized = 1;
     active_var->val.v.b = active;
+    active_var->is_initialized = 1;
     kappa_var->val.v.r = kappa;
+    kappa_var->is_initialized = 1;
     dh_dom_var->val.v.r = dh_dom;
+    dh_dom_var->is_initialized = 1;
     dh_dal_var->val.v.r = dh_dal;
+    dh_dal_var->is_initialized = 1;
     dh_dbe_var->val.v.r = dh_dbe;
+    dh_dbe_var->is_initialized = 1;
     dh_dth_var->val.v.r = dh_dth;
+    dh_dth_var->is_initialized = 1;
     h_var->val.v.r = h;
+    h_var->is_initialized = 1;
     loop_var->val.v.i = iter;
+    loop_var->is_initialized = 1;
     return 1;
 }
 
@@ -19684,6 +19846,18 @@ static const char *extract_forall_lhs_name(OfortNode *lhs) {
         return lhs->children[0]->name;
     }
     return NULL;
+}
+
+static void mark_assignment_root_initialized(OfortInterpreter *I, OfortNode *lhs) {
+    OfortNode *root = lhs;
+    while (root && (root->type == FND_MEMBER || root->type == FND_ARRAY_REF) &&
+           root->children[0]) {
+        root = root->children[0];
+    }
+    if (root && root->type == FND_IDENT) {
+        OfortVar *v = find_var(I, root->name);
+        if (v) v->is_initialized = 1;
+    }
 }
 
 static OfortNamelist *find_namelist(OfortInterpreter *I, const char *name) {
@@ -22086,6 +22260,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                                   sizeof(existing->val.v.arr.elem_type_name), n->str_val);
                     existing->val.v.arr.allocated = 0;
                     existing->scalar_allocated = 0;
+                    existing->is_initialized = 0;
+                } else if (n->intent != 2 && existing->val.type != FVAL_VOID) {
+                    existing->is_initialized = 1;
                 }
                 break;
             }
@@ -22117,6 +22294,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     existing->val = make_void_val();
                 }
                 existing->scalar_allocated = 0;
+                existing->is_initialized = 0;
+            } else if (n->intent != 2 && existing->val.type != FVAL_VOID) {
+                existing->is_initialized = 1;
             }
             if (n->val_type == FVAL_CHARACTER) existing->char_len = decl_char_len;
             break;
@@ -22143,6 +22323,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 existing->pointer_slice_stride = existing->val.pointer_slice_stride ? existing->val.pointer_slice_stride : 1;
             } else if (n->is_pointer && existing->val.type != FVAL_VOID) {
                 existing->pointer_associated = 1;
+            }
+            if (n->intent == 2) {
+                existing->is_initialized = 0;
+            } else if (existing->val.type != FVAL_VOID) {
+                existing->is_initialized = 1;
             }
             if (n->val_type == FVAL_CHARACTER) existing->char_len = decl_char_len;
             break;
@@ -22173,6 +22358,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 existing->val = val;
             }
             existing->is_parameter = 1;
+            existing->is_initialized = 1;
             break;
         }
         if (existing && existing == existing_current && n->bool_val) {
@@ -22320,7 +22506,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             n->is_parameter ||
                             val_is_alias ||
                             n->is_allocatable ||
-                            n->is_pointer;
+                            n->is_pointer ||
+                            (n->val_type == FVAL_DERIVED &&
+                             derived_type_is_default_defined(I, n->str_val, 0)) ||
+                            debug_decl_initializer_enabled(I, n->val_type);
         v->is_allocatable = n->is_allocatable;
         v->scalar_allocated = 0;
         v->declared_type = n->val_type;
@@ -22893,12 +23082,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     ofort_error(I, "Invalid array reference assignment target");
                 }
                 assign_array_ref_value(I, array_target, lhs, &rhs);
+                mark_assignment_root_initialized(I, lhs);
                 trace_assignment_value(I, lhs, rhs);
                 free_value(&rhs);
                 break;
             }
             free_value(target);
             *target = rhs;
+            mark_assignment_root_initialized(I, lhs);
             trace_assignment_value(I, lhs, rhs);
         } else if (lhs->type == FND_MEMBER) {
             /* Derived type member assignment: obj%field = val */
@@ -22910,6 +23101,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (v->val.type == FVAL_COMPLEX) {
                     if (want_re) v->val.v.cx.re = val_to_real(rhs);
                     else v->val.v.cx.im = val_to_real(rhs);
+                    mark_assignment_root_initialized(I, lhs);
                     trace_assignment_value(I, lhs, rhs);
                     free_value(&rhs);
                     break;
@@ -22926,12 +23118,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         if (want_re) v->val.v.arr.data[i].v.cx.re = part;
                         else v->val.v.arr.data[i].v.cx.im = part;
                     }
+                    mark_assignment_root_initialized(I, lhs);
                     trace_assignment_value(I, lhs, rhs);
                     free_value(&rhs);
                     break;
                 }
             }
             if (assign_derived_array_member(I, lhs, &rhs)) {
+                mark_assignment_root_initialized(I, lhs);
                 trace_assignment_value(I, lhs, rhs);
                 free_value(&rhs);
                 break;
@@ -22940,6 +23134,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (target) {
                 if (target->is_pointer_ref) {
                     write_through_pointer_value(I, target, &rhs);
+                    mark_assignment_root_initialized(I, lhs);
                     trace_assignment_value(I, lhs, rhs);
                     free_value(&rhs);
                     break;
@@ -22959,6 +23154,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             if (!target->v.arr.elem_type_name[0] && elem_type_name[0])
                                 copy_cstr(target->v.arr.elem_type_name, sizeof(target->v.arr.elem_type_name), elem_type_name);
                             if (n_dims > 0) target->v.arr.n_dims = n_dims;
+                            mark_assignment_root_initialized(I, lhs);
                             trace_assignment_value(I, lhs, rhs);
                             free_value(&rhs);
                             break;
@@ -22987,12 +23183,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             }
                         }
                     }
+                    mark_assignment_root_initialized(I, lhs);
                     trace_assignment_value(I, lhs, rhs);
                     free_value(&rhs);
                     break;
                 }
                 free_value(target);
                 *target = rhs;
+                mark_assignment_root_initialized(I, lhs);
                 trace_assignment_value(I, lhs, rhs);
                 break;
             }
@@ -23085,6 +23283,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             }
                         }
                         value_pos += needed;
+                        dv->is_initialized = 1;
                         continue;
                     }
                 }
@@ -24322,6 +24521,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             ofort_error(I, "Array index out of bounds: %d (size %d)",
                                         index + 1, array_var->val.v.arr.len);
                         array_var->val.v.arr.real_data[index] = seconds;
+                        array_var->is_initialized = 1;
                         break;
                     }
                 }
@@ -24334,6 +24534,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             val = time_type == FVAL_DOUBLE ? make_double(seconds) : make_real(seconds);
             free_value(time_slot);
             *time_slot = val;
+            mark_assignment_root_initialized(I, target_node);
             break;
         }
         if (strcmp(call_upper, "DATE_AND_TIME") == 0) {
@@ -24392,6 +24593,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         free_value(&values_var->val.v.arr.data[j]);
                         values_var->val.v.arr.data[j] = make_integer(values[j]);
                     }
+                    values_var->is_initialized = 1;
                 }
             }
             break;
@@ -25119,6 +25321,33 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                        n->stmts[i]->type == FND_IDENT) {
                 OfortVar *actual = find_var(I, n->stmts[i]->name);
                 args[i] = actual ? copy_value(actual->val) : make_void_val();
+            } else if (fn && i < fn->n_params && fn->param_intents[i] == 2 &&
+                       n->stmts[i]->type == FND_IDENT) {
+                OfortVar *actual = find_var(I, n->stmts[i]->name);
+                args[i] = actual ? copy_value(actual->val) : make_void_val();
+            } else if (fn && i < fn->n_params && fn->param_intents[i] == 2 &&
+                       n->stmts[i]->type == FND_MEMBER) {
+                OfortValue *actual = member_lvalue(I, n->stmts[i]);
+                args[i] = actual ? copy_value(*actual) : make_void_val();
+            } else if (fn && i < fn->n_params && fn->param_intents[i] != 1 &&
+                       n->stmts[i]->type == FND_IDENT) {
+                OfortVar *actual = find_var(I, n->stmts[i]->name);
+                if (actual && !actual->is_initialized) {
+                    args[i] = copy_value(actual->val);
+                } else {
+                    args[i] = eval_node(I, n->stmts[i]);
+                }
+            } else if (fn && i < fn->n_params && fn->param_intents[i] != 1 &&
+                       n->stmts[i]->type == FND_MEMBER) {
+                OfortValue *actual = member_lvalue(I, n->stmts[i]);
+                args[i] = actual ? copy_value(*actual) : make_void_val();
+            } else if (!fn && n->stmts[i]->type == FND_IDENT) {
+                OfortVar *actual = find_var(I, n->stmts[i]->name);
+                if (actual && !actual->is_initialized) {
+                    args[i] = copy_value(actual->val);
+                } else {
+                    args[i] = eval_node(I, n->stmts[i]);
+                }
             } else if (fn && i < fn->n_params && fn->param_allocatables[i] &&
                        n->stmts[i]->type == FND_MEMBER) {
                 OfortValue *actual = member_lvalue(I, n->stmts[i]);
@@ -25511,10 +25740,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                        (args[i].type != FVAL_VOID || fn->param_allocatables[i] ||
                         fn->param_pointers[i]) &&
                        (!procedure_ref_name(&args[i]) || fn->param_pointers[i])) {
-                OfortValue *target = member_lvalue(I, n->stmts[i]);
+                OfortValue *target = member_lvalue(I, actual_node);
                 if (target) {
                     free_value(target);
                     *target = copy_value(args[i]);
+                    mark_assignment_root_initialized(I, actual_node);
                     if (fn->param_pointers[i] && !pointer_copyback[i]) {
                         target->is_pointer_ref = 0;
                         target->pointer_target[0] = '\0';
@@ -25548,14 +25778,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (target) {
                     free_value(target);
                     *target = copy_value(args[i]);
+                    mark_assignment_root_initialized(I, actual_node);
                 } else if (actual_node->type == FND_FUNC_CALL) {
                     OfortVar *actual = find_var(I, actual_node->name);
                     if (actual && actual->val.type == FVAL_ARRAY && !actual->is_parameter)
                         assign_array_ref(I, actual, actual_node, &args[i]);
                 } else if (actual_node->type == FND_ARRAY_REF && actual_node->children[0]) {
                     OfortValue *array_target = member_lvalue(I, actual_node->children[0]);
-                    if (array_target && array_target->type == FVAL_ARRAY)
+                    if (array_target && array_target->type == FVAL_ARRAY) {
                         assign_array_ref_value(I, array_target, actual_node, &args[i]);
+                        mark_assignment_root_initialized(I, actual_node);
+                    }
                 }
             }
         }
@@ -25804,6 +26037,7 @@ unresolved_external_call_done:
                     *target = default_value(target_type, char_len);
             }
             set_allocate_status(I, n, 0, "");
+            mark_assignment_root_initialized(I, n->children[OFORT_ALLOC_TARGET_CHILD]);
             break;
         }
         OfortVar *var = find_var(I, n->name);
@@ -29226,6 +29460,7 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
         sorted = ofort_sorting_sorted_value(I, target, reverse);
         free_value(target);
         *target = sorted;
+        mark_assignment_root_initialized(I, n->stmts[x_idx]);
         return 1;
     }
 
@@ -29249,6 +29484,7 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
             ofort_error(I, "RNORM_FILL argument must be a variable");
         }
         ofort_rnorm_fill_value(I, target, method);
+        mark_assignment_root_initialized(I, n->stmts[0]);
         return 1;
     }
 
@@ -29339,6 +29575,9 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
             for (int j = 0; j < ncol; j++)
                 ofort_assign_real_array_element(components, c + j * ncomp, eigvecs[j + c * ncol]);
         }
+        mark_assignment_root_initialized(I, n->stmts[components_idx]);
+        mark_assignment_root_initialized(I, n->stmts[singular_idx]);
+        if (mean_idx >= 0) mark_assignment_root_initialized(I, n->stmts[mean_idx]);
         free(means); free(cov); free(eigvals); free(eigvecs);
         return 1;
     }
@@ -29412,6 +29651,7 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
                 }
             }
         }
+        mark_assignment_root_initialized(I, n->stmts[out_idx]);
         return 1;
     }
 
@@ -29453,15 +29693,18 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
 
         mean_target = ofort_scalar_output_lvalue(I, n->stmts[mean_idx], "mean");
         ofort_assign_real_output(mean_target, mean);
+        mark_assignment_root_initialized(I, n->stmts[mean_idx]);
         if (sd_idx >= 0) {
             OfortValue *sd_target = ofort_scalar_output_lvalue(I, n->stmts[sd_idx], "sd");
             if (isnan(var)) ofort_error(I, "CALC_STATS sd is undefined for this input");
             ofort_assign_real_output(sd_target, sqrt(var));
+            mark_assignment_root_initialized(I, n->stmts[sd_idx]);
         }
         if (var_idx >= 0) {
             OfortValue *var_target = ofort_scalar_output_lvalue(I, n->stmts[var_idx], "var");
             if (isnan(var)) ofort_error(I, "CALC_STATS var is undefined for this input");
             ofort_assign_real_output(var_target, var);
+            mark_assignment_root_initialized(I, n->stmts[var_idx]);
         }
         return 1;
     }
@@ -29542,6 +29785,14 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
 
         ofort_calc_col_stats_value(I, xval, mean_target, sd_target, var_target, cov_target, corr_target,
                                    rms_target, cov_zm_target, corr_zm_target);
+        if (mean_idx >= 0) mark_assignment_root_initialized(I, n->stmts[mean_idx]);
+        if (sd_idx >= 0) mark_assignment_root_initialized(I, n->stmts[sd_idx]);
+        if (var_idx >= 0) mark_assignment_root_initialized(I, n->stmts[var_idx]);
+        if (cov_idx >= 0) mark_assignment_root_initialized(I, n->stmts[cov_idx]);
+        if (corr_idx >= 0) mark_assignment_root_initialized(I, n->stmts[corr_idx]);
+        if (rms_idx >= 0) mark_assignment_root_initialized(I, n->stmts[rms_idx]);
+        if (cov_zm_idx >= 0) mark_assignment_root_initialized(I, n->stmts[cov_zm_idx]);
+        if (corr_zm_idx >= 0) mark_assignment_root_initialized(I, n->stmts[corr_zm_idx]);
         return 1;
     }
 
@@ -29588,6 +29839,7 @@ static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
                 ofort_assign_real_array_element(out_val, i + j * nrow, value);
             }
         }
+        mark_assignment_root_initialized(I, n->stmts[out_idx]);
         return 1;
     }
 
