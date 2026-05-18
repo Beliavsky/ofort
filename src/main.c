@@ -8760,7 +8760,7 @@ int main(int argc, char **argv) {
     if (check_path) {
         double start = monotonic_seconds();
         int rc = check_with_gfortran(check_path);
-        if (time_operation) print_elapsed_time(start);
+        if (time_operation && rc == 0) print_elapsed_time(start);
         path_list_free(&source_paths);
         return rc;
     }
@@ -8768,7 +8768,7 @@ int main(int argc, char **argv) {
     if (syntax_check_path) {
         double start = monotonic_seconds();
         int rc = check_ofort_file(syntax_check_path, quiet, 0);
-        if (time_operation && !g_time_detail) print_elapsed_time(start);
+        if (time_operation && rc == 0 && !g_time_detail) print_elapsed_time(start);
         path_list_free(&source_paths);
         return rc;
     }
@@ -8776,7 +8776,7 @@ int main(int argc, char **argv) {
     if (load_path) {
         double start = monotonic_seconds();
         int rc = run_interactive(load_path, run_after_load);
-        if (time_operation) print_elapsed_time(start);
+        if (time_operation && rc == 0) print_elapsed_time(start);
         path_list_free(&source_paths);
         return rc;
     }
@@ -8837,7 +8837,7 @@ int main(int argc, char **argv) {
             rc = check_with_gfortran_paths(source_paths.items, source_paths.count,
                                            program_argc, program_args);
         }
-        if (time_operation && !g_time_detail) print_elapsed_time(start);
+        if (time_operation && rc == 0 && !g_time_detail) print_elapsed_time(start);
         free(source);
         source_map_free(&source_map);
         path_list_free(&source_paths);
