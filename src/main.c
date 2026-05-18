@@ -2068,13 +2068,6 @@ static void reachable_add_name(ReachableName *names, int *n_names, int cap, cons
     (*n_names)++;
 }
 
-static int reachable_proc_index(ReachableProc *procs, int n_procs, const char *name) {
-    for (int i = 0; i < n_procs; i++) {
-        if (string_eq_nocase(procs[i].name, name)) return i;
-    }
-    return -1;
-}
-
 static int reachable_line_has_trailing_amp(SourceLine *line) {
     size_t len;
     if (!line || !line->text[0]) return 0;
@@ -2517,8 +2510,8 @@ static char *prune_source_to_reachable(const char *source) {
     while (changed) {
         changed = 0;
         for (int i = 0; i < n_names; i++) {
-            int pi = reachable_proc_index(procs, n_procs, names[i].name);
-            if (pi >= 0 && !procs[pi].keep) {
+            for (int pi = 0; pi < n_procs; pi++) {
+                if (!string_eq_nocase(procs[pi].name, names[i].name) || procs[pi].keep) continue;
                 procs[pi].keep = 1;
                 modules[procs[pi].module_index].keep = 1;
                 changed = 1;
@@ -4344,7 +4337,7 @@ static int g_specialized_fast_paths = 1;
 static int g_line_profile = 0;
 static int g_procedure_profile = 0;
 static int g_trace_assign = 0;
-static int g_check_uninitialized = 0;
+static int g_check_uninitialized = 1;
 static int g_warn_unused = 1;
 static int g_no_logo = 0;
 static int g_init_integer_enabled = 0;
@@ -4545,6 +4538,8 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
             free(source);
             return 2;
         }
+        free(source);
+        return 0;
     }
     setup_elapsed = monotonic_seconds() - setup_start;
 
@@ -8273,7 +8268,7 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--reachable] [--write-reachable file] [--cache] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--dep] [--check-gfortran] [--unused-procs] [--time|--time-detail] [--profile-lines|--profile-procs] [--trace-assign] [--warn-unused|--no-warn-unused] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--reachable] [--write-reachable file] [--cache] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--dep] [--check-gfortran] [--unused-procs] [--time|--time-detail] [--profile-lines|--profile-procs] [--trace-assign] [--warn-unused|--no-warn-unused] [--check-uninitialized|--check-uninit|--no-check-uninitialized] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
     fprintf(stderr, "       %s --each [--dep] [--check] [--quiet] [--limit n] [--max-fail n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
@@ -8302,7 +8297,8 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --trace-assign prints assignment trace diagnostics\n");
     fprintf(stderr, "       --warn-unused warns about simple declarations whose variables are never read (default unless --fast or -w)\n");
     fprintf(stderr, "       --no-warn-unused disables declared-but-unused variable warnings\n");
-    fprintf(stderr, "       --check-uninitialized, --check-uninit rejects reads of declared variables before assignment\n");
+    fprintf(stderr, "       --check-uninitialized, --check-uninit rejects reads of declared variables before assignment (default)\n");
+    fprintf(stderr, "       --no-check-uninitialized permits reads of otherwise uninitialized variables\n");
     fprintf(stderr, "       --init-int value initializes otherwise uninitialized INTEGER variables to value\n");
     fprintf(stderr, "       --init-real value|nan initializes otherwise uninitialized REAL/DOUBLE variables to value or NaN\n");
     fprintf(stderr, "       --init-char text initializes otherwise uninitialized CHARACTER variables with repeated/truncated text\n");
@@ -8486,6 +8482,9 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--check-uninitialized") == 0 ||
                    strcmp(argv[i], "--check-uninit") == 0) {
             g_check_uninitialized = 1;
+        } else if (strcmp(argv[i], "--no-check-uninitialized") == 0 ||
+                   strcmp(argv[i], "--no-check-uninit") == 0) {
+            g_check_uninitialized = 0;
         } else if (strcmp(argv[i], "--init-int") == 0) {
             char *endptr;
             long long parsed;
