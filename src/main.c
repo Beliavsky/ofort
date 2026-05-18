@@ -2107,6 +2107,69 @@ static int reachable_line_is_end_interface(SourceLine *line) {
     return starts_with_word_nocase(p, "interface");
 }
 
+static int reachable_line_is_prunable_decl_start(SourceLine *line) {
+    const char *p;
+    if (!line || !strstr(line->text, "::")) return 0;
+    p = skip_space(line->text);
+    return starts_with_word_nocase(p, "integer") ||
+           starts_with_word_nocase(p, "real") ||
+           starts_with_word_nocase(p, "double precision") ||
+           starts_with_word_nocase(p, "logical") ||
+           starts_with_word_nocase(p, "complex") ||
+           starts_with_word_nocase(p, "character");
+}
+
+static int reachable_decl_stmt_has_used_name(SourceLine *lines, int start, int end,
+                                             ReachableName *names, int n_names) {
+    char stmt[8192];
+    size_t len = 0;
+    const char *decls;
+    int depth = 0;
+    int at_name_start = 1;
+
+    stmt[0] = '\0';
+    for (int i = start; i <= end && len + 2 < sizeof(stmt); i++) {
+        const char *p = lines[i].text;
+        while (*p && len + 2 < sizeof(stmt)) {
+            if (*p != '&') stmt[len++] = *p;
+            p++;
+        }
+        stmt[len++] = ' ';
+    }
+    stmt[len] = '\0';
+    decls = strstr(stmt, "::");
+    if (!decls) return 1;
+    decls += 2;
+
+    for (const char *p = decls; *p; p++) {
+        char c = *p;
+        if (c == '(' || c == '[') depth++;
+        else if ((c == ')' || c == ']') && depth > 0) depth--;
+        if (depth == 0 && c == ',') {
+            at_name_start = 1;
+            continue;
+        }
+        if (at_name_start && depth == 0) {
+            char name[128];
+            size_t n = 0;
+            while (*p && isspace((unsigned char)*p)) p++;
+            if (!isalpha((unsigned char)*p) && *p != '_') {
+                at_name_start = 0;
+                continue;
+            }
+            while ((isalnum((unsigned char)*p) || *p == '_') && n + 1 < sizeof(name)) {
+                name[n++] = (char)tolower((unsigned char)*p++);
+            }
+            name[n] = '\0';
+            if (reachable_name_index(names, n_names, name) >= 0) return 1;
+            at_name_start = 0;
+            if (!*p) break;
+            p--;
+        }
+    }
+    return 0;
+}
+
 static int append_reachable_public_list(char **out, size_t *out_len, size_t *out_cap,
                                         ReachableProc *procs, int n_procs, int module_index) {
     int n_written = 0;
@@ -2278,6 +2341,17 @@ static char *prune_source_to_reachable(const char *source) {
                 if (reachable_line_is_interface_start(&lines[j])) {
                     while (j < modules[i].line_contains && !reachable_line_is_end_interface(&lines[j])) j++;
                     continue;
+                }
+                if (reachable_line_is_prunable_decl_start(&lines[j])) {
+                    int decl_end = j;
+                    while (decl_end < modules[i].line_contains &&
+                           reachable_line_has_trailing_amp(&lines[decl_end])) {
+                        decl_end++;
+                    }
+                    if (!reachable_decl_stmt_has_used_name(lines, j, decl_end, names, n_names)) {
+                        j = decl_end;
+                        continue;
+                    }
                 }
                 if (!append_text_n(&out, &out_len, &out_cap, lines[j].span.start,
                                    (size_t)(lines[j].span.end - lines[j].span.start))) goto fail;
