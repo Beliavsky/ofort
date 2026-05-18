@@ -21,6 +21,8 @@ ROOT = Path(__file__).resolve().parents[1]
 OFORT = ROOT / "ofort.exe"
 _WHITESPACE_RE = re.compile(r"\s+")
 _SIGNED_ZERO_RE = re.compile(r"(?<![\w.])-0(?:\.0+)?(?=$|\s)")
+_GFORTRAN_LINE_RE = re.compile(r"\bAt line\s+(\d+)\s+of file\b", re.IGNORECASE)
+_OFORT_LINE_RE = re.compile(r"^(?:[A-Za-z]:)?[^\n]*?:(\d+):", re.MULTILINE)
 
 
 def squeeze_text(text: str) -> str:
@@ -52,6 +54,17 @@ def run_command(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def failure_line(result: subprocess.CompletedProcess[str]) -> int | None:
+    text = result.stderr or ""
+    match = _GFORTRAN_LINE_RE.search(text)
+    if match:
+        return int(match.group(1))
+    match = _OFORT_LINE_RE.search(text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
 def results_match(gfortran_result: subprocess.CompletedProcess[str],
                   ofort_result: subprocess.CompletedProcess[str],
                   same_failure_ok: bool) -> bool:
@@ -60,7 +73,11 @@ def results_match(gfortran_result: subprocess.CompletedProcess[str],
     if gfortran_result.returncode == ofort_result.returncode and gfortran_out == ofort_out:
         return True
     if same_failure_ok and gfortran_result.returncode != 0 and ofort_result.returncode != 0:
-        return gfortran_out == ofort_out
+        if gfortran_out == ofort_out:
+            return True
+        gfortran_line = failure_line(gfortran_result)
+        ofort_line = failure_line(ofort_result)
+        return gfortran_line is not None and gfortran_line == ofort_line
     return False
 
 
