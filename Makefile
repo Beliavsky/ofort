@@ -1,6 +1,11 @@
 CC = gcc
 CFLAGS ?= -O2 -Wall -Wextra -Iinclude
-LDFLAGS ?=
+ifeq ($(OS),Windows_NT)
+STACK_LDFLAGS ?= -Wl,--stack,16777216
+else
+STACK_LDFLAGS ?=
+endif
+LDFLAGS ?= $(STACK_LDFLAGS)
 LDLIBS ?= -lm
 
 TARGET = ofort.exe
