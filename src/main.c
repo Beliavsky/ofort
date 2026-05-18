@@ -2119,6 +2119,60 @@ static int reachable_line_is_prunable_decl_start(SourceLine *line) {
            starts_with_word_nocase(p, "character");
 }
 
+static const char *reachable_strstr_nocase(const char *s, const char *needle) {
+    size_t n = strlen(needle);
+    if (n == 0) return s;
+    for (; *s; s++) {
+        size_t i;
+        for (i = 0; i < n; i++) {
+            if (!s[i] || tolower((unsigned char)s[i]) != tolower((unsigned char)needle[i])) break;
+        }
+        if (i == n) return s;
+    }
+    return NULL;
+}
+
+static int reachable_line_is_use_only_start(SourceLine *line) {
+    const char *p;
+    if (!line) return 0;
+    p = skip_space(line->text);
+    return starts_with_word_nocase(p, "use") && reachable_strstr_nocase(p, "only:") != NULL;
+}
+
+static int reachable_line_is_end_type(SourceLine *line) {
+    const char *p;
+    if (!line) return 0;
+    p = skip_space(line->text);
+    if (!starts_with_word_nocase(p, "end")) return 0;
+    p += 3;
+    while (*p && isspace((unsigned char)*p)) p++;
+    return starts_with_word_nocase(p, "type");
+}
+
+static int reachable_type_def_name(SourceLine *line, char *name, size_t name_size) {
+    const char *p;
+    const char *dc;
+    size_t n = 0;
+    if (!line) return 0;
+    p = skip_space(line->text);
+    if (!starts_with_word_nocase(p, "type")) return 0;
+    p += 4;
+    if (*p == '(') return 0;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (starts_with_word_nocase(p, "is")) return 0;
+    dc = strstr(p, "::");
+    if (dc) {
+        p = dc + 2;
+        while (*p && isspace((unsigned char)*p)) p++;
+    }
+    if (!isalpha((unsigned char)*p) && *p != '_') return 0;
+    while ((isalnum((unsigned char)*p) || *p == '_') && n + 1 < name_size) {
+        name[n++] = (char)tolower((unsigned char)*p++);
+    }
+    name[n] = '\0';
+    return n > 0;
+}
+
 static int reachable_decl_stmt_has_used_name(SourceLine *lines, int start, int end,
                                              ReachableName *names, int n_names) {
     char stmt[8192];
@@ -2168,6 +2222,157 @@ static int reachable_decl_stmt_has_used_name(SourceLine *lines, int start, int e
         }
     }
     return 0;
+}
+
+static int append_reachable_use_only(char **out, size_t *out_len, size_t *out_cap,
+                                     SourceLine *lines, int start, int end,
+                                     ReachableName *names, int n_names) {
+    char stmt[8192];
+    size_t len = 0;
+    size_t saved_len = *out_len;
+    const char *only;
+    size_t prefix_len;
+    int n_written = 0;
+
+    stmt[0] = '\0';
+    for (int i = start; i <= end && len + 2 < sizeof(stmt); i++) {
+        const char *p = lines[i].text;
+        while (*p && len + 2 < sizeof(stmt)) {
+            if (*p != '&') stmt[len++] = *p;
+            p++;
+        }
+        stmt[len++] = ' ';
+    }
+    stmt[len] = '\0';
+    only = reachable_strstr_nocase(stmt, "only:");
+    if (!only) return 1;
+    prefix_len = (size_t)(only - stmt) + 5;
+    while (prefix_len > 0 && isspace((unsigned char)stmt[prefix_len - 1])) prefix_len--;
+    if (!append_text_n(out, out_len, out_cap, stmt, prefix_len)) return 0;
+    if (!append_text(out, out_len, out_cap, " ")) return 0;
+
+    for (const char *p = only + 5; *p; ) {
+        char item[256];
+        char local[128];
+        const char *q;
+        size_t item_len = 0, local_len = 0;
+        int depth = 0;
+
+        while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+        if (!*p) break;
+        q = p;
+        while (*q) {
+            if (*q == '(' || *q == '[') depth++;
+            else if ((*q == ')' || *q == ']') && depth > 0) depth--;
+            else if (*q == ',' && depth == 0) break;
+            if (item_len + 1 < sizeof(item)) item[item_len++] = *q;
+            q++;
+        }
+        item[item_len] = '\0';
+        while (item_len > 0 && isspace((unsigned char)item[item_len - 1])) item[--item_len] = '\0';
+
+        p = q;
+        q = item;
+        while (*q && isspace((unsigned char)*q)) q++;
+        if (starts_with_word_nocase(q, "operator") || starts_with_word_nocase(q, "assignment")) {
+            if (n_written > 0 && !append_text(out, out_len, out_cap, ", ")) return 0;
+            if (!append_text(out, out_len, out_cap, item)) return 0;
+            n_written++;
+        } else if (isalpha((unsigned char)*q) || *q == '_') {
+            while ((isalnum((unsigned char)*q) || *q == '_') && local_len + 1 < sizeof(local)) {
+                local[local_len++] = (char)tolower((unsigned char)*q++);
+            }
+            local[local_len] = '\0';
+            if (reachable_name_index(names, n_names, local) >= 0) {
+                if (n_written > 0 && !append_text(out, out_len, out_cap, ", ")) return 0;
+                if (!append_text(out, out_len, out_cap, item)) return 0;
+                n_written++;
+            }
+        }
+    }
+    if (n_written == 0) {
+        *out_len = saved_len;
+        if (*out) (*out)[*out_len] = '\0';
+        return 1;
+    }
+    return append_text(out, out_len, out_cap, "\n");
+}
+
+static int append_reachable_access_list(char **out, size_t *out_len, size_t *out_cap,
+                                        SourceLine *lines, int start, int end,
+                                        ReachableName *names, int n_names) {
+    char stmt[8192];
+    size_t len = 0;
+    size_t saved_len = *out_len;
+    const char *dc;
+    size_t prefix_len;
+    int n_written = 0;
+
+    stmt[0] = '\0';
+    for (int i = start; i <= end && len + 2 < sizeof(stmt); i++) {
+        const char *p = lines[i].text;
+        while (*p && len + 2 < sizeof(stmt)) {
+            if (*p != '&') stmt[len++] = *p;
+            p++;
+        }
+        stmt[len++] = ' ';
+    }
+    stmt[len] = '\0';
+    dc = strstr(stmt, "::");
+    if (!dc) return 1;
+    prefix_len = (size_t)(dc - stmt) + 2;
+    while (prefix_len > 0 && isspace((unsigned char)stmt[prefix_len - 1])) prefix_len--;
+    if (!append_text_n(out, out_len, out_cap, stmt, prefix_len)) return 0;
+    if (!append_text(out, out_len, out_cap, " ")) return 0;
+
+    for (const char *p = dc + 2; *p; ) {
+        char item[256];
+        char local[128];
+        const char *q;
+        size_t item_len = 0, local_len = 0;
+        int depth = 0;
+
+        while (*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+        if (!*p) break;
+        q = p;
+        while (*q) {
+            if (*q == '(' || *q == '[') depth++;
+            else if ((*q == ')' || *q == ']') && depth > 0) depth--;
+            else if (*q == ',' && depth == 0) break;
+            if (item_len + 1 < sizeof(item)) item[item_len++] = *q;
+            q++;
+        }
+        item[item_len] = '\0';
+        while (item_len > 0 && isspace((unsigned char)item[item_len - 1])) item[--item_len] = '\0';
+
+        p = q;
+        q = item;
+        while (*q && isspace((unsigned char)*q)) q++;
+        if (isalpha((unsigned char)*q) || *q == '_') {
+            while ((isalnum((unsigned char)*q) || *q == '_') && local_len + 1 < sizeof(local)) {
+                local[local_len++] = (char)tolower((unsigned char)*q++);
+            }
+            local[local_len] = '\0';
+            if (reachable_name_index(names, n_names, local) >= 0) {
+                if (n_written > 0 && !append_text(out, out_len, out_cap, ", ")) return 0;
+                if (!append_text(out, out_len, out_cap, item)) return 0;
+                n_written++;
+            }
+        }
+    }
+    if (n_written == 0) {
+        *out_len = saved_len;
+        if (*out) (*out)[*out_len] = '\0';
+        return 1;
+    }
+    return append_text(out, out_len, out_cap, "\n");
+}
+
+static int append_reachable_unit_separator(char **out, size_t *out_len, size_t *out_cap) {
+    if (*out_len == 0) return 1;
+    if ((*out)[*out_len - 1] != '\n') return append_text(out, out_len, out_cap, "\n\n");
+    if (*out_len == 1 || (*out)[*out_len - 2] != '\n') return append_text(out, out_len, out_cap, "\n");
+    return 1;
 }
 
 static int append_reachable_public_list(char **out, size_t *out_len, size_t *out_cap,
@@ -2326,16 +2531,112 @@ static char *prune_source_to_reachable(const char *source) {
     }
 
     for (int i = 0; i < n_modules; i++) {
+        int spec_end;
+        if (!modules[i].keep) continue;
+        spec_end = modules[i].has_contains ? modules[i].line_contains : modules[i].line_end;
+        for (int j = modules[i].line_start; j <= spec_end; j++) {
+            char type_name[128];
+            if (reachable_line_is_prunable_decl_start(&lines[j])) {
+                int decl_end = j;
+                while (decl_end < spec_end &&
+                       reachable_line_has_trailing_amp(&lines[decl_end])) {
+                    decl_end++;
+                }
+                if (reachable_decl_stmt_has_used_name(lines, j, decl_end, names, n_names)) {
+                    for (int k = j; k <= decl_end; k++) {
+                        reachable_collect_identifiers(lines[k].text, names, &n_names,
+                                                      (int)(sizeof(names) / sizeof(names[0])));
+                    }
+                }
+                j = decl_end;
+            } else if (reachable_type_def_name(&lines[j], type_name, sizeof(type_name))) {
+                int type_end = j;
+                while (type_end < spec_end && !reachable_line_is_end_type(&lines[type_end])) {
+                    type_end++;
+                }
+                if (reachable_name_index(names, n_names, type_name) >= 0) {
+                    for (int k = j; k <= type_end; k++) {
+                        reachable_collect_identifiers(lines[k].text, names, &n_names,
+                                                      (int)(sizeof(names) / sizeof(names[0])));
+                    }
+                }
+                j = type_end;
+            }
+        }
+    }
+
+    for (int i = 0; i < n_modules; i++) {
         if (!modules[i].keep) continue;
         if (!modules[i].has_contains) {
-            for (int j = modules[i].line_start; j <= modules[i].line_end; j++)
+            for (int j = modules[i].line_start; j <= modules[i].line_end; j++) {
+                char type_name[128];
+                if (j != modules[i].line_start && j != modules[i].line_end &&
+                    reachable_line_is_public_access(&lines[j])) {
+                    int access_end = j;
+                    while (access_end < modules[i].line_end &&
+                           reachable_line_has_trailing_amp(&lines[access_end])) {
+                        access_end++;
+                    }
+                    if (!append_reachable_access_list(&out, &out_len, &out_cap, lines, j, access_end,
+                                                      names, n_names)) goto fail;
+                    j = access_end;
+                    continue;
+                }
+                if (j != modules[i].line_start && j != modules[i].line_end &&
+                    reachable_line_is_use_only_start(&lines[j])) {
+                    int use_end = j;
+                    while (use_end < modules[i].line_end &&
+                           reachable_line_has_trailing_amp(&lines[use_end])) {
+                        use_end++;
+                    }
+                    if (!append_reachable_use_only(&out, &out_len, &out_cap, lines, j, use_end,
+                                                   names, n_names)) goto fail;
+                    j = use_end;
+                    continue;
+                }
+                if (j != modules[i].line_start && j != modules[i].line_end &&
+                    reachable_line_is_prunable_decl_start(&lines[j])) {
+                    int decl_end = j;
+                    while (decl_end < modules[i].line_end &&
+                           reachable_line_has_trailing_amp(&lines[decl_end])) {
+                        decl_end++;
+                    }
+                    if (!reachable_decl_stmt_has_used_name(lines, j, decl_end, names, n_names)) {
+                        j = decl_end;
+                        continue;
+                    }
+                }
+                if (j != modules[i].line_start && j != modules[i].line_end &&
+                    reachable_type_def_name(&lines[j], type_name, sizeof(type_name))) {
+                    int type_end = j;
+                    while (type_end < modules[i].line_end && !reachable_line_is_end_type(&lines[type_end])) {
+                        type_end++;
+                    }
+                    if (reachable_name_index(names, n_names, type_name) < 0) {
+                        j = type_end;
+                        continue;
+                    }
+                }
                 if (!append_text_n(&out, &out_len, &out_cap, lines[j].span.start,
                                    (size_t)(lines[j].span.end - lines[j].span.start))) goto fail;
+            }
         } else {
             for (int j = modules[i].line_start; j <= modules[i].line_contains; j++) {
+                char type_name[128];
                 if (reachable_line_is_public_access(&lines[j])) {
                     if (!append_reachable_public_list(&out, &out_len, &out_cap, procs, n_procs, i)) goto fail;
                     while (j < modules[i].line_contains && reachable_line_has_trailing_amp(&lines[j])) j++;
+                    continue;
+                }
+                if (reachable_line_is_use_only_start(&lines[j])) {
+                    int use_end = j;
+                    while (use_end < modules[i].line_contains &&
+                           reachable_line_has_trailing_amp(&lines[use_end])) {
+                        use_end++;
+                    }
+                    if (!append_reachable_use_only(&out, &out_len, &out_cap, lines, j, use_end,
+                                                   names, n_names)) goto fail;
+                    j = use_end;
                     continue;
                 }
                 if (reachable_line_is_interface_start(&lines[j])) {
@@ -2353,6 +2654,16 @@ static char *prune_source_to_reachable(const char *source) {
                         continue;
                     }
                 }
+                if (reachable_type_def_name(&lines[j], type_name, sizeof(type_name))) {
+                    int type_end = j;
+                    while (type_end < modules[i].line_contains && !reachable_line_is_end_type(&lines[type_end])) {
+                        type_end++;
+                    }
+                    if (reachable_name_index(names, n_names, type_name) < 0) {
+                        j = type_end;
+                        continue;
+                    }
+                }
                 if (!append_text_n(&out, &out_len, &out_cap, lines[j].span.start,
                                    (size_t)(lines[j].span.end - lines[j].span.start))) goto fail;
             }
@@ -2365,6 +2676,7 @@ static char *prune_source_to_reachable(const char *source) {
             if (!append_text_n(&out, &out_len, &out_cap, lines[modules[i].line_end].span.start,
                                (size_t)(lines[modules[i].line_end].span.end - lines[modules[i].line_end].span.start))) goto fail;
         }
+        if (!append_reachable_unit_separator(&out, &out_len, &out_cap)) goto fail;
     }
     for (int j = program_start; j <= program_end; j++) {
         if (!append_text_n(&out, &out_len, &out_cap, lines[j].span.start,
@@ -4223,8 +4535,8 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
         }
     }
     if (g_write_reachable_path) {
-        if (!g_reachable_mode || !g_fast_mode) {
-            fprintf(stderr, "--write-reachable requires --fast --reachable\n");
+        if (!g_fast_mode) {
+            fprintf(stderr, "--write-reachable requires --fast\n");
             free(source);
             return 2;
         }
@@ -7980,7 +8292,7 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --std=f2023 rejects known nonstandard extensions; --std=legacy is the default\n");
     fprintf(stderr, "       --fast enables safe interpreter fast paths and suppresses warnings\n");
     fprintf(stderr, "       --reachable with --fast prunes unreachable module procedure bodies before execution\n");
-    fprintf(stderr, "       --write-reachable file writes the source after --fast --reachable pruning\n");
+    fprintf(stderr, "       --write-reachable file writes the source after --fast reachable pruning; implies --reachable\n");
     fprintf(stderr, "       --cache caches normalized/free-form source in .ofort_cache for repeated runs\n");
     fprintf(stderr, "       --no-specialize disables specialized pattern/program fast paths\n");
     fprintf(stderr, "       --time prints elapsed time for the requested operation\n");
@@ -8148,6 +8460,7 @@ int main(int argc, char **argv) {
                 return 2;
             }
             g_write_reachable_path = argv[i];
+            g_reachable_mode = 1;
         } else if (strcmp(argv[i], "--cache") == 0) {
             g_cache_mode = 1;
         } else if (strcmp(argv[i], "--no-specialize") == 0) {
