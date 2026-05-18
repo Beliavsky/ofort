@@ -81,6 +81,8 @@ static SourceFormMode g_source_form = SOURCE_FORM_AUTO;
 static int g_save_free_form = 0;
 static int g_quiet = 0;
 static int g_cache_mode = 0;
+static int g_reachable_mode = 0;
+static const char *g_write_reachable_path = NULL;
 static int g_repl_auto_end = 0;
 static int g_repl_defer_check = 0;
 static int g_repl_autorun = 0;
@@ -136,6 +138,16 @@ static int append_text_n(char **buf, size_t *len, size_t *cap, const char *text,
     }
     *len += n;
     (*buf)[*len] = '\0';
+    return 1;
+}
+
+static int write_text_file(const char *path, const char *text) {
+    FILE *fp;
+    if (!path || !path[0] || !text) return 0;
+    fp = fopen(path, "wb");
+    if (!fp) return 0;
+    fputs(text, fp);
+    fclose(fp);
     return 1;
 }
 
@@ -564,6 +576,39 @@ static void print_procedure_profile(OfortInterpreter *interp) {
         fprintf(stderr, "%8d %12.6f  %s\n", entries[i].count, entries[i].seconds, qualified);
     }
     free(entries);
+}
+
+static void print_tsv_field(FILE *fp, const char *text) {
+    const unsigned char *p = (const unsigned char *)(text ? text : "");
+    while (*p) {
+        if (*p == '\t' || *p == '\r' || *p == '\n') {
+            fputc(' ', fp);
+        } else {
+            fputc((int)*p, fp);
+        }
+        p++;
+    }
+}
+
+static void print_unused_proc_record(const OfortUnusedProcedureEntry *entry,
+                                     const SourceMap *source_map) {
+    const SourceMapEntry *map_entry = NULL;
+    int local_line = entry ? entry->line : 0;
+
+    if (!entry) return;
+    if (source_map) {
+        map_entry = source_map_find(source_map, entry->line, &local_line);
+    }
+    print_tsv_field(stdout, entry->status);
+    fputc('\t', stdout);
+    print_tsv_field(stdout, entry->kind);
+    fputc('\t', stdout);
+    print_tsv_field(stdout, entry->name);
+    fputc('\t', stdout);
+    print_tsv_field(stdout, entry->module_name);
+    fputc('\t', stdout);
+    print_tsv_field(stdout, map_entry ? map_entry->path : "");
+    fprintf(stdout, "\t%d\t%d\n", local_line, entry->line);
 }
 
 static int word_at_line_start(const char *line, int line_len, const char *word) {
@@ -1834,6 +1879,430 @@ static int starts_with_word_nocase(const char *line, const char *word) {
 
     return line[i] == '\0' || line[i] == '\r' || line[i] == '\n' ||
            !(isalnum((unsigned char)line[i]) || line[i] == '_');
+}
+
+typedef struct {
+    const char *start;
+    const char *end;
+} SourceSpan;
+
+typedef struct {
+    SourceSpan span;
+    char text[512];
+} SourceLine;
+
+typedef struct {
+    char name[128];
+} ReachableName;
+
+typedef struct {
+    char name[128];
+    char module_name[128];
+    int module_index;
+    int line_start;
+    int line_end;
+    int keep;
+} ReachableProc;
+
+typedef struct {
+    char name[128];
+    int line_start;
+    int line_contains;
+    int line_end;
+    int has_contains;
+    int keep;
+} ReachableModule;
+
+static void copy_trimmed_lower_line(char *dst, size_t dst_size, const char *start, const char *end) {
+    const char *first = start;
+    const char *last = end;
+    size_t n = 0;
+    int in_string = 0;
+    char quote = '\0';
+
+    while (first < last && isspace((unsigned char)*first)) first++;
+    while (last > first && isspace((unsigned char)last[-1])) last--;
+    for (const char *p = first; p < last && n + 1 < dst_size; p++) {
+        char c = *p;
+        if ((c == '\'' || c == '"') && (!in_string || quote == c)) {
+            if (in_string && p + 1 < last && p[1] == c) {
+                dst[n++] = (char)tolower((unsigned char)c);
+                if (n + 1 < dst_size) dst[n++] = (char)tolower((unsigned char)*++p);
+                continue;
+            }
+            in_string = !in_string;
+            quote = in_string ? c : '\0';
+        }
+        if (!in_string && c == '!') break;
+        dst[n++] = (char)tolower((unsigned char)c);
+    }
+    while (n > 0 && isspace((unsigned char)dst[n - 1])) n--;
+    dst[n] = '\0';
+}
+
+static SourceLine *split_source_lines(const char *source, int *n_lines) {
+    int cap = 256;
+    int n = 0;
+    const char *p = source;
+    SourceLine *lines = (SourceLine *)calloc((size_t)cap, sizeof(*lines));
+    if (!lines) return NULL;
+    while (*p) {
+        const char *start = p;
+        const char *end;
+        if (n >= cap) {
+            SourceLine *tmp;
+            cap *= 2;
+            tmp = (SourceLine *)realloc(lines, (size_t)cap * sizeof(*lines));
+            if (!tmp) {
+                free(lines);
+                return NULL;
+            }
+            lines = tmp;
+        }
+        while (*p && *p != '\n' && *p != '\r') p++;
+        end = p;
+        if (*p == '\r' && p[1] == '\n') p += 2;
+        else if (*p) p++;
+        lines[n].span.start = start;
+        lines[n].span.end = p;
+        copy_trimmed_lower_line(lines[n].text, sizeof(lines[n].text), start, end);
+        n++;
+    }
+    *n_lines = n;
+    return lines;
+}
+
+static int parse_decl_name_after_keyword(const char *line, const char *keyword, char *name, size_t name_size) {
+    const char *p = skip_space(line);
+    size_t kw_len = strlen(keyword);
+    size_t n = 0;
+    if (!starts_with_word_nocase(p, keyword)) return 0;
+    p += kw_len;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (!isalpha((unsigned char)*p) && *p != '_') return 0;
+    while ((isalnum((unsigned char)*p) || *p == '_') && n + 1 < name_size) {
+        name[n++] = (char)tolower((unsigned char)*p++);
+    }
+    name[n] = '\0';
+    return n > 0;
+}
+
+static int line_is_end_module(const char *line) {
+    const char *p = skip_space(line);
+    if (!starts_with_word_nocase(p, "end")) return 0;
+    p += 3;
+    while (*p && isspace((unsigned char)*p)) p++;
+    return *p == '\0' || starts_with_word_nocase(p, "module");
+}
+
+static int line_is_contains(const char *line) {
+    const char *p = skip_space(line);
+    return starts_with_word_nocase(p, "contains");
+}
+
+static int line_is_program_start_reachable(const char *line) {
+    const char *p = skip_space(line);
+    return starts_with_word_nocase(p, "program");
+}
+
+static int line_is_end_program_reachable(const char *line) {
+    const char *p = skip_space(line);
+    if (!starts_with_word_nocase(p, "end")) return 0;
+    p += 3;
+    while (*p && isspace((unsigned char)*p)) p++;
+    return *p == '\0' || starts_with_word_nocase(p, "program");
+}
+
+static int line_is_proc_start_reachable(const char *line, char *name, size_t name_size) {
+    const char *p = skip_space(line);
+    const char *prefixes[] = {"recursive", "pure", "impure", "elemental", "module"};
+    int advanced = 1;
+    while (advanced) {
+        advanced = 0;
+        for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+            size_t len = strlen(prefixes[i]);
+            if (starts_with_word_nocase(p, prefixes[i])) {
+                p += len;
+                while (*p && isspace((unsigned char)*p)) p++;
+                advanced = 1;
+            }
+        }
+    }
+    if (starts_with_word_nocase(p, "subroutine")) {
+        return parse_decl_name_after_keyword(p, "subroutine", name, name_size);
+    }
+    if (strstr(p, " function ") || starts_with_word_nocase(p, "function")) {
+        const char *f = strstr(p, "function");
+        size_t n = 0;
+        if (!f) return 0;
+        f += 8;
+        while (*f && isspace((unsigned char)*f)) f++;
+        if (!isalpha((unsigned char)*f) && *f != '_') return 0;
+        while ((isalnum((unsigned char)*f) || *f == '_') && n + 1 < name_size)
+            name[n++] = (char)tolower((unsigned char)*f++);
+        name[n] = '\0';
+        return n > 0;
+    }
+    return 0;
+}
+
+static int line_is_end_proc_reachable(const char *line) {
+    const char *p = skip_space(line);
+    if (!starts_with_word_nocase(p, "end")) return 0;
+    p += 3;
+    while (*p && isspace((unsigned char)*p)) p++;
+    return starts_with_word_nocase(p, "function") || starts_with_word_nocase(p, "subroutine");
+}
+
+static int reachable_name_index(ReachableName *names, int n_names, const char *name) {
+    for (int i = 0; i < n_names; i++) {
+        if (string_eq_nocase(names[i].name, name)) return i;
+    }
+    return -1;
+}
+
+static void reachable_add_name(ReachableName *names, int *n_names, int cap, const char *name) {
+    if (!name || !name[0] || *n_names >= cap) return;
+    if (reachable_name_index(names, *n_names, name) >= 0) return;
+    snprintf(names[*n_names].name, sizeof(names[*n_names].name), "%s", name);
+    (*n_names)++;
+}
+
+static int reachable_proc_index(ReachableProc *procs, int n_procs, const char *name) {
+    for (int i = 0; i < n_procs; i++) {
+        if (string_eq_nocase(procs[i].name, name)) return i;
+    }
+    return -1;
+}
+
+static int reachable_line_has_trailing_amp(SourceLine *line) {
+    size_t len;
+    if (!line || !line->text[0]) return 0;
+    len = strlen(line->text);
+    while (len > 0 && isspace((unsigned char)line->text[len - 1])) len--;
+    return len > 0 && line->text[len - 1] == '&';
+}
+
+static int reachable_line_is_public_access(SourceLine *line) {
+    const char *p;
+    if (!line) return 0;
+    p = skip_space(line->text);
+    return starts_with_word_nocase(p, "public") && strstr(p, "::") != NULL;
+}
+
+static int reachable_line_is_interface_start(SourceLine *line) {
+    const char *p;
+    if (!line) return 0;
+    p = skip_space(line->text);
+    return starts_with_word_nocase(p, "interface");
+}
+
+static int reachable_line_is_end_interface(SourceLine *line) {
+    const char *p;
+    if (!line) return 0;
+    p = skip_space(line->text);
+    if (!starts_with_word_nocase(p, "end")) return 0;
+    p += 3;
+    while (*p && isspace((unsigned char)*p)) p++;
+    return starts_with_word_nocase(p, "interface");
+}
+
+static int append_reachable_public_list(char **out, size_t *out_len, size_t *out_cap,
+                                        ReachableProc *procs, int n_procs, int module_index) {
+    int n_written = 0;
+    for (int p = 0; p < n_procs; p++) {
+        if (!procs[p].keep || procs[p].module_index != module_index) continue;
+        if (n_written == 0) {
+            if (!append_text(out, out_len, out_cap, "public :: ")) return 0;
+        } else {
+            if (!append_text(out, out_len, out_cap, ", ")) return 0;
+        }
+        if (!append_text(out, out_len, out_cap, procs[p].name)) return 0;
+        n_written++;
+    }
+    if (n_written > 0 && !append_text(out, out_len, out_cap, "\n")) return 0;
+    return 1;
+}
+
+static void reachable_collect_identifiers(const char *text, ReachableName *names, int *n_names, int cap) {
+    int in_string = 0;
+    char quote = '\0';
+    for (const char *p = text; *p; p++) {
+        if ((*p == '\'' || *p == '"') && (!in_string || quote == *p)) {
+            if (in_string && p[1] == *p) {
+                p++;
+                continue;
+            }
+            in_string = !in_string;
+            quote = in_string ? *p : '\0';
+            continue;
+        }
+        if (in_string) continue;
+        if (isalpha((unsigned char)*p) || *p == '_') {
+            char name[128];
+            size_t n = 0;
+            while ((isalnum((unsigned char)*p) || *p == '_') && n + 1 < sizeof(name)) {
+                name[n++] = (char)tolower((unsigned char)*p++);
+            }
+            name[n] = '\0';
+            p--;
+            if (!starts_with_word_nocase(name, "program") &&
+                !starts_with_word_nocase(name, "implicit") &&
+                !starts_with_word_nocase(name, "none") &&
+                !starts_with_word_nocase(name, "use") &&
+                !starts_with_word_nocase(name, "only") &&
+                !starts_with_word_nocase(name, "print") &&
+                !starts_with_word_nocase(name, "end")) {
+                reachable_add_name(names, n_names, cap, name);
+            }
+        }
+    }
+}
+
+static char *prune_source_to_reachable(const char *source) {
+    SourceLine *lines;
+    ReachableModule modules[256];
+    ReachableProc procs[1024];
+    ReachableName names[2048];
+    int n_lines = 0, n_modules = 0, n_procs = 0, n_names = 0;
+    int program_start = -1, program_end = -1;
+    int changed = 1;
+    char *out = NULL;
+    size_t out_len = 0, out_cap = 0;
+
+    lines = split_source_lines(source, &n_lines);
+    if (!lines) return NULL;
+    memset(modules, 0, sizeof(modules));
+    memset(procs, 0, sizeof(procs));
+    memset(names, 0, sizeof(names));
+
+    for (int i = 0; i < n_lines; i++) {
+        char mod_name[128];
+        if (parse_decl_name_after_keyword(lines[i].text, "module", mod_name, sizeof(mod_name)) &&
+            !starts_with_word_nocase(lines[i].text, "module procedure") &&
+            n_modules < (int)(sizeof(modules) / sizeof(modules[0]))) {
+            int mi = n_modules++;
+            snprintf(modules[mi].name, sizeof(modules[mi].name), "%s", mod_name);
+            modules[mi].line_start = i;
+            modules[mi].line_contains = -1;
+            modules[mi].line_end = i;
+            for (int j = i + 1; j < n_lines; j++) {
+                if (line_is_contains(lines[j].text) && modules[mi].line_contains < 0) {
+                    modules[mi].line_contains = j;
+                    modules[mi].has_contains = 1;
+                }
+                if (line_is_end_module(lines[j].text)) {
+                    modules[mi].line_end = j;
+                    i = j;
+                    break;
+                }
+            }
+        } else if (program_start < 0 && line_is_program_start_reachable(lines[i].text)) {
+            program_start = i;
+            for (int j = i + 1; j < n_lines; j++) {
+                if (line_is_end_program_reachable(lines[j].text)) {
+                    program_end = j;
+                    break;
+                }
+            }
+        }
+    }
+    if (program_start < 0 || program_end < program_start) {
+        free(lines);
+        return NULL;
+    }
+
+    for (int i = 0; i < n_modules; i++) {
+        if (!modules[i].has_contains) {
+            modules[i].keep = 1;
+            continue;
+        }
+        for (int j = modules[i].line_contains + 1; j < modules[i].line_end; j++) {
+            char proc_name[128];
+            if (line_is_proc_start_reachable(lines[j].text, proc_name, sizeof(proc_name)) &&
+                n_procs < (int)(sizeof(procs) / sizeof(procs[0]))) {
+                int pi = n_procs++;
+                snprintf(procs[pi].name, sizeof(procs[pi].name), "%s", proc_name);
+                snprintf(procs[pi].module_name, sizeof(procs[pi].module_name), "%.127s", modules[i].name);
+                procs[pi].module_index = i;
+                procs[pi].line_start = j;
+                procs[pi].line_end = j;
+                for (int k = j + 1; k < modules[i].line_end; k++) {
+                    if (line_is_end_proc_reachable(lines[k].text)) {
+                        procs[pi].line_end = k;
+                        j = k;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    for (int i = program_start; i <= program_end; i++) {
+        if (starts_with_word_nocase(lines[i].text, "use") ||
+            starts_with_word_nocase(lines[i].text, "implicit")) {
+            continue;
+        }
+        reachable_collect_identifiers(lines[i].text, names, &n_names, (int)(sizeof(names) / sizeof(names[0])));
+    }
+
+    while (changed) {
+        changed = 0;
+        for (int i = 0; i < n_names; i++) {
+            int pi = reachable_proc_index(procs, n_procs, names[i].name);
+            if (pi >= 0 && !procs[pi].keep) {
+                procs[pi].keep = 1;
+                modules[procs[pi].module_index].keep = 1;
+                changed = 1;
+                for (int j = procs[pi].line_start; j <= procs[pi].line_end; j++) {
+                    reachable_collect_identifiers(lines[j].text, names, &n_names,
+                                                  (int)(sizeof(names) / sizeof(names[0])));
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < n_modules; i++) {
+        if (!modules[i].keep) continue;
+        if (!modules[i].has_contains) {
+            for (int j = modules[i].line_start; j <= modules[i].line_end; j++)
+                if (!append_text_n(&out, &out_len, &out_cap, lines[j].span.start,
+                                   (size_t)(lines[j].span.end - lines[j].span.start))) goto fail;
+        } else {
+            for (int j = modules[i].line_start; j <= modules[i].line_contains; j++) {
+                if (reachable_line_is_public_access(&lines[j])) {
+                    if (!append_reachable_public_list(&out, &out_len, &out_cap, procs, n_procs, i)) goto fail;
+                    while (j < modules[i].line_contains && reachable_line_has_trailing_amp(&lines[j])) j++;
+                    continue;
+                }
+                if (reachable_line_is_interface_start(&lines[j])) {
+                    while (j < modules[i].line_contains && !reachable_line_is_end_interface(&lines[j])) j++;
+                    continue;
+                }
+                if (!append_text_n(&out, &out_len, &out_cap, lines[j].span.start,
+                                   (size_t)(lines[j].span.end - lines[j].span.start))) goto fail;
+            }
+            for (int p = 0; p < n_procs; p++) {
+                if (!procs[p].keep || procs[p].module_index != i) continue;
+                for (int j = procs[p].line_start; j <= procs[p].line_end; j++)
+                    if (!append_text_n(&out, &out_len, &out_cap, lines[j].span.start,
+                                       (size_t)(lines[j].span.end - lines[j].span.start))) goto fail;
+            }
+            if (!append_text_n(&out, &out_len, &out_cap, lines[modules[i].line_end].span.start,
+                               (size_t)(lines[modules[i].line_end].span.end - lines[modules[i].line_end].span.start))) goto fail;
+        }
+    }
+    for (int j = program_start; j <= program_end; j++) {
+        if (!append_text_n(&out, &out_len, &out_cap, lines[j].span.start,
+                           (size_t)(lines[j].span.end - lines[j].span.start))) goto fail;
+    }
+    free(lines);
+    return out;
+
+fail:
+    free(out);
+    free(lines);
+    return NULL;
 }
 
 static int names_match(const char *start, size_t len, const char *name) {
@@ -3535,6 +4004,70 @@ static OfortInterpreter *create_ofort_interpreter(void) {
     return interp;
 }
 
+static int analyze_unused_procs_source_text(const char *text, double setup_start,
+                                            const SourceMap *source_map) {
+    enum { UNUSED_PROC_ENTRY_CAP = 32768 };
+    char *source = copy_string(text);
+    OfortInterpreter *interp;
+    OfortUnusedProcedureEntry *entries;
+    int n_entries = 0;
+    int rc;
+    double setup_elapsed;
+
+    if (!source) {
+        return 2;
+    }
+    normalize_newlines(source);
+    source = maybe_wrap_loose_source(source);
+    if (!source) {
+        return 2;
+    }
+    setup_elapsed = monotonic_seconds() - setup_start;
+
+    interp = create_ofort_interpreter();
+    if (!interp) {
+        free(source);
+        fprintf(stderr, "failed to create Fortran interpreter\n");
+        return 2;
+    }
+    entries = (OfortUnusedProcedureEntry *)calloc((size_t)UNUSED_PROC_ENTRY_CAP, sizeof(*entries));
+    if (!entries) {
+        ofort_destroy(interp);
+        free(source);
+        fprintf(stderr, "out of memory\n");
+        return 2;
+    }
+
+    rc = ofort_analyze_unused_procs(interp, source, entries, UNUSED_PROC_ENTRY_CAP, &n_entries);
+    if (g_time_detail) {
+        OfortTiming timing;
+        if (ofort_get_timing(interp, &timing) == 0) {
+            print_detailed_time(setup_elapsed, &timing);
+        }
+    }
+    if (rc == 0) {
+        printf("ofort-unused-procs-v1\n");
+        printf("status\tkind\tname\tmodule\tfile\tline\tglobal_line\n");
+        if (n_entries > UNUSED_PROC_ENTRY_CAP) {
+            fprintf(stderr, "--unused-procs found too many procedures; output is truncated at %d records\n",
+                    UNUSED_PROC_ENTRY_CAP);
+            n_entries = UNUSED_PROC_ENTRY_CAP;
+        }
+        for (int i = 0; i < n_entries; i++) {
+            print_unused_proc_record(&entries[i], source_map);
+        }
+    } else {
+        const char *error = ofort_get_error(interp);
+        print_source_mapped_error((error && error[0] != '\0') ? error : "ofort unused-procs failed",
+                                  source_map);
+    }
+
+    free(entries);
+    ofort_destroy(interp);
+    free(source);
+    return rc == 0 ? 0 : 1;
+}
+
 static OfortInterpreter *create_repl_interpreter(void) {
     OfortInterpreter *interp = create_ofort_interpreter();
     if (interp) {
@@ -3607,6 +4140,25 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
     source = maybe_wrap_loose_source(source);
     if (!source) {
         return 2;
+    }
+    if (g_reachable_mode && g_fast_mode && !g_line_profile && !g_procedure_profile) {
+        char *reachable_source = prune_source_to_reachable(source);
+        if (reachable_source) {
+            free(source);
+            source = reachable_source;
+        }
+    }
+    if (g_write_reachable_path) {
+        if (!g_reachable_mode || !g_fast_mode) {
+            fprintf(stderr, "--write-reachable requires --fast --reachable\n");
+            free(source);
+            return 2;
+        }
+        if (!write_text_file(g_write_reachable_path, source)) {
+            fprintf(stderr, "failed to write reachable source %s\n", g_write_reachable_path);
+            free(source);
+            return 2;
+        }
     }
     setup_elapsed = monotonic_seconds() - setup_start;
 
@@ -7335,7 +7887,7 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--cache] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--dep] [--check-gfortran] [--time|--time-detail] [--profile-lines|--profile-procs] [--trace-assign] [--warn-unused|--no-warn-unused] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--reachable] [--write-reachable file] [--cache] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--dep] [--check-gfortran] [--unused-procs] [--time|--time-detail] [--profile-lines|--profile-procs] [--trace-assign] [--warn-unused|--no-warn-unused] [--check-uninitialized|--check-uninit] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
     fprintf(stderr, "       %s --each [--dep] [--check] [--quiet] [--limit n] [--max-fail n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
@@ -7353,6 +7905,8 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --quiet suppresses success/progress output but not diagnostics\n");
     fprintf(stderr, "       --std=f2023 rejects known nonstandard extensions; --std=legacy is the default\n");
     fprintf(stderr, "       --fast enables safe interpreter fast paths and suppresses warnings\n");
+    fprintf(stderr, "       --reachable with --fast prunes unreachable module procedure bodies before execution\n");
+    fprintf(stderr, "       --write-reachable file writes the source after --fast --reachable pruning\n");
     fprintf(stderr, "       --cache caches normalized/free-form source in .ofort_cache for repeated runs\n");
     fprintf(stderr, "       --no-specialize disables specialized pattern/program fast paths\n");
     fprintf(stderr, "       --time prints elapsed time for the requested operation\n");
@@ -7370,6 +7924,7 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --save-free saves converted fixed-form input beside the source as .f90\n");
     fprintf(stderr, "       --dep resolves USEd modules from the main source directory before running one main file; with --each, resolves each main file separately\n");
     fprintf(stderr, "       --check-gfortran after source files also compiles/runs the same file list with gfortran and compares output\n");
+    fprintf(stderr, "       --unused-procs prints TSV records for procedures not reachable from the main program\n");
     fprintf(stderr, "       --each treats each file or Windows glob match as a separate program\n");
     fprintf(stderr, "       --limit n checks at most n files in --each mode\n");
     fprintf(stderr, "       --max-fail n stops --each mode after n failed files; 0 means no limit\n");
@@ -7448,6 +8003,7 @@ int main(int argc, char **argv) {
     int force_interactive = 0;
     int dep_mode = 0;
     int check_gfortran_after = 0;
+    int unused_procs = 0;
     double setup_start = 0.0;
     int i;
     if (ISATTY(FILENO(stdout))) {
@@ -7509,6 +8065,15 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--fast") == 0) {
             g_fast_mode = 1;
             g_warnings_enabled = 0;
+        } else if (strcmp(argv[i], "--reachable") == 0) {
+            g_reachable_mode = 1;
+        } else if (strcmp(argv[i], "--write-reachable") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "--write-reachable requires a file path\n");
+                path_list_free(&source_paths);
+                return 2;
+            }
+            g_write_reachable_path = argv[i];
         } else if (strcmp(argv[i], "--cache") == 0) {
             g_cache_mode = 1;
         } else if (strcmp(argv[i], "--no-specialize") == 0) {
@@ -7522,6 +8087,8 @@ int main(int argc, char **argv) {
             g_line_profile = 1;
         } else if (strcmp(argv[i], "--profile-procs") == 0) {
             g_procedure_profile = 1;
+        } else if (strcmp(argv[i], "--unused-procs") == 0) {
+            unused_procs = 1;
         } else if (strcmp(argv[i], "--trace-assign") == 0) {
             g_trace_assign = 1;
             g_specialized_fast_paths = 0;
@@ -7726,6 +8293,12 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    if (unused_procs && (load_path || syntax_check_path || check_path || each_mode)) {
+        fprintf(stderr, "--unused-procs requires normal source input and cannot be combined with --load, --load-run, --check, --check-gfortran file, or --each\n");
+        path_list_free(&source_paths);
+        return 2;
+    }
+
     if (check_gfortran_after && source_paths.count == 0) {
         fprintf(stderr, "--check-gfortran requires source files when used as a flag\n");
         path_list_free(&source_paths);
@@ -7812,8 +8385,14 @@ int main(int argc, char **argv) {
     }
     {
         double start = setup_start > 0.0 ? setup_start : monotonic_seconds();
-        int rc = execute_source_text(source, 0, 0, program_argc, program_args, start,
+        int rc;
+        if (unused_procs) {
+            rc = analyze_unused_procs_source_text(source, start,
+                                                  source_paths.count > 0 ? &source_map : NULL);
+        } else {
+            rc = execute_source_text(source, 0, 0, program_argc, program_args, start,
                                      source_paths.count > 0 ? &source_map : NULL);
+        }
         if (rc == 0 && check_gfortran_after) {
             rc = check_with_gfortran_paths(source_paths.items, source_paths.count,
                                            program_argc, program_args);
