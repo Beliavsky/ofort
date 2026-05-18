@@ -27,10 +27,12 @@
 #ifndef _WIN32
 #include <unistd.h>
 #include <sys/wait.h>
+#include <dlfcn.h>
 #endif
 
 #define OFORT_ALLOC_TARGET_CHILD (OFORT_MAX_CHILDREN - 1)
 #define OFORT_MAX_TYPE_ACTUALS 16
+#define OFORT_MAX_NATIVE_SUBROUTINES 32
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
@@ -177,6 +179,17 @@ typedef struct {
     int n_vars;
 } OfortNamelist;
 
+typedef void (*OfortNativeIRealArrayRealRealFn)(int *, double *, double *, double *);
+
+typedef struct {
+    char name[256];
+    char library_path[512];
+    char symbol[256];
+    char abi[64];
+    void *handle;
+    void *fn;
+} OfortNativeSubroutine;
+
 struct OfortInterpreter {
     /* output */
     char output[OFORT_MAX_OUTPUT];
@@ -238,6 +251,8 @@ struct OfortInterpreter {
     int n_unit_files;
     OfortNamelist namelists[32];
     int n_namelists;
+    OfortNativeSubroutine native_subroutines[OFORT_MAX_NATIVE_SUBROUTINES];
+    int n_native_subroutines;
     int format_labels[256];
     char format_strings[256][512];
     int n_formats;
@@ -367,6 +382,7 @@ static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char
                                                  char arg_names[OFORT_MAX_PARAMS][256]);
 static void ofort_assign_real_array_element(OfortValue *target, int index, double value);
 static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n);
+static int call_native_subroutine(OfortInterpreter *I, OfortNode *n);
 static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bufsize);
 static OfortValue array_element_value(const OfortValue *arr, int index);
 static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, const char *tok);
@@ -10778,6 +10794,128 @@ static int assign_packed_array_element(OfortValue *arr, int index, OfortValue rh
     return 0;
 }
 
+static void *ofort_native_load_library(const char *path) {
+#ifdef _WIN32
+    return (void *)LoadLibraryA(path);
+#else
+    return dlopen(path, RTLD_NOW);
+#endif
+}
+
+static void *ofort_native_symbol(void *handle, const char *symbol) {
+    if (!handle || !symbol || !symbol[0]) return NULL;
+#ifdef _WIN32
+    return (void *)GetProcAddress((HMODULE)handle, symbol);
+#else
+    return dlsym(handle, symbol);
+#endif
+}
+
+static void ofort_native_close_library(void *handle) {
+    if (!handle) return;
+#ifdef _WIN32
+    FreeLibrary((HMODULE)handle);
+#else
+    dlclose(handle);
+#endif
+}
+
+static OfortNativeSubroutine *find_native_subroutine(OfortInterpreter *I, const char *name) {
+    if (!I || !name) return NULL;
+    for (int i = 0; i < I->n_native_subroutines; i++) {
+        if (str_eq_nocase(I->native_subroutines[i].name, name))
+            return &I->native_subroutines[i];
+    }
+    return NULL;
+}
+
+static double *native_real_array_data(OfortValue *array_val, double **owned) {
+    double *data;
+    if (owned) *owned = NULL;
+    if (!array_val || array_val->type != FVAL_ARRAY ||
+        (array_val->v.arr.elem_type != FVAL_REAL && array_val->v.arr.elem_type != FVAL_DOUBLE) ||
+        array_val->v.arr.len < 0) {
+        return NULL;
+    }
+    if (array_val->v.arr.real_data) return array_val->v.arr.real_data;
+    data = (double *)malloc(sizeof(double) * (size_t)array_val->v.arr.len);
+    if (!data) return NULL;
+    for (int i = 0; i < array_val->v.arr.len; i++) {
+        OfortValue elem = array_element_value(array_val, i);
+        data[i] = val_to_real(elem);
+        free_value(&elem);
+    }
+    if (owned) *owned = data;
+    return data;
+}
+
+static int call_native_i_r8arr_r8_r8(OfortInterpreter *I, OfortNativeSubroutine *native,
+                                     OfortNode *n) {
+    OfortNativeIRealArrayRealRealFn fn;
+    OfortValue n_val;
+    OfortValue x_val;
+    double *x_data;
+    double *owned_x = NULL;
+    int n_arg;
+    double out1 = 0.0;
+    double out2 = 0.0;
+
+    if (n->n_stmts != 4)
+        ofort_error(I, "Native subroutine '%s' ABI %s requires 4 arguments",
+                    n->name, native->abi);
+    if (n->stmts[2]->type != FND_IDENT || n->stmts[3]->type != FND_IDENT)
+        ofort_error(I, "Native subroutine '%s' output arguments must be scalar variables", n->name);
+
+    n_val = eval_node(I, n->stmts[0]);
+    x_val = eval_node(I, n->stmts[1]);
+    if (n_val.type != FVAL_INTEGER) {
+        free_value(&n_val);
+        free_value(&x_val);
+        ofort_error(I, "Native subroutine '%s' first argument must be INTEGER", n->name);
+    }
+    n_arg = (int)val_to_int(n_val);
+    if (x_val.type != FVAL_ARRAY ||
+        (x_val.v.arr.elem_type != FVAL_REAL && x_val.v.arr.elem_type != FVAL_DOUBLE)) {
+        free_value(&n_val);
+        free_value(&x_val);
+        ofort_error(I, "Native subroutine '%s' second argument must be a REAL array", n->name);
+    }
+    if (n_arg < 0 || n_arg > x_val.v.arr.len) {
+        free_value(&n_val);
+        free_value(&x_val);
+        ofort_error(I, "Native subroutine '%s' array size mismatch", n->name);
+    }
+
+    x_data = native_real_array_data(&x_val, &owned_x);
+    if (!x_data) {
+        free_value(&n_val);
+        free_value(&x_val);
+        ofort_error(I, "Native subroutine '%s' could not access REAL array data", n->name);
+    }
+
+    fn = (OfortNativeIRealArrayRealRealFn)native->fn;
+    fn(&n_arg, x_data, &out1, &out2);
+
+    set_var(I, n->stmts[2]->name, make_double(out1));
+    set_var(I, n->stmts[3]->name, make_double(out2));
+
+    free(owned_x);
+    free_value(&n_val);
+    free_value(&x_val);
+    return 1;
+}
+
+static int call_native_subroutine(OfortInterpreter *I, OfortNode *n) {
+    OfortNativeSubroutine *native = find_native_subroutine(I, n ? n->name : NULL);
+    if (!native) return 0;
+    if (!native->handle || !native->fn)
+        ofort_error(I, "Native subroutine '%s' is not loaded", n->name);
+    if (str_eq_nocase(native->abi, "i_r8arr_r8_r8"))
+        return call_native_i_r8arr_r8_r8(I, native, n);
+    ofort_error(I, "Unsupported native ABI '%s' for subroutine '%s'", native->abi, n->name);
+    return 0;
+}
+
 static int slice_count(int start, int end, int stride) {
     int count = 0;
     if (stride == 0) return 0;
@@ -17871,6 +18009,48 @@ static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n
     return 1;
 }
 
+static int fast_scalar_numeric_assignment_can_execute(OfortInterpreter *I, OfortNode *n) {
+    OfortNode *lhs;
+    OfortNode *rhs;
+    OfortVar *target;
+    double numeric_value;
+    int logical_value;
+    int slot;
+
+    if (!I || !I->fast_mode || !n || n->type != FND_ASSIGN) return 0;
+    lhs = n->children[0];
+    rhs = n->children[1];
+    if (!lhs || !rhs) return 0;
+
+    if (lhs->type == FND_FUNC_CALL) {
+        OfortVar *array_var;
+        int index;
+        if (!fast_array_ref_index(I, lhs, &array_var, &index)) return 0;
+        if (array_var->is_parameter || array_var->is_protected) return 0;
+        if (!array_has_packed_numeric(&array_var->val)) return 0;
+        return fast_numeric_expr_value_node(I, rhs, &numeric_value);
+    }
+
+    if (lhs->type != FND_IDENT) return 0;
+    target = cached_ident_var(I, n, 0, lhs);
+    if (!target || target->is_parameter || target->is_protected ||
+        target->is_pointer || target->is_alias) {
+        return 0;
+    }
+
+    if (target->val.type == FVAL_LOGICAL)
+        return fast_logical_expr_value(I, rhs, &logical_value);
+
+    if (target->val.type != FVAL_INTEGER &&
+        target->val.type != FVAL_REAL &&
+        target->val.type != FVAL_DOUBLE) {
+        return 0;
+    }
+
+    slot = 1;
+    return fast_numeric_expr_value(I, n, &slot, rhs, &numeric_value);
+}
+
 static void free_fast_numeric_loop_plan(FastNumericLoopPlan *plan) {
     if (!plan) return;
     for (int i = 0; i < plan->n_items; i++) {
@@ -17945,6 +18125,26 @@ static FastNumericLoopPlan *compile_fast_numeric_loop_plan(OfortNode *body) {
     return plan;
 }
 
+static int fast_numeric_loop_plan_can_execute(OfortInterpreter *I, FastNumericLoopPlan *plan) {
+    if (!I || !plan) return 0;
+    for (int i = 0; i < plan->n_items; i++) {
+        FastNumericLoopItem *item = &plan->items[i];
+        if (item->kind == 1) {
+            if (!fast_scalar_numeric_assignment_can_execute(I, item->node)) return 0;
+        } else if (item->kind == 2) {
+            return 0;
+        } else if (item->kind == 3) {
+            int cond = 0;
+            if (!fast_logical_expr_value(I, item->node->children[0], &cond)) return 0;
+            if (!fast_numeric_loop_plan_can_execute(I, item->then_plan)) return 0;
+            if (item->else_plan && !fast_numeric_loop_plan_can_execute(I, item->else_plan)) return 0;
+        } else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static FastNumericLoopPlan *get_fast_numeric_loop_plan(OfortNode *n) {
     FastNumericLoopPlan *plan;
     if (!n || n->type != FND_DO_LOOP) return NULL;
@@ -17990,6 +18190,7 @@ static int exec_fast_numeric_do_loop(OfortInterpreter *I, OfortNode *n) {
 
     set_var(I, n->name, make_integer(s));
     loop_var = find_var(I, n->name);
+    if (!fast_numeric_loop_plan_can_execute(I, plan)) return 0;
     iter = s;
     for (;;) {
         if (st > 0 && iter > e) break;
@@ -24181,6 +24382,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         char call_upper[256];
         str_upper(call_upper, n->name, 256);
         if (call_ofort_extension_subroutine(I, n)) {
+            break;
+        }
+        if (call_native_subroutine(I, n)) {
             break;
         }
         if (exec_fast_split_string_call(I, n)) {
@@ -30441,6 +30645,51 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         return result;
     }
 
+    if ((strcmp(upper, "MAX") == 0 || strcmp(upper, "MIN") == 0 ||
+         strcmp(upper, "MIN1") == 0 || strcmp(upper, "AMIN0") == 0) &&
+        nargs >= 2) {
+        OfortValue *shape_arg = NULL;
+        for (int i = 0; i < nargs; i++) {
+            if (args[i].type == FVAL_ARRAY) {
+                shape_arg = &args[i];
+                break;
+            }
+        }
+        if (shape_arg) {
+            OfortValType result_type = shape_arg->v.arr.elem_type;
+            int char_len = array_character_len(shape_arg);
+            OfortValue result;
+
+            for (int i = 0; i < nargs; i++) {
+                if (args[i].type == FVAL_ARRAY && args[i].v.arr.len != shape_arg->v.arr.len)
+                    ofort_error(I, "%s array arguments have different sizes", upper);
+            }
+
+            if (strcmp(upper, "MIN1") == 0 || strcmp(upper, "AMIN0") == 0)
+                result_type = FVAL_INTEGER;
+
+            result = make_array_with_char_len_options(result_type, shape_arg->v.arr.dims,
+                                                       shape_arg->v.arr.n_dims, char_len, 1);
+            for (int i = 0; i < result.v.arr.len; i++) {
+                OfortValue elem_args[OFORT_MAX_PARAMS];
+                OfortValue elem_result;
+                if (nargs > OFORT_MAX_PARAMS) too_many_params_error(I, "intrinsic arguments");
+                for (int j = 0; j < nargs; j++)
+                    elem_args[j] = args[j].type == FVAL_ARRAY ? array_element_value(&args[j], i)
+                                                              : copy_value(args[j]);
+                elem_result = call_intrinsic(I, name, elem_args, nargs, NULL);
+                for (int j = 0; j < nargs; j++) free_value(&elem_args[j]);
+                if (assign_packed_array_element(&result, i, elem_result)) {
+                    free_value(&elem_result);
+                } else {
+                    free_value(&result.v.arr.data[i]);
+                    result.v.arr.data[i] = elem_result;
+                }
+            }
+            return result;
+        }
+    }
+
     /* === Math intrinsics === */
     if (strcmp(upper, "TRANSFER") == 0) {
         int size_idx;
@@ -33524,6 +33773,11 @@ void ofort_destroy(OfortInterpreter *interp) {
     if (!interp) return;
     clear_line_profile(interp);
     clear_procedure_profile(interp);
+    for (int i = 0; i < interp->n_native_subroutines; i++) {
+        ofort_native_close_library(interp->native_subroutines[i].handle);
+        interp->native_subroutines[i].handle = NULL;
+        interp->native_subroutines[i].fn = NULL;
+    }
     /* Free node pool */
     if (interp->node_pool) {
         for (int i = 0; i < interp->node_pool_len; i++) {
@@ -34038,6 +34292,63 @@ void ofort_set_command_args(OfortInterpreter *interp, int argc, const char *cons
     for (int i = argc; i < OFORT_MAX_PARAMS; i++) {
         interp->command_args[i][0] = '\0';
     }
+}
+
+int ofort_add_native_subroutine(OfortInterpreter *interp, const char *name,
+                                const char *library_path, const char *symbol,
+                                const char *abi) {
+    OfortNativeSubroutine *entry;
+    void *handle;
+    void *fn;
+
+    if (!interp || !name || !name[0] || !library_path || !library_path[0] ||
+        !symbol || !symbol[0]) {
+        if (interp) {
+            snprintf(interp->error, sizeof(interp->error),
+                     "invalid native subroutine mapping");
+            interp->has_error = 1;
+        }
+        return -1;
+    }
+    if (!abi || !abi[0]) abi = "i_r8arr_r8_r8";
+    if (!str_eq_nocase(abi, "i_r8arr_r8_r8")) {
+        snprintf(interp->error, sizeof(interp->error),
+                 "unsupported native ABI '%s'", abi);
+        interp->has_error = 1;
+        return -1;
+    }
+    if (interp->n_native_subroutines >= OFORT_MAX_NATIVE_SUBROUTINES) {
+        snprintf(interp->error, sizeof(interp->error),
+                 "too many native subroutine mappings");
+        interp->has_error = 1;
+        return -1;
+    }
+
+    handle = ofort_native_load_library(library_path);
+    if (!handle) {
+        snprintf(interp->error, sizeof(interp->error),
+                 "failed to load native library '%s'", library_path);
+        interp->has_error = 1;
+        return -1;
+    }
+    fn = ofort_native_symbol(handle, symbol);
+    if (!fn) {
+        ofort_native_close_library(handle);
+        snprintf(interp->error, sizeof(interp->error),
+                 "failed to load native symbol '%s' from '%s'", symbol, library_path);
+        interp->has_error = 1;
+        return -1;
+    }
+
+    entry = &interp->native_subroutines[interp->n_native_subroutines++];
+    memset(entry, 0, sizeof(*entry));
+    copy_cstr(entry->name, sizeof(entry->name), name);
+    copy_cstr(entry->library_path, sizeof(entry->library_path), library_path);
+    copy_cstr(entry->symbol, sizeof(entry->symbol), symbol);
+    copy_cstr(entry->abi, sizeof(entry->abi), abi);
+    entry->handle = handle;
+    entry->fn = fn;
+    return 0;
 }
 
 int ofort_dump_variables(OfortInterpreter *interp, const char *const *names,
