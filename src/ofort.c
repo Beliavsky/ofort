@@ -21929,6 +21929,94 @@ static void validate_intent_in_assignments(OfortInterpreter *I, OfortNode *proc)
     validate_intent_in_assignment_tree(I, proc, proc->children[0]);
 }
 
+static int stmt_assigns_proc_param(OfortNode *proc, int param_index, OfortNode *n) {
+    const char *target_name = NULL;
+
+    if (!proc || param_index < 0 || param_index >= proc->n_params || !n) return 0;
+    if (n->type == FND_ASSIGN || n->type == FND_POINTER_ASSIGN) {
+        target_name = extract_forall_lhs_name(n->children[0]);
+        return target_name && str_eq_nocase(target_name, proc->param_names[param_index]);
+    }
+    if (n->type == FND_READ_STMT) {
+        for (int i = 0; i < n->n_stmts; i++) {
+            target_name = extract_forall_lhs_name(n->stmts[i]);
+            if (target_name && str_eq_nocase(target_name, proc->param_names[param_index])) return 1;
+        }
+    }
+    if ((n->type == FND_ALLOCATE || n->type == FND_DEALLOCATE) &&
+        n->children[OFORT_ALLOC_TARGET_CHILD]) {
+        target_name = extract_forall_lhs_name(n->children[OFORT_ALLOC_TARGET_CHILD]);
+        return target_name && str_eq_nocase(target_name, proc->param_names[param_index]);
+    }
+    return 0;
+}
+
+static int tree_assigns_proc_param(OfortNode *proc, int param_index, OfortNode *n) {
+    if (!n) return 0;
+    if (stmt_assigns_proc_param(proc, param_index, n)) return 1;
+    for (int i = 0; i < n->n_children; i++) {
+        if (tree_assigns_proc_param(proc, param_index, n->children[i])) return 1;
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        if (tree_assigns_proc_param(proc, param_index, n->stmts[i])) return 1;
+    }
+    return 0;
+}
+
+static int block_has_unconditional_proc_param_assignment(OfortNode *proc, int param_index,
+                                                        OfortNode *body) {
+    if (!body || body->type != FND_BLOCK) return 0;
+    for (int i = 0; i < body->n_stmts; i++) {
+        OfortNode *s = body->stmts[i];
+        if (!s) continue;
+        if (s->type == FND_BLOCK) {
+            if (block_has_unconditional_proc_param_assignment(proc, param_index, s)) return 1;
+        } else if (stmt_assigns_proc_param(proc, param_index, s)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int tree_has_conditional_proc_param_assignment_without_else(OfortNode *proc,
+                                                                  int param_index,
+                                                                  OfortNode *n) {
+    if (!n) return 0;
+    if (n->type == FND_IF) {
+        if (n->n_children < 3 && tree_assigns_proc_param(proc, param_index, n->children[1])) {
+            return 1;
+        }
+    }
+    for (int i = 0; i < n->n_children; i++) {
+        if (tree_has_conditional_proc_param_assignment_without_else(proc, param_index,
+                                                                   n->children[i])) {
+            return 1;
+        }
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        if (tree_has_conditional_proc_param_assignment_without_else(proc, param_index,
+                                                                   n->stmts[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void warn_intent_out_maybe_uninitialized(OfortInterpreter *I, OfortNode *proc) {
+    OfortNode *body = proc ? proc->children[0] : NULL;
+    if (!I || !proc || !body) return;
+    for (int i = 0; i < proc->n_params; i++) {
+        if (proc->param_intents[i] != 2) continue;
+        if (proc->param_optional[i]) continue;
+        if (block_has_unconditional_proc_param_assignment(proc, i, body)) continue;
+        if (tree_has_conditional_proc_param_assignment_without_else(proc, i, body)) {
+            ofort_warning(I, proc->line,
+                          "warning: INTENT(OUT) argument '%s' of procedure '%s' may be returned uninitialized",
+                          proc->param_names[i], proc->name);
+        }
+    }
+}
+
 static void check_semantics_identifier(OfortInterpreter *I, OfortNode *n) {
     int has_implicit_type = 0;
 
@@ -22281,6 +22369,7 @@ static void check_semantics_node(OfortInterpreter *I, OfortNode *n) {
                               s->type == FND_STMT_FUNCTION)) {
                         validate_pure_procedure_node(I, s);
                         validate_intent_in_assignments(I, s);
+                        warn_intent_out_maybe_uninitialized(I, s);
                     }
                 }
             }
@@ -22727,6 +22816,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                           s->type == FND_STMT_FUNCTION)) {
                     validate_pure_procedure_node(I, s);
                     validate_intent_in_assignments(I, s);
+                    warn_intent_out_maybe_uninitialized(I, s);
                 }
             }
             for (int i = 0; i < body->n_stmts; i++) {
@@ -22826,6 +22916,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                            s->type == FND_STMT_FUNCTION) {
                     validate_pure_procedure_node(I, s);
                     validate_intent_in_assignments(I, s);
+                    warn_intent_out_maybe_uninitialized(I, s);
                 } else if (s->type == FND_TYPE_DEF) {
                     exec_node(I, s);
                 } else {
@@ -27488,6 +27579,7 @@ unresolved_external_call_done:
         }
         validate_pure_procedure_node(I, n);
         validate_intent_in_assignments(I, n);
+        warn_intent_out_maybe_uninitialized(I, n);
         (void)register_func(I, n->name, n, n->type == FND_FUNCTION);
         break;
     }
