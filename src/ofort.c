@@ -26604,6 +26604,116 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             break;
         }
+        if (strcmp(call_upper, "GET_ENVIRONMENT_VARIABLE") == 0) {
+            int name_idx = -1;
+            int value_idx = -1;
+            int length_idx = -1;
+            int status_idx = -1;
+            int trim_name_idx = -1;
+            int trim_name = 1;
+            int status = 0;
+            int env_len = 0;
+            char env_name[OFORT_MAX_STRLEN];
+            const char *env_value = NULL;
+
+            for (int i = 0; i < n->n_stmts; i++) {
+                const char *pname = n->param_names[i];
+                if (str_eq_nocase(pname, "name")) {
+                    name_idx = i;
+                } else if (str_eq_nocase(pname, "value")) {
+                    value_idx = i;
+                } else if (str_eq_nocase(pname, "length")) {
+                    length_idx = i;
+                } else if (str_eq_nocase(pname, "status")) {
+                    status_idx = i;
+                } else if (str_eq_nocase(pname, "trim_name")) {
+                    trim_name_idx = i;
+                } else if (pname[0] != '\0') {
+                    ofort_error(I, "Unknown GET_ENVIRONMENT_VARIABLE keyword '%s'", pname);
+                } else if (name_idx < 0) {
+                    name_idx = i;
+                } else if (value_idx < 0) {
+                    value_idx = i;
+                } else if (length_idx < 0) {
+                    length_idx = i;
+                } else if (status_idx < 0) {
+                    status_idx = i;
+                } else if (trim_name_idx < 0) {
+                    trim_name_idx = i;
+                } else {
+                    ofort_error(I, "Too many arguments to GET_ENVIRONMENT_VARIABLE");
+                }
+            }
+            if (name_idx < 0)
+                ofort_error(I, "GET_ENVIRONMENT_VARIABLE requires NAME");
+
+            if (trim_name_idx >= 0) {
+                OfortValue trim_val = eval_node(I, n->stmts[trim_name_idx]);
+                if (trim_val.type != FVAL_LOGICAL) {
+                    free_value(&trim_val);
+                    ofort_error(I, "GET_ENVIRONMENT_VARIABLE TRIM_NAME must be LOGICAL");
+                }
+                trim_name = trim_val.v.b;
+                free_value(&trim_val);
+            }
+
+            {
+                OfortValue name_val = eval_node(I, n->stmts[name_idx]);
+                size_t name_len;
+                if (name_val.type != FVAL_CHARACTER || !name_val.v.s) {
+                    free_value(&name_val);
+                    ofort_error(I, "GET_ENVIRONMENT_VARIABLE NAME must be CHARACTER");
+                }
+                copy_cstr(env_name, sizeof(env_name), name_val.v.s);
+                free_value(&name_val);
+                if (trim_name) {
+                    name_len = strlen(env_name);
+                    while (name_len > 0 && isspace((unsigned char)env_name[name_len - 1]))
+                        env_name[--name_len] = '\0';
+                }
+            }
+
+            env_value = getenv(env_name);
+            if (env_value) {
+                env_len = (int)strlen(env_value);
+            } else {
+                status = 1;
+                env_value = "";
+                env_len = 0;
+            }
+
+            if (value_idx >= 0) {
+                int char_len = -1;
+                if (n->stmts[value_idx]->type == FND_IDENT) {
+                    OfortVar *value_var = find_var(I, n->stmts[value_idx]->name);
+                    if (!value_var)
+                        ofort_error(I, "Undefined variable '%s' in GET_ENVIRONMENT_VARIABLE",
+                                    n->stmts[value_idx]->name);
+                    if (value_var->val.type != FVAL_CHARACTER)
+                        ofort_error(I, "GET_ENVIRONMENT_VARIABLE VALUE must be CHARACTER");
+                    char_len = value_var->char_len;
+                } else {
+                    OfortValue *slot = member_lvalue(I, n->stmts[value_idx]);
+                    if (!slot)
+                        ofort_error(I, "GET_ENVIRONMENT_VARIABLE VALUE must be a variable");
+                    if (slot->type != FVAL_CHARACTER)
+                        ofort_error(I, "GET_ENVIRONMENT_VARIABLE VALUE must be CHARACTER");
+                    char_len = slot->v.s ? (int)strlen(slot->v.s) : -1;
+                }
+                if (status == 0 && char_len >= 0 && env_len > char_len) status = -1;
+                assign_intrinsic_output_target(I, "GET_ENVIRONMENT_VARIABLE", "VALUE",
+                                               n->stmts[value_idx], make_character(env_value));
+            }
+            if (length_idx >= 0) {
+                assign_intrinsic_output_target(I, "GET_ENVIRONMENT_VARIABLE", "LENGTH",
+                                               n->stmts[length_idx], make_integer(env_len));
+            }
+            if (status_idx >= 0) {
+                assign_intrinsic_output_target(I, "GET_ENVIRONMENT_VARIABLE", "STATUS",
+                                               n->stmts[status_idx], make_integer(status));
+            }
+            break;
+        }
         if (strcmp(call_upper, "GET_COMMAND_ARGUMENT") == 0 || strcmp(call_upper, "GETARG") == 0) {
             int is_getarg = strcmp(call_upper, "GETARG") == 0;
             const char *diag_name = is_getarg ? "GETARG" : "GET_COMMAND_ARGUMENT";
