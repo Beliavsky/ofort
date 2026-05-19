@@ -25248,8 +25248,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     values[6] = local_tm.tm_sec;
                     values[7] = millisecond;
                     for (int j = 0; j < 8; j++) {
-                        free_value(&values_var->val.v.arr.data[j]);
-                        values_var->val.v.arr.data[j] = make_integer(values[j]);
+                        OfortValue elem = make_integer(values[j]);
+                        if (assign_packed_array_element(&values_var->val, j, elem)) {
+                            free_value(&elem);
+                        } else if (values_var->val.v.arr.data) {
+                            free_value(&values_var->val.v.arr.data[j]);
+                            values_var->val.v.arr.data[j] = elem;
+                        } else {
+                            free_value(&elem);
+                        }
                     }
                     values_var->is_initialized = 1;
                 }
