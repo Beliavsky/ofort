@@ -3403,7 +3403,7 @@ static void tokenize(OfortInterpreter *I, const char *src) {
                         t->str_val[slen++] = *p;
                         p++;
                     }
-                    if (slen >= OFORT_MAX_STRLEN - 1) break;
+                    if (slen >= (int)sizeof(t->str_val) - 1) break;
                 }
                 t->str_val[slen] = '\0';
                 if (*p == quote) p++;
@@ -3490,7 +3490,7 @@ static void tokenize(OfortInterpreter *I, const char *src) {
                     t->str_val[slen++] = *p;
                     p++;
                 }
-                if (slen >= OFORT_MAX_STRLEN - 1) break;
+                if (slen >= (int)sizeof(t->str_val) - 1) break;
             }
             t->str_val[slen] = '\0';
             if (*p == quote) p++;
@@ -23086,12 +23086,20 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (!n->int_val && n->n_params == 0) {
             for (int fi = 0; fi < I->n_funcs; fi++) {
                 OfortFunc *src_func = &I->funcs[fi];
+                OfortNode *src_node;
+                int src_is_function;
+                char src_name[256];
+                char src_module_name[256];
                 if (!str_eq_nocase(src_func->module_name, mod->name)) continue;
                 if (find_func_in_module(I, src_func->name, "")) continue;
-                OfortFunc *alias_func = register_func_with_module(I, src_func->name, src_func->node,
-                                                                  src_func->is_function, "");
+                copy_cstr(src_name, sizeof(src_name), src_func->name);
+                copy_cstr(src_module_name, sizeof(src_module_name), src_func->module_name);
+                src_node = src_func->node;
+                src_is_function = src_func->is_function;
+                OfortFunc *alias_func = register_func_with_module(I, src_name, src_node,
+                                                                  src_is_function, "");
                 copy_cstr(alias_func->exec_module_name, sizeof(alias_func->exec_module_name),
-                          src_func->module_name);
+                          src_module_name);
             }
         }
         for (int i = 0; i < n->n_params; i++) {
@@ -23108,24 +23116,29 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             OfortGeneric *src = find_generic(I, remote);
             if (src) {
                 OfortGeneric *dst = find_generic(I, local);
+                int src_n_procedures = src->n_procedures;
                 if (!dst) {
                     ensure_generic_capacity(I, 1);
                     dst = &I->generics[I->n_generics++];
                     memset(dst, 0, sizeof(*dst));
                     copy_cstr(dst->name, sizeof(dst->name), local);
                 }
-                for (int gi = 0; gi < src->n_procedures; gi++) {
+                for (int gi = 0; gi < src_n_procedures; gi++) {
                     char imported_proc_name[256];
                     const char *proc_name = src->procedures[gi];
                     OfortFunc *src_func = find_func_in_module(I, proc_name, mod->name);
                     if (src_func) {
                         OfortFunc *alias_func;
+                        OfortNode *src_node = src_func->node;
+                        int src_is_function = src_func->is_function;
+                        char src_module_name[256];
+                        copy_cstr(src_module_name, sizeof(src_module_name), src_func->module_name);
                         snprintf(imported_proc_name, sizeof(imported_proc_name),
                                  "%s::%s", mod->name, proc_name);
-                        alias_func = register_func_with_module(I, imported_proc_name, src_func->node,
-                                                               src_func->is_function, "");
+                        alias_func = register_func_with_module(I, imported_proc_name, src_node,
+                                                               src_is_function, "");
                         copy_cstr(alias_func->exec_module_name, sizeof(alias_func->exec_module_name),
-                                  src_func->module_name);
+                                  src_module_name);
                         proc_name = imported_proc_name;
                     }
                     int duplicate = 0;
@@ -23144,10 +23157,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             {
                 OfortFunc *src_func = find_func_in_module(I, remote, mod->name);
                 if (src_func && !find_func_in_module(I, local, "")) {
-                    OfortFunc *alias_func = register_func_with_module(I, local, src_func->node,
-                                                                      src_func->is_function, "");
+                    OfortNode *src_node = src_func->node;
+                    int src_is_function = src_func->is_function;
+                    char src_module_name[256];
+                    copy_cstr(src_module_name, sizeof(src_module_name), src_func->module_name);
+                    OfortFunc *alias_func = register_func_with_module(I, local, src_node,
+                                                                      src_is_function, "");
                     copy_cstr(alias_func->exec_module_name, sizeof(alias_func->exec_module_name),
-                              src_func->module_name);
+                              src_module_name);
                 }
             }
         }
