@@ -18620,6 +18620,9 @@ static int exec_fast_numeric_do_loop(OfortInterpreter *I, OfortNode *n) {
 
     set_var(I, n->name, make_integer(s));
     loop_var = find_var(I, n->name);
+    if (loop_var && loop_var->val.type == FVAL_INTEGER && !loop_var->is_parameter && !loop_var->is_protected) {
+        loop_var->is_initialized = 1;
+    }
     if (!fast_numeric_loop_plan_can_execute(I, plan)) return 0;
     iter = s;
     for (;;) {
@@ -19432,8 +19435,10 @@ static int is_loop_array_ref(OfortNode *n, const char *array_name, const char *l
 
 static int expr_has_loop_array_ref(OfortNode *n, const char *loop_name) {
     if (!n) return 0;
-    if (n->type == FND_FUNC_CALL && n->n_stmts == 1 && is_loop_index_ref(n->stmts[0], loop_name)) {
-        return 1;
+    if (n->type == FND_FUNC_CALL) {
+        for (int i = 0; i < n->n_stmts; i++) {
+            if (expr_mentions_ident(n->stmts[i], loop_name)) return 1;
+        }
     }
     for (int i = 0; i < n->n_children; i++) {
         if (expr_has_loop_array_ref(n->children[i], loop_name)) return 1;
@@ -24023,6 +24028,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (st < 0 && iter < e) break;
             if (loop_var && loop_var->val.type == FVAL_INTEGER && !loop_var->is_parameter && !loop_var->is_protected) {
                 loop_var->val.v.i = iter;
+                loop_var->is_initialized = 1;
             } else {
                 set_var(I, n->name, make_integer(iter));
             }
@@ -24035,6 +24041,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (!I->returning && !I->stopping) {
             if (loop_var && loop_var->val.type == FVAL_INTEGER && !loop_var->is_parameter && !loop_var->is_protected) {
                 loop_var->val.v.i = iter;
+                loop_var->is_initialized = 1;
             } else {
                 set_var(I, n->name, make_integer(iter));
             }
