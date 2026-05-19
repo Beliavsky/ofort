@@ -15928,6 +15928,7 @@ static OfortValue execute_user_function_with_args(OfortInterpreter *I, OfortFunc
     const char *res_name;
     OfortValue result;
     if (!func || !fn || !func->is_function) ofort_error(I, "Invalid function call");
+    sync_module_vars_from_scope(I, func_exec_module_name(func));
     push_scope(I);
     OfortModule *mod = find_module(I, func_exec_module_name(func));
     if (mod) {
@@ -17093,6 +17094,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 free_call_args(args, nargs); args = NULL;
                 return elemental_result;
             }
+            sync_module_vars_from_scope(I, func_exec_module_name(func));
             push_scope(I);
             OfortModule *mod = find_module(I, func_exec_module_name(func));
             if (mod) {
@@ -26246,6 +26248,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             free(args);
             break;
         }
+        sync_module_vars_from_scope(I, func_exec_module_name(func));
         push_scope(I);
         {
             OfortModule *mod = find_module(I, func_exec_module_name(func));
