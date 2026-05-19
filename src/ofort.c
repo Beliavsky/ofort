@@ -17682,6 +17682,12 @@ static OfortValue elemental_actual_value(OfortValue *args, int *arg_alias,
     return copy_value(*v);
 }
 
+static int execute_fast_elemental_numeric_subroutine_call(OfortInterpreter *I, OfortNode *call,
+                                                          OfortFunc *func, OfortNode *fn,
+                                                          OfortValue *args, int nargs,
+                                                          int *arg_alias,
+                                                          OfortVar **arg_alias_var);
+
 static void assign_elemental_actual(OfortInterpreter *I, OfortNode *actual_node,
                                     OfortValue *args, int *arg_alias,
                                     OfortVar **arg_alias_var, int arg_index,
@@ -17726,9 +17732,13 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
                                              OfortFunc *func, OfortNode *fn,
                                              OfortValue *args, int nargs,
                                              int *arg_alias,
-                                             OfortVar **arg_alias_var) {
+    OfortVar **arg_alias_var) {
     int elem_count = 0;
     if (!fn || !fn->is_elemental) return 0;
+    if (execute_fast_elemental_numeric_subroutine_call(I, call, func, fn, args, nargs,
+                                                       arg_alias, arg_alias_var)) {
+        return 1;
+    }
     for (int i = 0; i < nargs; i++) {
         OfortValue *v = arg_alias[i] && arg_alias_var[i] ? &arg_alias_var[i]->val : &args[i];
         if (v->type != FVAL_ARRAY) continue;
@@ -17858,6 +17868,14 @@ static int eval_simple_elemental_numeric_expr(OfortInterpreter *I, OfortNode *ex
             *out = params[idx];
             return 1;
         }
+        {
+            OfortVar *v = find_var(I, expr->name);
+            if (v && (v->val.type == FVAL_REAL || v->val.type == FVAL_DOUBLE ||
+                      v->val.type == FVAL_INTEGER)) {
+                *out = val_to_real(v->val);
+                return 1;
+            }
+        }
         return 0;
     case FND_NEGATE:
         if (!eval_simple_elemental_numeric_expr(I, expr->children[0], fn, params, nparams, depth + 1, &a)) return 0;
@@ -17916,6 +17934,16 @@ static int eval_simple_elemental_numeric_expr(OfortInterpreter *I, OfortNode *ex
             *out = tanh(a);
             return 1;
         }
+        if (str_eq_nocase(expr->name, "ERF") && expr->n_stmts == 1) {
+            if (!eval_simple_elemental_numeric_expr(I, expr->stmts[0], fn, params, nparams, depth + 1, &a)) return 0;
+            *out = erf(a);
+            return 1;
+        }
+        if (str_eq_nocase(expr->name, "ACOS") && expr->n_stmts == 1) {
+            if (!eval_simple_elemental_numeric_expr(I, expr->stmts[0], fn, params, nparams, depth + 1, &a)) return 0;
+            *out = acos(a);
+            return 1;
+        }
         callee = find_func(I, expr->name);
         if (!callee || !callee->is_function || !callee->node || !callee->node->is_elemental ||
             expr->n_stmts > OFORT_MAX_PARAMS || expr->n_stmts != callee->node->n_params) {
@@ -17934,6 +17962,282 @@ static int eval_simple_elemental_numeric_expr(OfortInterpreter *I, OfortNode *ex
     default:
         return 0;
     }
+}
+
+typedef struct {
+    char name[256];
+    double value;
+} FastElementalEnvVar;
+
+static int fast_elemental_env_find(FastElementalEnvVar *env, int nenv, const char *name) {
+    if (!env || !name) return -1;
+    for (int i = 0; i < nenv; i++) {
+        if (str_eq_nocase(env[i].name, name)) return i;
+    }
+    return -1;
+}
+
+static int fast_elemental_env_add(FastElementalEnvVar *env, int *nenv, const char *name, double value) {
+    int idx;
+    if (!env || !nenv || !name || !name[0]) return 0;
+    idx = fast_elemental_env_find(env, *nenv, name);
+    if (idx >= 0) {
+        env[idx].value = value;
+        return 1;
+    }
+    if (*nenv >= OFORT_MAX_PARAMS * 2) return 0;
+    copy_cstr(env[*nenv].name, sizeof(env[*nenv].name), name);
+    env[*nenv].value = value;
+    (*nenv)++;
+    return 1;
+}
+
+static int collect_fast_elemental_decl_vars(OfortNode *stmt, FastElementalEnvVar *env, int *nenv) {
+    if (!stmt) return 1;
+    if (stmt->type == FND_BLOCK) {
+        for (int i = 0; i < stmt->n_stmts; i++) {
+            if (!collect_fast_elemental_decl_vars(stmt->stmts[i], env, nenv)) return 0;
+        }
+        return 1;
+    }
+    if (stmt->type != FND_VARDECL && stmt->type != FND_PARAMDECL) return 1;
+    if (stmt->n_dims != 0) return 0;
+    if (stmt->val_type != FVAL_REAL && stmt->val_type != FVAL_DOUBLE &&
+        stmt->val_type != FVAL_INTEGER && stmt->val_type != FVAL_VOID) {
+        return 0;
+    }
+    return fast_elemental_env_add(env, nenv, stmt->name, 0.0);
+}
+
+static int eval_fast_elemental_env_expr(OfortInterpreter *I, OfortNode *expr,
+                                        FastElementalEnvVar *env, int nenv,
+                                        int depth, double *out) {
+    double a, b;
+    int idx;
+    OfortFunc *callee;
+    OfortNode *callee_expr;
+    double call_args[OFORT_MAX_PARAMS];
+    if (!I || !expr || !env || !out || depth > 32) return 0;
+    switch (expr->type) {
+    case FND_INT_LIT:
+        *out = (double)expr->int_val;
+        return 1;
+    case FND_REAL_LIT:
+        *out = expr->num_val;
+        return 1;
+    case FND_IDENT:
+        idx = fast_elemental_env_find(env, nenv, expr->name);
+        if (idx >= 0) {
+            *out = env[idx].value;
+            return 1;
+        }
+        {
+            OfortVar *v = find_var(I, expr->name);
+            if (v && (v->val.type == FVAL_REAL || v->val.type == FVAL_DOUBLE ||
+                      v->val.type == FVAL_INTEGER)) {
+                *out = val_to_real(v->val);
+                return 1;
+            }
+        }
+        return 0;
+    case FND_NEGATE:
+        if (!eval_fast_elemental_env_expr(I, expr->children[0], env, nenv, depth + 1, &a)) return 0;
+        *out = -a;
+        return 1;
+    case FND_ADD:
+    case FND_SUB:
+    case FND_MUL:
+    case FND_DIV:
+    case FND_POWER:
+        if (!eval_fast_elemental_env_expr(I, expr->children[0], env, nenv, depth + 1, &a) ||
+            !eval_fast_elemental_env_expr(I, expr->children[1], env, nenv, depth + 1, &b)) {
+            return 0;
+        }
+        switch (expr->type) {
+        case FND_ADD: *out = a + b; return 1;
+        case FND_SUB: *out = a - b; return 1;
+        case FND_MUL: *out = a * b; return 1;
+        case FND_DIV: *out = a / b; return 1;
+        case FND_POWER: *out = pow(a, b); return 1;
+        default: return 0;
+        }
+    case FND_FUNC_CALL:
+        if (expr->n_stmts == 1) {
+            if (!eval_fast_elemental_env_expr(I, expr->stmts[0], env, nenv, depth + 1, &a)) return 0;
+            if (str_eq_nocase(expr->name, "ABS")) { *out = fabs(a); return 1; }
+            if (str_eq_nocase(expr->name, "EXP")) { *out = exp(a); return 1; }
+            if (str_eq_nocase(expr->name, "SQRT")) { *out = sqrt(a); return 1; }
+            if (str_eq_nocase(expr->name, "LOG")) { *out = log(a); return 1; }
+            if (str_eq_nocase(expr->name, "SIN")) { *out = sin(a); return 1; }
+            if (str_eq_nocase(expr->name, "COS")) { *out = cos(a); return 1; }
+            if (str_eq_nocase(expr->name, "TANH")) { *out = tanh(a); return 1; }
+            if (str_eq_nocase(expr->name, "ERF")) { *out = erf(a); return 1; }
+            if (str_eq_nocase(expr->name, "ACOS")) { *out = acos(a); return 1; }
+        }
+        callee = find_func(I, expr->name);
+        if (!callee || !callee->is_function || !callee->node || !callee->node->is_elemental ||
+            expr->n_stmts > OFORT_MAX_PARAMS || expr->n_stmts != callee->node->n_params) {
+            return 0;
+        }
+        callee_expr = simple_elemental_result_expr(callee->node);
+        if (!callee_expr) return 0;
+        for (int i = 0; i < expr->n_stmts; i++) {
+            if (!eval_fast_elemental_env_expr(I, expr->stmts[i], env, nenv, depth + 1, &call_args[i])) {
+                return 0;
+            }
+        }
+        return eval_simple_elemental_numeric_expr(I, callee_expr, callee->node, call_args,
+                                                  callee->node->n_params, depth + 1, out);
+    default:
+        return 0;
+    }
+}
+
+static int init_fast_elemental_decl_vars(OfortInterpreter *I, OfortNode *stmt,
+                                         FastElementalEnvVar *env, int *nenv) {
+    double value;
+    if (!stmt) return 1;
+    if (stmt->type == FND_BLOCK) {
+        for (int i = 0; i < stmt->n_stmts; i++) {
+            if (!init_fast_elemental_decl_vars(I, stmt->stmts[i], env, nenv)) return 0;
+        }
+        return 1;
+    }
+    if (stmt->type != FND_VARDECL && stmt->type != FND_PARAMDECL) return 1;
+    if (!stmt->children[0]) return 1;
+    if (!eval_fast_elemental_env_expr(I, stmt->children[0], env, *nenv, 0, &value)) return 0;
+    return fast_elemental_env_add(env, nenv, stmt->name, value);
+}
+
+static int execute_fast_elemental_numeric_subroutine_call(OfortInterpreter *I, OfortNode *call,
+                                                          OfortFunc *func, OfortNode *fn,
+                                                          OfortValue *args, int nargs,
+                                                          int *arg_alias,
+                                                          OfortVar **arg_alias_var) {
+    OfortValue *shape_arg = NULL;
+    int elem_count = 0;
+    int output_params[OFORT_MAX_PARAMS] = {0};
+    FastElementalEnvVar base_env[OFORT_MAX_PARAMS * 2];
+    int base_nenv = 0;
+    if (!I || !I->fast_mode || I->line_profile_enabled || !call || !func || !fn ||
+        !fn->is_elemental || !args || nargs > OFORT_MAX_PARAMS ||
+        fn->n_params > OFORT_MAX_PARAMS) {
+        return 0;
+    }
+    for (int i = 0; i < nargs; i++) {
+        OfortValue *v;
+        if (arg_alias && arg_alias[i]) return 0;
+        v = args[i].type == FVAL_VOID && arg_alias_var && arg_alias_var[i] ? &arg_alias_var[i]->val : &args[i];
+        if (v->type == FVAL_ARRAY) {
+            if (v->v.arr.elem_type != FVAL_REAL && v->v.arr.elem_type != FVAL_DOUBLE &&
+                v->v.arr.elem_type != FVAL_INTEGER) {
+                return 0;
+            }
+            if (!shape_arg) {
+                shape_arg = v;
+                elem_count = v->v.arr.len;
+            } else if (v->v.arr.len != elem_count) {
+                ofort_error(I, "Elemental subroutine array arguments must have the same size");
+            }
+        } else if (v->type != FVAL_REAL && v->type != FVAL_DOUBLE &&
+                   v->type != FVAL_INTEGER && v->type != FVAL_VOID) {
+            return 0;
+        }
+    }
+    if (!shape_arg || elem_count <= 0) return 0;
+    for (int i = 0; i < fn->n_params; i++) {
+        if (fn->param_pointers[i] || fn->param_allocatables[i] || fn->param_optional[i]) return 0;
+        if (!fast_elemental_env_add(base_env, &base_nenv, fn->param_names[i], 0.0)) return 0;
+        if (fn->param_intents[i] != 1) {
+            if (i >= nargs || call->stmts[i]->type != FND_IDENT) return 0;
+            output_params[i] = 1;
+        }
+    }
+    for (int si = 0; si < fn->children[0]->n_stmts; si++) {
+        OfortNode *s = fn->children[0]->stmts[si];
+        if (!s) continue;
+        if (s->type == FND_VARDECL || s->type == FND_PARAMDECL || s->type == FND_BLOCK) {
+            if (!collect_fast_elemental_decl_vars(s, base_env, &base_nenv)) return 0;
+            continue;
+        }
+        if (s->type != FND_ASSIGN || !s->children[0] || !s->children[1] ||
+            s->children[0]->type != FND_IDENT) {
+            return 0;
+        }
+        if (fast_elemental_env_find(base_env, base_nenv, s->children[0]->name) < 0) return 0;
+    }
+
+    double proc_profile_start = begin_procedure_profile(I, func);
+    for (int elem = 0; elem < elem_count; elem++) {
+        FastElementalEnvVar env[OFORT_MAX_PARAMS * 2];
+        int nenv = base_nenv;
+        memcpy(env, base_env, sizeof(base_env));
+        for (int i = 0; i < fn->n_params; i++) {
+            double value = 0.0;
+            if (i < nargs && args[i].type != FVAL_VOID) {
+                if (args[i].type == FVAL_ARRAY) {
+                    OfortValue ev = array_element_value(&args[i], elem);
+                    value = val_to_real(ev);
+                    free_value(&ev);
+                } else {
+                    value = val_to_real(args[i]);
+                }
+            }
+            if (!fast_elemental_env_add(env, &nenv, fn->param_names[i], value)) {
+                end_procedure_profile(I, func, proc_profile_start);
+                return 0;
+            }
+        }
+        for (int si = 0; si < fn->children[0]->n_stmts; si++) {
+            OfortNode *s = fn->children[0]->stmts[si];
+            if (!init_fast_elemental_decl_vars(I, s, env, &nenv)) {
+                end_procedure_profile(I, func, proc_profile_start);
+                return 0;
+            }
+        }
+        for (int si = 0; si < fn->children[0]->n_stmts; si++) {
+            OfortNode *s = fn->children[0]->stmts[si];
+            double value;
+            if (!s || s->type == FND_VARDECL || s->type == FND_PARAMDECL || s->type == FND_BLOCK) continue;
+            if (!eval_fast_elemental_env_expr(I, s->children[1], env, nenv, 0, &value) ||
+                !fast_elemental_env_add(env, &nenv, s->children[0]->name, value)) {
+                end_procedure_profile(I, func, proc_profile_start);
+                return 0;
+            }
+        }
+        for (int i = 0; i < fn->n_params && i < nargs; i++) {
+            int idx;
+            OfortVar *actual;
+            OfortValue value;
+            if (!output_params[i]) continue;
+            idx = fast_elemental_env_find(env, nenv, fn->param_names[i]);
+            if (idx < 0) {
+                end_procedure_profile(I, func, proc_profile_start);
+                return 0;
+            }
+            actual = find_var(I, call->stmts[i]->name);
+            if (!actual || actual->val.type != FVAL_ARRAY) {
+                end_procedure_profile(I, func, proc_profile_start);
+                return 0;
+            }
+            value = actual->val.v.arr.elem_type == FVAL_DOUBLE ?
+                    make_double(env[idx].value) :
+                    actual->val.v.arr.elem_type == FVAL_INTEGER ?
+                    make_integer((long long)env[idx].value) :
+                    make_real(env[idx].value);
+            if (assign_packed_array_element(&actual->val, elem, value)) {
+                free_value(&value);
+            } else if (actual->val.v.arr.data && elem >= 0 && elem < actual->val.v.arr.len) {
+                free_value(&actual->val.v.arr.data[elem]);
+                actual->val.v.arr.data[elem] = value;
+            } else {
+                free_value(&value);
+            }
+            actual->is_initialized = 1;
+        }
+    }
+    end_procedure_profile(I, func, proc_profile_start);
+    return 1;
 }
 
 static int execute_fast_elemental_numeric_function_call(OfortInterpreter *I, OfortFunc *func,
