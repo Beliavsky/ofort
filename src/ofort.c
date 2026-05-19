@@ -17690,7 +17690,8 @@ static int execute_fast_elemental_numeric_subroutine_call(OfortInterpreter *I, O
 
 static void assign_elemental_actual(OfortInterpreter *I, OfortNode *actual_node,
                                     OfortValue *args, int *arg_alias,
-                                    OfortVar **arg_alias_var, int arg_index,
+                                    OfortVar **arg_alias_var, OfortVar **actual_vars,
+                                    int arg_index,
                                     int elem_index, OfortValue *value) {
     OfortValue *arg = arg_alias[arg_index] && arg_alias_var[arg_index] ?
         &arg_alias_var[arg_index]->val : &args[arg_index];
@@ -17698,7 +17699,8 @@ static void assign_elemental_actual(OfortInterpreter *I, OfortNode *actual_node,
     if (arg->type == FVAL_ARRAY) {
         if (actual_node->type == FND_IDENT) {
             OfortVar *actual = arg_alias[arg_index] && arg_alias_var[arg_index] ?
-                arg_alias_var[arg_index] : find_var(I, actual_node->name);
+                arg_alias_var[arg_index] :
+                (actual_vars && actual_vars[arg_index] ? actual_vars[arg_index] : find_var(I, actual_node->name));
             OfortValue elem = copy_value(*value);
             if (!actual || actual->val.type != FVAL_ARRAY) {
                 free_value(&elem);
@@ -17734,6 +17736,7 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
                                              int *arg_alias,
     OfortVar **arg_alias_var) {
     int elem_count = 0;
+    OfortVar *actual_vars[OFORT_MAX_PARAMS] = {0};
     if (!fn || !fn->is_elemental) return 0;
     if (execute_fast_elemental_numeric_subroutine_call(I, call, func, fn, args, nargs,
                                                        arg_alias, arg_alias_var)) {
@@ -17749,6 +17752,12 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
         }
     }
     if (elem_count == 0) return 0;
+    for (int i = 0; i < fn->n_params && i < nargs && i < OFORT_MAX_PARAMS; i++) {
+        if (fn->param_intents[i] == 1 || !call->stmts[i]) continue;
+        if (call->stmts[i]->type == FND_IDENT) {
+            actual_vars[i] = find_var(I, call->stmts[i]->name);
+        }
+    }
 
     for (int elem = 0; elem < elem_count; elem++) {
         push_scope(I);
@@ -17785,7 +17794,7 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
                 OfortVar *pv = find_var(I, fn->param_names[i]);
                 if (pv && pv->present)
                     assign_elemental_actual(I, call->stmts[i], args, arg_alias,
-                                            arg_alias_var, i, elem, &pv->val);
+                                            arg_alias_var, actual_vars, i, elem, &pv->val);
             }
         }
         store_saved_vars(I, func, I->current_scope);
