@@ -33,6 +33,7 @@
 #define OFORT_ALLOC_TARGET_CHILD (OFORT_MAX_CHILDREN - 1)
 #define OFORT_MAX_TYPE_ACTUALS 16
 #define OFORT_MAX_NATIVE_SUBROUTINES 32
+#define OFORT_INITIAL_TOKEN_CAP 4096
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
@@ -850,15 +851,122 @@ static void free_call_args(OfortValue *args, int nargs) {
     free(args);
 }
 
+static int node_type_uses_param_storage(OfortNodeType type) {
+    switch (type) {
+    case FND_SUBROUTINE:
+    case FND_FUNCTION:
+    case FND_MODULE:
+    case FND_TYPE_DEF:
+    case FND_VARDECL:
+    case FND_PARAMDECL:
+    case FND_STMT_FUNCTION:
+    case FND_CALL:
+    case FND_FUNC_CALL:
+    case FND_ARRAY_REF:
+    case FND_MEMBER:
+    case FND_ARRAY_CONSTRUCTOR:
+    case FND_IMPLIED_DO:
+    case FND_MULTIPLE_SUBSCRIPT:
+    case FND_ASSOCIATE:
+    case FND_FORALL:
+    case FND_DO_CONCURRENT:
+    case FND_ALLOCATE:
+    case FND_DEALLOCATE:
+    case FND_USE:
+    case FND_IMPORT:
+    case FND_ACCESS:
+    case FND_ATTR_STMT:
+    case FND_INTERFACE:
+    case FND_WRITE:
+    case FND_READ_STMT:
+    case FND_OPEN:
+    case FND_CLOSE:
+    case FND_REWIND:
+    case FND_BACKSPACE:
+    case FND_ENDFILE:
+    case FND_WAIT:
+    case FND_INQUIRE:
+    case FND_NAMELIST:
+    case FND_DATA:
+    case FND_EQUIVALENCE:
+    case FND_FORMAT:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static void alloc_node_param_storage(OfortInterpreter *I, OfortNode *n) {
+    if (!n || n->param_names) return;
+    n->param_names = (char (*)[256])calloc(OFORT_MAX_PARAMS, sizeof(*n->param_names));
+    n->binding_proc_names = (char (*)[256])calloc(OFORT_MAX_PARAMS, sizeof(*n->binding_proc_names));
+    n->param_types = (OfortValType *)calloc(OFORT_MAX_PARAMS, sizeof(*n->param_types));
+    n->param_kinds = (int *)calloc(OFORT_MAX_PARAMS, sizeof(*n->param_kinds));
+    n->param_type_names = (char (*)[64])calloc(OFORT_MAX_PARAMS, sizeof(*n->param_type_names));
+    n->param_intents = (int *)calloc(OFORT_MAX_PARAMS, sizeof(*n->param_intents));
+    n->param_optional = (int *)calloc(OFORT_MAX_PARAMS, sizeof(*n->param_optional));
+    n->param_values = (int *)calloc(OFORT_MAX_PARAMS, sizeof(*n->param_values));
+    n->param_pointers = (int *)calloc(OFORT_MAX_PARAMS, sizeof(*n->param_pointers));
+    n->param_allocatables = (int *)calloc(OFORT_MAX_PARAMS, sizeof(*n->param_allocatables));
+    n->param_n_dims = (int *)calloc(OFORT_MAX_PARAMS, sizeof(*n->param_n_dims));
+    n->type_param_names = (char (*)[64])calloc(OFORT_MAX_PARAMS, sizeof(*n->type_param_names));
+    n->type_param_exprs = (OfortNode **)calloc(OFORT_MAX_PARAMS, sizeof(*n->type_param_exprs));
+    if (!n->param_names || !n->binding_proc_names || !n->param_types ||
+        !n->param_kinds || !n->param_type_names || !n->param_intents ||
+        !n->param_optional || !n->param_values || !n->param_pointers ||
+        !n->param_allocatables || !n->param_n_dims || !n->type_param_names ||
+        !n->type_param_exprs) {
+        ofort_error(I, "Out of memory allocating node parameter storage");
+    }
+}
+
 /* â”€â”€ Node allocation (tracked for cleanup) â”€â”€â”€â”€â”€ */
+static void clear_node_param_storage_refs(OfortNode *n) {
+    if (!n) return;
+    n->param_names = NULL;
+    n->binding_proc_names = NULL;
+    n->param_types = NULL;
+    n->param_kinds = NULL;
+    n->param_type_names = NULL;
+    n->param_intents = NULL;
+    n->param_optional = NULL;
+    n->param_values = NULL;
+    n->param_pointers = NULL;
+    n->param_allocatables = NULL;
+    n->param_n_dims = NULL;
+    n->type_param_names = NULL;
+    n->type_param_exprs = NULL;
+}
+
+static void copy_node_param_storage(OfortInterpreter *I, OfortNode *dst, const OfortNode *src) {
+    if (!dst || !src || !src->param_names) return;
+    clear_node_param_storage_refs(dst);
+    alloc_node_param_storage(I, dst);
+    memcpy(dst->param_names, src->param_names, OFORT_MAX_PARAMS * sizeof(*dst->param_names));
+    memcpy(dst->binding_proc_names, src->binding_proc_names, OFORT_MAX_PARAMS * sizeof(*dst->binding_proc_names));
+    memcpy(dst->param_types, src->param_types, OFORT_MAX_PARAMS * sizeof(*dst->param_types));
+    memcpy(dst->param_kinds, src->param_kinds, OFORT_MAX_PARAMS * sizeof(*dst->param_kinds));
+    memcpy(dst->param_type_names, src->param_type_names, OFORT_MAX_PARAMS * sizeof(*dst->param_type_names));
+    memcpy(dst->param_intents, src->param_intents, OFORT_MAX_PARAMS * sizeof(*dst->param_intents));
+    memcpy(dst->param_optional, src->param_optional, OFORT_MAX_PARAMS * sizeof(*dst->param_optional));
+    memcpy(dst->param_values, src->param_values, OFORT_MAX_PARAMS * sizeof(*dst->param_values));
+    memcpy(dst->param_pointers, src->param_pointers, OFORT_MAX_PARAMS * sizeof(*dst->param_pointers));
+    memcpy(dst->param_allocatables, src->param_allocatables, OFORT_MAX_PARAMS * sizeof(*dst->param_allocatables));
+    memcpy(dst->param_n_dims, src->param_n_dims, OFORT_MAX_PARAMS * sizeof(*dst->param_n_dims));
+    memcpy(dst->type_param_names, src->type_param_names, OFORT_MAX_PARAMS * sizeof(*dst->type_param_names));
+    memcpy(dst->type_param_exprs, src->type_param_exprs, OFORT_MAX_PARAMS * sizeof(*dst->type_param_exprs));
+}
+
 static OfortNode *alloc_node(OfortInterpreter *I, OfortNodeType type) {
     OfortNode *n = (OfortNode *)calloc(1, sizeof(OfortNode));
     if (!n) ofort_error(I, "Out of memory");
     n->type = type;
+    if (node_type_uses_param_storage(type)) alloc_node_param_storage(I, n);
     /* track for cleanup */
     if (I->node_pool_len >= I->node_pool_cap) {
         I->node_pool_cap = I->node_pool_cap ? I->node_pool_cap * 2 : 256;
         I->node_pool = (OfortNode **)realloc(I->node_pool, sizeof(OfortNode *) * I->node_pool_cap);
+        if (!I->node_pool) ofort_error(I, "Out of memory growing node pool");
     }
     I->node_pool[I->node_pool_len++] = n;
     return n;
@@ -3056,7 +3164,7 @@ static void ensure_token_capacity(OfortInterpreter *I, int extra) {
     needed = I->n_tokens + extra;
     if (needed < I->token_cap) return;
 
-    new_cap = I->token_cap > 0 ? I->token_cap : OFORT_MAX_TOKENS;
+    new_cap = I->token_cap > 0 ? I->token_cap : OFORT_INITIAL_TOKEN_CAP;
     while (needed >= new_cap) {
         if (new_cap > INT_MAX / 2) ofort_error(I, "Too many tokens");
         new_cap *= 2;
@@ -13068,6 +13176,9 @@ static OfortNode *clone_data_expr_with_loop_values(OfortInterpreter *I, OfortNod
     }
     copy = alloc_node(I, node->type);
     *copy = *node;
+    clear_node_param_storage_refs(copy);
+    copy_node_param_storage(I, copy, node);
+    memset(copy->fast_cache, 0, sizeof(copy->fast_cache));
     if (node->n_children > 0) {
         for (int i = 0; i < node->n_children && i < 8; i++) {
             copy->children[i] = clone_data_expr_with_loop_values(I, node->children[i]);
@@ -13088,6 +13199,9 @@ static OfortNode *clone_data_target_with_loop_values(OfortInterpreter *I, OfortN
     if (!node) return NULL;
     copy = alloc_node(I, node->type);
     *copy = *node;
+    clear_node_param_storage_refs(copy);
+    copy_node_param_storage(I, copy, node);
+    memset(copy->fast_cache, 0, sizeof(copy->fast_cache));
     if (node->n_children > 0) {
         for (int i = 0; i < node->n_children && i < 8; i++) {
             copy->children[i] = clone_data_target_with_loop_values(I, node->children[i]);
@@ -34862,7 +34976,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
 OfortInterpreter *ofort_create(void) {
     OfortInterpreter *I = (OfortInterpreter *)calloc(1, sizeof(OfortInterpreter));
     if (!I) return NULL;
-    I->token_cap = OFORT_MAX_TOKENS;
+    I->token_cap = OFORT_INITIAL_TOKEN_CAP;
     I->tokens = (OfortToken *)calloc((size_t)I->token_cap, sizeof(OfortToken));
     if (!I->tokens) {
         free(I);
@@ -34929,6 +35043,19 @@ void ofort_destroy(OfortInterpreter *interp) {
             if (n->fast_cache[4] == &fast_array_expr_program_tag && n->fast_cache[5]) {
                 free_fast_array_expr_program((FastArrayExprProgram *)n->fast_cache[5]);
             }
+            free(n->param_names);
+            free(n->binding_proc_names);
+            free(n->param_types);
+            free(n->param_kinds);
+            free(n->param_type_names);
+            free(n->param_intents);
+            free(n->param_optional);
+            free(n->param_values);
+            free(n->param_pointers);
+            free(n->param_allocatables);
+            free(n->param_n_dims);
+            free(n->type_param_names);
+            free(n->type_param_exprs);
             free(n);
         }
         free(interp->node_pool);
