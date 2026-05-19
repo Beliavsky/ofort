@@ -14059,20 +14059,55 @@ static void write_nodes_to_stream_file(OfortInterpreter *I, OfortUnitFile *entry
 static int read_next_token(FILE *fp, char *buf, int bufsize) {
     int c;
     int len = 0;
+    int quote = 0;
 
     do {
         c = fgetc(fp);
         if (c == EOF) return 0;
-    } while (isspace(c));
+        if (c == '!') {
+            while (c != EOF && c != '\n') c = fgetc(fp);
+            continue;
+        }
+    } while (isspace(c) || c == ',');
 
-    while (c != EOF && !isspace(c)) {
+    if (c == '\'' || c == '"') {
+        quote = c;
+        c = fgetc(fp);
+        while (c != EOF) {
+            if (c == quote) {
+                int next = fgetc(fp);
+                if (next == quote) {
+                    if (len < bufsize - 1) buf[len++] = (char)c;
+                    c = fgetc(fp);
+                    continue;
+                }
+                if (next != EOF) ungetc(next, fp);
+                break;
+            }
+            if (len < bufsize - 1) buf[len++] = (char)c;
+            c = fgetc(fp);
+        }
+        buf[len] = '\0';
+        return 1;
+    }
+
+    while (c != EOF && !isspace(c) && c != ',') {
         if (len < bufsize - 1) {
             buf[len++] = (char)c;
         }
         c = fgetc(fp);
     }
+    if (c != EOF) ungetc(c, fp);
     buf[len] = '\0';
     return 1;
+}
+
+static void skip_to_end_record(FILE *fp) {
+    int c;
+    if (!fp) return;
+    while ((c = fgetc(fp)) != EOF) {
+        if (c == '\n') break;
+    }
 }
 
 static int read_next_string_token(const char **p, char *buf, int bufsize) {
@@ -14753,6 +14788,7 @@ static int read_values_from_file(OfortInterpreter *I, OfortUnitFile *entry, Ofor
             break;
         }
     }
+    if (status == 0 && !n->format_str[0]) skip_to_end_record(fp);
     entry->stream_pos = (int)ftell(fp);
     fclose(fp);
     return status;
