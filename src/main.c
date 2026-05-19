@@ -89,6 +89,132 @@ static int g_repl_auto_end = 0;
 static int g_repl_defer_check = 0;
 static int g_repl_autorun = 0;
 
+typedef struct {
+    char name[256];
+    char library_path[512];
+    char symbol[256];
+    char abi[64];
+} NativeSpec;
+
+static NativeSpec g_native_specs[32];
+static int g_n_native_specs = 0;
+
+static int add_native_spec(const char *spec) {
+    const char *eq;
+    const char *colon;
+    const char *comma;
+    NativeSpec *native;
+    size_t name_len;
+    size_t lib_len;
+    size_t sym_len;
+
+    if (!spec || !spec[0]) return 0;
+    if (g_n_native_specs >= (int)(sizeof(g_native_specs) / sizeof(g_native_specs[0]))) {
+        fprintf(stderr, "too many --native mappings\n");
+        return 0;
+    }
+    eq = strchr(spec, '=');
+    colon = strrchr(spec, ':');
+    if (!eq || !colon || colon < eq + 2 || colon[1] == '\0') {
+        fprintf(stderr, "--native requires name=library:symbol[,abi]\n");
+        return 0;
+    }
+    comma = strchr(colon + 1, ',');
+    name_len = (size_t)(eq - spec);
+    lib_len = (size_t)(colon - eq - 1);
+    sym_len = comma ? (size_t)(comma - colon - 1) : strlen(colon + 1);
+    if (name_len == 0 || name_len >= sizeof(g_native_specs[0].name) ||
+        lib_len == 0 || lib_len >= sizeof(g_native_specs[0].library_path) ||
+        sym_len == 0 || sym_len >= sizeof(g_native_specs[0].symbol)) {
+        fprintf(stderr, "--native mapping is too long\n");
+        return 0;
+    }
+    native = &g_native_specs[g_n_native_specs++];
+    memset(native, 0, sizeof(*native));
+    memcpy(native->name, spec, name_len);
+    native->name[name_len] = '\0';
+    memcpy(native->library_path, eq + 1, lib_len);
+    native->library_path[lib_len] = '\0';
+    memcpy(native->symbol, colon + 1, sym_len);
+    native->symbol[sym_len] = '\0';
+    snprintf(native->abi, sizeof(native->abi), "%s", comma && comma[1] ? comma + 1 : "r8arr_r8arr");
+    return 1;
+}
+
+static int starts_with_nocase_len(const char *s, const char *prefix, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (tolower((unsigned char)s[i]) != tolower((unsigned char)prefix[i])) return 0;
+    }
+    return 1;
+}
+
+static int source_line_has_ofort_native_directive(const char *line, const char *line_end,
+                                                  const char **spec_start, const char **spec_end) {
+    const char *p = line;
+    const char *end = line_end;
+    static const char directive[] = "!$ofort";
+    static const char native_word[] = "native";
+
+    while (p < end && (*p == ' ' || *p == '\t')) p++;
+    if ((size_t)(end - p) < sizeof(directive) - 1 ||
+        !starts_with_nocase_len(p, directive, sizeof(directive) - 1)) {
+        return 0;
+    }
+    p += sizeof(directive) - 1;
+    if (p < end && !(isspace((unsigned char)*p))) return 0;
+    while (p < end && isspace((unsigned char)*p)) p++;
+    if ((size_t)(end - p) < sizeof(native_word) - 1 ||
+        !starts_with_nocase_len(p, native_word, sizeof(native_word) - 1)) {
+        return 0;
+    }
+    p += sizeof(native_word) - 1;
+    if (p < end && !(isspace((unsigned char)*p))) return 0;
+    while (p < end && isspace((unsigned char)*p)) p++;
+    while (end > p && isspace((unsigned char)end[-1])) end--;
+    *spec_start = p;
+    *spec_end = end;
+    return 1;
+}
+
+static int apply_native_directives_from_source(const char *source, int *saved_native_count) {
+    const char *line = source;
+    int line_no = 1;
+
+    if (saved_native_count) *saved_native_count = g_n_native_specs;
+    while (line && *line) {
+        const char *line_end = strchr(line, '\n');
+        const char *spec_start = NULL;
+        const char *spec_end = NULL;
+        if (!line_end) line_end = line + strlen(line);
+        if (source_line_has_ofort_native_directive(line, line_end, &spec_start, &spec_end)) {
+            char spec[1024];
+            size_t spec_len = (size_t)(spec_end - spec_start);
+            if (spec_len == 0 || spec_len >= sizeof(spec)) {
+                fprintf(stderr, "line %d: !$ofort native requires name=library:symbol[,abi]\n", line_no);
+                if (saved_native_count) g_n_native_specs = *saved_native_count;
+                return 0;
+            }
+            memcpy(spec, spec_start, spec_len);
+            spec[spec_len] = '\0';
+            if (!add_native_spec(spec)) {
+                fprintf(stderr, "line %d: invalid !$ofort native directive\n", line_no);
+                if (saved_native_count) g_n_native_specs = *saved_native_count;
+                return 0;
+            }
+        }
+        if (*line_end == '\0') break;
+        line = line_end + 1;
+        line_no++;
+    }
+    return 1;
+}
+
+static void restore_native_directives(int saved_native_count) {
+    if (saved_native_count >= 0 && saved_native_count <= g_n_native_specs) {
+        g_n_native_specs = saved_native_count;
+    }
+}
+
 static int append_text(char **buf, size_t *len, size_t *cap, const char *text) {
     size_t n = strlen(text);
 
@@ -4367,6 +4493,7 @@ static int is_trace_assign_immediate_line(const char *line) {
 
 static int g_implicit_typing = 1;
 static int g_warnings_enabled = 1;
+static int g_warnings_as_errors = 0;
 static int g_time_detail = 0;
 static int g_fast_mode = 0;
 static int g_specialized_fast_paths = 1;
@@ -4400,6 +4527,22 @@ static int warn_unused_repl_source_if_enabled(const char *source, int fast_mode,
     return n_unused;
 }
 
+static int warnings_should_fail(void) {
+    return g_warnings_enabled && g_warnings_as_errors;
+}
+
+static int warning_text_present(const char *warnings) {
+    return warnings && warnings[0] != '\0';
+}
+
+static int maybe_fail_for_warnings(int warnings_seen) {
+    if (warnings_seen && warnings_should_fail()) {
+        fprintf(stderr, "warnings treated as errors\n");
+        return 1;
+    }
+    return 0;
+}
+
 static OfortInterpreter *create_ofort_interpreter(void) {
     OfortInterpreter *interp = ofort_create();
     if (interp) {
@@ -4415,6 +4558,16 @@ static OfortInterpreter *create_ofort_interpreter(void) {
         ofort_set_init_real(interp, g_init_real_enabled, g_init_real_value);
         ofort_set_init_character(interp, g_init_character_enabled, g_init_character_value);
         ofort_set_standard_mode(interp, g_standard_mode);
+        for (int i = 0; i < g_n_native_specs; i++) {
+            if (ofort_add_native_subroutine(interp, g_native_specs[i].name,
+                                            g_native_specs[i].library_path,
+                                            g_native_specs[i].symbol,
+                                            g_native_specs[i].abi) != 0) {
+                fprintf(stderr, "%s\n", ofort_get_error(interp));
+                ofort_destroy(interp);
+                return NULL;
+            }
+        }
     }
     return interp;
 }
@@ -4427,6 +4580,7 @@ static int analyze_unused_procs_source_text(const char *text, double setup_start
     OfortUnusedProcedureEntry *entries;
     int n_entries = 0;
     int rc;
+    int saved_native_count = -1;
     double setup_elapsed;
 
     if (!source) {
@@ -4437,10 +4591,15 @@ static int analyze_unused_procs_source_text(const char *text, double setup_start
     if (!source) {
         return 2;
     }
+    if (!apply_native_directives_from_source(source, &saved_native_count)) {
+        free(source);
+        return 2;
+    }
     setup_elapsed = monotonic_seconds() - setup_start;
 
     interp = create_ofort_interpreter();
     if (!interp) {
+        restore_native_directives(saved_native_count);
         free(source);
         fprintf(stderr, "failed to create Fortran interpreter\n");
         return 2;
@@ -4448,6 +4607,7 @@ static int analyze_unused_procs_source_text(const char *text, double setup_start
     entries = (OfortUnusedProcedureEntry *)calloc((size_t)UNUSED_PROC_ENTRY_CAP, sizeof(*entries));
     if (!entries) {
         ofort_destroy(interp);
+        restore_native_directives(saved_native_count);
         free(source);
         fprintf(stderr, "out of memory\n");
         return 2;
@@ -4479,6 +4639,7 @@ static int analyze_unused_procs_source_text(const char *text, double setup_start
 
     free(entries);
     ofort_destroy(interp);
+    restore_native_directives(saved_native_count);
     free(source);
     return rc == 0 ? 0 : 1;
 }
@@ -4545,6 +4706,7 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
     char *source = copy_string(text);
     OfortInterpreter *interp;
     int rc;
+    int saved_native_count = -1;
     double setup_elapsed;
 
     if (!source) {
@@ -4595,9 +4757,14 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
         return 0;
     }
     setup_elapsed = monotonic_seconds() - setup_start;
+    if (!apply_native_directives_from_source(source, &saved_native_count)) {
+        free(source);
+        return 2;
+    }
 
     interp = create_ofort_interpreter();
     if (!interp) {
+        restore_native_directives(saved_native_count);
         free(source);
         fprintf(stderr, "failed to create Fortran interpreter\n");
         return 2;
@@ -4611,6 +4778,7 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
     if (rc == 0 || rc == -2) {
         const char *warnings = ofort_get_warnings(interp);
         const char *output = ofort_get_output(interp);
+        int warnings_seen = 0;
         if (g_time_detail) {
             OfortTiming timing;
             if (ofort_get_timing(interp, &timing) == 0) {
@@ -4618,10 +4786,11 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
             }
         }
         if (g_warn_unused && g_warnings_enabled) {
-            warn_unused_declarations_in_source(source);
+            if (warn_unused_declarations_in_source(source) > 0) warnings_seen = 1;
         }
-        if (warnings && warnings[0] != '\0') {
+        if (warning_text_present(warnings)) {
             fputs(warnings, stderr);
+            warnings_seen = 1;
         }
         if (output && output[0] != '\0') {
             fputs(output, stdout);
@@ -4633,6 +4802,9 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
         if (g_procedure_profile) {
             print_procedure_profile(interp);
         }
+        if (maybe_fail_for_warnings(warnings_seen)) {
+            rc = 1;
+        }
     } else {
         const char *error = ofort_get_error(interp);
         const char *warnings = ofort_get_warnings(interp);
@@ -4643,16 +4815,17 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
                 print_detailed_time(setup_elapsed, &timing);
             }
         }
-        if (rc == -3 && warnings && warnings[0] != '\0') {
+        if (warning_text_present(warnings)) {
             fputs(warnings, stderr);
         }
         if (rc == -3 && output && output[0] != '\0') {
             fputs(output, stdout);
         }
-        print_source_mapped_error(error, source_map);
+        print_source_mapped_error((error && error[0] != '\0') ? error : "ofort execution failed", source_map);
     }
 
     ofort_destroy(interp);
+    restore_native_directives(saved_native_count);
     free(source);
     return rc == 0 ? 0 : 1;
 }
@@ -4684,11 +4857,15 @@ static int execute_source_text_on_interpreter(OfortInterpreter *interp, const ch
     if (rc == 0 || rc == -2) {
         const char *warnings = ofort_get_warnings(interp);
         const char *output = ofort_get_output(interp);
-        if (warnings && warnings[0] != '\0') {
+        int warnings_seen = warning_text_present(warnings);
+        if (warnings_seen) {
             fputs(warnings, stderr);
         }
         if (output && output[0] != '\0') {
             fputs(output, stdout);
+        }
+        if (maybe_fail_for_warnings(warnings_seen)) {
+            rc = 1;
         }
     } else {
         const char *error = ofort_get_error(interp);
@@ -4728,8 +4905,12 @@ static int run_ofort_file_to_path(const char *source_path, const char *out_path)
     rc = ofort_execute(interp, source);
     if (rc == 0 || rc == -2) {
         const char *warnings = ofort_get_warnings(interp);
-        if (warnings && warnings[0] != '\0') {
+        int warnings_seen = warning_text_present(warnings);
+        if (warnings_seen) {
             fputs(warnings, stderr);
+        }
+        if (maybe_fail_for_warnings(warnings_seen)) {
+            rc = 1;
         }
         fp = fopen(out_path, "wb");
         if (!fp) {
@@ -4785,8 +4966,17 @@ static int check_ofort_file(const char *source_path, int quiet, int label_failur
             print_detailed_time(setup_elapsed, &timing);
         }
     }
-    if (rc == 0 && !quiet) {
-        printf("ofort check passed\n");
+    if (rc == 0) {
+        const char *warnings = ofort_get_warnings(interp);
+        int warnings_seen = warning_text_present(warnings);
+        if (warnings_seen) {
+            fputs(warnings, stderr);
+        }
+        if (maybe_fail_for_warnings(warnings_seen)) {
+            rc = 1;
+        } else if (!quiet) {
+            printf("ofort check passed\n");
+        }
     } else if (rc != 0) {
         const char *error = ofort_get_error(interp);
         if (label_failures) {
@@ -4809,6 +4999,7 @@ static int check_ofort_source_text(const char *source_label, const char *text, i
     char *source = copy_string(text);
     OfortInterpreter *interp;
     int rc;
+    int saved_native_count = -1;
     double setup_elapsed;
 
     if (!source) {
@@ -4820,9 +5011,14 @@ static int check_ofort_source_text(const char *source_label, const char *text, i
         return 2;
     }
     setup_elapsed = monotonic_seconds() - setup_start;
+    if (!apply_native_directives_from_source(source, &saved_native_count)) {
+        free(source);
+        return 2;
+    }
 
     interp = create_ofort_interpreter();
     if (!interp) {
+        restore_native_directives(saved_native_count);
         free(source);
         fprintf(stderr, "failed to create Fortran interpreter\n");
         return 2;
@@ -4835,8 +5031,17 @@ static int check_ofort_source_text(const char *source_label, const char *text, i
             print_detailed_time(setup_elapsed, &timing);
         }
     }
-    if (rc == 0 && !quiet) {
-        printf("ofort check passed\n");
+    if (rc == 0) {
+        const char *warnings = ofort_get_warnings(interp);
+        int warnings_seen = warning_text_present(warnings);
+        if (warnings_seen) {
+            fputs(warnings, stderr);
+        }
+        if (maybe_fail_for_warnings(warnings_seen)) {
+            rc = 1;
+        } else if (!quiet) {
+            printf("ofort check passed\n");
+        }
     } else if (rc != 0) {
         const char *error = ofort_get_error(interp);
         if (label_failures) {
@@ -4849,6 +5054,7 @@ static int check_ofort_source_text(const char *source_label, const char *text, i
     }
 
     ofort_destroy(interp);
+    restore_native_directives(saved_native_count);
     free(source);
     return rc == 0 ? 0 : 1;
 }
@@ -5085,6 +5291,7 @@ static int run_ofort_paths_to_path(const char *const *paths, int npaths, const c
     FILE *fp;
     OfortInterpreter *interp;
     int rc;
+    int saved_native_count = -1;
 
     source = read_files_concatenated(paths, npaths, &source_map);
     source_map_free(&source_map);
@@ -5096,9 +5303,14 @@ static int run_ofort_paths_to_path(const char *const *paths, int npaths, const c
     }
     source = maybe_wrap_loose_source(source);
     if (!source) return 2;
+    if (!apply_native_directives_from_source(source, &saved_native_count)) {
+        free(source);
+        return 2;
+    }
 
     interp = create_ofort_interpreter();
     if (!interp) {
+        restore_native_directives(saved_native_count);
         free(source);
         fprintf(stderr, "failed to create Fortran interpreter\n");
         return 2;
@@ -5108,11 +5320,16 @@ static int run_ofort_paths_to_path(const char *const *paths, int npaths, const c
     rc = ofort_execute(interp, source);
     if (rc == 0 || rc == -2) {
         const char *warnings = ofort_get_warnings(interp);
-        if (warnings && warnings[0] != '\0') fputs(warnings, stderr);
+        int warnings_seen = warning_text_present(warnings);
+        if (warnings_seen) fputs(warnings, stderr);
+        if (maybe_fail_for_warnings(warnings_seen)) {
+            rc = 1;
+        }
         fp = fopen(out_path, "wb");
         if (!fp) {
             fprintf(stderr, "failed to open %s\n", out_path);
             ofort_destroy(interp);
+            restore_native_directives(saved_native_count);
             free(source);
             return 2;
         }
@@ -5124,6 +5341,7 @@ static int run_ofort_paths_to_path(const char *const *paths, int npaths, const c
     }
 
     ofort_destroy(interp);
+    restore_native_directives(saved_native_count);
     free(source);
     return rc == 0 ? 0 : 1;
 }
@@ -8321,7 +8539,7 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [--quiet] [--std=f2023|--std=legacy] [--fast] [--reachable] [--write-reachable file] [--cache] [--no-specialize] [--fixed-form|--free-form] [--save-free] [--dep] [--check-gfortran] [--unused-procs] [--time|--time-detail] [--profile-lines|--profile-procs] [--trace-assign] [--warn-unused|--no-warn-unused] [--check-uninitialized|--check-uninit|--no-check-uninitialized] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [-Werror|--warn-error] [--quiet] [--std=f2023|--std=legacy] [--fast] [--reachable] [--write-reachable file] [--cache] [--no-specialize] [--native name=dll:symbol[,abi]] [--fixed-form|--free-form] [--save-free] [--dep] [--check-gfortran] [--unused-procs] [--time|--time-detail] [--profile-lines|--profile-procs] [--trace-assign] [--warn-unused|--no-warn-unused] [--check-uninitialized|--check-uninit|--no-check-uninitialized] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
     fprintf(stderr, "       %s --each [--dep] [--check] [--quiet] [--limit n] [--max-fail n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
@@ -8336,6 +8554,7 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --defer-check makes the REPL check source lines only when run\n");
     fprintf(stderr, "       --autorun runs complete top-level executable REPL lines after entry\n");
     fprintf(stderr, "       -w suppresses warnings\n");
+    fprintf(stderr, "       -Werror, --warn-error treats warnings as errors\n");
     fprintf(stderr, "       --quiet suppresses success/progress output but not diagnostics\n");
     fprintf(stderr, "       --std=f2023 rejects known nonstandard extensions; --std=legacy is the default\n");
     fprintf(stderr, "       --fast enables safe interpreter fast paths and suppresses warnings\n");
@@ -8343,6 +8562,7 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --write-reachable file writes the source after --fast reachable pruning; implies --reachable\n");
     fprintf(stderr, "       --cache caches normalized/free-form source in .ofort_cache for repeated runs\n");
     fprintf(stderr, "       --no-specialize disables specialized pattern/program fast paths\n");
+    fprintf(stderr, "       --native name=dll:symbol[,abi] calls a native shared-library subroutine; default ABI is r8arr_r8arr\n");
     fprintf(stderr, "       --time prints elapsed time for the requested operation\n");
     fprintf(stderr, "       --time-detail prints setup, lex, parse, register, execute, and total times\n");
     fprintf(stderr, "       --profile-lines prints elapsed execution time by source line\n");
@@ -8468,6 +8688,9 @@ int main(int argc, char **argv) {
             g_implicit_typing = 0;
         } else if (strcmp(argv[i], "-w") == 0) {
             g_warnings_enabled = 0;
+        } else if (strcmp(argv[i], "-Werror") == 0 ||
+                   strcmp(argv[i], "--warn-error") == 0) {
+            g_warnings_as_errors = 1;
         } else if (strcmp(argv[i], "--quiet") == 0) {
             quiet = 1;
             g_quiet = 1;
@@ -8515,6 +8738,16 @@ int main(int argc, char **argv) {
             g_cache_mode = 1;
         } else if (strcmp(argv[i], "--no-specialize") == 0) {
             g_specialized_fast_paths = 0;
+        } else if (strcmp(argv[i], "--native") == 0) {
+            if (++i >= argc) {
+                fprintf(stderr, "--native requires name=library:symbol[,abi]\n");
+                path_list_free(&source_paths);
+                return 2;
+            }
+            if (!add_native_spec(argv[i])) {
+                path_list_free(&source_paths);
+                return 2;
+            }
         } else if (strcmp(argv[i], "--time") == 0) {
             time_operation = 1;
         } else if (strcmp(argv[i], "--time-detail") == 0) {
