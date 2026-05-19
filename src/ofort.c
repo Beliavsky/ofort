@@ -17945,6 +17945,9 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
             pv->intent = fn->param_intents[i];
             pv->is_value = fn->param_values[i];
             pv->is_optional = fn->param_optional[i];
+            if (fn->param_intents[i] == 2 && !fn->param_allocatables[i]) {
+                pv->is_initialized = 0;
+            }
         }
         restore_saved_vars(I, func);
         double proc_profile_start = begin_procedure_profile(I, func);
@@ -26417,12 +26420,6 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 status = 1;
             }
             arg_len = status == 0 ? (int)strlen(arg) : 0;
-            if (status > 0 && value_idx >= 0 && status_idx < 0) {
-                ofort_error(I,
-                            "Required command argument %d is missing; pass program arguments after '--'",
-                            number);
-            }
-
             if (value_idx >= 0) {
                 if (n->stmts[value_idx]->type != FND_IDENT)
                     ofort_error(I, "%s VALUE must be a variable", diag_name);
@@ -27120,6 +27117,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             pv->intent = fn->param_intents[i];
             pv->is_value = fn->param_values[i];
             pv->is_optional = fn->param_optional[i];
+            if (fn->param_intents[i] == 2 && !fn->param_allocatables[i]) {
+                pv->is_initialized = 0;
+            }
         }
         restore_saved_vars(I, func);
 
@@ -27142,6 +27142,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int pointer_copyback_slice_start[OFORT_MAX_PARAMS] = {0};
         int pointer_copyback_slice_end[OFORT_MAX_PARAMS] = {0};
         int pointer_copyback_slice_stride[OFORT_MAX_PARAMS] = {0};
+        int param_copyback_initialized[OFORT_MAX_PARAMS] = {0};
         if (!pointer_copyback_target) ofort_error(I, "Out of memory");
 
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
@@ -27215,6 +27216,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (pv && pv->present && actual_node &&
                     (actual_node->type == FND_IDENT || actual_node->type == FND_MEMBER ||
                      actual_node->type == FND_FUNC_CALL || actual_node->type == FND_ARRAY_REF)) {
+                    param_copyback_initialized[i] = pv->is_initialized;
                     if (actual_node->type == FND_IDENT) {
                         OfortVar *actual = find_var(I, actual_node->name);
                         if (actual && actual->is_pointer && pv->is_pointer) {
@@ -27256,6 +27258,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 if (pv && pv->present && fn->param_allocatables[i] && actual_node &&
                     (actual_node->type == FND_IDENT || actual_node->type == FND_MEMBER)) {
+                    param_copyback_initialized[i] = pv->is_initialized;
                     free_value(&args[i]);
                     args[i] = copy_value(pv->val);
                 }
@@ -27332,6 +27335,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     continue;
                 }
                 set_var(I, actual_node->name, copy_value(args[i]));
+                actual = find_var(I, actual_node->name);
+                if (actual) actual->is_initialized = param_copyback_initialized[i];
             } else if (!arg_alias[i] && actual_node && actual_node->type == FND_MEMBER && fn->param_intents[i] != 1 &&
                        (args[i].type != FVAL_VOID || fn->param_allocatables[i] ||
                         fn->param_pointers[i]) &&
@@ -27375,15 +27380,31 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     free_value(target);
                     *target = copy_value(args[i]);
                     mark_assignment_root_initialized(I, actual_node);
+                    if (actual_node->name[0]) {
+                        OfortVar *actual = find_var(I, actual_node->name);
+                        if (actual) actual->is_initialized = param_copyback_initialized[i];
+                    }
                 } else if (actual_node->type == FND_FUNC_CALL) {
                     OfortVar *actual = find_var(I, actual_node->name);
-                    if (actual && actual->val.type == FVAL_ARRAY && !actual->is_parameter)
+                    if (actual && actual->val.type == FVAL_ARRAY && !actual->is_parameter) {
                         assign_array_ref(I, actual, actual_node, &args[i]);
+                        actual->is_initialized = param_copyback_initialized[i];
+                    }
+                } else if (actual_node->type == FND_ARRAY_REF && !actual_node->children[0]) {
+                    OfortVar *actual = find_var(I, actual_node->name);
+                    if (actual && actual->val.type == FVAL_ARRAY && !actual->is_parameter) {
+                        assign_array_ref(I, actual, actual_node, &args[i]);
+                        actual->is_initialized = param_copyback_initialized[i];
+                    }
                 } else if (actual_node->type == FND_ARRAY_REF && actual_node->children[0]) {
                     OfortValue *array_target = member_lvalue(I, actual_node->children[0]);
                     if (array_target && array_target->type == FVAL_ARRAY) {
                         assign_array_ref_value(I, array_target, actual_node, &args[i]);
                         mark_assignment_root_initialized(I, actual_node);
+                        if (actual_node->name[0]) {
+                            OfortVar *actual = find_var(I, actual_node->name);
+                            if (actual) actual->is_initialized = param_copyback_initialized[i];
+                        }
                     }
                 }
             }
