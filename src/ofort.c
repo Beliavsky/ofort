@@ -179,7 +179,11 @@ typedef struct {
     int n_vars;
 } OfortNamelist;
 
-typedef void (*OfortNativeIRealArrayRealRealFn)(int *, double *, double *, double *);
+typedef void (*OfortNativeRealArrayRealArrayFn)(int *, double *, int *, double *);
+typedef void (*OfortNativeRealArrayRealFn)(int *, double *, double *);
+typedef void (*OfortNativeTwoRealArrayRealFn)(int *, double *, int *, double *, double *);
+typedef void (*OfortNativeRealMatrixRealMatrixFn)(int *, int *, double *, int *, int *, double *);
+typedef void (*OfortNativeIntegerRealArrayFn)(int *, int *, double *);
 
 typedef struct {
     char name[256];
@@ -383,6 +387,10 @@ static OfortValue call_ofort_extension_intrinsic(OfortInterpreter *I, const char
 static void ofort_assign_real_array_element(OfortValue *target, int index, double value);
 static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n);
 static int call_native_subroutine(OfortInterpreter *I, OfortNode *n);
+static int call_native_function(OfortInterpreter *I, const char *name, int nargs,
+                                OfortValue *args, OfortValue *result);
+static int call_native_function_direct(OfortInterpreter *I, const char *name, int nargs,
+                                       OfortNode **arg_nodes, OfortValue *result);
 static void value_to_string(OfortInterpreter *I, OfortValue v, char *buf, int bufsize);
 static OfortValue array_element_value(const OfortValue *arr, int index);
 static int assign_token_to_read_target(OfortInterpreter *I, OfortNode *target, const char *tok);
@@ -10307,6 +10315,8 @@ static int debug_decl_initializer_enabled(OfortInterpreter *I, OfortValType decl
 }
 
 static OfortValue make_array(OfortValType elem_type, int *dims, int n_dims);
+static OfortValue make_array_with_char_len_options(OfortValType elem_type, int *dims, int n_dims,
+                                                   int char_len, int defer_numeric_tags);
 static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, int n_dims, int char_len);
 static int assign_packed_array_element(OfortValue *arr, int index, OfortValue rhs);
 static OfortValue array_element_value(const OfortValue *arr, int index);
@@ -10849,58 +10859,255 @@ static double *native_real_array_data(OfortValue *array_val, double **owned) {
     return data;
 }
 
-static int call_native_i_r8arr_r8_r8(OfortInterpreter *I, OfortNativeSubroutine *native,
-                                     OfortNode *n) {
-    OfortNativeIRealArrayRealRealFn fn;
-    OfortValue n_val;
-    OfortValue x_val;
-    double *x_data;
-    double *owned_x = NULL;
-    int n_arg;
-    double out1 = 0.0;
-    double out2 = 0.0;
-
-    if (n->n_stmts != 4)
-        ofort_error(I, "Native subroutine '%s' ABI %s requires 4 arguments",
-                    n->name, native->abi);
-    if (n->stmts[2]->type != FND_IDENT || n->stmts[3]->type != FND_IDENT)
-        ofort_error(I, "Native subroutine '%s' output arguments must be scalar variables", n->name);
-
-    n_val = eval_node(I, n->stmts[0]);
-    x_val = eval_node(I, n->stmts[1]);
-    if (n_val.type != FVAL_INTEGER) {
-        free_value(&n_val);
-        free_value(&x_val);
-        ofort_error(I, "Native subroutine '%s' first argument must be INTEGER", n->name);
+static void native_store_real_array_data(OfortValue *array_val, const double *data) {
+    if (!array_val || array_val->type != FVAL_ARRAY || !data) return;
+    if (array_val->v.arr.real_data &&
+        (array_val->v.arr.elem_type == FVAL_REAL || array_val->v.arr.elem_type == FVAL_DOUBLE)) {
+        memcpy(array_val->v.arr.real_data, data, sizeof(double) * (size_t)array_val->v.arr.len);
+        return;
     }
-    n_arg = (int)val_to_int(n_val);
+    if (array_val->v.arr.data &&
+        (array_val->v.arr.elem_type == FVAL_REAL || array_val->v.arr.elem_type == FVAL_DOUBLE)) {
+        for (int i = 0; i < array_val->v.arr.len; i++) {
+            free_value(&array_val->v.arr.data[i]);
+            array_val->v.arr.data[i] = array_val->v.arr.elem_type == FVAL_DOUBLE ?
+                make_double(data[i]) : make_real(data[i]);
+        }
+    }
+}
+
+typedef struct {
+    int len;
+    double *data;
+    double *owned;
+    OfortValue temp;
+    int has_temp;
+} OfortNativeRealVectorArg;
+
+static int is_full_slice_node(OfortNode *n) {
+    return n && n->type == FND_SLICE &&
+           !n->children[0] && !n->children[1] &&
+           (n->n_children < 3 || !n->children[2]);
+}
+
+static int native_real_vector_arg_from_node(OfortInterpreter *I, OfortNode *node,
+                                            OfortNativeRealVectorArg *arg) {
+    OfortVar *var;
+
+    memset(arg, 0, sizeof(*arg));
+    arg->temp = make_void_val();
+    if (!node) return 0;
+
+    if (node->type == FND_IDENT) {
+        var = find_var(I, node->name);
+        if (var && var->val.type == FVAL_ARRAY &&
+            (var->val.v.arr.elem_type == FVAL_REAL || var->val.v.arr.elem_type == FVAL_DOUBLE)) {
+            arg->len = var->val.v.arr.len;
+            arg->data = native_real_array_data(&var->val, &arg->owned);
+            return arg->data != NULL || arg->len == 0;
+        }
+    }
+
+    if (((node->type == FND_ARRAY_REF && node->children[0] &&
+          node->children[0]->type == FND_IDENT) ||
+         node->type == FND_FUNC_CALL) &&
+        node->n_stmts == 2 && is_full_slice_node(node->stmts[0]) && node->stmts[1]) {
+        const char *base_name = node->type == FND_ARRAY_REF ? node->children[0]->name : node->name;
+        OfortValue col_v;
+        int col;
+        int lower2;
+        int nx1;
+        int nx2;
+        var = find_var(I, base_name);
+        if (var && var->val.type == FVAL_ARRAY && var->val.v.arr.n_dims == 2 &&
+            var->val.v.arr.real_data &&
+            (var->val.v.arr.elem_type == FVAL_REAL || var->val.v.arr.elem_type == FVAL_DOUBLE)) {
+            col_v = eval_node(I, node->stmts[1]);
+            col = (int)val_to_int(col_v);
+            free_value(&col_v);
+            lower2 = var->val.v.arr.lower_bounds[1];
+            nx1 = var->val.v.arr.dims[0];
+            nx2 = var->val.v.arr.dims[1];
+            if (col < lower2 || col >= lower2 + nx2)
+                ofort_error(I, "Array section index out of bounds");
+            arg->len = nx1;
+            arg->data = var->val.v.arr.real_data + (size_t)(col - lower2) * (size_t)nx1;
+            return 1;
+        }
+    }
+
+    arg->temp = eval_node(I, node);
+    arg->has_temp = 1;
+    if (arg->temp.type != FVAL_ARRAY ||
+        (arg->temp.v.arr.elem_type != FVAL_REAL && arg->temp.v.arr.elem_type != FVAL_DOUBLE)) {
+        return 0;
+    }
+    arg->len = arg->temp.v.arr.len;
+    arg->data = native_real_array_data(&arg->temp, &arg->owned);
+    return arg->data != NULL || arg->len == 0;
+}
+
+static void free_native_real_vector_arg(OfortNativeRealVectorArg *arg) {
+    if (!arg) return;
+    free(arg->owned);
+    if (arg->has_temp) free_value(&arg->temp);
+    memset(arg, 0, sizeof(*arg));
+}
+
+static int real_matrix_column_pointer_from_node(OfortInterpreter *I, OfortNode *node,
+                                                double **data, int *len, OfortVar **var_out) {
+    OfortVar *var;
+    const char *base_name;
+    OfortValue col_v;
+    int col;
+    int lower2;
+    int nx1;
+    int nx2;
+
+    if (!I || !node || !data || !len) return 0;
+    if (!(((node->type == FND_ARRAY_REF && node->children[0] &&
+            node->children[0]->type == FND_IDENT) ||
+           node->type == FND_FUNC_CALL) &&
+          node->n_stmts == 2 && is_full_slice_node(node->stmts[0]) && node->stmts[1])) {
+        return 0;
+    }
+    base_name = node->type == FND_ARRAY_REF ? node->children[0]->name : node->name;
+    var = find_var(I, base_name);
+    if (!var || var->val.type != FVAL_ARRAY || var->val.v.arr.n_dims != 2 ||
+        !var->val.v.arr.real_data ||
+        (var->val.v.arr.elem_type != FVAL_REAL && var->val.v.arr.elem_type != FVAL_DOUBLE)) {
+        return 0;
+    }
+    col_v = eval_node(I, node->stmts[1]);
+    col = (int)val_to_int(col_v);
+    free_value(&col_v);
+    lower2 = var->val.v.arr.lower_bounds[1];
+    nx1 = var->val.v.arr.dims[0];
+    nx2 = var->val.v.arr.dims[1];
+    if (col < lower2 || col >= lower2 + nx2)
+        ofort_error(I, "Array section index out of bounds");
+    *len = nx1;
+    *data = var->val.v.arr.real_data + (size_t)(col - lower2) * (size_t)nx1;
+    if (var_out) *var_out = var;
+    return 1;
+}
+
+static int is_native_i4_r8arr_function_call(OfortInterpreter *I, OfortNode *node) {
+    OfortNativeSubroutine *native;
+    if (!I || !node || node->type != FND_FUNC_CALL) return 0;
+    native = find_native_subroutine(I, node->name);
+    return native && str_eq_nocase(native->abi, "i4_r8arr");
+}
+
+static int call_native_r8arr_r8arr(OfortInterpreter *I, OfortNativeSubroutine *native,
+                                   OfortNode *n) {
+    OfortNativeRealArrayRealArrayFn fn;
+    OfortValue x_val;
+    OfortVar *y_var;
+    double *x_data;
+    double *y_data;
+    double *owned_x = NULL;
+    double *owned_y = NULL;
+    int nx;
+    int ny;
+
+    if (n->n_stmts != 2)
+        ofort_error(I, "Native subroutine '%s' ABI %s requires 2 arguments",
+                    n->name, native->abi);
+    if (n->stmts[1]->type != FND_IDENT)
+        ofort_error(I, "Native subroutine '%s' output argument must be a REAL array variable", n->name);
+
+    x_val = eval_node(I, n->stmts[0]);
     if (x_val.type != FVAL_ARRAY ||
         (x_val.v.arr.elem_type != FVAL_REAL && x_val.v.arr.elem_type != FVAL_DOUBLE)) {
-        free_value(&n_val);
         free_value(&x_val);
-        ofort_error(I, "Native subroutine '%s' second argument must be a REAL array", n->name);
+        ofort_error(I, "Native subroutine '%s' first argument must be a REAL array", n->name);
     }
-    if (n_arg < 0 || n_arg > x_val.v.arr.len) {
-        free_value(&n_val);
+    y_var = find_var(I, n->stmts[1]->name);
+    if (!y_var || y_var->val.type != FVAL_ARRAY ||
+        (y_var->val.v.arr.elem_type != FVAL_REAL && y_var->val.v.arr.elem_type != FVAL_DOUBLE)) {
         free_value(&x_val);
-        ofort_error(I, "Native subroutine '%s' array size mismatch", n->name);
+        ofort_error(I, "Native subroutine '%s' second argument must be a REAL array variable", n->name);
     }
+    nx = x_val.v.arr.len;
+    ny = y_var->val.v.arr.len;
 
     x_data = native_real_array_data(&x_val, &owned_x);
     if (!x_data) {
-        free_value(&n_val);
         free_value(&x_val);
-        ofort_error(I, "Native subroutine '%s' could not access REAL array data", n->name);
+        ofort_error(I, "Native subroutine '%s' could not access input REAL array data", n->name);
+    }
+    y_data = native_real_array_data(&y_var->val, &owned_y);
+    if (!y_data) {
+        free(owned_x);
+        free_value(&x_val);
+        ofort_error(I, "Native subroutine '%s' could not access output REAL array data", n->name);
     }
 
-    fn = (OfortNativeIRealArrayRealRealFn)native->fn;
-    fn(&n_arg, x_data, &out1, &out2);
+    fn = (OfortNativeRealArrayRealArrayFn)native->fn;
+    fn(&nx, x_data, &ny, y_data);
 
-    set_var(I, n->stmts[2]->name, make_double(out1));
-    set_var(I, n->stmts[3]->name, make_double(out2));
-
+    if (owned_y) native_store_real_array_data(&y_var->val, owned_y);
+    y_var->is_initialized = 1;
+    free(owned_y);
     free(owned_x);
-    free_value(&n_val);
+    free_value(&x_val);
+    return 1;
+}
+
+static int call_native_r8mat_r8mat(OfortInterpreter *I, OfortNativeSubroutine *native,
+                                   OfortNode *n) {
+    OfortNativeRealMatrixRealMatrixFn fn;
+    OfortValue x_val;
+    OfortVar *y_var;
+    double *x_data;
+    double *y_data;
+    double *owned_x = NULL;
+    double *owned_y = NULL;
+    int nx1, nx2, ny1, ny2;
+
+    if (n->n_stmts != 2)
+        ofort_error(I, "Native subroutine '%s' ABI %s requires 2 arguments",
+                    n->name, native->abi);
+    if (n->stmts[1]->type != FND_IDENT)
+        ofort_error(I, "Native subroutine '%s' output argument must be a REAL rank-2 array variable", n->name);
+
+    x_val = eval_node(I, n->stmts[0]);
+    if (x_val.type != FVAL_ARRAY || x_val.v.arr.n_dims != 2 ||
+        (x_val.v.arr.elem_type != FVAL_REAL && x_val.v.arr.elem_type != FVAL_DOUBLE)) {
+        free_value(&x_val);
+        ofort_error(I, "Native subroutine '%s' first argument must be a REAL rank-2 array", n->name);
+    }
+    y_var = find_var(I, n->stmts[1]->name);
+    if (!y_var || y_var->val.type != FVAL_ARRAY || y_var->val.v.arr.n_dims != 2 ||
+        (y_var->val.v.arr.elem_type != FVAL_REAL && y_var->val.v.arr.elem_type != FVAL_DOUBLE)) {
+        free_value(&x_val);
+        ofort_error(I, "Native subroutine '%s' second argument must be a REAL rank-2 array variable", n->name);
+    }
+    nx1 = x_val.v.arr.dims[0];
+    nx2 = x_val.v.arr.dims[1];
+    ny1 = y_var->val.v.arr.dims[0];
+    ny2 = y_var->val.v.arr.dims[1];
+
+    x_data = native_real_array_data(&x_val, &owned_x);
+    if (!x_data) {
+        free_value(&x_val);
+        ofort_error(I, "Native subroutine '%s' could not access input REAL matrix data", n->name);
+    }
+    y_data = native_real_array_data(&y_var->val, &owned_y);
+    if (!y_data) {
+        free(owned_x);
+        free_value(&x_val);
+        ofort_error(I, "Native subroutine '%s' could not access output REAL matrix data", n->name);
+    }
+
+    fn = (OfortNativeRealMatrixRealMatrixFn)native->fn;
+    fn(&nx1, &nx2, x_data, &ny1, &ny2, y_data);
+
+    if (owned_y) native_store_real_array_data(&y_var->val, owned_y);
+    y_var->is_initialized = 1;
+    free(owned_y);
+    free(owned_x);
     free_value(&x_val);
     return 1;
 }
@@ -10910,9 +11117,158 @@ static int call_native_subroutine(OfortInterpreter *I, OfortNode *n) {
     if (!native) return 0;
     if (!native->handle || !native->fn)
         ofort_error(I, "Native subroutine '%s' is not loaded", n->name);
-    if (str_eq_nocase(native->abi, "i_r8arr_r8_r8"))
-        return call_native_i_r8arr_r8_r8(I, native, n);
+    if (str_eq_nocase(native->abi, "r8arr_r8arr"))
+        return call_native_r8arr_r8arr(I, native, n);
+    if (str_eq_nocase(native->abi, "r8mat_r8mat"))
+        return call_native_r8mat_r8mat(I, native, n);
     ofort_error(I, "Unsupported native ABI '%s' for subroutine '%s'", native->abi, n->name);
+    return 0;
+}
+
+static int call_native_function(OfortInterpreter *I, const char *name, int nargs,
+                                OfortValue *args, OfortValue *result) {
+    OfortNativeSubroutine *native = find_native_subroutine(I, name);
+
+    if (!native) return 0;
+    if (!native->handle || !native->fn)
+        ofort_error(I, "Native function '%s' is not loaded", name);
+
+    if (str_eq_nocase(native->abi, "r8arr_r8")) {
+        OfortNativeRealArrayRealFn fn;
+        double *x_data;
+        double *owned_x = NULL;
+        int nx;
+        double y = 0.0;
+
+        if (nargs != 1) {
+            ofort_error(I, "Native function '%s' ABI %s requires 1 argument", name, native->abi);
+        }
+        if (!args || args[0].type != FVAL_ARRAY ||
+            (args[0].v.arr.elem_type != FVAL_REAL && args[0].v.arr.elem_type != FVAL_DOUBLE)) {
+            ofort_error(I, "Native function '%s' argument must be a REAL array", name);
+        }
+
+        nx = args[0].v.arr.len;
+        x_data = native_real_array_data(&args[0], &owned_x);
+        if (!x_data) {
+            ofort_error(I, "Native function '%s' could not access input REAL array data", name);
+        }
+        fn = (OfortNativeRealArrayRealFn)native->fn;
+        fn(&nx, x_data, &y);
+        free(owned_x);
+        if (result) *result = make_double(y);
+        return 1;
+    }
+
+    if (str_eq_nocase(native->abi, "r8arr_r8arr_r8")) {
+        OfortNativeTwoRealArrayRealFn fn;
+        double *x_data;
+        double *y_data;
+        double *owned_x = NULL;
+        double *owned_y = NULL;
+        int nx, ny;
+        double z = 0.0;
+
+        if (nargs != 2) {
+            ofort_error(I, "Native function '%s' ABI %s requires 2 arguments", name, native->abi);
+        }
+        if (!args || args[0].type != FVAL_ARRAY ||
+            (args[0].v.arr.elem_type != FVAL_REAL && args[0].v.arr.elem_type != FVAL_DOUBLE) ||
+            args[1].type != FVAL_ARRAY ||
+            (args[1].v.arr.elem_type != FVAL_REAL && args[1].v.arr.elem_type != FVAL_DOUBLE)) {
+            ofort_error(I, "Native function '%s' arguments must be REAL arrays", name);
+        }
+
+        nx = args[0].v.arr.len;
+        ny = args[1].v.arr.len;
+        x_data = native_real_array_data(&args[0], &owned_x);
+        if (!x_data) {
+            ofort_error(I, "Native function '%s' could not access first input REAL array data", name);
+        }
+        y_data = native_real_array_data(&args[1], &owned_y);
+        if (!y_data) {
+            free(owned_x);
+            ofort_error(I, "Native function '%s' could not access second input REAL array data", name);
+        }
+        fn = (OfortNativeTwoRealArrayRealFn)native->fn;
+        fn(&nx, x_data, &ny, y_data, &z);
+        free(owned_y);
+        free(owned_x);
+        if (result) *result = make_double(z);
+        return 1;
+    }
+
+    if (str_eq_nocase(native->abi, "i4_r8arr")) {
+        OfortNativeIntegerRealArrayFn fn;
+        OfortValue out;
+        int n;
+        int ny;
+        int dims[1];
+
+        if (nargs != 1) {
+            ofort_error(I, "Native function '%s' ABI %s requires 1 argument", name, native->abi);
+        }
+        if (!args || (args[0].type != FVAL_INTEGER && args[0].type != FVAL_REAL &&
+                      args[0].type != FVAL_DOUBLE)) {
+            ofort_error(I, "Native function '%s' argument must be an integer size", name);
+        }
+
+        n = (int)val_to_int(args[0]);
+        if (n < 0)
+            ofort_error(I, "Native function '%s' array size must be nonnegative", name);
+        ny = n;
+        dims[0] = n;
+        out = make_array_with_char_len_options(FVAL_DOUBLE, dims, 1, 0, 1);
+        if (n > 0 && !out.v.arr.real_data) {
+            free_value(&out);
+            ofort_error(I, "Native function '%s' could not allocate output REAL array", name);
+        }
+        fn = (OfortNativeIntegerRealArrayFn)native->fn;
+        fn(&n, &ny, out.v.arr.real_data);
+        if (result) {
+            *result = out;
+        } else {
+            free_value(&out);
+        }
+        return 1;
+    }
+
+    ofort_error(I, "Unsupported native ABI '%s' for function '%s'", native->abi, name);
+    return 0;
+}
+
+static int call_native_function_direct(OfortInterpreter *I, const char *name, int nargs,
+                                       OfortNode **arg_nodes, OfortValue *result) {
+    OfortNativeSubroutine *native = find_native_subroutine(I, name);
+    if (!native) return 0;
+    if (!native->handle || !native->fn)
+        ofort_error(I, "Native function '%s' is not loaded", name);
+
+    if (str_eq_nocase(native->abi, "r8arr_r8arr_r8")) {
+        OfortNativeTwoRealArrayRealFn fn;
+        OfortNativeRealVectorArg x;
+        OfortNativeRealVectorArg y;
+        double z = 0.0;
+
+        if (nargs != 2)
+            ofort_error(I, "Native function '%s' ABI %s requires 2 arguments", name, native->abi);
+        if (!native_real_vector_arg_from_node(I, arg_nodes[0], &x)) {
+            free_native_real_vector_arg(&x);
+            ofort_error(I, "Native function '%s' first argument must be a REAL array", name);
+        }
+        if (!native_real_vector_arg_from_node(I, arg_nodes[1], &y)) {
+            free_native_real_vector_arg(&x);
+            free_native_real_vector_arg(&y);
+            ofort_error(I, "Native function '%s' second argument must be a REAL array", name);
+        }
+        fn = (OfortNativeTwoRealArrayRealFn)native->fn;
+        fn(&x.len, x.data, &y.len, y.data, &z);
+        free_native_real_vector_arg(&y);
+        free_native_real_vector_arg(&x);
+        if (result) *result = make_double(z);
+        return 1;
+    }
+
     return 0;
 }
 
@@ -16542,6 +16898,14 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             return make_real(FLT_MAX);
         }
 
+        {
+            OfortValue native_result = make_void_val();
+            if (call_native_function_direct(I, procedure_call_name[0] ? procedure_call_name : n->name,
+                                            nargs, n->stmts, &native_result)) {
+                return native_result;
+            }
+        }
+
         /* Evaluate all args */
         args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
         if (!args) ofort_error(I, "Out of memory");
@@ -16600,6 +16964,15 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             OfortValue result = eval_in_operator(I, args[0], args[1]);
             free_call_args(args, nargs); args = NULL;
             return result;
+        }
+
+        {
+            OfortValue native_result = make_void_val();
+            if (call_native_function(I, procedure_call_name[0] ? procedure_call_name : n->name,
+                                     nargs, args, &native_result)) {
+                free_call_args(args, nargs); args = NULL;
+                return native_result;
+            }
         }
 
         /* Check for user function */
@@ -17737,6 +18110,63 @@ static int exec_fast_array_affine_assignment(OfortInterpreter *I, OfortNode *n) 
         else target->val.v.arr.int_data[i] = (long long)y;
     }
     target->is_initialized = 1;
+    return 1;
+}
+
+static int exec_fast_real_column_plus_native_array_assignment(OfortInterpreter *I, OfortNode *n) {
+    OfortNode *lhs;
+    OfortNode *rhs;
+    OfortNode *col_node = NULL;
+    OfortNode *native_node = NULL;
+    OfortVar *target_var = NULL;
+    double *dst = NULL;
+    double *src = NULL;
+    double *rnd = NULL;
+    double *owned_rnd = NULL;
+    int dst_len = 0;
+    int src_len = 0;
+    int sign = 1;
+    OfortValue rnd_val;
+
+    if (!I || !I->fast_mode || !n || n->type != FND_ASSIGN) return 0;
+    lhs = n->children[0];
+    rhs = n->children[1];
+    if (!lhs || !rhs || (rhs->type != FND_ADD && rhs->type != FND_SUB)) return 0;
+    if (!real_matrix_column_pointer_from_node(I, lhs, &dst, &dst_len, &target_var)) return 0;
+
+    if (real_matrix_column_pointer_from_node(I, rhs->children[0], &src, &src_len, NULL) &&
+        is_native_i4_r8arr_function_call(I, rhs->children[1])) {
+        col_node = rhs->children[0];
+        native_node = rhs->children[1];
+        sign = rhs->type == FND_SUB ? -1 : 1;
+        (void)col_node;
+    } else if (rhs->type == FND_ADD &&
+               real_matrix_column_pointer_from_node(I, rhs->children[1], &src, &src_len, NULL) &&
+               is_native_i4_r8arr_function_call(I, rhs->children[0])) {
+        native_node = rhs->children[0];
+    } else {
+        return 0;
+    }
+    if (dst_len != src_len) return 0;
+
+    rnd_val = eval_node(I, native_node);
+    if (rnd_val.type != FVAL_ARRAY ||
+        (rnd_val.v.arr.elem_type != FVAL_REAL && rnd_val.v.arr.elem_type != FVAL_DOUBLE) ||
+        rnd_val.v.arr.len != dst_len) {
+        free_value(&rnd_val);
+        return 0;
+    }
+    rnd = native_real_array_data(&rnd_val, &owned_rnd);
+    if (!rnd && dst_len > 0) {
+        free_value(&rnd_val);
+        ofort_error(I, "Native function result could not be accessed as REAL array");
+    }
+    for (int i = 0; i < dst_len; i++) {
+        dst[i] = src[i] + sign * rnd[i];
+    }
+    free(owned_rnd);
+    free_value(&rnd_val);
+    if (target_var) target_var->is_initialized = 1;
     return 1;
 }
 
@@ -23077,6 +23507,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (v && v->intent == 1) ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", lhs->name);
         }
         if (I->where_mask) I->where_mask_index = 0;
+        if (!I->where_mask && exec_fast_real_column_plus_native_array_assignment(I, n)) {
+            break;
+        }
         if (!I->where_mask && exec_fast_array_poly2_assignment(I, n)) {
             break;
         }
@@ -34310,8 +34743,12 @@ int ofort_add_native_subroutine(OfortInterpreter *interp, const char *name,
         }
         return -1;
     }
-    if (!abi || !abi[0]) abi = "i_r8arr_r8_r8";
-    if (!str_eq_nocase(abi, "i_r8arr_r8_r8")) {
+    if (!abi || !abi[0]) abi = "r8arr_r8arr";
+    if (!str_eq_nocase(abi, "r8arr_r8arr") &&
+        !str_eq_nocase(abi, "r8arr_r8") &&
+        !str_eq_nocase(abi, "r8arr_r8arr_r8") &&
+        !str_eq_nocase(abi, "r8mat_r8mat") &&
+        !str_eq_nocase(abi, "i4_r8arr")) {
         snprintf(interp->error, sizeof(interp->error),
                  "unsupported native ABI '%s'", abi);
         interp->has_error = 1;
