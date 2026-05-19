@@ -17041,6 +17041,26 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             }
         }
 
+        if (I->fast_mode && I->specialized_fast_paths &&
+            str_eq_nocase(procedure_call_name[0] ? procedure_call_name : n->name, "pythag") &&
+            nargs == 2 &&
+            is_numeric_type(args[0].type) && is_numeric_type(args[1].type)) {
+            double absa = fabs(val_to_real(args[0]));
+            double absb = fabs(val_to_real(args[1]));
+            double value;
+            if (absa > absb) {
+                double ratio = absb / absa;
+                value = absa * sqrt(1.0 + ratio * ratio);
+            } else if (absb == 0.0) {
+                value = 0.0;
+            } else {
+                double ratio = absa / absb;
+                value = absb * sqrt(1.0 + ratio * ratio);
+            }
+            free_call_args(args, nargs); args = NULL;
+            return make_double(value);
+        }
+
         if (str_eq_nocase(n->name, ".IN.") && nargs == 2) {
             OfortValue result = eval_in_operator(I, args[0], args[1]);
             free_call_args(args, nargs); args = NULL;
@@ -17765,6 +17785,238 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
     return 1;
 }
 
+static OfortNode *simple_elemental_result_expr(OfortNode *fn) {
+    const char *res_name;
+    OfortNode *body;
+    if (!fn || !fn->children[0]) return NULL;
+    res_name = fn->result_name[0] ? fn->result_name : fn->name;
+    body = fn->children[0];
+    for (int i = 0; i < body->n_stmts; i++) {
+        OfortNode *s = body->stmts[i];
+        if (!s || s->type != FND_ASSIGN || !s->children[0] || !s->children[1]) continue;
+        if (s->children[0]->type == FND_IDENT && str_eq_nocase(s->children[0]->name, res_name)) {
+            return s->children[1];
+        }
+    }
+    return NULL;
+}
+
+static OfortValType simple_elemental_result_decl_type(OfortNode *fn) {
+    const char *res_name;
+    OfortNode *body;
+    if (!fn || !fn->children[0]) return FVAL_VOID;
+    res_name = fn->result_name[0] ? fn->result_name : fn->name;
+    body = fn->children[0];
+    for (int i = 0; i < body->n_stmts; i++) {
+        OfortNode *s = body->stmts[i];
+        OfortNode **decls = &s;
+        int n_decls = 1;
+        if (!s) continue;
+        if (s->type == FND_BLOCK) {
+            decls = s->stmts;
+            n_decls = s->n_stmts;
+        }
+        for (int j = 0; j < n_decls; j++) {
+            OfortNode *d = decls[j];
+            if (d && (d->type == FND_VARDECL || d->type == FND_PARAMDECL) &&
+                str_eq_nocase(d->name, res_name)) {
+                return d->val_type;
+            }
+        }
+    }
+    return fn->val_type;
+}
+
+static int simple_elemental_param_index(OfortNode *fn, const char *name) {
+    if (!fn || !name) return -1;
+    for (int i = 0; i < fn->n_params; i++) {
+        if (str_eq_nocase(fn->param_names[i], name)) return i;
+    }
+    return -1;
+}
+
+static int eval_simple_elemental_numeric_expr(OfortInterpreter *I, OfortNode *expr,
+                                              OfortNode *fn, const double *params,
+                                              int nparams, int depth,
+                                              double *out) {
+    double a, b;
+    int idx;
+    OfortFunc *callee;
+    OfortNode *callee_expr;
+    double call_args[OFORT_MAX_PARAMS];
+    if (!I || !expr || !fn || !params || !out || depth > 16) return 0;
+    switch (expr->type) {
+    case FND_INT_LIT:
+        *out = (double)expr->int_val;
+        return 1;
+    case FND_REAL_LIT:
+        *out = expr->num_val;
+        return 1;
+    case FND_IDENT:
+        idx = simple_elemental_param_index(fn, expr->name);
+        if (idx >= 0 && idx < nparams) {
+            *out = params[idx];
+            return 1;
+        }
+        return 0;
+    case FND_NEGATE:
+        if (!eval_simple_elemental_numeric_expr(I, expr->children[0], fn, params, nparams, depth + 1, &a)) return 0;
+        *out = -a;
+        return 1;
+    case FND_ADD:
+    case FND_SUB:
+    case FND_MUL:
+    case FND_DIV:
+    case FND_POWER:
+        if (!eval_simple_elemental_numeric_expr(I, expr->children[0], fn, params, nparams, depth + 1, &a) ||
+            !eval_simple_elemental_numeric_expr(I, expr->children[1], fn, params, nparams, depth + 1, &b)) {
+            return 0;
+        }
+        switch (expr->type) {
+        case FND_ADD: *out = a + b; return 1;
+        case FND_SUB: *out = a - b; return 1;
+        case FND_MUL: *out = a * b; return 1;
+        case FND_DIV: *out = a / b; return 1;
+        case FND_POWER: *out = pow(a, b); return 1;
+        default: return 0;
+        }
+    case FND_FUNC_CALL:
+        if (str_eq_nocase(expr->name, "ABS") && expr->n_stmts == 1) {
+            if (!eval_simple_elemental_numeric_expr(I, expr->stmts[0], fn, params, nparams, depth + 1, &a)) return 0;
+            *out = fabs(a);
+            return 1;
+        }
+        if (str_eq_nocase(expr->name, "EXP") && expr->n_stmts == 1) {
+            if (!eval_simple_elemental_numeric_expr(I, expr->stmts[0], fn, params, nparams, depth + 1, &a)) return 0;
+            *out = exp(a);
+            return 1;
+        }
+        if (str_eq_nocase(expr->name, "SQRT") && expr->n_stmts == 1) {
+            if (!eval_simple_elemental_numeric_expr(I, expr->stmts[0], fn, params, nparams, depth + 1, &a)) return 0;
+            *out = sqrt(a);
+            return 1;
+        }
+        if (str_eq_nocase(expr->name, "LOG") && expr->n_stmts == 1) {
+            if (!eval_simple_elemental_numeric_expr(I, expr->stmts[0], fn, params, nparams, depth + 1, &a)) return 0;
+            *out = log(a);
+            return 1;
+        }
+        if (str_eq_nocase(expr->name, "SIN") && expr->n_stmts == 1) {
+            if (!eval_simple_elemental_numeric_expr(I, expr->stmts[0], fn, params, nparams, depth + 1, &a)) return 0;
+            *out = sin(a);
+            return 1;
+        }
+        if (str_eq_nocase(expr->name, "COS") && expr->n_stmts == 1) {
+            if (!eval_simple_elemental_numeric_expr(I, expr->stmts[0], fn, params, nparams, depth + 1, &a)) return 0;
+            *out = cos(a);
+            return 1;
+        }
+        if (str_eq_nocase(expr->name, "TANH") && expr->n_stmts == 1) {
+            if (!eval_simple_elemental_numeric_expr(I, expr->stmts[0], fn, params, nparams, depth + 1, &a)) return 0;
+            *out = tanh(a);
+            return 1;
+        }
+        callee = find_func(I, expr->name);
+        if (!callee || !callee->is_function || !callee->node || !callee->node->is_elemental ||
+            expr->n_stmts > OFORT_MAX_PARAMS || expr->n_stmts != callee->node->n_params) {
+            return 0;
+        }
+        callee_expr = simple_elemental_result_expr(callee->node);
+        if (!callee_expr) return 0;
+        for (int i = 0; i < expr->n_stmts; i++) {
+            if (!eval_simple_elemental_numeric_expr(I, expr->stmts[i], fn, params, nparams,
+                                                    depth + 1, &call_args[i])) {
+                return 0;
+            }
+        }
+        return eval_simple_elemental_numeric_expr(I, callee_expr, callee->node, call_args,
+                                                  callee->node->n_params, depth + 1, out);
+    default:
+        return 0;
+    }
+}
+
+static int execute_fast_elemental_numeric_function_call(OfortInterpreter *I, OfortFunc *func,
+                                                        OfortNode *fn, OfortValue *args,
+                                                        int nargs, OfortValue *result_out) {
+    OfortValue *shape_arg = NULL;
+    OfortNode *expr;
+    OfortValue result;
+    OfortValType result_type;
+    OfortValType declared_result_type;
+    double params[OFORT_MAX_PARAMS];
+    if (!I || !I->fast_mode || I->line_profile_enabled ||
+        !func || !fn || !fn->is_elemental ||
+        !args || !result_out || nargs > OFORT_MAX_PARAMS || fn->n_params > OFORT_MAX_PARAMS) {
+        return 0;
+    }
+    expr = simple_elemental_result_expr(fn);
+    if (!expr) return 0;
+    for (int i = 0; i < nargs; i++) {
+        if (args[i].type == FVAL_ARRAY) {
+            if (args[i].v.arr.elem_type != FVAL_REAL && args[i].v.arr.elem_type != FVAL_DOUBLE &&
+                args[i].v.arr.elem_type != FVAL_INTEGER) {
+                return 0;
+            }
+            if (!shape_arg) {
+                shape_arg = &args[i];
+            } else if (args[i].v.arr.len != shape_arg->v.arr.len) {
+                ofort_error(I, "Elemental function array arguments must have the same size");
+            }
+        } else if (args[i].type != FVAL_REAL && args[i].type != FVAL_DOUBLE &&
+                   args[i].type != FVAL_INTEGER && args[i].type != FVAL_VOID) {
+            return 0;
+        }
+    }
+    declared_result_type = simple_elemental_result_decl_type(fn);
+    if (declared_result_type != FVAL_VOID &&
+        declared_result_type != FVAL_REAL && declared_result_type != FVAL_DOUBLE) {
+        return 0;
+    }
+    if (!shape_arg) return 0;
+
+    result_type = declared_result_type == FVAL_DOUBLE ? FVAL_DOUBLE : shape_arg->v.arr.elem_type;
+    if (result_type != FVAL_DOUBLE) result_type = FVAL_REAL;
+    result = make_array_with_char_len_options(result_type, shape_arg->v.arr.dims,
+                                              shape_arg->v.arr.n_dims, 1, 1);
+    if (array_storage_failed(&result)) return 0;
+
+    double proc_profile_start = begin_procedure_profile(I, func);
+    for (int elem = 0; elem < shape_arg->v.arr.len; elem++) {
+        double value;
+        for (int i = 0; i < fn->n_params; i++) {
+            if (i < nargs && args[i].type != FVAL_VOID) {
+                if (args[i].type == FVAL_ARRAY) {
+                    OfortValue ev = array_element_value(&args[i], elem);
+                    params[i] = val_to_real(ev);
+                    free_value(&ev);
+                } else {
+                    params[i] = val_to_real(args[i]);
+                }
+            } else if (fn->param_optional[i]) {
+                params[i] = 0.0;
+            } else {
+                free_value(&result);
+                ofort_error(I, "Missing required argument '%s' in call to '%s'",
+                            fn->param_names[i], fn->name);
+            }
+        }
+        if (!eval_simple_elemental_numeric_expr(I, expr, fn, params, fn->n_params, 0, &value)) {
+            end_procedure_profile(I, func, proc_profile_start);
+            free_value(&result);
+            return 0;
+        }
+        if (result.v.arr.real_data) {
+            result.v.arr.real_data[elem] = value;
+        } else if (result.v.arr.data) {
+            result.v.arr.data[elem] = result_type == FVAL_DOUBLE ? make_double(value) : make_real(value);
+        }
+    }
+    end_procedure_profile(I, func, proc_profile_start);
+    *result_out = result;
+    return 1;
+}
+
 static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
                                            OfortFunc *func, OfortNode *fn,
                                            OfortValue *args, int nargs,
@@ -17772,6 +18024,9 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
     OfortValue *shape_arg = NULL;
     OfortValue result = make_void_val();
     if (!fn || !fn->is_elemental) return 0;
+    if (execute_fast_elemental_numeric_function_call(I, func, fn, args, nargs, result_out)) {
+        return 1;
+    }
     for (int i = 0; i < nargs; i++) {
         if (args[i].type != FVAL_ARRAY) continue;
         if (!shape_arg) {
