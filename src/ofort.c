@@ -67,6 +67,7 @@ typedef struct {
     char protected_module[128];
     int is_save;
     int is_implicit_save;
+    int is_imported_module_var;
     int import_module_index;
     int import_var_index;
     int is_alias;
@@ -1091,6 +1092,7 @@ static void warn_character_truncation(OfortInterpreter *I, const char *name,
 static void mark_imported_module_var(OfortInterpreter *I, OfortVar *v,
                                      const OfortModule *mod, int var_index) {
     if (!v) return;
+    v->is_imported_module_var = 0;
     v->import_module_index = -1;
     v->import_var_index = -1;
     if (!I || !mod || var_index < 0 || var_index >= mod->n_vars) return;
@@ -1098,6 +1100,7 @@ static void mark_imported_module_var(OfortInterpreter *I, OfortVar *v,
         if (&I->modules[i] == mod) {
             v->import_module_index = i;
             v->import_var_index = var_index;
+            v->is_imported_module_var = 1;
             break;
         }
     }
@@ -1105,7 +1108,8 @@ static void mark_imported_module_var(OfortInterpreter *I, OfortVar *v,
 
 static void update_imported_module_var(OfortInterpreter *I, OfortVar *v) {
     OfortVar *remote;
-    if (!I || !v || v->import_module_index < 0 || v->import_module_index >= I->n_modules) return;
+    if (!I || !v || !v->is_imported_module_var ||
+        v->import_module_index < 0 || v->import_module_index >= I->n_modules) return;
     if (v->import_var_index < 0 || v->import_var_index >= I->modules[v->import_module_index].n_vars) return;
     remote = &I->modules[v->import_module_index].vars[v->import_var_index];
     if (!remote || remote == v) return;
@@ -1333,6 +1337,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->is_protected = 0;
     v->is_save = 0;
     v->is_implicit_save = 0;
+    v->is_imported_module_var = 0;
     v->import_module_index = -1;
     v->import_var_index = -1;
     v->is_alias = 0;
@@ -1370,6 +1375,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
             if (val.type == FVAL_DERIVED)
                 copy_cstr(s->vars[i].declared_type_name,
                           sizeof(s->vars[i].declared_type_name), val.v.dt.type_name);
+            s->vars[i].is_imported_module_var = 0;
             s->vars[i].import_module_index = -1;
             s->vars[i].import_var_index = -1;
             return &s->vars[i];
@@ -1397,6 +1403,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->is_protected = 0;
     v->is_save = 0;
     v->is_implicit_save = 0;
+    v->is_imported_module_var = 0;
     v->import_module_index = -1;
     v->import_var_index = -1;
     v->is_alias = 0;
@@ -1435,6 +1442,7 @@ static OfortVar *declare_alias_var(OfortInterpreter *I, const char *name, OfortV
     v->is_protected = target->is_protected;
     v->is_save = target->is_save;
     v->is_implicit_save = target->is_implicit_save;
+    v->is_imported_module_var = target->is_imported_module_var;
     v->import_module_index = target->import_module_index;
     v->import_var_index = target->import_var_index;
     v->is_alias = 1;
@@ -1465,6 +1473,9 @@ static OfortVar *declare_alias_value_var(OfortInterpreter *I, const char *name, 
     if (target->type == FVAL_DERIVED) {
         copy_cstr(v->declared_type_name, sizeof(v->declared_type_name), target->v.dt.type_name);
     }
+    v->is_imported_module_var = 0;
+    v->import_module_index = -1;
+    v->import_var_index = -1;
     v->is_alias = 1;
     return v;
 }
@@ -2175,6 +2186,7 @@ static void copy_imported_var_attrs(OfortVar *dst, const OfortVar *src) {
     copy_cstr(dst->protected_module, sizeof(dst->protected_module), src->protected_module);
     dst->is_save = src->is_save;
     dst->is_implicit_save = src->is_implicit_save;
+    dst->is_imported_module_var = src->is_imported_module_var;
     dst->import_module_index = src->import_module_index;
     dst->import_var_index = src->import_var_index;
     dst->is_alias = src->is_alias;
@@ -12210,12 +12222,22 @@ static OfortValue eval_decl_initializer(OfortInterpreter *I, OfortNode *decl, Of
 }
 
 static int can_reuse_fast_local_array(OfortInterpreter *I, OfortNode *n) {
-    return I && I->fast_mode && I->procedure_depth > 0 &&
-           n && n->type == FND_VARDECL &&
-           n->n_dims > 0 && !n->is_allocatable && !n->is_pointer &&
-           !n->is_save && !n->is_implicit_save && !n->is_parameter &&
-           n->intent == 0 && n->n_children == 0 &&
-           can_pack_numeric_array(n->val_type);
+    if (!I || !I->fast_mode || I->procedure_depth <= 0 ||
+        !n || n->type != FND_VARDECL ||
+        n->n_dims <= 0 || n->is_allocatable || n->is_pointer ||
+        n->is_save || n->is_implicit_save || n->is_parameter ||
+        n->intent != 0 || n->n_children != 0 ||
+        !can_pack_numeric_array(n->val_type)) {
+        return 0;
+    }
+    for (int i = 0; i < n->n_dims; i++) {
+        if ((n->stmts && i < n->n_stmts && n->stmts[i]) ||
+            (n->has_lower_bound[i] && n->lower_bound_exprs[i]) ||
+            n->dims[i] <= 0) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static void clear_packed_numeric_array(OfortValue *arr) {
@@ -23641,7 +23663,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         (v->is_allocatable && rhs.v.arr.len != v->val.v.arr.len)) {
                         int dims[7];
                         for (int i = 0; i < rhs.v.arr.n_dims; i++) dims[i] = rhs.v.arr.dims[i];
-                        free_value(&v->val);
+                        if (v->is_alias) {
+                            v->is_alias = 0;
+                        } else {
+                            free_value(&v->val);
+                        }
                         v->val = make_array(rhs.v.arr.elem_type, dims, rhs.v.arr.n_dims);
                         if (rhs.v.arr.elem_type == FVAL_DERIVED && rhs.v.arr.elem_type_name[0]) {
                             copy_cstr(v->val.v.arr.elem_type_name, sizeof(v->val.v.arr.elem_type_name),
@@ -23655,7 +23681,6 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         memcpy(v->val.v.arr.real_data, rhs.v.arr.real_data,
                                sizeof(double) * (size_t)v->val.v.arr.len);
                         v->is_initialized = 1;
-                        update_imported_module_var(I, v);
                         trace_assignment_value(I, lhs, rhs);
                         free_value(&rhs);
                         break;
@@ -23664,7 +23689,6 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         memcpy(v->val.v.arr.int_data, rhs.v.arr.int_data,
                                sizeof(long long) * (size_t)v->val.v.arr.len);
                         v->is_initialized = 1;
-                        update_imported_module_var(I, v);
                         trace_assignment_value(I, lhs, rhs);
                         free_value(&rhs);
                         break;
@@ -23726,7 +23750,6 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     }
                 }
                 v->is_initialized = 1;
-                update_imported_module_var(I, v);
                 trace_assignment_value(I, lhs, rhs);
                 free_value(&rhs);
             } else {
