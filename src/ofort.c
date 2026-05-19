@@ -22017,6 +22017,144 @@ static void warn_intent_out_maybe_uninitialized(OfortInterpreter *I, OfortNode *
     }
 }
 
+static int is_present_call_for_proc_param(OfortNode *n, const char *param_name) {
+    return n && param_name && n->type == FND_FUNC_CALL &&
+           str_eq_nocase(n->name, "present") &&
+           n->n_stmts == 1 && n->stmts[0] &&
+           n->stmts[0]->type == FND_IDENT &&
+           str_eq_nocase(n->stmts[0]->name, param_name);
+}
+
+static int is_not_present_call_for_proc_param(OfortNode *n, const char *param_name) {
+    return n && n->type == FND_NOT &&
+           is_present_call_for_proc_param(n->children[0], param_name);
+}
+
+static int node_guarantees_procedure_exit(OfortNode *n) {
+    if (!n) return 0;
+    if (n->type == FND_RETURN || n->type == FND_STOP) return 1;
+    if (n->type == FND_BLOCK) {
+        for (int i = 0; i < n->n_stmts; i++) {
+            if (node_guarantees_procedure_exit(n->stmts[i])) return 1;
+            if (n->stmts[i] && n->stmts[i]->type != FND_VARDECL &&
+                n->stmts[i]->type != FND_PARAMDECL) {
+                return 0;
+            }
+        }
+    }
+    return 0;
+}
+
+static int if_exits_when_optional_absent(OfortNode *n, const char *param_name) {
+    return n && n->type == FND_IF && n->n_children < 3 &&
+           is_not_present_call_for_proc_param(n->children[0], param_name) &&
+           node_guarantees_procedure_exit(n->children[1]);
+}
+
+static int warn_optional_dummy_use_tree(OfortInterpreter *I, OfortNode *proc,
+                                        int param_index, OfortNode *n,
+                                        int guarded, int *warned);
+
+static int warn_optional_dummy_use_block(OfortInterpreter *I, OfortNode *proc,
+                                         int param_index, OfortNode *body,
+                                         int guarded, int *warned) {
+    int current_guarded = guarded;
+    const char *param_name;
+
+    if (!proc || param_index < 0 || param_index >= proc->n_params || !body) return 0;
+    param_name = proc->param_names[param_index];
+    if (body->type != FND_BLOCK) {
+        return warn_optional_dummy_use_tree(I, proc, param_index, body, guarded, warned);
+    }
+    for (int i = 0; i < body->n_stmts; i++) {
+        OfortNode *s = body->stmts[i];
+        if (!s) continue;
+        warn_optional_dummy_use_tree(I, proc, param_index, s, current_guarded, warned);
+        if (if_exits_when_optional_absent(s, param_name)) current_guarded = 1;
+        if (*warned) return 1;
+    }
+    return *warned;
+}
+
+static int warn_optional_dummy_use_tree(OfortInterpreter *I, OfortNode *proc,
+                                        int param_index, OfortNode *n,
+                                        int guarded, int *warned) {
+    const char *param_name;
+    int then_guarded;
+    int else_guarded;
+
+    if (!I || !proc || param_index < 0 || param_index >= proc->n_params || !n || !warned) {
+        return 0;
+    }
+    if (*warned) return 1;
+    param_name = proc->param_names[param_index];
+    if (!param_name || !param_name[0]) return 0;
+
+    if ((n->type == FND_SUBROUTINE || n->type == FND_FUNCTION ||
+         n->type == FND_STMT_FUNCTION) && n != proc) {
+        return 0;
+    }
+    if (n->type == FND_VARDECL || n->type == FND_PARAMDECL) return 0;
+    if (is_present_call_for_proc_param(n, param_name)) return 0;
+
+    if (n->type == FND_IDENT && str_eq_nocase(n->name, param_name)) {
+        if (!guarded) {
+            ofort_warning(I, n->line > 0 ? n->line : proc->line,
+                          "warning: OPTIONAL argument '%s' of procedure '%s' may be used when not present",
+                          param_name, proc->name);
+            *warned = 1;
+            return 1;
+        }
+        return 0;
+    }
+
+    if (n->type == FND_IF) {
+        if (!is_present_call_for_proc_param(n->children[0], param_name) &&
+            !is_not_present_call_for_proc_param(n->children[0], param_name)) {
+            warn_optional_dummy_use_tree(I, proc, param_index, n->children[0],
+                                         guarded, warned);
+            if (*warned) return 1;
+        }
+        then_guarded = guarded || is_present_call_for_proc_param(n->children[0], param_name);
+        else_guarded = guarded || is_not_present_call_for_proc_param(n->children[0], param_name);
+        if (n->n_children > 1) {
+            warn_optional_dummy_use_block(I, proc, param_index, n->children[1],
+                                          then_guarded, warned);
+            if (*warned) return 1;
+        }
+        if (n->n_children > 2) {
+            warn_optional_dummy_use_block(I, proc, param_index, n->children[2],
+                                          else_guarded, warned);
+            if (*warned) return 1;
+        }
+        return 0;
+    }
+
+    if (n->type == FND_CALL || n->type == FND_FUNC_CALL) {
+        return 0;
+    }
+
+    for (int i = 0; i < n->n_children; i++) {
+        warn_optional_dummy_use_tree(I, proc, param_index, n->children[i], guarded, warned);
+        if (*warned) return 1;
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        warn_optional_dummy_use_tree(I, proc, param_index, n->stmts[i], guarded, warned);
+        if (*warned) return 1;
+    }
+    return *warned;
+}
+
+static void warn_optional_dummy_maybe_absent_use(OfortInterpreter *I, OfortNode *proc) {
+    OfortNode *body = proc ? proc->children[0] : NULL;
+    if (!I || !proc || !body) return;
+    for (int i = 0; i < proc->n_params; i++) {
+        int warned = 0;
+        if (!proc->param_optional[i]) continue;
+        warn_optional_dummy_use_block(I, proc, i, body, 0, &warned);
+    }
+}
+
 static void check_semantics_identifier(OfortInterpreter *I, OfortNode *n) {
     int has_implicit_type = 0;
 
@@ -22370,6 +22508,7 @@ static void check_semantics_node(OfortInterpreter *I, OfortNode *n) {
                         validate_pure_procedure_node(I, s);
                         validate_intent_in_assignments(I, s);
                         warn_intent_out_maybe_uninitialized(I, s);
+                        warn_optional_dummy_maybe_absent_use(I, s);
                     }
                 }
             }
@@ -22817,6 +22956,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     validate_pure_procedure_node(I, s);
                     validate_intent_in_assignments(I, s);
                     warn_intent_out_maybe_uninitialized(I, s);
+                    warn_optional_dummy_maybe_absent_use(I, s);
                 }
             }
             for (int i = 0; i < body->n_stmts; i++) {
@@ -22917,6 +23057,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     validate_pure_procedure_node(I, s);
                     validate_intent_in_assignments(I, s);
                     warn_intent_out_maybe_uninitialized(I, s);
+                    warn_optional_dummy_maybe_absent_use(I, s);
                 } else if (s->type == FND_TYPE_DEF) {
                     exec_node(I, s);
                 } else {
@@ -27580,6 +27721,7 @@ unresolved_external_call_done:
         validate_pure_procedure_node(I, n);
         validate_intent_in_assignments(I, n);
         warn_intent_out_maybe_uninitialized(I, n);
+        warn_optional_dummy_maybe_absent_use(I, n);
         (void)register_func(I, n->name, n, n->type == FND_FUNCTION);
         break;
     }
