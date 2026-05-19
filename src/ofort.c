@@ -1649,7 +1649,8 @@ static OfortFunc *find_matching_generic_proc(OfortInterpreter *I, const char *na
             OfortValType actual_type = args[j].type == FVAL_ARRAY ? args[j].v.arr.elem_type : args[j].type;
             int actual_rank = args[j].type == FVAL_ARRAY ? args[j].v.arr.n_dims : 0;
             if (fn->param_types[j] != FVAL_VOID && fn->param_types[j] != actual_type &&
-                !(args[j].type == FVAL_ARRAY && args[j].v.arr.len == 0)) {
+                !(args[j].type == FVAL_ARRAY && args[j].v.arr.len == 0 &&
+                  args[j].v.arr.elem_type == FVAL_VOID)) {
                 match = 0;
                 break;
             }
