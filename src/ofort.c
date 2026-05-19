@@ -13425,16 +13425,32 @@ static int fill_random_number_array_section(OfortInterpreter *I, OfortVar *var, 
             has_section = 1;
     }
 
-    if (!has_section) {
-        free_subscript_specs(specs, nargs);
-        return 0;
-    }
-
     if (I->fast_mode) {
         seed_fast_rng_if_needed(I);
         rng_state = I->fast_rng_state;
     }
-    fill_random_number_section_recursive(I, &var->val, specs, nargs, nargs - 1, subscripts, &rng_state);
+
+    if (!has_section) {
+        OfortValue elem;
+        int index;
+        for (int i = 0; i < nargs; i++) subscripts[i] = specs[i].range.start;
+        index = section_linear_index(&var->val, subscripts, nargs);
+        if (index < 0 || index >= var->val.v.arr.len)
+            ofort_error(I, "Array index out of bounds");
+        if (var->val.v.arr.elem_type == FVAL_DOUBLE)
+            elem = make_double(random_number_next(I, &rng_state));
+        else
+            elem = make_real(random_number_next(I, &rng_state));
+        if (assign_packed_array_element(&var->val, index, elem)) {
+            free_value(&elem);
+        } else {
+            free_value(&var->val.v.arr.data[index]);
+            var->val.v.arr.data[index] = elem;
+        }
+    } else {
+        fill_random_number_section_recursive(I, &var->val, specs, nargs, nargs - 1, subscripts, &rng_state);
+    }
+
     if (I->fast_mode) I->fast_rng_state = rng_state;
 
     var->is_initialized = 1;
