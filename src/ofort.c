@@ -1622,9 +1622,88 @@ static OfortFunc *find_func(OfortInterpreter *I, const char *name) {
 static OfortGeneric *find_generic(OfortInterpreter *I, const char *name);
 static int type_extends_or_same(OfortInterpreter *I, const char *actual_name,
                                 const char *expected_name);
+static int call_has_named_actuals(OfortNode *call, int nargs);
+static int procedure_dummy_index(OfortNode *fn, const char *name);
+
+static int generic_actual_matches_param(OfortInterpreter *I, OfortNode *fn, int param_index,
+                                        OfortValue *arg, int allow_numeric, int *score) {
+    OfortValType actual_type;
+    int actual_rank;
+    if (!fn || !arg || param_index < 0 || param_index >= fn->n_params) return 0;
+    if (arg->type == FVAL_VOID && fn->param_optional[param_index]) return 1;
+    actual_type = arg->type == FVAL_ARRAY ? arg->v.arr.elem_type : arg->type;
+    actual_rank = arg->type == FVAL_ARRAY ? arg->v.arr.n_dims : 0;
+    if (fn->param_n_dims[param_index] != actual_rank &&
+        fn->param_n_dims[param_index] != -1 &&
+        !(fn->is_elemental && fn->param_n_dims[param_index] == 0 && actual_rank > 0) &&
+        !(arg->type == FVAL_ARRAY && !arg->v.arr.allocated &&
+          actual_rank == 0 && fn->param_n_dims[param_index] > 0)) {
+        return 0;
+    }
+    if (fn->param_types[param_index] == FVAL_DERIVED && fn->param_type_names[param_index][0]) {
+        const char *actual_name = arg->type == FVAL_ARRAY ?
+            arg->v.arr.elem_type_name : arg->v.dt.type_name;
+        return actual_name && actual_name[0] &&
+               type_extends_or_same(I, actual_name, fn->param_type_names[param_index]);
+    }
+    if (fn->param_types[param_index] == FVAL_VOID ||
+        fn->param_types[param_index] == actual_type) {
+        return 1;
+    }
+    if (arg->type == FVAL_ARRAY && arg->v.arr.len == 0 &&
+        arg->v.arr.elem_type == FVAL_VOID) {
+        if (score) *score += 2;
+        return 1;
+    }
+    if (allow_numeric && is_numeric_type(fn->param_types[param_index]) &&
+        is_numeric_type(actual_type)) {
+        if (score) *score += 1;
+        return 1;
+    }
+    return 0;
+}
+
+static int generic_proc_match_score(OfortInterpreter *I, OfortNode *call, OfortNode *fn,
+                                    OfortValue *args, int nargs, int allow_numeric,
+                                    int *score_out) {
+    int actual_for_param[OFORT_MAX_PARAMS];
+    int used[OFORT_MAX_PARAMS] = {0};
+    int next_pos = 0;
+    int score = 0;
+    int has_named = call_has_named_actuals(call, nargs);
+
+    if (!fn || nargs > OFORT_MAX_PARAMS) return 0;
+    for (int i = 0; i < OFORT_MAX_PARAMS; i++) actual_for_param[i] = -1;
+    for (int i = 0; i < nargs; i++) {
+        int target = -1;
+        if (has_named && call && call->param_names[i][0]) {
+            target = procedure_dummy_index(fn, call->param_names[i]);
+            if (target < 0) return 0;
+        } else {
+            while (next_pos < fn->n_params && used[next_pos]) next_pos++;
+            target = next_pos++;
+            if (target >= fn->n_params) return 0;
+        }
+        if (target < 0 || target >= OFORT_MAX_PARAMS || used[target]) return 0;
+        used[target] = 1;
+        actual_for_param[target] = i;
+    }
+    for (int j = 0; j < fn->n_params; j++) {
+        int ai = actual_for_param[j];
+        if (ai < 0) {
+            if (!fn->param_optional[j]) return 0;
+            continue;
+        }
+        if (!generic_actual_matches_param(I, fn, j, &args[ai], allow_numeric, &score)) {
+            return 0;
+        }
+    }
+    if (score_out) *score_out = score;
+    return 1;
+}
 
 static OfortFunc *find_matching_generic_proc(OfortInterpreter *I, const char *name,
-                                             OfortValue *args, int nargs,
+                                             OfortValue *args, int nargs, OfortNode *call,
                                              int want_function) {
     OfortGeneric *g = find_generic(I, name);
     if (!g) return NULL;
@@ -1632,103 +1711,20 @@ static OfortFunc *find_matching_generic_proc(OfortInterpreter *I, const char *na
         OfortFunc *func = find_func(I, g->procedures[i]);
         if (!func) func = find_func_in_module(I, g->procedures[i], NULL);
         if (!func || func->is_function != want_function || !func->node) continue;
-        OfortNode *fn = func->node;
-        int match = 1;
-        if (nargs > fn->n_params) continue;
-        for (int j = nargs; j < fn->n_params; j++) {
-            if (!fn->param_optional[j]) {
-                match = 0;
-                break;
-            }
-        }
-        if (!match) continue;
-        for (int j = 0; j < nargs; j++) {
-            if (args[j].type == FVAL_VOID && fn->param_optional[j]) {
-                continue;
-            }
-            OfortValType actual_type = args[j].type == FVAL_ARRAY ? args[j].v.arr.elem_type : args[j].type;
-            int actual_rank = args[j].type == FVAL_ARRAY ? args[j].v.arr.n_dims : 0;
-            if (fn->param_types[j] != FVAL_VOID && fn->param_types[j] != actual_type &&
-                !(args[j].type == FVAL_ARRAY && args[j].v.arr.len == 0 &&
-                  args[j].v.arr.elem_type == FVAL_VOID)) {
-                match = 0;
-                break;
-            }
-            if (fn->param_types[j] == FVAL_DERIVED && fn->param_type_names[j][0]) {
-                const char *actual_name = args[j].type == FVAL_ARRAY ?
-                    args[j].v.arr.elem_type_name : args[j].v.dt.type_name;
-                if (!actual_name || !actual_name[0] ||
-                    !type_extends_or_same(I, actual_name, fn->param_type_names[j])) {
-                    match = 0;
-                    break;
-                }
-            }
-            if (fn->param_n_dims[j] != actual_rank &&
-                fn->param_n_dims[j] != -1 &&
-                !(fn->is_elemental && fn->param_n_dims[j] == 0 && actual_rank > 0) &&
-                !(args[j].type == FVAL_ARRAY && !args[j].v.arr.allocated &&
-                  actual_rank == 0 && fn->param_n_dims[j] > 0)) {
-                match = 0;
-                break;
-            }
-        }
-        if (match) return func;
+        if (generic_proc_match_score(I, call, func->node, args, nargs, 0, NULL)) return func;
     }
     {
         OfortFunc *best = NULL;
         int best_score = 1000000;
         for (int i = 0; i < g->n_procedures; i++) {
-        OfortFunc *func = find_func(I, g->procedures[i]);
-        if (!func || func->is_function != want_function || !func->node) continue;
-        OfortNode *fn = func->node;
-        int ok = 1;
-        int score = 0;
-        if (nargs > fn->n_params) continue;
-        for (int j = nargs; j < fn->n_params; j++) {
-            if (!fn->param_optional[j]) {
-                ok = 0;
-                break;
+            OfortFunc *func = find_func(I, g->procedures[i]);
+            int score = 0;
+            if (!func || func->is_function != want_function || !func->node) continue;
+            if (generic_proc_match_score(I, call, func->node, args, nargs, 1, &score) &&
+                score < best_score) {
+                best = func;
+                best_score = score;
             }
-        }
-        if (!ok) continue;
-        for (int j = 0; j < nargs && j < fn->n_params; j++) {
-            OfortValType actual_type = args[j].type == FVAL_ARRAY ? args[j].v.arr.elem_type : args[j].type;
-            int actual_rank = args[j].type == FVAL_ARRAY ? args[j].v.arr.n_dims : 0;
-            if (args[j].type == FVAL_VOID && fn->param_optional[j]) continue;
-            if (fn->param_n_dims[j] != actual_rank &&
-                fn->param_n_dims[j] != -1 &&
-                !(fn->is_elemental && fn->param_n_dims[j] == 0 && actual_rank > 0) &&
-                !(args[j].type == FVAL_ARRAY && !args[j].v.arr.allocated &&
-                  actual_rank == 0 && fn->param_n_dims[j] > 0)) {
-                ok = 0;
-                break;
-            }
-            if (fn->param_types[j] == FVAL_DERIVED && fn->param_type_names[j][0]) {
-                const char *actual_name = args[j].type == FVAL_ARRAY ?
-                    args[j].v.arr.elem_type_name : args[j].v.dt.type_name;
-                if (!actual_name || !actual_name[0] ||
-                    !type_extends_or_same(I, actual_name, fn->param_type_names[j])) {
-                    ok = 0;
-                    break;
-                }
-                continue;
-            }
-            if (fn->param_types[j] == FVAL_VOID || fn->param_types[j] == actual_type) continue;
-            if (is_numeric_type(fn->param_types[j]) && is_numeric_type(actual_type)) {
-                score += 1;
-                continue;
-            }
-            if (args[j].type == FVAL_ARRAY && args[j].v.arr.len == 0) {
-                score += 2;
-                continue;
-            }
-            ok = 0;
-            break;
-        }
-        if (ok && score < best_score) {
-            best = func;
-            best_score = score;
-        }
         }
         if (best) return best;
     }
@@ -1737,12 +1733,19 @@ static OfortFunc *find_matching_generic_proc(OfortInterpreter *I, const char *na
 
 static OfortFunc *find_matching_generic_func(OfortInterpreter *I, const char *name,
                                              OfortValue *args, int nargs) {
-    return find_matching_generic_proc(I, name, args, nargs, 1);
+    return find_matching_generic_proc(I, name, args, nargs, NULL, 1);
 }
 
-static OfortFunc *find_matching_generic_subroutine(OfortInterpreter *I, const char *name,
-                                                   OfortValue *args, int nargs) {
-    return find_matching_generic_proc(I, name, args, nargs, 0);
+static OfortFunc *find_matching_generic_func_call(OfortInterpreter *I, const char *name,
+                                                  OfortValue *args, int nargs,
+                                                  OfortNode *call) {
+    return find_matching_generic_proc(I, name, args, nargs, call, 1);
+}
+
+static OfortFunc *find_matching_generic_subroutine_call(OfortInterpreter *I, const char *name,
+                                                        OfortValue *args, int nargs,
+                                                        OfortNode *call) {
+    return find_matching_generic_proc(I, name, args, nargs, call, 0);
 }
 
 static int call_has_named_actuals(OfortNode *call, int nargs) {
@@ -17229,7 +17232,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 
         /* Check for user function */
         OfortFunc *func = find_func(I, procedure_call_name[0] ? procedure_call_name : n->name);
-        if (!func) func = find_matching_generic_func(I, procedure_call_name[0] ? procedure_call_name : n->name, args, nargs);
+        if (!func) func = find_matching_generic_func_call(I, procedure_call_name[0] ? procedure_call_name : n->name, args, nargs, n);
         if (func && func->is_function) {
             OfortNode *fn = func->node;
             reorder_named_function_actuals(I, n, fn, &args, &nargs);
@@ -17609,7 +17612,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             }
 
             func = find_func(I, call_name);
-            if (!func) func = find_matching_generic_func(I, call_name, args, nargs);
+            if (!func) func = find_matching_generic_func_call(I, call_name, args, nargs, n);
             if (func && func->is_function) {
                 OfortValue result;
                 reorder_named_function_actuals(I, n, func->node, &args, &nargs);
@@ -21647,6 +21650,54 @@ static OfortValType pure_local_decl_type(OfortNode *n, const char *name) {
     return FVAL_VOID;
 }
 
+static OfortNode *pure_local_decl_node(OfortNode *n, const char *name) {
+    if (!n || !name || !name[0]) return NULL;
+    if (n->type == FND_SUBROUTINE || n->type == FND_FUNCTION || n->type == FND_STMT_FUNCTION)
+        return NULL;
+    if ((n->type == FND_VARDECL || n->type == FND_PARAMDECL) &&
+        str_eq_nocase(n->name, name)) {
+        return n;
+    }
+    for (int i = 0; i < n->n_children; i++) {
+        OfortNode *found = pure_local_decl_node(n->children[i], name);
+        if (found) return found;
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        OfortNode *found = pure_local_decl_node(n->stmts[i], name);
+        if (found) return found;
+    }
+    return NULL;
+}
+
+static OfortNode *root_target_node(OfortNode *n) {
+    while (n && (n->type == FND_MEMBER || n->type == FND_ARRAY_REF ||
+                 n->type == FND_FUNC_CALL) && n->children[0]) {
+        n = n->children[0];
+    }
+    return n;
+}
+
+static int pure_internal_write_member_target(OfortInterpreter *I, OfortNode *proc, OfortNode *target) {
+    OfortNode *root;
+    OfortNode *decl;
+    OfortTypeDef *td;
+    if (!I || !proc || !target || target->type != FND_MEMBER || !target->children[0])
+        return 0;
+    root = root_target_node(target->children[0]);
+    if (!root || root->type != FND_IDENT) return 0;
+    decl = pure_local_decl_node(proc->children[0], root->name);
+    if (!decl || decl->val_type != FVAL_DERIVED || !decl->str_val[0]) return 0;
+    td = find_type_def(I, decl->str_val);
+    while (td) {
+        for (int i = 0; i < td->n_fields; i++) {
+            if (str_eq_nocase(td->field_names[i], target->name))
+                return td->field_types[i] == FVAL_CHARACTER;
+        }
+        td = td->parent_type_name[0] ? find_type_def(I, td->parent_type_name) : NULL;
+    }
+    return 0;
+}
+
 static OfortNode *find_procedure_dummy_declaration(OfortNode *n, const char *name) {
     if (!n || !name || !name[0]) return NULL;
     if (n->type == FND_SUBROUTINE || n->type == FND_FUNCTION || n->type == FND_STMT_FUNCTION)
@@ -21676,9 +21727,10 @@ static int pure_function_param_is_pure_procedure_dummy(OfortInterpreter *I,
     return iface && iface->is_pure;
 }
 
-static int is_pure_internal_write(OfortNode *proc, OfortNode *n) {
+static int is_pure_internal_write(OfortInterpreter *I, OfortNode *proc, OfortNode *n) {
     const char *target_name;
     if (!proc || !n || n->type != FND_WRITE || !n->children[0]) return 0;
+    if (pure_internal_write_member_target(I, proc, n->children[0])) return 1;
     target_name = extract_forall_lhs_name(n->children[0]);
     if (!target_name || !target_name[0]) return 0;
     return pure_local_decl_type(proc->children[0], target_name) == FVAL_CHARACTER;
@@ -21704,7 +21756,7 @@ static void validate_pure_procedure_tree(OfortInterpreter *I, OfortNode *proc, O
 
     if (!n) return;
     io_name = io_statement_name(n->type);
-    if (io_name && !is_pure_internal_write(proc, n)) {
+    if (io_name && !is_pure_internal_write(I, proc, n)) {
         ofort_append_error(I, n->line > 0 ? n->line : proc->line,
                            "%s statement is not allowed in PURE procedure '%s'",
                            io_name, proc->name);
@@ -26889,7 +26941,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
         }
         if (!func) {
-            func = find_matching_generic_subroutine(I, n->name, args, nargs);
+            func = find_matching_generic_subroutine_call(I, n->name, args, nargs, n);
             fn = func ? func->node : NULL;
         }
         if (!func) {
