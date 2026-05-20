@@ -1764,6 +1764,10 @@ static int procedure_dummy_index(OfortNode *fn, const char *name) {
     return -1;
 }
 
+static int procedure_has_param_name(OfortNode *fn, const char *name) {
+    return procedure_dummy_index(fn, name) >= 0;
+}
+
 static void reorder_named_function_actuals(OfortInterpreter *I, OfortNode *call,
                                            OfortNode *fn, OfortValue **args_ptr,
                                            int *nargs_ptr) {
@@ -2559,14 +2563,28 @@ static OfortNode *find_top_level_module_node(OfortInterpreter *I, const char *na
     return NULL;
 }
 
-static void sync_module_vars_from_scope(OfortInterpreter *I, const char *module_name) {
+static void sync_module_vars_from_scope_except_params(OfortInterpreter *I, const char *module_name,
+                                                      OfortNode *proc) {
     if (!module_name || !module_name[0] || !I->current_scope) return;
     OfortModule *mod = find_module(I, module_name);
     if (!mod) return;
     for (int i = 0; i < mod->n_vars; i++) {
+        int mod_index = (int)(mod - I->modules);
+        if (procedure_has_param_name(proc, mod->vars[i].name)) continue;
         OfortVar *local = find_var_in_current_scope(I, mod->vars[i].name);
+        if (!local) continue;
+        if (!str_eq_nocase(I->active_module_name, module_name) &&
+            !(local->is_imported_module_var &&
+              local->import_module_index == mod_index &&
+              local->import_var_index == i)) {
+            continue;
+        }
         if (local) copy_var_payload_and_attrs(&mod->vars[i], local);
     }
+}
+
+static void sync_module_vars_from_scope(OfortInterpreter *I, const char *module_name) {
+    sync_module_vars_from_scope_except_params(I, module_name, NULL);
 }
 
 static void sync_module_vars_to_scope(OfortInterpreter *I, const char *module_name) {
@@ -16175,6 +16193,7 @@ static OfortValue execute_user_function_with_args(OfortInterpreter *I, OfortFunc
     OfortModule *mod = find_module(I, func_exec_module_name(func));
     if (mod) {
         for (int i = 0; i < mod->n_vars; i++) {
+            if (procedure_has_param_name(fn, mod->vars[i].name)) continue;
             OfortVar *mv = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
                     copy_imported_var_attrs(mv, &mod->vars[i]);
         }
@@ -17080,9 +17099,9 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             alloc_var = find_var(I, n->stmts[0]->name);
             if (alloc_var && alloc_var->is_optional && !alloc_var->present)
                 ofort_error(I, "Optional dummy argument '%s' is not present", n->stmts[0]->name);
-            if (!alloc_var || !alloc_var->is_allocatable) return make_logical(0);
-            if (alloc_var->val.type == FVAL_ARRAY)
+            if (alloc_var && alloc_var->val.type == FVAL_ARRAY)
                 return make_logical(alloc_var->val.v.arr.allocated);
+            if (!alloc_var || !alloc_var->is_allocatable) return make_logical(0);
             return make_logical(alloc_var->scalar_allocated);
         }
 
@@ -17356,11 +17375,12 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 free_call_args(args, nargs); args = NULL;
                 return elemental_result;
             }
-            sync_module_vars_from_scope(I, func_exec_module_name(func));
+            sync_module_vars_from_scope_except_params(I, func_exec_module_name(func), fn);
             push_scope(I);
             OfortModule *mod = find_module(I, func_exec_module_name(func));
             if (mod) {
                 for (int i = 0; i < mod->n_vars; i++) {
+                    if (procedure_has_param_name(fn, mod->vars[i].name)) continue;
                     OfortVar *mv = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
                     copy_imported_var_attrs(mv, &mod->vars[i]);
                 }
@@ -17447,7 +17467,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             }
 
             store_saved_vars(I, func, I->current_scope);
-            sync_module_vars_from_scope(I, func_exec_module_name(func));
+            sync_module_vars_from_scope_except_params(I, func_exec_module_name(func), fn);
             pop_scope(I);
             sync_module_vars_to_scope(I, func_exec_module_name(func));
 
@@ -26975,6 +26995,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         OfortModule *mod = find_module(I, func_exec_module_name(pfunc));
                         if (mod) {
                             for (int mi = 0; mi < mod->n_vars; mi++) {
+                                if (procedure_has_param_name(pfn, mod->vars[mi].name)) continue;
                                 OfortVar *mv = declare_var(I, mod->vars[mi].name, copy_value(mod->vars[mi].val));
                                 copy_imported_var_attrs(mv, &mod->vars[mi]);
                             }
@@ -27022,7 +27043,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         }
                     }
                     store_saved_vars(I, pfunc, I->current_scope);
-                    sync_module_vars_from_scope(I, func_exec_module_name(pfunc));
+                    sync_module_vars_from_scope_except_params(I, func_exec_module_name(pfunc), pfn);
                     pop_scope(I);
                     sync_module_vars_to_scope(I, func_exec_module_name(pfunc));
                     for (int pi = 0; pi < pfn->n_params && pi < pnargs; pi++) {
@@ -27088,6 +27109,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 OfortModule *mod = find_module(I, func_exec_module_name(func));
                 if (mod) {
                     for (int i = 0; i < mod->n_vars; i++) {
+                        if (procedure_has_param_name(fn, mod->vars[i].name)) continue;
                         OfortVar *mv = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
                     copy_imported_var_attrs(mv, &mod->vars[i]);
                     }
@@ -27492,12 +27514,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             free(args);
             break;
         }
-        sync_module_vars_from_scope(I, func_exec_module_name(func));
+        sync_module_vars_from_scope_except_params(I, func_exec_module_name(func), fn);
         push_scope(I);
         {
             OfortModule *mod = find_module(I, func_exec_module_name(func));
             if (mod) {
                 for (int mi = 0; mi < mod->n_vars; mi++) {
+                    if (procedure_has_param_name(fn, mod->vars[mi].name)) continue;
                     OfortVar *mv = declare_var(I, mod->vars[mi].name, copy_value(mod->vars[mi].val));
                     copy_imported_var_attrs(mv, &mod->vars[mi]);
                 }
@@ -27709,7 +27732,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
 
         store_saved_vars(I, func, I->current_scope);
-        sync_module_vars_from_scope(I, func_exec_module_name(func));
+        sync_module_vars_from_scope_except_params(I, func_exec_module_name(func), fn);
         pop_scope(I);
         sync_module_vars_to_scope(I, func_exec_module_name(func));
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
