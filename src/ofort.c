@@ -1641,12 +1641,46 @@ static int type_extends_or_same(OfortInterpreter *I, const char *actual_name,
 static int call_has_named_actuals(OfortNode *call, int nargs);
 static int procedure_dummy_index(OfortNode *fn, const char *name);
 
+static int optional_actual_decl_matches_param(OfortInterpreter *I, OfortNode *actual_node,
+                                              OfortNode *fn, int param_index,
+                                              int allow_numeric, int *score) {
+    OfortVar *actual;
+    OfortValType actual_type;
+    int actual_rank;
+    if (!actual_node || actual_node->type != FND_IDENT) return 0;
+    actual = find_var(I, actual_node->name);
+    if (!actual || !actual->is_optional || actual->present) return 0;
+    actual_type = actual->declared_type != FVAL_VOID ? actual->declared_type :
+                  (actual->val.type == FVAL_ARRAY ? actual->val.v.arr.elem_type : actual->val.type);
+    actual_rank = actual->val.type == FVAL_ARRAY ? actual->val.v.arr.n_dims : 0;
+    if (fn->param_n_dims[param_index] != actual_rank &&
+        fn->param_n_dims[param_index] != -1 &&
+        !(fn->is_elemental && fn->param_n_dims[param_index] == 0 && actual_rank > 0)) {
+        return 0;
+    }
+    if (fn->param_types[param_index] == FVAL_VOID ||
+        fn->param_types[param_index] == actual_type) {
+        return 1;
+    }
+    if (allow_numeric && is_numeric_type(fn->param_types[param_index]) &&
+        is_numeric_type(actual_type)) {
+        if (score) *score += 1;
+        return 1;
+    }
+    return 0;
+}
+
 static int generic_actual_matches_param(OfortInterpreter *I, OfortNode *fn, int param_index,
-                                        OfortValue *arg, int allow_numeric, int *score) {
+                                        OfortValue *arg, OfortNode *actual_node,
+                                        int allow_numeric, int *score) {
     OfortValType actual_type;
     int actual_rank;
     if (!fn || !arg || param_index < 0 || param_index >= fn->n_params) return 0;
     if (arg->type == FVAL_VOID && fn->param_optional[param_index]) return 1;
+    if (arg->type == FVAL_VOID &&
+        optional_actual_decl_matches_param(I, actual_node, fn, param_index, allow_numeric, score)) {
+        return 1;
+    }
     actual_type = arg->type == FVAL_ARRAY ? arg->v.arr.elem_type : arg->type;
     actual_rank = arg->type == FVAL_ARRAY ? arg->v.arr.n_dims : 0;
     if (fn->param_n_dims[param_index] != actual_rank &&
@@ -1710,7 +1744,8 @@ static int generic_proc_match_score(OfortInterpreter *I, OfortNode *call, OfortN
             if (!fn->param_optional[j]) return 0;
             continue;
         }
-        if (!generic_actual_matches_param(I, fn, j, &args[ai], allow_numeric, &score)) {
+        OfortNode *actual_node = call && ai >= 0 && ai < call->n_stmts ? call->stmts[ai] : NULL;
+        if (!generic_actual_matches_param(I, fn, j, &args[ai], actual_node, allow_numeric, &score)) {
             return 0;
         }
     }
@@ -17462,6 +17497,18 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     if (i < nargs && args[i].type != FVAL_VOID) {
                         OfortVar *pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
                         pv->is_optional = fn->param_optional[i];
+                    } else if (i < nargs && n->stmts[i]->type == FND_IDENT) {
+                        OfortVar *actual = find_var(I, n->stmts[i]->name);
+                        if (actual && actual->is_optional && !actual->present) {
+                            declare_absent_optional_var(I, fn->param_names[i]);
+                        } else if (fn->param_optional[i]) {
+                            declare_absent_optional_var(I, fn->param_names[i]);
+                        } else {
+                            pop_scope(I);
+                            for (int j = 0; j < nargs; j++) free_value(&args[j]);
+                            ofort_error(I, "Missing required argument '%s' in statement function '%s'",
+                                        fn->param_names[i], fn->name);
+                        }
                     } else if (fn->param_optional[i]) {
                         declare_absent_optional_var(I, fn->param_names[i]);
                     } else {
@@ -17497,6 +17544,16 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 if (i < nargs && args[i].type != FVAL_VOID) {
                     OfortVar *pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
                     pv->is_optional = fn->param_optional[i];
+                } else if (i < nargs && n->stmts[i]->type == FND_IDENT) {
+                    OfortVar *actual = find_var(I, n->stmts[i]->name);
+                    if (actual && actual->is_optional && !actual->present) {
+                        declare_absent_optional_var(I, fn->param_names[i]);
+                    } else if (fn->param_optional[i]) {
+                        declare_absent_optional_var(I, fn->param_names[i]);
+                    } else {
+                        ofort_error(I, "Missing required argument '%s' in call to '%s'",
+                                    fn->param_names[i], fn->name);
+                    }
                 } else if (fn->param_optional[i]) {
                     declare_absent_optional_var(I, fn->param_names[i]);
                 } else {
