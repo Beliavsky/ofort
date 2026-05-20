@@ -10513,6 +10513,78 @@ static OfortValue default_derived_value_with_params(OfortInterpreter *I, const c
                                                     OfortNode **param_exprs,
                                                     char param_names[OFORT_MAX_PARAMS][256],
                                                     int n_param_exprs);
+static OfortNode *data_node_from_value(OfortInterpreter *I, OfortValue *value);
+
+static int node_references_type_param(OfortNode *node, OfortTypeDef *td) {
+    if (!node || !td) return 0;
+    if (node->type == FND_IDENT) {
+        for (int i = 0; i < td->n_type_params && i < OFORT_MAX_PARAMS; i++) {
+            if (str_eq_nocase(node->name, td->type_param_names[i])) return 1;
+        }
+    }
+    for (int i = 0; i < node->n_children && i < OFORT_MAX_CHILDREN; i++) {
+        if (node_references_type_param(node->children[i], td)) return 1;
+    }
+    for (int i = 0; i < node->n_stmts; i++) {
+        if (node_references_type_param(node->stmts[i], td)) return 1;
+    }
+    return 0;
+}
+
+static void resolve_non_type_param_field_bounds(OfortInterpreter *I, OfortTypeDef *td, int field) {
+    if (!td || field < 0 || field >= td->n_fields) return;
+    for (int d = 0; d < td->field_n_dims[field] && d < 7; d++) {
+        if (td->field_dim_exprs[field][d] &&
+            !node_references_type_param(td->field_dim_exprs[field][d], td)) {
+            OfortValue dv = eval_node(I, td->field_dim_exprs[field][d]);
+            td->field_dims[field][d] = (int)val_to_int(dv);
+            td->field_dim_exprs[field][d] = NULL;
+            free_value(&dv);
+        }
+        if (td->field_has_lower_bound[field][d] &&
+            td->field_lower_bound_exprs[field][d] &&
+            !node_references_type_param(td->field_lower_bound_exprs[field][d], td)) {
+            OfortValue lv = eval_node(I, td->field_lower_bound_exprs[field][d]);
+            td->field_lower_bounds[field][d] = (int)val_to_int(lv);
+            td->field_lower_bound_exprs[field][d] = NULL;
+            free_value(&lv);
+        }
+    }
+}
+
+static void resolve_non_type_param_field_initializers(OfortInterpreter *I, OfortTypeDef *td) {
+    if (!td) return;
+    for (int i = 0; i < td->n_fields; i++) {
+        if (!td->field_init_exprs[i]) continue;
+        if (node_references_type_param(td->field_init_exprs[i], td)) continue;
+        if (td->field_init_exprs[i]->type == FND_INT_LIT ||
+            td->field_init_exprs[i]->type == FND_REAL_LIT ||
+            td->field_init_exprs[i]->type == FND_STRING_LIT ||
+            td->field_init_exprs[i]->type == FND_LOGICAL_LIT ||
+            td->field_init_exprs[i]->type == FND_COMPLEX_LIT ||
+            td->field_init_exprs[i]->type == FND_ARRAY_CONSTRUCTOR) {
+            continue;
+        }
+        {
+            OfortValue init = eval_node(I, td->field_init_exprs[i]);
+            td->field_init_exprs[i] = data_node_from_value(I, &init);
+            free_value(&init);
+        }
+    }
+}
+
+static void resolve_module_type_initializers(OfortInterpreter *I, OfortNode *body) {
+    if (!body) return;
+    for (int i = 0; i < body->n_stmts; i++) {
+        OfortNode *s = body->stmts[i];
+        if (s && s->type == FND_BLOCK) {
+            resolve_module_type_initializers(I, s);
+        } else if (s && s->type == FND_TYPE_DEF) {
+            OfortTypeDef *td = find_type_def(I, s->name);
+            resolve_non_type_param_field_initializers(I, td);
+        }
+    }
+}
 
 static void resolve_type_field_shape(OfortInterpreter *I, OfortTypeDef *td, int field,
                                      int *dims, int *lower_bounds) {
@@ -23064,6 +23136,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     exec_node(I, s);
                 }
             }
+            resolve_module_type_initializers(I, body);
             /* Copy module variables */
             OfortScope *ms = I->current_scope;
             for (int i = 0; i < ms->n_vars && i < OFORT_MAX_MODULE_VARS; i++) {
@@ -23679,6 +23752,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             td->field_dim_exprs[td->n_fields][fd] = d->stmts ? d->stmts[fd] : NULL;
                         }
                         td->n_fields++;
+                        resolve_non_type_param_field_bounds(I, td, td->n_fields - 1);
                     }
                 }
             } else if ((s->type == FND_VARDECL || s->type == FND_PARAMDECL) && td->n_fields < OFORT_MAX_FIELDS) {
@@ -23757,6 +23831,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     td->field_dim_exprs[td->n_fields][fd] = s->stmts ? s->stmts[fd] : NULL;
                 }
                 td->n_fields++;
+                resolve_non_type_param_field_bounds(I, td, td->n_fields - 1);
             }
         }
         break;
