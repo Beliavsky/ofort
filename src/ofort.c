@@ -11558,6 +11558,12 @@ static OfortValue pointer_referenced_value(OfortInterpreter *I, const char *targ
     if (!target) return make_void_val();
     if (!has_slice) return copy_value(target->val);
     if (target->val.type != FVAL_ARRAY) return make_void_val();
+    if (slice_stride == 0) {
+        int subs[1] = { slice_start };
+        int idx = section_linear_index(&target->val, subs, 1);
+        if (idx < 0 || idx >= target->val.v.arr.len) return make_void_val();
+        return array_element_value(&target->val, idx);
+    }
     int dims[1] = { slice_count(slice_start, slice_end, slice_stride) };
     OfortValue result = make_array(target->val.v.arr.elem_type, dims, 1);
     result.v.arr.lower_bounds[0] = 1;
@@ -11582,7 +11588,7 @@ static OfortValue pointer_referenced_value_preserve_lbound(OfortInterpreter *I, 
     if (!ptr || !ptr->is_pointer_ref || !ptr->pointer_target[0]) return make_void_val();
     result = pointer_referenced_value(I, ptr->pointer_target, ptr->pointer_has_slice,
                                       ptr->pointer_slice_start, ptr->pointer_slice_end,
-                                      ptr->pointer_slice_stride ? ptr->pointer_slice_stride : 1);
+                                      ptr->pointer_slice_stride);
     if (result.type == FVAL_ARRAY && ptr->type == FVAL_ARRAY && ptr->v.arr.n_dims > 0) {
         for (int i = 0; i < result.v.arr.n_dims && i < ptr->v.arr.n_dims && i < 7; i++)
             result.v.arr.lower_bounds[i] = ptr->v.arr.lower_bounds[i];
@@ -11596,6 +11602,32 @@ static int write_through_pointer_var(OfortInterpreter *I, OfortVar *ptr, OfortVa
     target = find_var(I, ptr->pointer_target);
     if (!target) return 0;
     if (ptr->pointer_has_slice) {
+        if (ptr->pointer_slice_stride == 0) {
+            int subs[1] = { ptr->pointer_slice_start };
+            int idx;
+            if (target->val.type != FVAL_ARRAY) return 0;
+            idx = section_linear_index(&target->val, subs, 1);
+            if (idx < 0 || idx >= target->val.v.arr.len)
+                ofort_error(I, "Array index out of bounds");
+            {
+                OfortValue elem = copy_value(*rhs);
+                if (assign_packed_array_element(&target->val, idx, elem)) {
+                    free_value(&elem);
+                } else if (target->val.v.arr.data) {
+                    free_value(&target->val.v.arr.data[idx]);
+                    target->val.v.arr.data[idx] = elem;
+                } else {
+                    free_value(&elem);
+                }
+            }
+            free_value(&ptr->val);
+            ptr->val = pointer_referenced_value(I, ptr->pointer_target, ptr->pointer_has_slice,
+                                                ptr->pointer_slice_start, ptr->pointer_slice_end,
+                                                ptr->pointer_slice_stride);
+            target->is_initialized = 1;
+            ptr->is_initialized = 1;
+            return 1;
+        }
         int count = slice_count(ptr->pointer_slice_start, ptr->pointer_slice_end,
                                 ptr->pointer_slice_stride);
         if (target->val.type != FVAL_ARRAY) return 0;
@@ -11674,7 +11706,7 @@ static int write_through_pointer_value(OfortInterpreter *I, OfortValue *ptr, Ofo
     fake.pointer_has_slice = ptr->pointer_has_slice;
     fake.pointer_slice_start = ptr->pointer_slice_start;
     fake.pointer_slice_end = ptr->pointer_slice_end;
-    fake.pointer_slice_stride = ptr->pointer_slice_stride ? ptr->pointer_slice_stride : 1;
+    fake.pointer_slice_stride = ptr->pointer_slice_stride;
     fake.val = copy_value(*ptr);
     if (!write_through_pointer_var(I, &fake, rhs)) {
         free_value(&fake.val);
@@ -12845,46 +12877,44 @@ static int pointer_target_descriptor(OfortInterpreter *I, OfortNode *node,
             *has_slice = target->pointer_has_slice;
             *slice_start = target->pointer_slice_start;
             *slice_end = target->pointer_slice_end;
-            *slice_stride = target->pointer_slice_stride ? target->pointer_slice_stride : 1;
+            *slice_stride = target->pointer_slice_stride;
             return 1;
         }
         return 0;
     }
     if (node->type == FND_ARRAY_REF && node->children[0] &&
-        node->children[0]->type == FND_MEMBER && node->n_stmts == 1 &&
-        node->stmts[0] && node->stmts[0]->type == FND_SLICE) {
+        node->children[0]->type == FND_MEMBER && node->n_stmts == 1) {
         OfortValue *target = member_lvalue(I, node->children[0]);
         OfortSubscriptRange range;
         if (!target || target->type != FVAL_ARRAY) return 0;
         if (!target->is_pointer_ref || !target->pointer_target[0]) return 0;
         eval_subscript_range(I, node->stmts[0], target->v.arr.lower_bounds[0],
                              target->v.arr.dims[0], &range);
-        if (!range.is_slice) return 0;
         copy_cstr(name, name_size, target->pointer_target);
         *has_slice = 1;
         if (target->pointer_has_slice) {
-            int stride = target->pointer_slice_stride ? target->pointer_slice_stride : 1;
+            int stride = target->pointer_slice_stride;
+            if (stride == 0) return 0;
             *slice_start = target->pointer_slice_start + (range.start - target->v.arr.lower_bounds[0]) * stride;
             *slice_end = target->pointer_slice_start + (range.end - target->v.arr.lower_bounds[0]) * stride;
-            *slice_stride = range.step * stride;
+            *slice_stride = range.is_slice ? range.step * stride : 0;
         } else {
             *slice_start = range.start;
             *slice_end = range.end;
-            *slice_stride = range.step;
+            *slice_stride = range.is_slice ? range.step : 0;
         }
         return 1;
     }
-    if (node->type == FND_FUNC_CALL && node->n_stmts == 1 && node->stmts[0]->type == FND_SLICE) {
+    if (node->type == FND_FUNC_CALL && node->n_stmts == 1) {
         OfortVar *var = find_var(I, node->name);
         OfortSubscriptRange range;
         if (!var || var->val.type != FVAL_ARRAY) return 0;
         eval_subscript_range(I, node->stmts[0], var->val.v.arr.lower_bounds[0], var->val.v.arr.len, &range);
-        if (!range.is_slice) return 0;
         copy_cstr(name, name_size, node->name);
         *has_slice = 1;
         *slice_start = range.start;
         *slice_end = range.end;
-        *slice_stride = range.step;
+        *slice_stride = range.is_slice ? range.step : 0;
         return 1;
     }
     return 0;
