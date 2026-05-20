@@ -4861,6 +4861,21 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
         n->num_val = t->num_val;
         n->kind = t->kind;
         copy_cstr(n->str_val, sizeof(n->str_val), t->str_val);
+        if (t->str_val[0]) {
+            int all_digits = 1;
+            for (int k = 0; t->str_val[k]; k++) {
+                if (!isdigit((unsigned char)t->str_val[k])) {
+                    all_digits = 0;
+                    break;
+                }
+            }
+            if (!all_digits) {
+                OfortNode *ke = alloc_node(I, FND_IDENT);
+                copy_cstr(ke->name, sizeof(ke->name), t->str_val);
+                ke->line = t->line;
+                n->kind_expr = ke;
+            }
+        }
         n->line = t->line;
         return n;
     }
@@ -10522,6 +10537,22 @@ static OfortValue default_value(OfortValType vtype, int char_len) {
         case FVAL_LOGICAL: return make_logical(0);
         default: return make_void_val();
     }
+}
+
+static OfortValue default_function_result_value(OfortNode *fn, int char_len) {
+    OfortValue v;
+    if (fn && fn->val_type == FVAL_INTEGER && fn->kind > 0) {
+        return make_integer_kind(0, fn->kind);
+    }
+    if (fn && fn->val_type == FVAL_REAL && fn->kind > 0) {
+        v = make_real(0.0);
+        v.kind = fn->kind;
+        return v;
+    }
+    if (fn && fn->val_type == FVAL_COMPLEX && fn->kind > 0) {
+        return make_complex_kind(0.0, 0.0, fn->kind);
+    }
+    return default_value(fn ? fn->val_type : FVAL_VOID, char_len);
 }
 
 static int decl_has_explicit_initializer(OfortNode *n) {
@@ -16396,7 +16427,7 @@ static OfortValue execute_user_function_with_args(OfortInterpreter *I, OfortFunc
     restore_saved_vars(I, func);
     res_name = fn->result_name[0] ? fn->result_name : fn->name;
     if (!procedure_body_declares_name(fn->children[0], res_name)) {
-        declare_var(I, res_name, default_value(fn->val_type, 1));
+        declare_var(I, res_name, default_function_result_value(fn, 1));
     }
     double proc_profile_start = begin_procedure_profile(I, func);
     char prev_module_name[256];
@@ -16427,6 +16458,13 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 
     switch (n->type) {
     case FND_INT_LIT:
+        if (n->kind_expr) {
+            OfortValue kv = eval_node(I, n->kind_expr);
+            int runtime_kind = (int)val_to_int(kv);
+            free_value(&kv);
+            reject_unsupported_kind(I, FVAL_INTEGER, runtime_kind);
+            return make_integer_kind(n->int_val, runtime_kind);
+        }
         if (n->kind == 16 && n->str_val[0]) return make_integer128(parse_int128_text(n->str_val));
         return make_integer_kind(n->int_val, n->kind);
 
@@ -17604,7 +17642,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             const char *res_name = fn->result_name[0] ? fn->result_name : fn->name;
             if (!procedure_body_declares_name(fn->children[0], res_name)) {
                 int result_char_len = fn->val_type == FVAL_CHARACTER && fn->char_len > 0 ? fn->char_len : 1;
-                declare_var(I, res_name, default_value(fn->val_type, result_char_len));
+                declare_var(I, res_name, default_function_result_value(fn, result_char_len));
             }
 
             /* Execute body */
@@ -18160,7 +18198,9 @@ static void annotate_procedure_params(OfortInterpreter *I, OfortNode *n) {
     if (!body) return;
 
     if (n->type == FND_FUNCTION && n->kind_expr &&
-        (n->val_type == FVAL_REAL || n->val_type == FVAL_DOUBLE)) {
+        (n->val_type == FVAL_INTEGER || n->val_type == FVAL_REAL ||
+         n->val_type == FVAL_DOUBLE || n->val_type == FVAL_COMPLEX ||
+         n->val_type == FVAL_LOGICAL)) {
         int result_kind = declaration_signature_kind(I, n);
         if (result_kind > 0) {
             n->kind = result_kind;
@@ -18933,7 +18973,7 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
         restore_saved_vars(I, func);
         const char *res_name = fn->result_name[0] ? fn->result_name : fn->name;
         if (!procedure_body_declares_name(fn->children[0], res_name)) {
-            declare_var(I, res_name, default_value(fn->val_type, 1));
+            declare_var(I, res_name, default_function_result_value(fn, 1));
         }
 
         double proc_profile_start = begin_procedure_profile(I, func);
