@@ -28104,14 +28104,14 @@ unresolved_external_call_done:
         }
         OfortVar *var = find_var(I, n->name);
         if (!var) ofort_error(I, "Variable '%s' not found for ALLOCATE", n->name);
-        if (var->val.type == FVAL_ARRAY && var->val.v.arr.allocated) {
+        if (!var->is_pointer && var->val.type == FVAL_ARRAY && var->val.v.arr.allocated) {
             if (n->param_names[0][0]) {
                 set_allocate_status(I, n, 5014, "Attempt to allocate an allocated object");
                 break;
             }
             ofort_error(I, "Attempting to allocate already allocated variable '%s'", n->name);
         }
-        if (var->is_allocatable && var->val.type != FVAL_ARRAY && var->scalar_allocated) {
+        if (!var->is_pointer && var->is_allocatable && var->val.type != FVAL_ARRAY && var->scalar_allocated) {
             if (n->param_names[0][0]) {
                 set_allocate_status(I, n, 5014, "Attempt to allocate an allocated object");
                 break;
@@ -28278,6 +28278,7 @@ unresolved_external_call_done:
         if (elem_type == FVAL_CHARACTER) var->char_len = alloc_char_len;
         var->scalar_allocated = 0;
         var->is_initialized = 1;
+        if (var->is_pointer) var->pointer_associated = 1;
         set_array_lower_bounds(&var->val, lower_bounds, ndims);
         if (n->children[0]) {
             OfortValue source = eval_node(I, n->children[0]);
