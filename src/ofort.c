@@ -33792,6 +33792,11 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (vector && selected > result_len) ofort_error(I, "PACK VECTOR is too short");
         dims[0] = result_len;
         result = make_array(array->v.arr.elem_type, dims, 1);
+        result.kind = array->kind;
+        if (array->v.arr.elem_type_name[0]) {
+            copy_cstr(result.v.arr.elem_type_name, sizeof(result.v.arr.elem_type_name),
+                      array->v.arr.elem_type_name);
+        }
 
         for (int i = 0; i < array->v.arr.len; i++) {
             int take;
