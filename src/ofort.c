@@ -17736,6 +17736,15 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                         break;
                     }
                 }
+                if (!suppress_root_uninit) {
+                    for (int fi = 0; fi < root_td->n_fields; fi++) {
+                        if (str_eq_nocase(n->name, root_td->field_names[fi]) &&
+                            (root_td->field_is_allocatable[fi] || root_td->field_is_pointer[fi])) {
+                            suppress_root_uninit = 1;
+                            break;
+                        }
+                    }
+                }
             }
         }
         if (suppress_root_uninit) I->strict_uninitialized = 0;
