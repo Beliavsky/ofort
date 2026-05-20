@@ -16352,7 +16352,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                                                 v->pointer_slice_stride);
             return copy_value(v->val);
         }
-        if (I->strict_uninitialized && !v->is_initialized && !v->is_allocatable) {
+        if (I->strict_uninitialized && !v->is_initialized && !v->is_allocatable &&
+            !(v->val.type == FVAL_ARRAY && v->val.v.arr.len == 0)) {
             ofort_error(I, "Variable '%s' is used before it is set at line %d", n->name, n->line);
         }
         return copy_value(v->val);
@@ -17036,7 +17037,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                                                         v->pointer_slice_stride);
                     return copy_value(v->val);
                 }
-                if (I->strict_uninitialized && !v->is_initialized && !v->is_allocatable) {
+                if (I->strict_uninitialized && !v->is_initialized && !v->is_allocatable &&
+                    !(v->val.type == FVAL_ARRAY && v->val.v.arr.len == 0)) {
                     ofort_error(I, "Variable '%s' is used before it is set at line %d", n->name, n->line);
                 }
                 return copy_value(v->val);
@@ -31973,6 +31975,26 @@ static OfortValue shift_scalar_value(const char *upper, OfortValue value_arg, Of
     return make_integer_kind(value_arg.v.i >> (unsigned int)shift, kind);
 }
 
+static OfortValue minmaxval_empty_identity(OfortValue *array, int want_max) {
+    OfortValType elem_type = array ? array->v.arr.elem_type : FVAL_VOID;
+    int kind = array && array->kind ? array->kind : 4;
+    if (elem_type == FVAL_INTEGER) {
+        if (kind == 1) return make_integer_kind(want_max ? -128 : 127, 1);
+        if (kind == 2) return make_integer_kind(want_max ? -32768 : 32767, 2);
+        if (kind == 8) return make_integer_kind(want_max ? LLONG_MIN : LLONG_MAX, 8);
+        if (kind == 16) {
+            __int128 huge = parse_int128_text("170141183460469231731687303715884105727");
+            return make_integer128(want_max ? -huge - 1 : huge);
+        }
+        return make_integer_kind(want_max ? -2147483647LL - 1LL : 2147483647LL, 4);
+    }
+    if (elem_type == FVAL_DOUBLE || kind == 8)
+        return make_double(want_max ? -DBL_MAX : DBL_MAX);
+    if (elem_type == FVAL_REAL)
+        return make_real(want_max ? -FLT_MAX : FLT_MAX);
+    return default_value(elem_type, 1);
+}
+
 static OfortValue minmaxval_dim_result(OfortInterpreter *I, OfortValue *array, int dim, int want_max, OfortValue *mask) {
     int rank = array->v.arr.n_dims;
     int result_dims[7];
@@ -32005,8 +32027,7 @@ static OfortValue minmaxval_dim_result(OfortInterpreter *I, OfortValue *array, i
             free_value(&elem);
         }
         if (!found) {
-            best = default_value(array->v.arr.elem_type, 1);
-            best.kind = array->kind ? array->kind : 4;
+            best = minmaxval_empty_identity(array, want_max);
         }
         return best;
     }
@@ -32042,8 +32063,7 @@ static OfortValue minmaxval_dim_result(OfortInterpreter *I, OfortValue *array, i
             free_value(&elem);
         }
         if (!found) {
-            best = default_value(array->v.arr.elem_type, 1);
-            best.kind = array->kind ? array->kind : 4;
+            best = minmaxval_empty_identity(array, want_max);
         }
         free_value(&result.v.arr.data[ri]);
         result.v.arr.data[ri] = best;
@@ -33369,7 +33389,8 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
     if (strcmp(upper, "HUGE") == 0) {
         int kind;
         if (nargs < 1) ofort_error(I, "HUGE requires 1 argument");
-        if (args[0].type == FVAL_INTEGER) {
+        if (args[0].type == FVAL_INTEGER ||
+            (args[0].type == FVAL_ARRAY && args[0].v.arr.elem_type == FVAL_INTEGER)) {
             kind = args[0].kind ? args[0].kind : 4;
             if (kind == 1) return make_integer_kind(127, 1);
             if (kind == 2) return make_integer_kind(32767, 2);
@@ -33379,7 +33400,9 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             }
             return make_integer_kind(2147483647LL, 4);
         }
-        if (args[0].type == FVAL_DOUBLE || args[0].kind == 8) return make_double(DBL_MAX);
+        if (args[0].type == FVAL_DOUBLE ||
+            (args[0].type == FVAL_ARRAY && args[0].v.arr.elem_type == FVAL_DOUBLE) ||
+            args[0].kind == 8) return make_double(DBL_MAX);
         return make_real(FLT_MAX);
     }
     if (strcmp(upper, "TINY") == 0) {
@@ -34270,7 +34293,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             return minmaxval_dim_result(I, &args[array_idx], (int)val_to_int(args[dim_idx]), 1,
                                         (mask_idx >= 0 && mask_idx < nargs) ? &args[mask_idx] : NULL);
         if (args[array_idx].v.arr.len == 0)
-            ofort_error(I, "MAXVAL requires a non-empty array");
+            return minmaxval_empty_identity(&args[array_idx], 1);
         if (mask_idx >= 0 && mask_idx < nargs) {
             OfortValue best = make_void_val();
             int found = 0;
@@ -34288,8 +34311,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                 free_value(&elem);
             }
             if (!found) {
-                best = default_value(args[array_idx].v.arr.elem_type, 1);
-                best.kind = args[array_idx].kind ? args[array_idx].kind : 4;
+                best = minmaxval_empty_identity(&args[array_idx], 1);
             }
             return best;
         }
@@ -34351,7 +34373,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             return minmaxval_dim_result(I, &args[array_idx], (int)val_to_int(args[dim_idx]), 0,
                                         (mask_idx >= 0 && mask_idx < nargs) ? &args[mask_idx] : NULL);
         if (args[array_idx].v.arr.len == 0)
-            ofort_error(I, "MINVAL requires a non-empty array");
+            return minmaxval_empty_identity(&args[array_idx], 0);
         if (mask_idx >= 0 && mask_idx < nargs) {
             OfortValue best = make_void_val();
             int found = 0;
@@ -34369,8 +34391,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                 free_value(&elem);
             }
             if (!found) {
-                best = default_value(args[array_idx].v.arr.elem_type, 1);
-                best.kind = args[array_idx].kind ? args[array_idx].kind : 4;
+                best = minmaxval_empty_identity(&args[array_idx], 0);
             }
             return best;
         }
