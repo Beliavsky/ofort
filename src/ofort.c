@@ -18268,6 +18268,8 @@ static int generic_dummy_signature_same(OfortNode *a, OfortNode *b) {
         int bk = generic_effective_kind(b->param_types[i], b->param_kinds[i]);
         if (at != bt) return 0;
         if ((is_numeric_type(at) || at == FVAL_LOGICAL) && ak != bk) return 0;
+        if (at == FVAL_DERIVED &&
+            !str_eq_nocase(a->param_type_names[i], b->param_type_names[i])) return 0;
         if (a->param_n_dims[i] != b->param_n_dims[i]) return 0;
         if (a->param_optional[i] != b->param_optional[i]) return 0;
     }
