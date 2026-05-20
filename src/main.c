@@ -2252,6 +2252,33 @@ static int reachable_line_is_interface_start(SourceLine *line) {
     return starts_with_word_nocase(p, "interface");
 }
 
+static int reachable_interface_name(SourceLine *line, char *name, size_t name_size) {
+    const char *p;
+    size_t n = 0;
+    if (!line || !name || name_size == 0) return 0;
+    name[0] = '\0';
+    p = skip_space(line->text);
+    if (!starts_with_word_nocase(p, "interface")) return 0;
+    p += 9;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (!identifier_char((unsigned char)*p) || isdigit((unsigned char)*p)) return 0;
+    while (identifier_char((unsigned char)*p) && n + 1 < name_size) {
+        name[n++] = (char)tolower((unsigned char)*p++);
+    }
+    name[n] = '\0';
+    return n > 0;
+}
+
+static int reachable_interface_is_operator_or_assignment(SourceLine *line) {
+    const char *p;
+    if (!line) return 0;
+    p = skip_space(line->text);
+    if (!starts_with_word_nocase(p, "interface")) return 0;
+    p += 9;
+    while (*p && isspace((unsigned char)*p)) p++;
+    return starts_with_word_nocase(p, "operator") || starts_with_word_nocase(p, "assignment");
+}
+
 static int reachable_line_is_end_interface(SourceLine *line) {
     const char *p;
     if (!line) return 0;
@@ -2530,23 +2557,6 @@ static int append_reachable_unit_separator(char **out, size_t *out_len, size_t *
     return 1;
 }
 
-static int append_reachable_public_list(char **out, size_t *out_len, size_t *out_cap,
-                                        ReachableProc *procs, int n_procs, int module_index) {
-    int n_written = 0;
-    for (int p = 0; p < n_procs; p++) {
-        if (!procs[p].keep || procs[p].module_index != module_index) continue;
-        if (n_written == 0) {
-            if (!append_text(out, out_len, out_cap, "public :: ")) return 0;
-        } else {
-            if (!append_text(out, out_len, out_cap, ", ")) return 0;
-        }
-        if (!append_text(out, out_len, out_cap, procs[p].name)) return 0;
-        n_written++;
-    }
-    if (n_written > 0 && !append_text(out, out_len, out_cap, "\n")) return 0;
-    return 1;
-}
-
 static void reachable_collect_identifiers(const char *text, ReachableName *names, int *n_names, int cap) {
     int in_string = 0;
     char quote = '\0';
@@ -2584,9 +2594,9 @@ static void reachable_collect_identifiers(const char *text, ReachableName *names
 
 static char *prune_source_to_reachable(const char *source) {
     SourceLine *lines;
-    ReachableModule modules[256];
-    ReachableProc procs[1024];
-    ReachableName names[2048];
+    ReachableModule modules[1024];
+    ReachableProc procs[8192];
+    ReachableName names[16384];
     int n_lines = 0, n_modules = 0, n_procs = 0, n_names = 0;
     int program_start = -1, program_end = -1;
     int changed = 1;
@@ -2671,6 +2681,31 @@ static char *prune_source_to_reachable(const char *source) {
 
     while (changed) {
         changed = 0;
+        for (int mi = 0; mi < n_modules; mi++) {
+            int spec_end = modules[mi].has_contains ? modules[mi].line_contains : modules[mi].line_end;
+            for (int j = modules[mi].line_start; j <= spec_end; j++) {
+                char interface_name[128];
+                int interface_end;
+                if (!reachable_interface_is_operator_or_assignment(&lines[j]) &&
+                    (!reachable_interface_name(&lines[j], interface_name, sizeof(interface_name)) ||
+                     reachable_name_index(names, n_names, interface_name) < 0)) {
+                    continue;
+                }
+                interface_end = j;
+                while (interface_end < spec_end && !reachable_line_is_end_interface(&lines[interface_end])) {
+                    interface_end++;
+                }
+                {
+                    int old_n_names = n_names;
+                    for (int k = j; k <= interface_end; k++) {
+                        reachable_collect_identifiers(lines[k].text, names, &n_names,
+                                                      (int)(sizeof(names) / sizeof(names[0])));
+                    }
+                    if (n_names > old_n_names) changed = 1;
+                }
+                j = interface_end;
+            }
+        }
         for (int i = 0; i < n_names; i++) {
             for (int pi = 0; pi < n_procs; pi++) {
                 if (!string_eq_nocase(procs[pi].name, names[i].name) || procs[pi].keep) continue;
@@ -2720,6 +2755,48 @@ static char *prune_source_to_reachable(const char *source) {
         }
     }
 
+    changed = 1;
+    while (changed) {
+        changed = 0;
+        for (int mi = 0; mi < n_modules; mi++) {
+            int spec_end = modules[mi].line_contains >= 0 ? modules[mi].line_contains : modules[mi].line_end;
+            for (int j = modules[mi].line_start + 1; j < spec_end; j++) {
+                char interface_name[128];
+                int interface_end;
+                if (!reachable_interface_is_operator_or_assignment(&lines[j]) &&
+                    (!reachable_interface_name(&lines[j], interface_name, sizeof(interface_name)) ||
+                     reachable_name_index(names, n_names, interface_name) < 0)) {
+                    continue;
+                }
+                interface_end = j;
+                while (interface_end < spec_end && !reachable_line_is_end_interface(&lines[interface_end])) {
+                    interface_end++;
+                }
+                if (interface_end < spec_end) {
+                    int old_n_names = n_names;
+                    for (int k = j; k <= interface_end; k++) {
+                        reachable_collect_identifiers(lines[k].text, names, &n_names,
+                                                      (int)(sizeof(names) / sizeof(names[0])));
+                    }
+                    if (n_names > old_n_names) changed = 1;
+                }
+                j = interface_end;
+            }
+        }
+        for (int i = 0; i < n_names; i++) {
+            for (int pi = 0; pi < n_procs; pi++) {
+                if (!string_eq_nocase(procs[pi].name, names[i].name) || procs[pi].keep) continue;
+                procs[pi].keep = 1;
+                modules[procs[pi].module_index].keep = 1;
+                changed = 1;
+                for (int j = procs[pi].line_start; j <= procs[pi].line_end; j++) {
+                    reachable_collect_identifiers(lines[j].text, names, &n_names,
+                                                  (int)(sizeof(names) / sizeof(names[0])));
+                }
+            }
+        }
+    }
+
     for (int i = 0; i < n_modules; i++) {
         if (!modules[i].keep) continue;
         if (!modules[i].has_contains) {
@@ -2747,6 +2824,26 @@ static char *prune_source_to_reachable(const char *source) {
                     if (!append_reachable_use_only(&out, &out_len, &out_cap, lines, j, use_end,
                                                    names, n_names)) goto fail;
                     j = use_end;
+                    continue;
+                }
+                if (j != modules[i].line_start && j != modules[i].line_end &&
+                    reachable_line_is_interface_start(&lines[j])) {
+                    char interface_name[128];
+                    int interface_end = j;
+                    int keep_interface = reachable_interface_is_operator_or_assignment(&lines[j]) ||
+                                         (reachable_interface_name(&lines[j], interface_name, sizeof(interface_name)) &&
+                                          reachable_name_index(names, n_names, interface_name) >= 0);
+                    while (interface_end < modules[i].line_end &&
+                           !reachable_line_is_end_interface(&lines[interface_end])) {
+                        interface_end++;
+                    }
+                    if (keep_interface) {
+                        for (int k = j; k <= interface_end; k++) {
+                            if (!append_text_n(&out, &out_len, &out_cap, lines[k].span.start,
+                                               (size_t)(lines[k].span.end - lines[k].span.start))) goto fail;
+                        }
+                    }
+                    j = interface_end;
                     continue;
                 }
                 if (j != modules[i].line_start && j != modules[i].line_end &&
@@ -2779,7 +2876,13 @@ static char *prune_source_to_reachable(const char *source) {
             for (int j = modules[i].line_start; j <= modules[i].line_contains; j++) {
                 char type_name[128];
                 if (reachable_line_is_public_access(&lines[j])) {
-                    if (!append_reachable_public_list(&out, &out_len, &out_cap, procs, n_procs, i)) goto fail;
+                    int access_end = j;
+                    while (access_end < modules[i].line_contains &&
+                           reachable_line_has_trailing_amp(&lines[access_end])) {
+                        access_end++;
+                    }
+                    if (!append_reachable_access_list(&out, &out_len, &out_cap, lines, j, access_end,
+                                                      names, n_names)) goto fail;
                     while (j < modules[i].line_contains && reachable_line_has_trailing_amp(&lines[j])) j++;
                     continue;
                 }
@@ -2795,7 +2898,22 @@ static char *prune_source_to_reachable(const char *source) {
                     continue;
                 }
                 if (reachable_line_is_interface_start(&lines[j])) {
-                    while (j < modules[i].line_contains && !reachable_line_is_end_interface(&lines[j])) j++;
+                    char interface_name[128];
+                    int interface_end = j;
+                    int keep_interface = reachable_interface_is_operator_or_assignment(&lines[j]) ||
+                                         (reachable_interface_name(&lines[j], interface_name, sizeof(interface_name)) &&
+                                          reachable_name_index(names, n_names, interface_name) >= 0);
+                    while (interface_end < modules[i].line_contains &&
+                           !reachable_line_is_end_interface(&lines[interface_end])) {
+                        interface_end++;
+                    }
+                    if (keep_interface) {
+                        for (int k = j; k <= interface_end; k++) {
+                            if (!append_text_n(&out, &out_len, &out_cap, lines[k].span.start,
+                                               (size_t)(lines[k].span.end - lines[k].span.start))) goto fail;
+                        }
+                    }
+                    j = interface_end;
                     continue;
                 }
                 if (reachable_line_is_prunable_decl_start(&lines[j])) {
@@ -4718,7 +4836,7 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
     if (!source) {
         return 2;
     }
-    if (g_reachable_mode && g_fast_mode && !g_line_profile && !g_procedure_profile) {
+    if (g_reachable_mode && (g_fast_mode || g_write_reachable_path) && !g_line_profile && !g_procedure_profile) {
         char *reachable_source = prune_source_to_reachable(source);
         if (reachable_source) {
             free(source);
@@ -4728,11 +4846,6 @@ static int execute_source_text(const char *text, int print_expr_statements, int 
     if (g_write_reachable_path) {
         char *emitted_source = NULL;
         size_t emitted_len = 0, emitted_cap = 0;
-        if (!g_fast_mode) {
-            fprintf(stderr, "--write-reachable requires --fast\n");
-            free(source);
-            return 2;
-        }
         if (!append_text(&emitted_source, &emitted_len, &emitted_cap,
                          "! Generated by ofort --write-reachable\n") ||
             !append_text(&emitted_source, &emitted_len, &emitted_cap,
@@ -8559,7 +8672,7 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --std=f2023 rejects known nonstandard extensions; --std=legacy is the default\n");
     fprintf(stderr, "       --fast enables safe interpreter fast paths and suppresses warnings\n");
     fprintf(stderr, "       --reachable with --fast prunes unreachable module procedure bodies before execution\n");
-    fprintf(stderr, "       --write-reachable file writes the source after --fast reachable pruning; implies --reachable\n");
+    fprintf(stderr, "       --write-reachable file writes source after reachable pruning; implies --reachable\n");
     fprintf(stderr, "       --cache caches normalized/free-form source in .ofort_cache for repeated runs\n");
     fprintf(stderr, "       --no-specialize disables specialized pattern/program fast paths\n");
     fprintf(stderr, "       --native name=dll:symbol[,abi] calls a native shared-library subroutine; default ABI is r8arr_r8arr\n");
