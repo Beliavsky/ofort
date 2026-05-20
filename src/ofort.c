@@ -54,6 +54,7 @@ typedef struct {
     int intent;       /* 0=none,1=IN,2=OUT,3=INOUT */
     int is_value;
     int is_initialized;
+    int initialized_prefix_len;
     int char_len;     /* declared CHARACTER length, 0 if not CHARACTER */
     int present;      /* 0 for absent OPTIONAL dummy arguments */
     int is_optional;
@@ -1275,6 +1276,8 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 s->vars[i].val = alias_val;
                 s->vars[i].is_alias = 1;
                 s->vars[i].is_initialized = alias_val.type != FVAL_VOID;
+                s->vars[i].initialized_prefix_len =
+                    s->vars[i].is_initialized && alias_val.type == FVAL_ARRAY ? alias_val.v.arr.len : 0;
                 update_imported_module_var(I, &s->vars[i]);
                 return &s->vars[i];
             }
@@ -1288,6 +1291,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 s->vars[i].val = val;
                 s->vars[i].is_alias = 0;
                 s->vars[i].is_initialized = 0;
+                s->vars[i].initialized_prefix_len = 0;
                 s->vars[i].pointer_associated = 0;
                 s->vars[i].pointer_target[0] = '\0';
                 s->vars[i].pointer_has_slice = 0;
@@ -1313,6 +1317,8 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
             s->vars[i].val = val;
             s->vars[i].is_alias = 0;
             s->vars[i].is_initialized = val.type != FVAL_VOID;
+            s->vars[i].initialized_prefix_len =
+                s->vars[i].is_initialized && val.type == FVAL_ARRAY ? val.v.arr.len : 0;
             if (s->vars[i].is_pointer) s->vars[i].pointer_associated = 1;
             update_imported_module_var(I, &s->vars[i]);
             return &s->vars[i];
@@ -1353,6 +1359,8 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                     ps->vars[i].val = alias_val;
                     ps->vars[i].is_alias = 1;
                     ps->vars[i].is_initialized = alias_val.type != FVAL_VOID;
+                    ps->vars[i].initialized_prefix_len =
+                        ps->vars[i].is_initialized && alias_val.type == FVAL_ARRAY ? alias_val.v.arr.len : 0;
                     update_imported_module_var(I, &ps->vars[i]);
                     return &ps->vars[i];
                 }
@@ -1366,6 +1374,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                     ps->vars[i].val = val;
                     ps->vars[i].is_alias = 0;
                     ps->vars[i].is_initialized = 0;
+                    ps->vars[i].initialized_prefix_len = 0;
                     ps->vars[i].pointer_associated = 0;
                     ps->vars[i].pointer_target[0] = '\0';
                     ps->vars[i].pointer_has_slice = 0;
@@ -1391,6 +1400,8 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 ps->vars[i].val = val;
                 ps->vars[i].is_alias = 0;
                 ps->vars[i].is_initialized = val.type != FVAL_VOID;
+                ps->vars[i].initialized_prefix_len =
+                    ps->vars[i].is_initialized && val.type == FVAL_ARRAY ? val.v.arr.len : 0;
                 if (ps->vars[i].is_pointer) ps->vars[i].pointer_associated = 1;
                 update_imported_module_var(I, &ps->vars[i]);
                 return &ps->vars[i];
@@ -1430,6 +1441,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->intent = 0;
     v->is_value = 0;
     v->is_initialized = val.type != FVAL_VOID;
+    v->initialized_prefix_len = v->is_initialized && val.type == FVAL_ARRAY ? val.v.arr.len : 0;
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     v->present = 1;
     v->is_optional = 0;
@@ -1473,6 +1485,8 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
             s->vars[i].val = val;
             s->vars[i].is_alias = 0;
             s->vars[i].is_initialized = val.type != FVAL_VOID;
+            s->vars[i].initialized_prefix_len =
+                s->vars[i].is_initialized && val.type == FVAL_ARRAY ? val.v.arr.len : 0;
             s->vars[i].char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
             s->vars[i].present = val.type != FVAL_VOID;
             s->vars[i].is_optional = 0;
@@ -1496,6 +1510,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->intent = 0;
     v->is_value = 0;
     v->is_initialized = val.type != FVAL_VOID;
+    v->initialized_prefix_len = v->is_initialized && val.type == FVAL_ARRAY ? val.v.arr.len : 0;
     v->char_len = val.type == FVAL_CHARACTER && val.v.s ? (int)strlen(val.v.s) : 0;
     v->present = val.type != FVAL_VOID;
     v->is_optional = 0;
@@ -1537,6 +1552,7 @@ static OfortVar *declare_alias_var(OfortInterpreter *I, const char *name, OfortV
     v->intent = target->intent;
     v->is_value = target->is_value;
     v->is_initialized = target->is_initialized;
+    v->initialized_prefix_len = target->initialized_prefix_len;
     v->char_len = target->char_len;
     v->present = target->present;
     v->is_optional = target->is_optional;
@@ -2287,6 +2303,7 @@ static void copy_imported_var_attrs(OfortVar *dst, const OfortVar *src) {
     dst->intent = src->intent;
     dst->is_value = src->is_value;
     dst->is_initialized = src->is_initialized;
+    dst->initialized_prefix_len = src->initialized_prefix_len;
     dst->char_len = src->char_len;
     dst->present = src->present;
     dst->is_optional = src->is_optional;
@@ -11076,6 +11093,64 @@ static int assign_packed_array_element(OfortValue *arr, int index, OfortValue rh
     return 0;
 }
 
+static int copy_sequence_associated_array_back(OfortInterpreter *I, const char *name,
+                                               OfortValue *actual, const OfortValue *dummy) {
+    int shape_differs = 0;
+    if (!actual || !dummy || actual->type != FVAL_ARRAY || dummy->type != FVAL_ARRAY) return 0;
+    if (dummy->v.arr.len > actual->v.arr.len) return 0;
+    if (actual->v.arr.n_dims != dummy->v.arr.n_dims) {
+        shape_differs = 1;
+    } else {
+        for (int d = 0; d < actual->v.arr.n_dims && d < 7; d++) {
+            if (actual->v.arr.dims[d] != dummy->v.arr.dims[d] ||
+                actual->v.arr.lower_bounds[d] != dummy->v.arr.lower_bounds[d]) {
+                shape_differs = 1;
+                break;
+            }
+        }
+    }
+    if (!shape_differs) return 0;
+    for (int j = 0; j < dummy->v.arr.len; j++) {
+        OfortValue elem = array_element_value(dummy, j);
+        elem = coerce_assignment_value(I, name, actual->v.arr.elem_type, elem);
+        if (!assign_packed_array_element(actual, j, copy_value(elem))) {
+            if (actual->v.arr.data && j < actual->v.arr.len) {
+                free_value(&actual->v.arr.data[j]);
+                actual->v.arr.data[j] = copy_value(elem);
+            }
+        }
+        free_value(&elem);
+    }
+    return 1;
+}
+
+static void error_uninitialized_var(OfortInterpreter *I, OfortVar *var, int line) {
+    if (var && var->val.type == FVAL_ARRAY &&
+        var->initialized_prefix_len > 0 &&
+        var->initialized_prefix_len < var->val.v.arr.len) {
+        int linear = var->initialized_prefix_len;
+        int rem = linear;
+        int sub[7] = {1, 1, 1, 1, 1, 1, 1};
+        char where[128];
+        size_t len = 0;
+        for (int d = 0; d < var->val.v.arr.n_dims && d < 7; d++) {
+            int extent = var->val.v.arr.dims[d] > 0 ? var->val.v.arr.dims[d] : 1;
+            sub[d] = var->val.v.arr.lower_bounds[d] + (rem % extent);
+            rem /= extent;
+        }
+        len += (size_t)snprintf(where + len, sizeof(where) - len, "%s(", var->name);
+        for (int d = 0; d < var->val.v.arr.n_dims && d < 7 && len < sizeof(where); d++) {
+            len += (size_t)snprintf(where + len, sizeof(where) - len,
+                                    "%s%d", d ? "," : "", sub[d]);
+        }
+        if (len < sizeof(where)) snprintf(where + len, sizeof(where) - len, ")");
+        ofort_error(I, "Variable '%s' is used before it is fully set; first unset element is %s at line %d",
+                    var->name, where, line);
+    }
+    ofort_error(I, "Variable '%s' is used before it is set at line %d",
+                var ? var->name : "", line);
+}
+
 static void *ofort_native_load_library(const char *path) {
 #ifdef _WIN32
     return (void *)LoadLibraryA(path);
@@ -16384,7 +16459,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         }
         if (I->strict_uninitialized && !v->is_initialized && !v->is_allocatable &&
             !(v->val.type == FVAL_ARRAY && v->val.v.arr.len == 0)) {
-            ofort_error(I, "Variable '%s' is used before it is set at line %d", n->name, n->line);
+            error_uninitialized_var(I, v, n->line);
         }
         return copy_value(v->val);
     }
@@ -17069,7 +17144,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 if (I->strict_uninitialized && !v->is_initialized && !v->is_allocatable &&
                     !(v->val.type == FVAL_ARRAY && v->val.v.arr.len == 0)) {
-                    ofort_error(I, "Variable '%s' is used before it is set at line %d", n->name, n->line);
+                    error_uninitialized_var(I, v, n->line);
                 }
                 return copy_value(v->val);
             }
@@ -24447,6 +24522,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             (n->val_type == FVAL_DERIVED &&
                              derived_type_is_default_defined(I, n->str_val, 0)) ||
                             debug_decl_initializer_enabled(I, n->val_type);
+        v->initialized_prefix_len =
+            v->is_initialized && v->val.type == FVAL_ARRAY ? v->val.v.arr.len : 0;
         v->is_allocatable = n->is_allocatable;
         v->scalar_allocated = 0;
         v->declared_type = n->val_type;
@@ -27830,6 +27907,18 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                                                !(args[i].type == FVAL_ARRAY && !args[i].v.arr.allocated);
                     actual->is_initialized = actual->scalar_allocated ||
                                              (actual->val.type == FVAL_ARRAY && actual->val.v.arr.allocated);
+                    continue;
+                }
+                if (actual && copy_sequence_associated_array_back(I, actual_node->name, &actual->val, &args[i])) {
+                    if (args[i].type == FVAL_ARRAY &&
+                        args[i].v.arr.len > actual->initialized_prefix_len) {
+                        actual->initialized_prefix_len = args[i].v.arr.len;
+                    }
+                    actual->is_initialized = actual->is_initialized ||
+                                             (args[i].type == FVAL_ARRAY &&
+                                              actual->val.type == FVAL_ARRAY &&
+                                              args[i].v.arr.len == actual->val.v.arr.len &&
+                                              param_copyback_initialized[i]);
                     continue;
                 }
                 set_var(I, actual_node->name, copy_value(args[i]));
