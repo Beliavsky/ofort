@@ -18244,6 +18244,59 @@ static void annotate_procedure_params(OfortInterpreter *I, OfortNode *n) {
     }
 }
 
+static int generic_effective_kind(OfortValType type, int kind) {
+    if (kind == -1) return -1;
+    if (kind != 0) return kind;
+    if (type == FVAL_DOUBLE) return 8;
+    if (type == FVAL_INTEGER || type == FVAL_REAL ||
+        type == FVAL_COMPLEX || type == FVAL_LOGICAL) return 4;
+    return 0;
+}
+
+static OfortValType generic_effective_type(OfortValType type, int kind) {
+    int ek = generic_effective_kind(type, kind);
+    if (type == FVAL_REAL && ek == 8) return FVAL_DOUBLE;
+    return type;
+}
+
+static int generic_dummy_signature_same(OfortNode *a, OfortNode *b) {
+    if (!a || !b || a->n_params != b->n_params) return 0;
+    for (int i = 0; i < a->n_params; i++) {
+        OfortValType at = generic_effective_type(a->param_types[i], a->param_kinds[i]);
+        OfortValType bt = generic_effective_type(b->param_types[i], b->param_kinds[i]);
+        int ak = generic_effective_kind(a->param_types[i], a->param_kinds[i]);
+        int bk = generic_effective_kind(b->param_types[i], b->param_kinds[i]);
+        if (at != bt) return 0;
+        if ((is_numeric_type(at) || at == FVAL_LOGICAL) && ak != bk) return 0;
+        if (a->param_n_dims[i] != b->param_n_dims[i]) return 0;
+        if (a->param_optional[i] != b->param_optional[i]) return 0;
+    }
+    return 1;
+}
+
+static void validate_generic_interface_ambiguity(OfortInterpreter *I, OfortNode *iface) {
+    if (!iface || iface->type != FND_INTERFACE || !iface->name[0]) return;
+    for (int i = 0; i < iface->n_params; i++) {
+        OfortFunc *fi = find_func(I, iface->param_names[i]);
+        if (!fi) fi = find_func_in_module(I, iface->param_names[i], I->active_module_name);
+        if (!fi || !fi->node) continue;
+        annotate_procedure_params(I, fi->node);
+        for (int j = i + 1; j < iface->n_params; j++) {
+            OfortFunc *fj = find_func(I, iface->param_names[j]);
+            if (!fj) fj = find_func_in_module(I, iface->param_names[j], I->active_module_name);
+            if (!fj || !fj->node) continue;
+            if (fi->is_function != fj->is_function) continue;
+            annotate_procedure_params(I, fj->node);
+            if (generic_dummy_signature_same(fi->node, fj->node)) {
+                I->current_line = fi->node->line > 0 ? fi->node->line : iface->line;
+                ofort_error(I,
+                            "Ambiguous interfaces in generic interface '%s' for '%s' and '%s'",
+                            iface->name, fi->node->name, fj->node->name);
+            }
+        }
+    }
+}
+
 static int procedure_body_declares_name(OfortNode *body, const char *name) {
     if (!body || !name || !name[0]) return 0;
     for (int i = 0; i < body->n_stmts; i++) {
@@ -23520,6 +23573,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
             }
             I->n_namelists = namelist_start;
+            for (int i = 0; i < body->n_stmts; i++) {
+                OfortNode *s = body->stmts[i];
+                if (s && s->type == FND_INTERFACE) {
+                    validate_generic_interface_ambiguity(I, s);
+                }
+            }
         }
         copy_cstr(I->active_module_name, sizeof(I->active_module_name), prev_module_name);
         pop_scope(I);
