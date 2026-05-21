@@ -35663,12 +35663,16 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         OfortValType result_type = (args[0].v.arr.elem_type == FVAL_DOUBLE ||
                                     args[1].v.arr.elem_type == FVAL_DOUBLE) ?
                                    FVAL_DOUBLE : FVAL_REAL;
+        int result_kind = (value_declared_kind(&args[0]) == 8 ||
+                           value_declared_kind(&args[1]) == 8 ||
+                           result_type == FVAL_DOUBLE) ? 8 : 4;
         if (args[0].v.arr.n_dims == 2 && args[1].v.arr.n_dims == 2) {
             m = args[0].v.arr.dims[0]; k1 = args[0].v.arr.dims[1];
             k2 = args[1].v.arr.dims[0]; nn = args[1].v.arr.dims[1];
             if (k1 != k2) ofort_error(I, "MATMUL: incompatible dimensions");
             int dims[2] = {m, nn};
             OfortValue result = make_array(result_type, dims, 2);
+            set_numeric_array_kind(&result, result_kind);
             for (int i = 0; i < m; i++) {
                 for (int j = 0; j < nn; j++) {
                     double sum = 0;
@@ -35683,6 +35687,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                     free_value(&result.v.arr.data[i + j * m]);
                     result.v.arr.data[i + j * m] =
                         result_type == FVAL_DOUBLE ? make_double(sum) : make_real(sum);
+                    result.v.arr.data[i + j * m].kind = result_kind;
                 }
             }
             return result;
@@ -35695,6 +35700,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             if (k1 != k2) ofort_error(I, "MATMUL: incompatible dimensions");
             int dims[1] = {m};
             OfortValue result = make_array(result_type, dims, 1);
+            set_numeric_array_kind(&result, result_kind);
             for (int i = 0; i < m; i++) {
                 double sum = 0;
                 for (int kk = 0; kk < k1; kk++) {
@@ -35707,6 +35713,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                 free_value(&result.v.arr.data[i]);
                 result.v.arr.data[i] =
                     result_type == FVAL_DOUBLE ? make_double(sum) : make_real(sum);
+                result.v.arr.data[i].kind = result_kind;
             }
             return result;
         }
@@ -35718,6 +35725,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             if (k1 != k2) ofort_error(I, "MATMUL: incompatible dimensions");
             int dims[1] = {nn};
             OfortValue result = make_array(result_type, dims, 1);
+            set_numeric_array_kind(&result, result_kind);
             for (int j = 0; j < nn; j++) {
                 double sum = 0;
                 for (int kk = 0; kk < k1; kk++) {
@@ -35730,6 +35738,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                 free_value(&result.v.arr.data[j]);
                 result.v.arr.data[j] =
                     result_type == FVAL_DOUBLE ? make_double(sum) : make_real(sum);
+                result.v.arr.data[j].kind = result_kind;
             }
             return result;
         }
@@ -35744,6 +35753,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                 free_value(&av);
                 free_value(&bv);
             }
+            if (result_kind == 8) return make_double(sum);
             return make_real(sum);
         }
     }
