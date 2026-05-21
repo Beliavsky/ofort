@@ -12216,6 +12216,15 @@ static OfortValue make_array_with_char_len(OfortValType elem_type, int *dims, in
     return make_array_with_char_len_options(elem_type, dims, n_dims, char_len, 0);
 }
 
+static void set_numeric_array_kind(OfortValue *arr, int kind) {
+    if (!arr || arr->type != FVAL_ARRAY || kind <= 0) return;
+    if (!is_numeric_type(arr->v.arr.elem_type) && arr->v.arr.elem_type != FVAL_LOGICAL) return;
+    arr->kind = kind;
+    if (arr->v.arr.data) {
+        for (int i = 0; i < arr->v.arr.len; i++) arr->v.arr.data[i].kind = kind;
+    }
+}
+
 static int array_character_len(const OfortValue *v) {
     if (!v || v->type != FVAL_ARRAY || v->v.arr.elem_type != FVAL_CHARACTER) return 0;
     if (v->v.arr.data && v->v.arr.len > 0 && v->v.arr.data[0].type == FVAL_CHARACTER &&
@@ -28699,6 +28708,10 @@ unresolved_external_call_done:
             new_array = make_array_with_char_len(elem_type, dims, ndims, alloc_char_len);
         else
             new_array = make_array_with_char_len_options(elem_type, dims, ndims, 1, 1);
+        if (explicit_kind > 0)
+            set_numeric_array_kind(&new_array, explicit_kind);
+        else if (var->declared_kind > 0)
+            set_numeric_array_kind(&new_array, var->declared_kind);
         if (array_storage_failed(&new_array)) {
             free_value(&new_array);
             if (n->param_names[0][0]) {
