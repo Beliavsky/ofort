@@ -2659,7 +2659,14 @@ static void sync_module_vars_to_scope(OfortInterpreter *I, const char *module_na
     OfortModule *mod = find_module(I, module_name);
     if (!mod) return;
     for (int i = 0; i < mod->n_vars; i++) {
+        int mod_index = (int)(mod - I->modules);
         OfortVar *local = find_var_in_current_scope(I, mod->vars[i].name);
+        if (!local) continue;
+        if (!(local->is_imported_module_var &&
+              local->import_module_index == mod_index &&
+              local->import_var_index == i)) {
+            continue;
+        }
         if (local) copy_var_payload_and_attrs(local, &mod->vars[i]);
     }
 }
