@@ -18738,6 +18738,32 @@ static OfortValType simple_elemental_result_decl_type(OfortNode *fn) {
     return fn->val_type;
 }
 
+static int simple_elemental_result_decl_kind(OfortInterpreter *I, OfortNode *fn) {
+    const char *res_name;
+    OfortNode *body;
+    if (!fn || !fn->children[0]) return 0;
+    res_name = fn->result_name[0] ? fn->result_name : fn->name;
+    body = fn->children[0];
+    for (int i = 0; i < body->n_stmts; i++) {
+        OfortNode *s = body->stmts[i];
+        OfortNode **decls = &s;
+        int n_decls = 1;
+        if (!s) continue;
+        if (s->type == FND_BLOCK) {
+            decls = s->stmts;
+            n_decls = s->n_stmts;
+        }
+        for (int j = 0; j < n_decls; j++) {
+            OfortNode *d = decls[j];
+            if (d && (d->type == FND_VARDECL || d->type == FND_PARAMDECL) &&
+                str_eq_nocase(d->name, res_name)) {
+                return declaration_signature_kind(I, d);
+            }
+        }
+    }
+    return declaration_signature_kind(I, fn);
+}
+
 static int simple_elemental_param_index(OfortNode *fn, const char *name) {
     if (!fn || !name) return -1;
     for (int i = 0; i < fn->n_params; i++) {
@@ -19149,6 +19175,7 @@ static int execute_fast_elemental_numeric_function_call(OfortInterpreter *I, Ofo
     OfortValue result;
     OfortValType result_type;
     OfortValType declared_result_type;
+    int result_kind;
     double params[OFORT_MAX_PARAMS];
     if (!I || !I->fast_mode || I->line_profile_enabled ||
         !func || !fn || !fn->is_elemental ||
@@ -19173,7 +19200,14 @@ static int execute_fast_elemental_numeric_function_call(OfortInterpreter *I, Ofo
             return 0;
         }
     }
-    declared_result_type = simple_elemental_result_decl_type(fn);
+    {
+        char prev_module_name[256];
+        copy_cstr(prev_module_name, sizeof(prev_module_name), I->active_module_name);
+        copy_cstr(I->active_module_name, sizeof(I->active_module_name), func_exec_module_name(func));
+        declared_result_type = simple_elemental_result_decl_type(fn);
+        result_kind = simple_elemental_result_decl_kind(I, fn);
+        copy_cstr(I->active_module_name, sizeof(I->active_module_name), prev_module_name);
+    }
     if (declared_result_type != FVAL_VOID &&
         declared_result_type != FVAL_REAL && declared_result_type != FVAL_DOUBLE) {
         return 0;
@@ -19184,6 +19218,8 @@ static int execute_fast_elemental_numeric_function_call(OfortInterpreter *I, Ofo
     if (result_type != FVAL_DOUBLE) result_type = FVAL_REAL;
     result = make_array_with_char_len_options(result_type, shape_arg->v.arr.dims,
                                               shape_arg->v.arr.n_dims, 1, 1);
+    if (result_kind <= 0) result_kind = value_declared_kind(shape_arg);
+    set_numeric_array_kind(&result, result_kind);
     if (array_storage_failed(&result)) return 0;
 
     double proc_profile_start = begin_procedure_profile(I, func);
@@ -19243,11 +19279,14 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
     if (!shape_arg) return 0;
     if (shape_arg->v.arr.len == 0) {
         OfortValType result_type = simple_elemental_result_decl_type(fn);
+        int result_kind = simple_elemental_result_decl_kind(I, fn);
         if (result_type == FVAL_VOID) result_type = fn->val_type;
         if (result_type == FVAL_VOID) result_type = shape_arg->v.arr.elem_type;
         result = make_array_with_char_len_options(result_type, shape_arg->v.arr.dims,
                                                   shape_arg->v.arr.n_dims,
                                                   fn->char_len > 0 ? fn->char_len : 1, 1);
+        if (result_kind <= 0) result_kind = value_declared_kind(shape_arg);
+        set_numeric_array_kind(&result, result_kind);
         *result_out = result;
         return 1;
     }
@@ -19303,6 +19342,7 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
 
         if (elem == 0) {
             result = make_array(scalar_result.type, shape_arg->v.arr.dims, shape_arg->v.arr.n_dims);
+            set_numeric_array_kind(&result, value_declared_kind(&scalar_result));
         }
         if (result.type == FVAL_ARRAY) {
             OfortValue elem_value = coerce_assignment_value(I, call->name, result.v.arr.elem_type, scalar_result);
