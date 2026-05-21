@@ -1711,6 +1711,30 @@ static int generic_actual_matches_param(OfortInterpreter *I, OfortNode *fn, int 
         optional_actual_decl_matches_param(I, actual_node, fn, param_index, allow_numeric, score)) {
         return 1;
     }
+    if (actual_node && actual_node->type == FND_IDENT) {
+        OfortVar *actual_var = find_var(I, actual_node->name);
+        if (actual_var && actual_var->is_pointer && actual_var->pointer_associated &&
+            actual_var->val.type == FVAL_ARRAY) {
+            OfortValType pointer_type = actual_var->val.v.arr.elem_type;
+            int pointer_rank = actual_var->val.v.arr.n_dims;
+            int pointer_kind = actual_var->declared_kind > 0 ?
+                actual_var->declared_kind : actual_var->val.kind;
+            if (fn->param_n_dims[param_index] == pointer_rank ||
+                fn->param_n_dims[param_index] == -1 ||
+                (fn->is_elemental && fn->param_n_dims[param_index] == 0 && pointer_rank > 0)) {
+                if (fn->param_types[param_index] == FVAL_DERIVED &&
+                    fn->param_type_names[param_index][0]) {
+                    const char *actual_name = actual_var->val.v.arr.elem_type_name;
+                    return actual_name && actual_name[0] &&
+                           type_extends_or_same(I, actual_name, fn->param_type_names[param_index]);
+                }
+                if (generic_types_match(fn->param_types[param_index], fn->param_kinds[param_index],
+                                        pointer_type, pointer_kind)) {
+                    return 1;
+                }
+            }
+        }
+    }
     actual_type = arg->type == FVAL_ARRAY ? arg->v.arr.elem_type : arg->type;
     actual_rank = arg->type == FVAL_ARRAY ? arg->v.arr.n_dims : 0;
     if (fn->param_n_dims[param_index] != actual_rank &&
@@ -11747,6 +11771,28 @@ static OfortValue pointer_referenced_value(OfortInterpreter *I, const char *targ
     if (!target) return make_void_val();
     if (!has_slice) return copy_value(target->val);
     if (target->val.type != FVAL_ARRAY) return make_void_val();
+    if (has_slice == 2) {
+        int dims[1] = { slice_count(slice_start, slice_end, slice_stride) };
+        OfortValue result = make_array(target->val.v.arr.elem_type, dims, 1);
+        result.v.arr.lower_bounds[0] = 1;
+        for (int pos = 0, sub = slice_start; pos < dims[0]; pos++, sub += slice_stride) {
+            int idx = sub - 1;
+            if (idx < 0 || idx >= target->val.v.arr.len) {
+                free_value(&result);
+                return make_void_val();
+            }
+            OfortValue elem = array_element_value(&target->val, idx);
+            if (assign_packed_array_element(&result, pos, elem)) {
+                free_value(&elem);
+            } else if (result.v.arr.data) {
+                free_value(&result.v.arr.data[pos]);
+                result.v.arr.data[pos] = elem;
+            } else {
+                free_value(&elem);
+            }
+        }
+        return result;
+    }
     if (slice_stride == 0) {
         int subs[1] = { slice_start };
         int idx = section_linear_index(&target->val, subs, 1);
@@ -11791,6 +11837,35 @@ static int write_through_pointer_var(OfortInterpreter *I, OfortVar *ptr, OfortVa
     target = find_var(I, ptr->pointer_target);
     if (!target) return 0;
     if (ptr->pointer_has_slice) {
+        if (ptr->pointer_has_slice == 2) {
+            int count = slice_count(ptr->pointer_slice_start, ptr->pointer_slice_end,
+                                    ptr->pointer_slice_stride);
+            if (target->val.type != FVAL_ARRAY) return 0;
+            if (rhs->type == FVAL_ARRAY && rhs->v.arr.len != count)
+                ofort_error(I, "Array assignment shape mismatch");
+            for (int pos = 0, sub = ptr->pointer_slice_start; pos < count;
+                 pos++, sub += ptr->pointer_slice_stride) {
+                int idx = sub - 1;
+                if (idx < 0 || idx >= target->val.v.arr.len)
+                    ofort_error(I, "Array index out of bounds");
+                OfortValue elem = rhs->type == FVAL_ARRAY ? array_element_value(rhs, pos) : copy_value(*rhs);
+                if (assign_packed_array_element(&target->val, idx, elem)) {
+                    free_value(&elem);
+                } else if (target->val.v.arr.data) {
+                    free_value(&target->val.v.arr.data[idx]);
+                    target->val.v.arr.data[idx] = elem;
+                } else {
+                    free_value(&elem);
+                }
+            }
+            free_value(&ptr->val);
+            ptr->val = pointer_referenced_value(I, ptr->pointer_target, ptr->pointer_has_slice,
+                                                ptr->pointer_slice_start, ptr->pointer_slice_end,
+                                                ptr->pointer_slice_stride);
+            target->is_initialized = 1;
+            ptr->is_initialized = 1;
+            return 1;
+        }
         if (ptr->pointer_slice_stride == 0) {
             int subs[1] = { ptr->pointer_slice_start };
             int idx;
@@ -13119,6 +13194,46 @@ static int pointer_target_descriptor(OfortInterpreter *I, OfortNode *node,
         *slice_start = range.start;
         *slice_end = range.end;
         *slice_stride = range.is_slice ? range.step : 0;
+        return 1;
+    }
+    if ((node->type == FND_FUNC_CALL ||
+         (node->type == FND_ARRAY_REF && node->children[0] &&
+          node->children[0]->type == FND_IDENT)) &&
+        node->n_stmts > 1) {
+        const char *base_name = node->type == FND_FUNC_CALL ? node->name : node->children[0]->name;
+        OfortVar *var = find_var(I, base_name);
+        int subs[7] = {0};
+        int slice_dim = -1;
+        OfortSubscriptRange slice_range;
+        if (!var || var->val.type != FVAL_ARRAY) return 0;
+        if (node->n_stmts > var->val.v.arr.n_dims) return 0;
+        memset(&slice_range, 0, sizeof(slice_range));
+        for (int d = 0; d < node->n_stmts && d < 7; d++) {
+            OfortNode *sub = node->stmts[d];
+            int lower = var->val.v.arr.lower_bounds[d];
+            int extent = var->val.v.arr.dims[d];
+            if (sub && sub->type == FND_SLICE) {
+                if (slice_dim >= 0) return 0;
+                eval_subscript_range(I, sub, lower, extent, &slice_range);
+                slice_dim = d;
+                subs[d] = slice_range.start;
+            } else {
+                OfortValue sv = eval_node(I, sub);
+                subs[d] = (int)val_to_int(sv);
+                free_value(&sv);
+            }
+        }
+        if (slice_dim < 0) return 0;
+        int start_index = section_linear_index(&var->val, subs, node->n_stmts) + 1;
+        subs[slice_dim] = slice_range.end;
+        int end_index = section_linear_index(&var->val, subs, node->n_stmts) + 1;
+        int linear_stride = slice_range.step;
+        for (int d = 0; d < slice_dim; d++) linear_stride *= var->val.v.arr.dims[d];
+        copy_cstr(name, name_size, base_name);
+        *has_slice = 2;
+        *slice_start = start_index;
+        *slice_end = end_index;
+        *slice_stride = linear_stride;
         return 1;
     }
     return 0;
@@ -24690,10 +24805,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     copy_cstr(existing->declared_type_name,
                               sizeof(existing->declared_type_name), n->str_val);
                 if (n->is_allocatable && n->intent == 2) {
+                    int preserved_char_len = n->val_type == FVAL_CHARACTER ?
+                        (decl_char_len > 0 && decl_char_len < OFORT_MAX_STRLEN - 1 ? decl_char_len :
+                         decl_char_len >= OFORT_MAX_STRLEN - 1 ? existing->char_len : 0) : 0;
                     free_value(&existing->val);
                     existing->val.type = FVAL_ARRAY;
                     memset(&existing->val.v.arr, 0, sizeof(existing->val.v.arr));
-                    existing->val.kind = n->kind;
+                    existing->val.kind = preserved_char_len > 0 ? preserved_char_len : n->kind;
                     existing->val.v.arr.elem_type = n->val_type;
                     if (n->val_type == FVAL_DERIVED)
                         copy_cstr(existing->val.v.arr.elem_type_name,
@@ -24704,6 +24822,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 } else if (n->intent != 2 && existing->val.type != FVAL_VOID) {
                     existing->is_initialized = 1;
                 }
+                if (n->val_type == FVAL_CHARACTER)
+                    existing->char_len = decl_char_len > 0 && decl_char_len < OFORT_MAX_STRLEN - 1 ?
+                        decl_char_len :
+                        decl_char_len >= OFORT_MAX_STRLEN - 1 ? existing->char_len : 0;
                 break;
             }
         }
@@ -24721,11 +24843,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 copy_cstr(existing->declared_type_name,
                           sizeof(existing->declared_type_name), n->str_val);
             if (n->is_allocatable && n->intent == 2) {
+                int preserved_char_len = n->val_type == FVAL_CHARACTER ?
+                    (decl_char_len > 0 && decl_char_len < OFORT_MAX_STRLEN - 1 ? decl_char_len :
+                     decl_char_len >= OFORT_MAX_STRLEN - 1 ? existing->char_len : 0) : 0;
                 free_value(&existing->val);
                 if (n->n_dims > 0) {
                     existing->val.type = FVAL_ARRAY;
                     memset(&existing->val.v.arr, 0, sizeof(existing->val.v.arr));
-                    existing->val.kind = n->kind;
+                    existing->val.kind = preserved_char_len > 0 ? preserved_char_len : n->kind;
                     existing->val.v.arr.elem_type = n->val_type;
                     if (n->val_type == FVAL_DERIVED)
                         copy_cstr(existing->val.v.arr.elem_type_name,
@@ -24739,7 +24864,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             } else if (n->intent != 2 && existing->val.type != FVAL_VOID) {
                 existing->is_initialized = 1;
             }
-            if (n->val_type == FVAL_CHARACTER) existing->char_len = decl_char_len;
+            if (n->val_type == FVAL_CHARACTER)
+                existing->char_len = decl_char_len > 0 && decl_char_len < OFORT_MAX_STRLEN - 1 ?
+                    decl_char_len :
+                    decl_char_len >= OFORT_MAX_STRLEN - 1 ? existing->char_len : 0;
             break;
         }
         if (existing && existing == existing_current && I->procedure_depth > 0) {
@@ -24770,7 +24898,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             } else if (existing->val.type != FVAL_VOID) {
                 existing->is_initialized = 1;
             }
-            if (n->val_type == FVAL_CHARACTER) existing->char_len = decl_char_len;
+            if (n->val_type == FVAL_CHARACTER)
+                existing->char_len = decl_char_len > 0 && decl_char_len < OFORT_MAX_STRLEN - 1 ?
+                    decl_char_len :
+                    decl_char_len >= OFORT_MAX_STRLEN - 1 ? existing->char_len : 0;
             break;
         }
         if (existing && existing == existing_current &&
@@ -24853,6 +24984,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             /* Allocatable: create empty array placeholder */
             val.type = FVAL_ARRAY;
             memset(&val.v.arr, 0, sizeof(val.v.arr));
+            if (n->val_type == FVAL_CHARACTER && decl_char_len > 0) val.kind = decl_char_len;
             val.v.arr.elem_type = n->val_type;
             val.v.arr.n_dims = n->n_dims;
             for (int i = 0; i < n->n_dims && i < 7; i++) {
