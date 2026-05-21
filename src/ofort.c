@@ -11158,9 +11158,13 @@ static int array_storage_failed(const OfortValue *v) {
 static OfortValue packed_array_element_value(const OfortValue *arr, int index) {
     if (!arr || arr->type != FVAL_ARRAY || index < 0 || index >= arr->v.arr.len) return make_void_val();
     if (arr->v.arr.real_data) {
-        return arr->v.arr.elem_type == FVAL_DOUBLE ?
-               make_double(arr->v.arr.real_data[index]) :
-               make_real(arr->v.arr.real_data[index]);
+        if (arr->v.arr.elem_type == FVAL_DOUBLE) {
+            return make_double(arr->v.arr.real_data[index]);
+        } else {
+            OfortValue value = make_real(arr->v.arr.real_data[index]);
+            if (arr->kind > 0) value.kind = arr->kind;
+            return value;
+        }
     }
     if (arr->v.arr.int_data) {
         return make_integer(arr->v.arr.int_data[index]);
@@ -11175,7 +11179,9 @@ static OfortValue array_element_value(const OfortValue *arr, int index) {
     }
     if (!arr->v.arr.data) return default_value(arr->v.arr.elem_type, 1);
     if (arr->v.arr.data[index].kind == 0 && can_defer_numeric_array_tags(arr->v.arr.elem_type)) {
-        return default_value(arr->v.arr.elem_type, 1);
+        OfortValue value = default_value(arr->v.arr.elem_type, 1);
+        if (arr->kind > 0 && is_numeric_type(value.type)) value.kind = arr->kind;
+        return value;
     }
     return copy_value(arr->v.arr.data[index]);
 }
@@ -13199,6 +13205,11 @@ static void assign_subscripted_recursive(OfortInterpreter *I, OfortValue *dst, O
             free_value(&value);
             return;
         }
+        if (dst->v.arr.elem_type != FVAL_CHARACTER)
+            value = coerce_assignment_value(I, "", dst->v.arr.elem_type, value);
+        if (dst->kind > 0 && is_numeric_type(value.type)) value.kind = dst->kind;
+        if (dst->v.arr.data && dst->v.arr.data[dst_index].kind > 0 && is_numeric_type(value.type))
+            value.kind = dst->v.arr.data[dst_index].kind;
         if (assign_packed_array_element(dst, dst_index, value)) {
             free_value(&value);
             return;
@@ -13230,11 +13241,18 @@ static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs,
         int index = section_linear_index(&var->val, subscripts, nargs);
         if (index < 0 || index >= var->val.v.arr.len)
             ofort_error(I, "Array index out of bounds");
-        if (assign_packed_array_element(&var->val, index, *rhs)) {
+        OfortValue value = copy_value(*rhs);
+        if (var->val.v.arr.elem_type != FVAL_CHARACTER)
+            value = coerce_assignment_value(I, var->name, var->val.v.arr.elem_type, value);
+        if (var->val.kind > 0 && is_numeric_type(value.type)) value.kind = var->val.kind;
+        if (var->val.v.arr.data && var->val.v.arr.data[index].kind > 0 && is_numeric_type(value.type))
+            value.kind = var->val.v.arr.data[index].kind;
+        if (assign_packed_array_element(&var->val, index, value)) {
+            free_value(&value);
             return;
         }
         free_value(&var->val.v.arr.data[index]);
-        var->val.v.arr.data[index] = copy_value(*rhs);
+        var->val.v.arr.data[index] = value;
         return;
     }
 
@@ -13270,9 +13288,18 @@ static void assign_array_ref_value(OfortInterpreter *I, OfortValue *array, Ofort
         index = section_linear_index(array, subscripts, nargs);
         if (index < 0 || index >= array->v.arr.len)
             ofort_error(I, "Array index out of bounds");
-        if (assign_packed_array_element(array, index, *rhs)) return;
+        OfortValue value = copy_value(*rhs);
+        if (array->v.arr.elem_type != FVAL_CHARACTER)
+            value = coerce_assignment_value(I, "", array->v.arr.elem_type, value);
+        if (array->kind > 0 && is_numeric_type(value.type)) value.kind = array->kind;
+        if (array->v.arr.data && array->v.arr.data[index].kind > 0 && is_numeric_type(value.type))
+            value.kind = array->v.arr.data[index].kind;
+        if (assign_packed_array_element(array, index, value)) {
+            free_value(&value);
+            return;
+        }
         free_value(&array->v.arr.data[index]);
-        array->v.arr.data[index] = copy_value(*rhs);
+        array->v.arr.data[index] = value;
         return;
     }
 
@@ -16812,6 +16839,46 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 free_value(&left); free_value(&right);
                 return arr_op;
             }
+            if (arr_op.v.arr.int_data && (scalar.type == FVAL_REAL || scalar.type == FVAL_DOUBLE)) {
+                int result_type = (scalar.type == FVAL_DOUBLE || scalar.kind == 8) ? FVAL_DOUBLE : FVAL_REAL;
+                OfortValue result = make_array_with_char_len_options((OfortValType)result_type,
+                                                                     arr_op.v.arr.dims,
+                                                                     arr_op.v.arr.n_dims, 1, 1);
+                set_array_lower_bounds(&result, arr_op.v.arr.lower_bounds, arr_op.v.arr.n_dims);
+                if (result_type == FVAL_DOUBLE) set_numeric_array_kind(&result, 8);
+                for (int i = 0; i < arr_len; i++) {
+                    double ev = (double)arr_op.v.arr.int_data[i];
+                    double res;
+                    if (left.type == FVAL_ARRAY) {
+                        switch (n->type) {
+                            case FND_ADD: res = ev + sv; break;
+                            case FND_SUB: res = ev - sv; break;
+                            case FND_MUL: res = ev * sv; break;
+                            case FND_DIV: res = ev / sv; break;
+                            case FND_POWER: res = pow(ev, sv); break;
+                            default: res = 0; break;
+                        }
+                    } else {
+                        switch (n->type) {
+                            case FND_ADD: res = sv + ev; break;
+                            case FND_SUB: res = sv - ev; break;
+                            case FND_MUL: res = sv * ev; break;
+                            case FND_DIV: res = sv / ev; break;
+                            case FND_POWER: res = pow(sv, ev); break;
+                            default: res = 0; break;
+                        }
+                    }
+                    if (result.v.arr.real_data) {
+                        result.v.arr.real_data[i] = res;
+                    } else {
+                        free_value(&result.v.arr.data[i]);
+                        result.v.arr.data[i] = result_type == FVAL_DOUBLE ? make_double(res) : make_real(res);
+                    }
+                }
+                free_value(&arr_op);
+                free_value(&left); free_value(&right);
+                return result;
+            }
             if (arr_op.v.arr.int_data) {
                 for (int i = 0; i < arr_len; i++) {
                     double ev = (double)arr_op.v.arr.int_data[i];
@@ -16845,6 +16912,45 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 free_value(&left); free_value(&right);
                 return arr_op;
+            }
+            if (arr_op.v.arr.elem_type == FVAL_INTEGER &&
+                (scalar.type == FVAL_REAL || scalar.type == FVAL_DOUBLE)) {
+                int result_type = (scalar.type == FVAL_DOUBLE || scalar.kind == 8) ? FVAL_DOUBLE : FVAL_REAL;
+                OfortValue result = make_array_with_char_len((OfortValType)result_type,
+                                                             arr_op.v.arr.dims,
+                                                             arr_op.v.arr.n_dims, 1);
+                set_array_lower_bounds(&result, arr_op.v.arr.lower_bounds, arr_op.v.arr.n_dims);
+                if (result_type == FVAL_DOUBLE) set_numeric_array_kind(&result, 8);
+                for (int i = 0; i < arr_len; i++) {
+                    OfortValue elem = array_element_value(&arr_op, i);
+                    double ev = val_to_real(elem);
+                    double res;
+                    if (left.type == FVAL_ARRAY) {
+                        switch (n->type) {
+                            case FND_ADD: res = ev + sv; break;
+                            case FND_SUB: res = ev - sv; break;
+                            case FND_MUL: res = ev * sv; break;
+                            case FND_DIV: res = ev / sv; break;
+                            case FND_POWER: res = pow(ev, sv); break;
+                            default: res = 0; break;
+                        }
+                    } else {
+                        switch (n->type) {
+                            case FND_ADD: res = sv + ev; break;
+                            case FND_SUB: res = sv - ev; break;
+                            case FND_MUL: res = sv * ev; break;
+                            case FND_DIV: res = sv / ev; break;
+                            case FND_POWER: res = pow(sv, ev); break;
+                            default: res = 0; break;
+                        }
+                    }
+                    free_value(&result.v.arr.data[i]);
+                    result.v.arr.data[i] = result_type == FVAL_DOUBLE ? make_double(res) : make_real(res);
+                    free_value(&elem);
+                }
+                free_value(&arr_op);
+                free_value(&left); free_value(&right);
+                return result;
             }
             for (int i = 0; i < arr_len; i++) {
                 double ev = val_to_real(arr_op.v.arr.data[i]);
@@ -18125,6 +18231,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             }
         }
         OfortValue arr = make_array_with_char_len(etype, dims, 1, char_len);
+        if (nelem > 0) arr.kind = elems[0].kind;
         if (etype == FVAL_DERIVED && nelem > 0 && elems[0].v.dt.type_name[0]) {
             copy_cstr(arr.v.arr.elem_type_name, sizeof(arr.v.arr.elem_type_name),
                       elems[0].v.dt.type_name);
@@ -24563,6 +24670,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     free_value(&existing->val);
                     existing->val.type = FVAL_ARRAY;
                     memset(&existing->val.v.arr, 0, sizeof(existing->val.v.arr));
+                    existing->val.kind = n->kind;
                     existing->val.v.arr.elem_type = n->val_type;
                     if (n->val_type == FVAL_DERIVED)
                         copy_cstr(existing->val.v.arr.elem_type_name,
@@ -24594,6 +24702,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 if (n->n_dims > 0) {
                     existing->val.type = FVAL_ARRAY;
                     memset(&existing->val.v.arr, 0, sizeof(existing->val.v.arr));
+                    existing->val.kind = n->kind;
                     existing->val.v.arr.elem_type = n->val_type;
                     if (n->val_type == FVAL_DERIVED)
                         copy_cstr(existing->val.v.arr.elem_type_name,
@@ -25253,6 +25362,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         OfortValue elem = array_element_value(&rhs, i);
                         if (v->val.v.arr.elem_type == FVAL_CHARACTER)
                             elem = resize_character_value(elem, v->char_len);
+                        else
+                            elem = coerce_assignment_value(I, lhs->name, v->val.v.arr.elem_type, elem);
+                        if (v->val.kind > 0 && is_numeric_type(elem.type)) elem.kind = v->val.kind;
                         if (v->val.v.arr.data && v->val.v.arr.data[i].kind > 0 && is_numeric_type(elem.type))
                             elem.kind = v->val.v.arr.data[i].kind;
                         if (assign_packed_array_element(&v->val, i, elem)) {
@@ -25281,6 +25393,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         OfortValue elem = copy_value(rhs);
                         if (v->val.v.arr.elem_type == FVAL_CHARACTER)
                             elem = resize_character_value(elem, v->char_len);
+                        else
+                            elem = coerce_assignment_value(I, lhs->name, v->val.v.arr.elem_type, elem);
+                        if (v->val.kind > 0 && is_numeric_type(elem.type)) elem.kind = v->val.kind;
                         if (v->val.v.arr.data && v->val.v.arr.data[i].kind > 0 && is_numeric_type(elem.type))
                             elem.kind = v->val.v.arr.data[i].kind;
                         if (assign_packed_array_element(&v->val, i, elem)) {
@@ -25479,6 +25594,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         }
                         for (int i = 0; i < target->v.arr.len; i++) {
                             OfortValue elem = array_element_value(&rhs, i);
+                            if (target->v.arr.elem_type != FVAL_CHARACTER)
+                                elem = coerce_assignment_value(I, lhs->name, target->v.arr.elem_type, elem);
+                            if (target->kind > 0 && is_numeric_type(elem.type)) elem.kind = target->kind;
                             if (target->v.arr.data && target->v.arr.data[i].kind > 0 && is_numeric_type(elem.type))
                                 elem.kind = target->v.arr.data[i].kind;
                             if (assign_packed_array_element(target, i, elem)) {
@@ -25491,6 +25609,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     } else {
                         for (int i = 0; i < target->v.arr.len; i++) {
                             OfortValue elem = copy_value(rhs);
+                            if (target->v.arr.elem_type != FVAL_CHARACTER)
+                                elem = coerce_assignment_value(I, lhs->name, target->v.arr.elem_type, elem);
+                            if (target->kind > 0 && is_numeric_type(elem.type)) elem.kind = target->kind;
                             if (target->v.arr.data && target->v.arr.data[i].kind > 0 && is_numeric_type(elem.type))
                                 elem.kind = target->v.arr.data[i].kind;
                             if (assign_packed_array_element(target, i, elem)) {
@@ -26798,6 +26919,21 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (cmdstat != 0 && cmdstat_idx < 0) {
                 ofort_error(I, "EXECUTE_COMMAND_LINE failed to execute command");
             }
+            break;
+        }
+        if (strcmp(call_upper, "SYSTEM") == 0) {
+            OfortValue command_val;
+            char command_buf[OFORT_MAX_STRLEN];
+            if (n->n_stmts != 1)
+                ofort_error(I, "SYSTEM requires one CHARACTER argument");
+            command_val = eval_node(I, n->stmts[0]);
+            if (command_val.type != FVAL_CHARACTER) {
+                free_value(&command_val);
+                ofort_error(I, "SYSTEM command must be CHARACTER");
+            }
+            copy_trimmed_path(command_buf, sizeof(command_buf), command_val.v.s ? command_val.v.s : "");
+            free_value(&command_val);
+            (void)system(command_buf);
             break;
         }
         if (strcmp(call_upper, "CPU_TIME") == 0) {
@@ -35465,6 +35601,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             free_value(&first);
         }
         OfortValue result = make_array_with_char_len(source->v.arr.elem_type, new_dims, n_new_dims, char_len);
+        result.kind = source->kind;
         int src_len = source->v.arr.len;
         int pad_len = pad ? pad->v.arr.len : 0;
         int strides[7];
