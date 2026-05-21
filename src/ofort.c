@@ -22645,7 +22645,13 @@ static int actual_argument_is_definable(OfortInterpreter *I, OfortNode *actual) 
     if (!actual) return 0;
     if (actual->type == FND_IDENT) {
         v = find_var(I, actual->name);
-        return v && !v->is_parameter;
+        if (v) return !v->is_parameter;
+        if (!current_scope_has_implicit_none(I)) {
+            int has_type = 0;
+            implicit_type_for_name(I, actual->name, &has_type);
+            return has_type;
+        }
+        return 0;
     }
     if (actual->type == FND_MEMBER || actual->type == FND_ARRAY_REF) {
         return actual_argument_is_definable(I, actual->children[0]);
@@ -28318,8 +28324,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (i < nargs && arg_alias[i]) {
                 pv = declare_alias_var(I, fn->param_names[i], arg_alias_var[i]);
             } else if (i < nargs && arg_present[i] &&
-                       (args[i].type != FVAL_VOID || fn->param_allocatables[i] || fn->param_pointers[i])) {
-                pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
+                       (args[i].type != FVAL_VOID || fn->param_intents[i] == 2 ||
+                        fn->param_allocatables[i] || fn->param_pointers[i])) {
+                OfortValue param_value = args[i].type != FVAL_VOID ?
+                                         copy_value(args[i]) :
+                                         (fn->param_allocatables[i] || fn->param_pointers[i] ?
+                                          make_void_val() :
+                                          (fn->param_types[i] == FVAL_DERIVED && fn->param_type_names[i][0] ?
+                                          default_derived_value(I, fn->param_type_names[i]) :
+                                          default_value(fn->param_types[i], 1)));
+                pv = declare_var(I, fn->param_names[i], param_value);
                 if (args[i].type == FVAL_CHARACTER && args[i].v.s) {
                     pv->char_len = (int)strlen(args[i].v.s);
                 } else if (args[i].type == FVAL_ARRAY && args[i].v.arr.elem_type == FVAL_CHARACTER) {
