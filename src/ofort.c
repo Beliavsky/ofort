@@ -24670,6 +24670,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 existing->is_pointer = n->is_pointer;
                 existing->is_allocatable = n->is_allocatable;
                 existing->is_target = n->is_target;
+                existing->is_parameter = n->is_parameter || n->type == FND_PARAMDECL;
+                if (!existing->is_parameter) {
+                    existing->is_imported_module_var = 0;
+                    existing->import_module_index = -1;
+                    existing->import_var_index = -1;
+                }
                 existing->declared_type = n->val_type;
                 existing->declared_kind = n->kind;
                 existing->declared_type_name[0] = '\0';
@@ -24927,7 +24933,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
         OfortVar *v = declare_var(I, n->name, val);
         if (val_is_alias) v->is_alias = 1;
-        if (n->is_parameter || n->type == FND_PARAMDECL) v->is_parameter = 1;
+        v->is_parameter = n->is_parameter || n->type == FND_PARAMDECL;
+        if (!v->is_parameter) {
+            v->is_imported_module_var = 0;
+            v->import_module_index = -1;
+            v->import_var_index = -1;
+        }
         v->is_value = n->is_value;
         v->is_initialized = decl_has_explicit_initializer(n) ||
                             n->type == FND_PARAMDECL ||
