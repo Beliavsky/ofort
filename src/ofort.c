@@ -838,6 +838,16 @@ static int make_procedure_ref_text(const char *name, char *buf, size_t buf_size)
     return 1;
 }
 
+static int make_qualified_procedure_ref_text(const char *module_name, const char *name,
+                                             char *buf, size_t buf_size) {
+    char qualified[512];
+    if (module_name && module_name[0]) {
+        snprintf(qualified, sizeof(qualified), "%s::%s", module_name, name ? name : "");
+        return make_procedure_ref_text(qualified, buf, buf_size);
+    }
+    return make_procedure_ref_text(name, buf, buf_size);
+}
+
 static const char *procedure_ref_name(const OfortValue *v) {
     const char *prefix = "__ofort_proc:";
     size_t len = strlen(prefix);
@@ -1628,6 +1638,19 @@ static OfortFunc *find_func_in_module(OfortInterpreter *I, const char *name, con
 
 static OfortFunc *find_func(OfortInterpreter *I, const char *name) {
     OfortFunc *func;
+    const char *sep;
+    if (!name) return NULL;
+    sep = strstr(name, "::");
+    if (sep) {
+        char module_name[256];
+        char proc_name[256];
+        size_t module_len = (size_t)(sep - name);
+        if (module_len >= sizeof(module_name)) module_len = sizeof(module_name) - 1;
+        memcpy(module_name, name, module_len);
+        module_name[module_len] = '\0';
+        copy_cstr(proc_name, sizeof(proc_name), sep + 2);
+        return find_func_in_module(I, proc_name, module_name);
+    }
     if (I->active_module_name[0]) {
         func = find_func_in_module(I, name, I->active_module_name);
         if (func) return func;
@@ -5994,6 +6017,8 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
         if (is_external) {
             char proc_ref[OFORT_MAX_STRLEN];
             decl->val_type = FVAL_CHARACTER;
+            decl->kind = 0;
+            decl->kind_expr = NULL;
             decl->char_len = 256;
             if (!is_pointer && make_procedure_ref_text(token_name_text(name_tok), proc_ref, sizeof(proc_ref))) {
                 OfortNode *init = alloc_node(I, FND_STRING_LIT);
@@ -16700,7 +16725,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         if (!v) {
             OfortFunc *func = find_func(I, n->name);
             char ref[320];
-            if (func && make_procedure_ref_text(n->name, ref, sizeof(ref))) {
+            if (func && make_qualified_procedure_ref_text(func_exec_module_name(func),
+                                                          n->name, ref, sizeof(ref))) {
                 return make_character(ref);
             }
             if (!current_scope_has_implicit_none(I)) {
