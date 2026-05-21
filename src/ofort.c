@@ -24842,6 +24842,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (n->val_type == FVAL_DERIVED)
                 copy_cstr(existing->declared_type_name,
                           sizeof(existing->declared_type_name), n->str_val);
+            if (n->intent == 2 && n->val_type == FVAL_DERIVED &&
+                !n->is_allocatable && !n->is_pointer && n->n_dims == 0) {
+                free_value(&existing->val);
+                existing->val = default_derived_value(I, n->str_val);
+                existing->is_initialized = 0;
+                break;
+            }
             if (n->is_allocatable && n->intent == 2) {
                 int preserved_char_len = n->val_type == FVAL_CHARACTER ?
                     (decl_char_len > 0 && decl_char_len < OFORT_MAX_STRLEN - 1 ? decl_char_len :
@@ -24883,6 +24890,13 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (n->val_type == FVAL_DERIVED)
                 copy_cstr(existing->declared_type_name,
                           sizeof(existing->declared_type_name), n->str_val);
+            if (n->intent == 2 && n->val_type == FVAL_DERIVED &&
+                !n->is_allocatable && !n->is_pointer && n->n_dims == 0) {
+                free_value(&existing->val);
+                existing->val = default_derived_value(I, n->str_val);
+                existing->is_initialized = 0;
+                break;
+            }
             if (n->is_pointer && existing->val.is_pointer_ref && existing->val.pointer_target[0]) {
                 existing->pointer_associated = 1;
                 copy_cstr(existing->pointer_target, sizeof(existing->pointer_target), existing->val.pointer_target);
