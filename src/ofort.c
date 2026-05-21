@@ -24410,7 +24410,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
     case FND_VARDECL:
     case FND_PARAMDECL: {
-        OfortValue val;
+        OfortValue val = make_void_val();
         int val_is_alias = 0;
         /* Resolve runtime kind expression (e.g., real(kind=dp) where dp is a parameter) */
         OfortValType effective_type = n->val_type;
