@@ -19119,6 +19119,16 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
         }
     }
     if (!shape_arg) return 0;
+    if (shape_arg->v.arr.len == 0) {
+        OfortValType result_type = simple_elemental_result_decl_type(fn);
+        if (result_type == FVAL_VOID) result_type = fn->val_type;
+        if (result_type == FVAL_VOID) result_type = shape_arg->v.arr.elem_type;
+        result = make_array_with_char_len_options(result_type, shape_arg->v.arr.dims,
+                                                  shape_arg->v.arr.n_dims,
+                                                  fn->char_len > 0 ? fn->char_len : 1, 1);
+        *result_out = result;
+        return 1;
+    }
 
     for (int elem = 0; elem < shape_arg->v.arr.len; elem++) {
         OfortValue scalar_result;
