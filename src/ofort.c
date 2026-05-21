@@ -12892,6 +12892,7 @@ static OfortValue eval_subscripted_array(OfortInterpreter *I, OfortValue *array,
         free_value(&lo);
         if (n_result_dims == 0) n_result_dims = 1;
         OfortValue result = make_array(array->v.arr.elem_type, result_dims, n_result_dims);
+        result.kind = array->kind;
         copy_cstr(result.v.arr.elem_type_name, sizeof(result.v.arr.elem_type_name),
                   array->v.arr.elem_type_name);
         copy_subscripted_recursive(I, array, &result, specs, rank, rank - 1, subscripts, &out_index);
@@ -12918,6 +12919,7 @@ static OfortValue eval_subscripted_array(OfortInterpreter *I, OfortValue *array,
 
     if (n_result_dims == 0) n_result_dims = 1;
     OfortValue result = make_array(array->v.arr.elem_type, result_dims, n_result_dims);
+    result.kind = array->kind;
     copy_cstr(result.v.arr.elem_type_name, sizeof(result.v.arr.elem_type_name),
               array->v.arr.elem_type_name);
     copy_subscripted_recursive(I, array, &result, specs, nargs, nargs - 1, subscripts, &out_index);
