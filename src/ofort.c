@@ -17730,6 +17730,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         }
 
         if (str_eq_nocase(n->name, "sum") && nargs == 1 &&
+            !find_func(I, n->name) && !find_generic(I, n->name) &&
             n->stmts[0]->type == FND_IDENT) {
             OfortVar *array_var = find_var(I, n->stmts[0]->name);
             if (array_var && array_var->val.type == FVAL_ARRAY) {
@@ -17759,6 +17760,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         }
 
         if (str_eq_nocase(n->name, "size") && nargs >= 1 &&
+            !find_func(I, n->name) && !find_generic(I, n->name) &&
             n->stmts[0]->type == FND_IDENT) {
             OfortVar *array_var = find_var(I, n->stmts[0]->name);
             if (array_var && array_var->val.type == FVAL_ARRAY) {
@@ -17826,6 +17828,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
              str_eq_nocase(n->name, "lbound") || str_eq_nocase(n->name, "ubound") ||
              str_eq_nocase(n->name, "shape") || str_eq_nocase(n->name, "rank") ||
              str_eq_nocase(n->name, "bit_size") || str_eq_nocase(n->name, "storage_size")) &&
+            !find_func(I, n->name) && !find_generic(I, n->name) &&
             !find_imported_extension_intrinsic(I, n->name) &&
             nargs >= 1 && n->stmts[0]->type == FND_IDENT) {
             OfortVar *inquiry_var = find_var(I, n->stmts[0]->name);
