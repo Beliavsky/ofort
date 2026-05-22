@@ -79,6 +79,12 @@ typedef struct {
     int pointer_slice_start;
     int pointer_slice_end;
     int pointer_slice_stride;
+    int pointer_section_rank;
+    int pointer_section_lower[7];
+    int pointer_section_start[7];
+    int pointer_section_end[7];
+    int pointer_section_stride[7];
+    int pointer_section_dims[7];
 } OfortVar;
 
 typedef struct OfortScope {
@@ -1225,6 +1231,26 @@ static void mark_imported_module_var(OfortInterpreter *I, OfortVar *v,
     }
 }
 
+static void clear_pointer_section_desc(OfortVar *v) {
+    if (!v) return;
+    v->pointer_section_rank = 0;
+    memset(v->pointer_section_lower, 0, sizeof(v->pointer_section_lower));
+    memset(v->pointer_section_start, 0, sizeof(v->pointer_section_start));
+    memset(v->pointer_section_end, 0, sizeof(v->pointer_section_end));
+    memset(v->pointer_section_stride, 0, sizeof(v->pointer_section_stride));
+    memset(v->pointer_section_dims, 0, sizeof(v->pointer_section_dims));
+}
+
+static void copy_pointer_section_desc(OfortVar *dst, const OfortVar *src) {
+    if (!dst || !src) return;
+    dst->pointer_section_rank = src->pointer_section_rank;
+    memcpy(dst->pointer_section_lower, src->pointer_section_lower, sizeof(dst->pointer_section_lower));
+    memcpy(dst->pointer_section_start, src->pointer_section_start, sizeof(dst->pointer_section_start));
+    memcpy(dst->pointer_section_end, src->pointer_section_end, sizeof(dst->pointer_section_end));
+    memcpy(dst->pointer_section_stride, src->pointer_section_stride, sizeof(dst->pointer_section_stride));
+    memcpy(dst->pointer_section_dims, src->pointer_section_dims, sizeof(dst->pointer_section_dims));
+}
+
 static void update_imported_module_var(OfortInterpreter *I, OfortVar *v) {
     OfortVar *remote;
     if (!I || !v || !v->is_imported_module_var ||
@@ -1242,6 +1268,7 @@ static void update_imported_module_var(OfortInterpreter *I, OfortVar *v) {
     remote->pointer_slice_start = v->pointer_slice_start;
     remote->pointer_slice_end = v->pointer_slice_end;
     remote->pointer_slice_stride = v->pointer_slice_stride;
+    copy_pointer_section_desc(remote, v);
 }
 
 static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) {
@@ -1477,6 +1504,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     v->pointer_slice_start = 0;
     v->pointer_slice_end = 0;
     v->pointer_slice_stride = 1;
+    clear_pointer_section_desc(v);
     return v;
 }
 
@@ -1546,6 +1574,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     v->pointer_slice_start = 0;
     v->pointer_slice_end = 0;
     v->pointer_slice_stride = 1;
+    clear_pointer_section_desc(v);
     return v;
 }
 
@@ -1586,6 +1615,7 @@ static OfortVar *declare_alias_var(OfortInterpreter *I, const char *name, OfortV
     v->pointer_slice_start = target->pointer_slice_start;
     v->pointer_slice_end = target->pointer_slice_end;
     v->pointer_slice_stride = target->pointer_slice_stride;
+    copy_pointer_section_desc(v, target);
     return v;
 }
 
@@ -2326,6 +2356,7 @@ static void restore_saved_vars(OfortInterpreter *I, OfortFunc *func) {
         v->pointer_slice_start = func->saved_vars[i].pointer_slice_start;
         v->pointer_slice_end = func->saved_vars[i].pointer_slice_end;
         v->pointer_slice_stride = func->saved_vars[i].pointer_slice_stride;
+        copy_pointer_section_desc(v, &func->saved_vars[i]);
     }
 }
 
@@ -2390,6 +2421,7 @@ static void store_saved_vars(OfortInterpreter *I, OfortFunc *func, OfortScope *s
         dst->pointer_slice_start = src->pointer_slice_start;
         dst->pointer_slice_end = src->pointer_slice_end;
         dst->pointer_slice_stride = src->pointer_slice_stride;
+        copy_pointer_section_desc(dst, src);
     }
 }
 
@@ -2426,6 +2458,7 @@ static void copy_imported_var_attrs(OfortVar *dst, const OfortVar *src) {
     dst->pointer_slice_start = src->pointer_slice_start;
     dst->pointer_slice_end = src->pointer_slice_end;
     dst->pointer_slice_stride = src->pointer_slice_stride;
+    copy_pointer_section_desc(dst, src);
 }
 
 static void copy_var_payload_and_attrs(OfortVar *dst, const OfortVar *src) {
@@ -11856,12 +11889,81 @@ static OfortValue pointer_referenced_value_preserve_lbound(OfortInterpreter *I, 
     return result;
 }
 
+static void pointer_section_assign_recursive(OfortInterpreter *I, OfortValue *target,
+                                             OfortVar *ptr, OfortValue *rhs,
+                                             int dim, int *subscripts, int *rhs_index) {
+    if (dim < 0) {
+        int target_index = section_linear_index(target, subscripts, ptr->pointer_section_rank);
+        OfortValue elem;
+        if (target_index < 0 || target_index >= target->v.arr.len)
+            ofort_error(I, "Array index out of bounds");
+        elem = rhs->type == FVAL_ARRAY ? array_element_value(rhs, *rhs_index) : copy_value(*rhs);
+        if (assign_packed_array_element(target, target_index, elem)) {
+            free_value(&elem);
+        } else if (target->v.arr.data) {
+            free_value(&target->v.arr.data[target_index]);
+            target->v.arr.data[target_index] = elem;
+        } else {
+            free_value(&elem);
+        }
+        (*rhs_index)++;
+        return;
+    }
+    for (int sub = ptr->pointer_section_start[dim];
+         ptr->pointer_section_stride[dim] > 0 ?
+             sub <= ptr->pointer_section_end[dim] :
+             sub >= ptr->pointer_section_end[dim];
+         sub += ptr->pointer_section_stride[dim]) {
+        subscripts[dim] = sub;
+        pointer_section_assign_recursive(I, target, ptr, rhs, dim - 1, subscripts, rhs_index);
+    }
+}
+
 static int write_through_pointer_var(OfortInterpreter *I, OfortVar *ptr, OfortValue *rhs) {
     OfortVar *target;
     if (!ptr || !ptr->is_pointer || !ptr->pointer_associated || !ptr->pointer_target[0]) return 0;
     target = find_var(I, ptr->pointer_target);
     if (!target) return 0;
     if (ptr->pointer_has_slice) {
+        if (ptr->pointer_has_slice == 3) {
+            int subscripts[7] = {0};
+            int rhs_index = 0;
+            if (target->val.type != FVAL_ARRAY || ptr->pointer_section_rank <= 0) return 0;
+            if (rhs->type == FVAL_ARRAY && rhs->v.arr.len != ptr->val.v.arr.len)
+                ofort_error(I, "Array assignment shape mismatch");
+            pointer_section_assign_recursive(I, &target->val, ptr, rhs,
+                                             ptr->pointer_section_rank - 1,
+                                             subscripts, &rhs_index);
+            free_value(&ptr->val);
+            if (rhs->type == FVAL_ARRAY) {
+                ptr->val = copy_value(*rhs);
+            } else {
+                ptr->val = make_array(target->val.v.arr.elem_type,
+                                      ptr->pointer_section_dims,
+                                      ptr->pointer_section_rank);
+                for (int i = 0; i < ptr->val.v.arr.len; i++) {
+                    OfortValue elem = copy_value(*rhs);
+                    if (assign_packed_array_element(&ptr->val, i, elem)) {
+                        free_value(&elem);
+                    } else if (ptr->val.v.arr.data) {
+                        free_value(&ptr->val.v.arr.data[i]);
+                        ptr->val.v.arr.data[i] = elem;
+                    } else {
+                        free_value(&elem);
+                    }
+                }
+            }
+            if (ptr->val.type == FVAL_ARRAY) {
+                ptr->val.v.arr.n_dims = ptr->pointer_section_rank;
+                for (int d = 0; d < ptr->pointer_section_rank && d < 7; d++) {
+                    ptr->val.v.arr.dims[d] = ptr->pointer_section_dims[d];
+                    ptr->val.v.arr.lower_bounds[d] = ptr->pointer_section_lower[d];
+                }
+            }
+            target->is_initialized = 1;
+            ptr->is_initialized = 1;
+            return 1;
+        }
         if (ptr->pointer_has_slice == 2) {
             int count = slice_count(ptr->pointer_slice_start, ptr->pointer_slice_end,
                                     ptr->pointer_slice_stride);
@@ -13262,6 +13364,42 @@ static int pointer_target_descriptor(OfortInterpreter *I, OfortNode *node,
         return 1;
     }
     return 0;
+}
+
+static int pointer_rank_section_descriptor(OfortInterpreter *I, OfortNode *node,
+                                           char *name, size_t name_size,
+                                           int *rank, int lower[7],
+                                           int start[7], int end[7],
+                                           int stride[7], int dims[7]) {
+    const char *base_name = NULL;
+    OfortVar *var;
+    if (node->type == FND_FUNC_CALL) {
+        base_name = node->name;
+    } else if (node->type == FND_ARRAY_REF && node->children[0] &&
+               node->children[0]->type == FND_IDENT) {
+        base_name = node->children[0]->name;
+    } else {
+        return 0;
+    }
+    var = find_var(I, base_name);
+    if (!var || var->val.type != FVAL_ARRAY) return 0;
+    if (node->n_stmts != var->val.v.arr.n_dims) return 0;
+    if (node->n_stmts <= 0 || node->n_stmts > 7) return 0;
+    for (int d = 0; d < node->n_stmts; d++) {
+        OfortSubscriptRange range;
+        if (!node->stmts[d] || node->stmts[d]->type != FND_SLICE) return 0;
+        eval_subscript_range(I, node->stmts[d],
+                             var->val.v.arr.lower_bounds[d],
+                             var->val.v.arr.dims[d], &range);
+        lower[d] = 1;
+        start[d] = range.start;
+        end[d] = range.end;
+        stride[d] = range.step ? range.step : 1;
+        dims[d] = range.count;
+    }
+    copy_cstr(name, name_size, base_name);
+    *rank = node->n_stmts;
+    return 1;
 }
 
 static int is_null_func_call_node(OfortNode *node) {
@@ -16749,6 +16887,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         if (v->is_pointer) {
             if (!v->pointer_associated && v->val.type == FVAL_VOID) return make_void_val();
             if (procedure_ref_name(&v->val)) return copy_value(v->val);
+            if (v->pointer_associated && v->pointer_has_slice == 3) return copy_value(v->val);
             if (v->pointer_associated && v->pointer_target[0])
                 return pointer_referenced_value(I, v->pointer_target, v->pointer_has_slice,
                                                 v->pointer_slice_start, v->pointer_slice_end,
@@ -25263,6 +25402,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int remap_dims[7] = {0, 0, 0, 0, 0, 0, 0};
         char target_name[256];
         int has_slice, slice_start, slice_end, slice_stride;
+        int section_rank = 0;
+        int section_lower[7] = {0};
+        int section_start[7] = {0};
+        int section_end[7] = {0};
+        int section_stride[7] = {0};
+        int section_dims[7] = {0};
         OfortValue rhs;
         if (lhs->type == FND_ARRAY_REF && lhs->children[0] &&
             lhs->children[0]->type == FND_MEMBER && lhs->n_stmts == 1 &&
@@ -25456,7 +25601,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         rhs = eval_node(I, rhs_node);
         if (!pointer_target_descriptor(I, rhs_node, target_name, sizeof(target_name),
                                        &has_slice, &slice_start, &slice_end, &slice_stride)) {
-            if (procedure_ref_name(&rhs)) {
+            if (pointer_rank_section_descriptor(I, rhs_node, target_name, sizeof(target_name),
+                                                &section_rank, section_lower, section_start,
+                                                section_end, section_stride, section_dims)) {
+                has_slice = 3;
+                slice_start = 0;
+                slice_end = 0;
+                slice_stride = 1;
+            } else if (procedure_ref_name(&rhs)) {
                 copy_cstr(target_name, sizeof(target_name), procedure_ref_name(&rhs));
                 has_slice = 0;
                 slice_start = 0;
@@ -25516,6 +25668,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         ptr->pointer_slice_start = slice_start;
         ptr->pointer_slice_end = slice_end;
         ptr->pointer_slice_stride = slice_stride;
+        if (has_slice == 3) {
+            ptr->pointer_section_rank = section_rank;
+            memcpy(ptr->pointer_section_lower, section_lower, sizeof(ptr->pointer_section_lower));
+            memcpy(ptr->pointer_section_start, section_start, sizeof(ptr->pointer_section_start));
+            memcpy(ptr->pointer_section_end, section_end, sizeof(ptr->pointer_section_end));
+            memcpy(ptr->pointer_section_stride, section_stride, sizeof(ptr->pointer_section_stride));
+            memcpy(ptr->pointer_section_dims, section_dims, sizeof(ptr->pointer_section_dims));
+        } else {
+            clear_pointer_section_desc(ptr);
+        }
         trace_assignment_value(I, lhs, ptr->val);
         break;
     }
@@ -25710,7 +25872,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     } else {
                     int pidx = section_linear_index(&var->val, psubs, lhs->n_stmts);
                     int tidx = pidx;
-                    if (var->pointer_has_slice) {
+                    if (var->pointer_has_slice == 3) {
+                        int tsubs[7] = {0};
+                        for (int d = 0; d < lhs->n_stmts && d < var->pointer_section_rank && d < 7; d++) {
+                            tsubs[d] = var->pointer_section_start[d] +
+                                       (psubs[d] - var->val.v.arr.lower_bounds[d]) *
+                                       var->pointer_section_stride[d];
+                        }
+                        tidx = section_linear_index(&target_var->val, tsubs, var->pointer_section_rank);
+                    } else if (var->pointer_has_slice) {
                         int target_sub = var->pointer_slice_start + pidx * var->pointer_slice_stride;
                         int tsubs[1] = { target_sub };
                         tidx = section_linear_index(&target_var->val, tsubs, 1);
