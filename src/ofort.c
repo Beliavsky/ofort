@@ -17119,6 +17119,47 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 arr_op = copy_value(right); scalar = left; arr_len = right.v.arr.len;
             }
             double sv = val_to_real(scalar);
+            if (arr_op.v.arr.real_data &&
+                (scalar.type == FVAL_DOUBLE || scalar.kind == 8) &&
+                !(arr_op.v.arr.elem_type == FVAL_DOUBLE || arr_op.kind == 8)) {
+                OfortValue result = make_array_with_char_len_options(FVAL_DOUBLE,
+                                                                     arr_op.v.arr.dims,
+                                                                     arr_op.v.arr.n_dims, 1, 1);
+                set_array_lower_bounds(&result, arr_op.v.arr.lower_bounds, arr_op.v.arr.n_dims);
+                set_numeric_array_kind(&result, 8);
+                for (int i = 0; i < arr_len; i++) {
+                    double ev = arr_op.v.arr.real_data[i];
+                    double res;
+                    if (left.type == FVAL_ARRAY) {
+                        switch (n->type) {
+                            case FND_ADD: res = ev + sv; break;
+                            case FND_SUB: res = ev - sv; break;
+                            case FND_MUL: res = ev * sv; break;
+                            case FND_DIV: res = ev / sv; break;
+                            case FND_POWER: res = pow(ev, sv); break;
+                            default: res = 0; break;
+                        }
+                    } else {
+                        switch (n->type) {
+                            case FND_ADD: res = sv + ev; break;
+                            case FND_SUB: res = sv - ev; break;
+                            case FND_MUL: res = sv * ev; break;
+                            case FND_DIV: res = sv / ev; break;
+                            case FND_POWER: res = pow(sv, ev); break;
+                            default: res = 0; break;
+                        }
+                    }
+                    if (result.v.arr.real_data) {
+                        result.v.arr.real_data[i] = res;
+                    } else {
+                        free_value(&result.v.arr.data[i]);
+                        result.v.arr.data[i] = make_double(res);
+                    }
+                }
+                free_value(&arr_op);
+                free_value(&left); free_value(&right);
+                return result;
+            }
             if (arr_op.v.arr.real_data) {
                 for (int i = 0; i < arr_len; i++) {
                     double ev = arr_op.v.arr.real_data[i];
@@ -17252,6 +17293,49 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     }
                     free_value(&result.v.arr.data[i]);
                     result.v.arr.data[i] = result_type == FVAL_DOUBLE ? make_double(res) : make_real(res);
+                    free_value(&elem);
+                }
+                free_value(&arr_op);
+                free_value(&left); free_value(&right);
+                return result;
+            }
+            if (arr_op.v.arr.elem_type == FVAL_REAL &&
+                (scalar.type == FVAL_DOUBLE || scalar.kind == 8) &&
+                arr_op.kind != 8) {
+                OfortValue result = make_array_with_char_len_options(FVAL_DOUBLE,
+                                                                     arr_op.v.arr.dims,
+                                                                     arr_op.v.arr.n_dims, 1, 1);
+                set_array_lower_bounds(&result, arr_op.v.arr.lower_bounds, arr_op.v.arr.n_dims);
+                set_numeric_array_kind(&result, 8);
+                for (int i = 0; i < arr_len; i++) {
+                    OfortValue elem = array_element_value(&arr_op, i);
+                    double ev = val_to_real(elem);
+                    double res;
+                    if (left.type == FVAL_ARRAY) {
+                        switch (n->type) {
+                            case FND_ADD: res = ev + sv; break;
+                            case FND_SUB: res = ev - sv; break;
+                            case FND_MUL: res = ev * sv; break;
+                            case FND_DIV: res = ev / sv; break;
+                            case FND_POWER: res = pow(ev, sv); break;
+                            default: res = 0; break;
+                        }
+                    } else {
+                        switch (n->type) {
+                            case FND_ADD: res = sv + ev; break;
+                            case FND_SUB: res = sv - ev; break;
+                            case FND_MUL: res = sv * ev; break;
+                            case FND_DIV: res = sv / ev; break;
+                            case FND_POWER: res = pow(sv, ev); break;
+                            default: res = 0; break;
+                        }
+                    }
+                    if (result.v.arr.real_data) {
+                        result.v.arr.real_data[i] = res;
+                    } else {
+                        free_value(&result.v.arr.data[i]);
+                        result.v.arr.data[i] = make_double(res);
+                    }
                     free_value(&elem);
                 }
                 free_value(&arr_op);
