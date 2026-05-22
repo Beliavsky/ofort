@@ -16728,7 +16728,8 @@ static OfortValue execute_user_function_with_args(OfortInterpreter *I, OfortFunc
         for (int i = 0; i < mod->n_vars; i++) {
             if (procedure_has_param_name(fn, mod->vars[i].name)) continue;
             OfortVar *mv = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
-                    copy_imported_var_attrs(mv, &mod->vars[i]);
+            copy_imported_var_attrs(mv, &mod->vars[i]);
+            mark_imported_module_var(I, mv, mod, i);
         }
     }
     for (int i = 0; i < fn->n_params; i++) {
@@ -18018,6 +18019,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     if (procedure_has_param_name(fn, mod->vars[i].name)) continue;
                     OfortVar *mv = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
                     copy_imported_var_attrs(mv, &mod->vars[i]);
+                    mark_imported_module_var(I, mv, mod, i);
                 }
             }
             /* Bind parameters */
@@ -19463,7 +19465,8 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
         if (mod) {
             for (int i = 0; i < mod->n_vars; i++) {
                 OfortVar *mv = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
-                    copy_imported_var_attrs(mv, &mod->vars[i]);
+                copy_imported_var_attrs(mv, &mod->vars[i]);
+                mark_imported_module_var(I, mv, mod, i);
             }
         }
         for (int i = 0; i < fn->n_params; i++) {
@@ -27962,6 +27965,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                                 if (procedure_has_param_name(pfn, mod->vars[mi].name)) continue;
                                 OfortVar *mv = declare_var(I, mod->vars[mi].name, copy_value(mod->vars[mi].val));
                                 copy_imported_var_attrs(mv, &mod->vars[mi]);
+                                mark_imported_module_var(I, mv, mod, mi);
                             }
                         }
                     }
@@ -28075,7 +28079,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     for (int i = 0; i < mod->n_vars; i++) {
                         if (procedure_has_param_name(fn, mod->vars[i].name)) continue;
                         OfortVar *mv = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
-                    copy_imported_var_attrs(mv, &mod->vars[i]);
+                        copy_imported_var_attrs(mv, &mod->vars[i]);
+                        mark_imported_module_var(I, mv, mod, i);
                     }
                 }
             }
@@ -28496,6 +28501,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     if (procedure_has_param_name(fn, mod->vars[mi].name)) continue;
                     OfortVar *mv = declare_var(I, mod->vars[mi].name, copy_value(mod->vars[mi].val));
                     copy_imported_var_attrs(mv, &mod->vars[mi]);
+                    mark_imported_module_var(I, mv, mod, mi);
                 }
             }
         }
