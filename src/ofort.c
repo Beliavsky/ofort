@@ -1422,7 +1422,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     /* create new in current scope */
     if (current_scope_has_implicit_none(I)) {
         free_value(&val);
-        ofort_error(I, "Variable '%s' has no implicit type", name);
+        ofort_error(I, "Variable '%s' has no implicit type; declare it or run with --implicit-typing", name);
     }
     int has_implicit_type = 0;
     OfortValType implicit_type = implicit_type_for_name(I, name, &has_implicit_type);
@@ -13492,9 +13492,9 @@ static void ensure_data_target_declared(OfortInterpreter *I, OfortNode *target) 
         OfortValType type;
         int char_len = 0;
         if (current_scope_has_implicit_none(I))
-            ofort_error(I, "Variable '%s' has no implicit type", target->name);
+            ofort_error(I, "Variable '%s' has no implicit type; declare it or run with --implicit-typing", target->name);
         type = implicit_type_for_name(I, target->name, &has_type);
-        if (!has_type) ofort_error(I, "Variable '%s' has no implicit type", target->name);
+        if (!has_type) ofort_error(I, "Variable '%s' has no implicit type; declare it or run with --implicit-typing", target->name);
         if (type == FVAL_CHARACTER) char_len = implicit_char_len_for_name(I, target->name);
         if (type == FVAL_DERIVED) {
             const char *type_name = implicit_type_name_for_name(I, target->name);
@@ -22663,6 +22663,12 @@ static int actual_argument_is_definable(OfortInterpreter *I, OfortNode *actual) 
     return 0;
 }
 
+static int actual_argument_is_undeclared_implicit_name(OfortInterpreter *I, OfortNode *actual) {
+    return actual && actual->type == FND_IDENT &&
+           !find_var(I, actual->name) &&
+           current_scope_has_implicit_none(I);
+}
+
 static int procedure_param_may_be_defined_tree(OfortNode *proc, int param_index, OfortNode *n) {
     const char *target_name;
 
@@ -28295,6 +28301,11 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (!arg_present[i] || actual_i < 0) continue;
             if (procedure_param_may_be_defined(fn, i) &&
                 !actual_argument_is_definable(I, n->stmts[actual_i])) {
+                if (actual_argument_is_undeclared_implicit_name(I, n->stmts[actual_i])) {
+                    ofort_error(I,
+                                "Actual argument '%s' for dummy argument '%s' of '%s' is not declared; declare it or run with --implicit-typing",
+                                n->stmts[actual_i]->name, fn->param_names[i], fn->name);
+                }
                 ofort_error(I, "Actual argument for dummy argument '%s' of '%s' is not definable",
                             fn->param_names[i], fn->name);
             }
@@ -36472,7 +36483,7 @@ OfortInterpreter *ofort_create(void) {
     }
     I->scope_cache_counter = 1;
     I->global_scope->cache_id = I->scope_cache_counter;
-    set_scope_legacy_implicit_typing(I->global_scope);
+    set_scope_explicit_typing(I->global_scope);
     I->current_scope = I->global_scope;
     I->node_pool = NULL;
     I->node_pool_len = 0;
