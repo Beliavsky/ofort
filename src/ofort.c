@@ -18926,6 +18926,32 @@ static OfortValType simple_elemental_result_decl_type(OfortNode *fn) {
     return fn->val_type;
 }
 
+static const char *simple_elemental_result_decl_type_name(OfortNode *fn) {
+    const char *res_name;
+    OfortNode *body;
+    if (!fn || !fn->children[0]) return "";
+    res_name = fn->result_name[0] ? fn->result_name : fn->name;
+    body = fn->children[0];
+    for (int i = 0; i < body->n_stmts; i++) {
+        OfortNode *s = body->stmts[i];
+        OfortNode **decls = &s;
+        int n_decls = 1;
+        if (!s) continue;
+        if (s->type == FND_BLOCK) {
+            decls = s->stmts;
+            n_decls = s->n_stmts;
+        }
+        for (int j = 0; j < n_decls; j++) {
+            OfortNode *d = decls[j];
+            if (d && (d->type == FND_VARDECL || d->type == FND_PARAMDECL) &&
+                str_eq_nocase(d->name, res_name)) {
+                return d->val_type == FVAL_DERIVED ? d->str_val : "";
+            }
+        }
+    }
+    return fn->val_type == FVAL_DERIVED ? fn->str_val : "";
+}
+
 static int simple_elemental_result_decl_kind(OfortInterpreter *I, OfortNode *fn) {
     const char *res_name;
     OfortNode *body;
@@ -19467,12 +19493,18 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
     if (!shape_arg) return 0;
     if (shape_arg->v.arr.len == 0) {
         OfortValType result_type = simple_elemental_result_decl_type(fn);
+        const char *result_type_name = simple_elemental_result_decl_type_name(fn);
         int result_kind = simple_elemental_result_decl_kind(I, fn);
         if (result_type == FVAL_VOID) result_type = fn->val_type;
         if (result_type == FVAL_VOID) result_type = shape_arg->v.arr.elem_type;
-        result = make_array_with_char_len_options(result_type, shape_arg->v.arr.dims,
-                                                  shape_arg->v.arr.n_dims,
-                                                  fn->char_len > 0 ? fn->char_len : 1, 1);
+        if (result_type == FVAL_DERIVED && result_type_name && result_type_name[0]) {
+            result = make_derived_array(I, result_type_name,
+                                        shape_arg->v.arr.dims, shape_arg->v.arr.n_dims);
+        } else {
+            result = make_array_with_char_len_options(result_type, shape_arg->v.arr.dims,
+                                                      shape_arg->v.arr.n_dims,
+                                                      fn->char_len > 0 ? fn->char_len : 1, 1);
+        }
         if (result_kind <= 0) result_kind = value_declared_kind(shape_arg);
         set_numeric_array_kind(&result, result_kind);
         *result_out = result;
@@ -19531,6 +19563,10 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
 
         if (elem == 0) {
             result = make_array(scalar_result.type, shape_arg->v.arr.dims, shape_arg->v.arr.n_dims);
+            if (scalar_result.type == FVAL_DERIVED && scalar_result.v.dt.type_name[0]) {
+                copy_cstr(result.v.arr.elem_type_name, sizeof(result.v.arr.elem_type_name),
+                          scalar_result.v.dt.type_name);
+            }
             set_numeric_array_kind(&result, value_declared_kind(&scalar_result));
         }
         if (result.type == FVAL_ARRAY) {
