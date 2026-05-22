@@ -214,6 +214,7 @@ struct OfortInterpreter {
     char warnings[4096];
     int warn_len;
     int warnings_enabled;
+    int warn_intrinsic_shadow;
     OfortStandardMode standard_mode;
     int fast_mode;
     int specialized_fast_paths;
@@ -785,6 +786,19 @@ static void ofort_warning(OfortInterpreter *I, int line, const char *fmt, ...) {
         I->warnings[I->warn_len] = '\0';
     }
     append_source_line_to_warning(I, line);
+}
+
+static void warn_intrinsic_shadow(OfortInterpreter *I, int line, const char *kind, const char *name) {
+    char upper[256];
+    int i;
+    if (!I || !I->warn_intrinsic_shadow || !name || !name[0]) return;
+    if (!is_intrinsic(name)) return;
+    for (i = 0; name[i] && i < (int)sizeof(upper) - 1; i++) {
+        upper[i] = (char)toupper((unsigned char)name[i]);
+    }
+    upper[i] = '\0';
+    ofort_warning(I, line, "warning: %s '%s' shadows intrinsic procedure %s",
+                  kind ? kind : "name", name, upper);
 }
 
 /* â”€â”€ String upper-case helper (for case-insensitive matching) â”€â”€ */
@@ -2100,6 +2114,7 @@ static void ensure_generic_capacity(OfortInterpreter *I, int extra) {
 static void register_generic(OfortInterpreter *I, OfortNode *node) {
     OfortGeneric *g;
     if (!node || node->type != FND_INTERFACE || !node->name[0]) return;
+    warn_intrinsic_shadow(I, node->line, "generic interface", node->name);
     g = find_generic(I, node->name);
     if (!g) {
         ensure_generic_capacity(I, 1);
@@ -2141,6 +2156,9 @@ static void register_generic_procedure(OfortInterpreter *I, const char *generic_
 
 static OfortFunc *register_func_with_module(OfortInterpreter *I, const char *name, OfortNode *node,
                                             int is_function, const char *module_name) {
+    const char *kind = is_function ? "function" : "subroutine";
+    if (node && node->type == FND_STMT_FUNCTION) kind = "statement function";
+    warn_intrinsic_shadow(I, node ? node->line : 0, kind, name);
     for (int i = 0; i < I->n_funcs; i++) {
         if (str_eq_nocase(I->funcs[i].name, name) &&
             str_eq_nocase(I->funcs[i].module_name, module_name ? module_name : "")) {
@@ -24782,6 +24800,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         reject_unsupported_kind(I, effective_type, effective_kind);
         n->val_type = effective_type;
         n->kind = effective_kind;
+        warn_intrinsic_shadow(I, n->line,
+                              n->type == FND_PARAMDECL ? "parameter" : "variable",
+                              n->name);
         int decl_char_len = n->val_type == FVAL_CHARACTER ? eval_character_length(I, n) : 0;
         OfortVar *existing = find_var(I, n->name);
         OfortVar *existing_current = find_var_in_current_scope(I, n->name);
@@ -36668,6 +36689,7 @@ OfortInterpreter *ofort_create(void) {
     I->node_pool_len = 0;
     I->node_pool_cap = 0;
     I->warnings_enabled = 1;
+    I->warn_intrinsic_shadow = 1;
     I->standard_mode = OFORT_STD_LEGACY;
     I->specialized_fast_paths = 1;
     return I;
@@ -37163,6 +37185,12 @@ void ofort_set_implicit_typing(OfortInterpreter *interp, int enabled) {
 void ofort_set_warnings_enabled(OfortInterpreter *interp, int enabled) {
     if (interp) {
         interp->warnings_enabled = enabled ? 1 : 0;
+    }
+}
+
+void ofort_set_warn_intrinsic_shadow(OfortInterpreter *interp, int enabled) {
+    if (interp) {
+        interp->warn_intrinsic_shadow = enabled ? 1 : 0;
     }
 }
 
