@@ -25157,7 +25157,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     decl_char_len >= OFORT_MAX_STRLEN - 1 ? existing->char_len : 0;
             break;
         }
-        if (existing && existing == existing_current && I->procedure_depth > 0) {
+        if (existing && existing == existing_current && I->procedure_depth > 0 &&
+            n->type != FND_PARAMDECL) {
             existing->intent = n->intent;
             existing->is_value = n->is_value;
             existing->is_optional = n->is_optional;
@@ -28942,6 +28943,30 @@ unresolved_external_call_done:
     }
 
     case FND_STMT_FUNCTION:
+        {
+            OfortVar *array_var = find_var(I, n->name);
+            if (array_var && array_var->val.type == FVAL_ARRAY) {
+                OfortNode *lhs = alloc_node(I, FND_FUNC_CALL);
+                OfortNode *assign = alloc_node(I, FND_ASSIGN);
+                copy_cstr(lhs->name, sizeof(lhs->name), n->name);
+                lhs->line = n->line;
+                lhs->n_stmts = n->n_params;
+                lhs->stmts = (OfortNode **)calloc((size_t)n->n_params, sizeof(OfortNode *));
+                if (n->n_params > 0 && !lhs->stmts) ofort_error(I, "Out of memory");
+                for (int i = 0; i < n->n_params; i++) {
+                    OfortNode *sub = alloc_node(I, FND_IDENT);
+                    copy_cstr(sub->name, sizeof(sub->name), n->param_names[i]);
+                    sub->line = n->line;
+                    lhs->stmts[i] = sub;
+                }
+                assign->children[0] = lhs;
+                assign->children[1] = n->children[0];
+                assign->n_children = 2;
+                assign->line = n->line;
+                exec_node(I, assign);
+                break;
+            }
+        }
         (void)register_func(I, n->name, n, 1);
         break;
 
