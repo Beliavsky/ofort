@@ -35,22 +35,58 @@ BUILTINS = {
     "equicor",
     "exp",
     "log",
+    "mad",
     "maxval",
     "mean",
+    "median",
     "minval",
+    "corr",
+    "corrcoef",
+    "cov",
+    "cumsum",
+    "iqr",
+    "kurtosis",
+    "movmean",
+    "prctile",
+    "quantile",
     "reshape",
+    "rms",
     "sqrt",
+    "std",
+    "skewness",
     "sin",
     "size",
     "sum",
     "tan",
+    "var",
+    "zscore",
 }
 
 MATRIX_FUNC_RE = re.compile(r"^(rand|zeros|ones)\s*\((.*)\)$", re.IGNORECASE)
+STAT_SCALAR_FUNCTIONS = {
+    "mean", "std", "var", "median", "skewness", "kurtosis", "rms", "mad",
+    "quantile", "prctile", "iqr", "corr"
+}
+STAT_VECTOR_FUNCTIONS = {"cumsum", "zscore", "movmean"}
+STAT_MATRIX_FUNCTIONS = {"cov", "corrcoef"}
 LA_SCALAR_FUNCTIONS = {"trace", "det", "cond", "norm", "rank", "is_square", "is_diagonal", "is_symmetric", "is_invertible"}
 LA_VECTOR_FUNCTIONS = {"eig", "svd"}
 LA_MATRIX_FUNCTIONS = {"eye", "triu", "tril", "kron", "inv", "qr", "lu", "pinv", "chol", "outer_product", "transpose2", "matmul2", "crossprod", "tcrossprod"}
 LA_FUNCTIONS = LA_SCALAR_FUNCTIONS | LA_VECTOR_FUNCTIONS | LA_MATRIX_FUNCTIONS | {"diag", "solve", "mldivide", "col_sums", "col_means"}
+RANDOM_DIST_PARAM_COUNTS = {
+    "randn": 0,
+    "normrnd": 2,
+    "unifrnd": 2,
+    "exprnd": 1,
+    "lognrnd": 2,
+    "gamrnd": 2,
+    "poissrnd": 1,
+    "binornd": 2,
+    "trnd": 1,
+    "laprnd": 2,
+    "sechrnd": 2,
+    "logisticrnd": 2,
+}
 
 
 @dataclass
@@ -84,6 +120,8 @@ class Translator:
         self.needs_linstep = False
         self.needs_la_mod = False
         self.la_names: set[str] = set()
+        self.needs_random_mod = False
+        self.random_names: set[str] = set()
 
     def translate(self, source: str) -> str:
         for line_no, raw in enumerate(source.splitlines(), start=1):
@@ -169,7 +207,7 @@ class Translator:
 
     def infer_kind(self, rhs: str) -> str:
         low = rhs.strip().lower()
-        if re.match(r"^(mean|min|max|minval|maxval)\s*\(.+\)$", low, re.IGNORECASE):
+        if re.match(r"^(min|max|minval|maxval)\s*\(.+\)$", low, re.IGNORECASE):
             return "real"
         if is_flatten_expr(low):
             return "real_vector"
@@ -184,6 +222,27 @@ class Translator:
                     if shape_rank == 2:
                         return "real_matrix"
                     return "real_vector"
+            if name in STAT_SCALAR_FUNCTIONS:
+                if name != "corr" and args:
+                    sym = self.symbols.get(args[0].strip().lower())
+                    if sym is not None and sym.kind == "real_matrix":
+                        return "real_vector"
+                return "real"
+            if name in STAT_VECTOR_FUNCTIONS:
+                if args:
+                    sym = self.symbols.get(args[0].strip().lower())
+                    if sym is not None and sym.kind == "real_matrix":
+                        return "real_matrix"
+                return "real_vector"
+            if name in STAT_MATRIX_FUNCTIONS:
+                return "real_matrix"
+            if name in RANDOM_DIST_PARAM_COUNTS:
+                n_size_args = len(args) - RANDOM_DIST_PARAM_COUNTS[name]
+                if n_size_args <= 0:
+                    return "real"
+                if n_size_args == 1:
+                    return "real_vector"
+                return "real_matrix"
             if name in LA_SCALAR_FUNCTIONS:
                 return "real"
             if name in {"col_sums", "col_means", "eig", "svd"}:
@@ -240,6 +299,8 @@ class Translator:
         out = self.convert_power(out)
         out = self.convert_matrix_multiply(out)
         out = self.convert_la_functions(out)
+        out = self.convert_random_dist_functions(out)
+        out = self.convert_stats_functions(out)
         out = self.convert_function_names(out)
         out = self.convert_rand(out)
         out = self.convert_zeros_ones(out)
@@ -290,6 +351,14 @@ class Translator:
                 self.la_names.add(name)
         return text
 
+    def convert_random_dist_functions(self, text: str) -> str:
+        for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
+            name = match.group(1).lower()
+            if name in RANDOM_DIST_PARAM_COUNTS:
+                self.needs_random_mod = True
+                self.random_names.add(name)
+        return text
+
     def convert_function_names(self, text: str) -> str:
         out = text
         out = self.convert_sum(out)
@@ -316,6 +385,73 @@ class Translator:
             raise OmatError("matrix sum currently supports sum(A), sum(A,1), and sum(A,2)")
 
         return re.sub(r"\bsum\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_stats_functions(self, text: str) -> str:
+        out = text
+        for name in ["mean", "std", "var", "median", "skewness", "kurtosis", "rms", "mad", "iqr", "cumsum", "zscore"]:
+            out = self.convert_one_stats_function(out, name)
+        out = self.convert_quantile_function(out, "quantile", "quantile")
+        out = self.convert_quantile_function(out, "prctile", "prctile")
+        out = self.convert_movmean_function(out)
+        out = self.convert_binary_vector_function(out, "corr", "corr_omat")
+        out = self.convert_matrix_stats_function(out, "cov", "cov_omat")
+        out = self.convert_matrix_stats_function(out, "corrcoef", "corrcoef_omat")
+        return out
+
+    def convert_one_stats_function(self, text: str, name: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 1:
+                raise OmatError(f"{name} currently supports one argument")
+            arg = args[0].strip()
+            sym = self.symbols.get(arg.lower())
+            suffix = "mat" if sym is not None and sym.kind == "real_matrix" else "vec"
+            helper = f"{name}_{suffix}_omat"
+            return f"{helper}({self.expr(arg)})"
+
+        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_quantile_function(self, text: str, name: str, helper_base: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 2:
+                raise OmatError(f"{name} currently supports two arguments")
+            arg = args[0].strip()
+            sym = self.symbols.get(arg.lower())
+            suffix = "mat" if sym is not None and sym.kind == "real_matrix" else "vec"
+            return f"{helper_base}_{suffix}_omat({self.expr(arg)}, real({self.expr(args[1])}, real64))"
+
+        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_movmean_function(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 2:
+                raise OmatError("movmean currently supports movmean(x,k)")
+            arg = args[0].strip()
+            sym = self.symbols.get(arg.lower())
+            suffix = "mat" if sym is not None and sym.kind == "real_matrix" else "vec"
+            return f"movmean_{suffix}_omat({self.expr(arg)}, int({self.expr(args[1])}))"
+
+        return re.sub(r"\bmovmean\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_binary_vector_function(self, text: str, name: str, helper: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 2:
+                raise OmatError(f"{name} currently supports two vector arguments")
+            return f"{helper}({self.expr(args[0])}, {self.expr(args[1])})"
+
+        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_matrix_stats_function(self, text: str, name: str, helper: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 1:
+                raise OmatError(f"{name} currently supports one matrix argument")
+            return f"{helper}({self.expr(args[0])})"
+
+        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
 
     def convert_matlab_reshape(self, text: str) -> str:
         def repl(match: re.Match[str]) -> str:
@@ -441,6 +577,9 @@ class Translator:
         if self.needs_la_mod:
             names = sorted(self.la_names)
             lines.append("use ofort_la_mod, only: " + ", ".join(names))
+        if self.needs_random_mod:
+            names = sorted(self.random_names)
+            lines.append("use ofort_random_mod, only: " + ", ".join(names))
         lines.append("implicit none")
         for sym in self.symbols.values():
             if sym.kind == "integer":
@@ -865,6 +1004,396 @@ def helper_source(include_linspace: bool) -> list[str]:
         "real(real64), intent(in) :: x(:)",
         "mean = sum(x) / real(size(x), real64)",
         "end function mean",
+        "",
+        "real(real64) function mean_vec_omat(x)",
+        "real(real64), intent(in) :: x(:)",
+        "mean_vec_omat = sum(x) / real(size(x), real64)",
+        "end function mean_vec_omat",
+        "",
+        "function mean_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: j",
+        "allocate(y(size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(j) = mean_vec_omat(x(:, j))",
+        "end do",
+        "end function mean_mat_omat",
+        "",
+        "real(real64) function var_vec_omat(x)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64) :: xmean",
+        "if (size(x) <= 1) then",
+        "  var_vec_omat = 0.0_real64",
+        "else",
+        "  xmean = mean_vec_omat(x)",
+        "  var_vec_omat = sum((x - xmean)**2) / real(size(x) - 1, real64)",
+        "end if",
+        "end function var_vec_omat",
+        "",
+        "function var_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: j",
+        "allocate(y(size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(j) = var_vec_omat(x(:, j))",
+        "end do",
+        "end function var_mat_omat",
+        "",
+        "real(real64) function std_vec_omat(x)",
+        "real(real64), intent(in) :: x(:)",
+        "std_vec_omat = sqrt(var_vec_omat(x))",
+        "end function std_vec_omat",
+        "",
+        "function std_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: j",
+        "allocate(y(size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(j) = std_vec_omat(x(:, j))",
+        "end do",
+        "end function std_mat_omat",
+        "",
+        "real(real64) function rms_vec_omat(x)",
+        "real(real64), intent(in) :: x(:)",
+        "if (size(x) <= 0) then",
+        "  rms_vec_omat = 0.0_real64",
+        "else",
+        "  rms_vec_omat = sqrt(sum(x**2) / real(size(x), real64))",
+        "end if",
+        "end function rms_vec_omat",
+        "",
+        "function rms_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: j",
+        "allocate(y(size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(j) = rms_vec_omat(x(:, j))",
+        "end do",
+        "end function rms_mat_omat",
+        "",
+        "real(real64) function median_vec_omat(x)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64), allocatable :: y(:)",
+        "real(real64) :: tmp",
+        "integer :: i, j, n",
+        "n = size(x)",
+        "allocate(y(n))",
+        "y = x",
+        "do i = 2, n",
+        "  tmp = y(i)",
+        "  j = i - 1",
+        "  do while (j >= 1)",
+        "    if (y(j) <= tmp) exit",
+        "    y(j + 1) = y(j)",
+        "    j = j - 1",
+        "  end do",
+        "  y(j + 1) = tmp",
+        "end do",
+        "if (mod(n, 2) == 1) then",
+        "  median_vec_omat = y((n + 1) / 2)",
+        "else",
+        "  median_vec_omat = 0.5_real64 * (y(n / 2) + y(n / 2 + 1))",
+        "end if",
+        "end function median_vec_omat",
+        "",
+        "function median_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: j",
+        "allocate(y(size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(j) = median_vec_omat(x(:, j))",
+        "end do",
+        "end function median_mat_omat",
+        "",
+        "real(real64) function mad_vec_omat(x)",
+        "real(real64), intent(in) :: x(:)",
+        "mad_vec_omat = median_vec_omat(abs(x - median_vec_omat(x)))",
+        "end function mad_vec_omat",
+        "",
+        "function mad_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: j",
+        "allocate(y(size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(j) = mad_vec_omat(x(:, j))",
+        "end do",
+        "end function mad_mat_omat",
+        "",
+        "real(real64) function quantile_vec_omat(x, p)",
+        "real(real64), intent(in) :: x(:), p",
+        "real(real64), allocatable :: y(:)",
+        "real(real64) :: pos, frac, tmp, pp",
+        "integer :: i, j, lo, hi, n",
+        "n = size(x)",
+        "if (n <= 0) then",
+        "  quantile_vec_omat = 0.0_real64",
+        "  return",
+        "end if",
+        "allocate(y(n))",
+        "y = x",
+        "do i = 2, n",
+        "  tmp = y(i)",
+        "  j = i - 1",
+        "  do while (j >= 1)",
+        "    if (y(j) <= tmp) exit",
+        "    y(j + 1) = y(j)",
+        "    j = j - 1",
+        "  end do",
+        "  y(j + 1) = tmp",
+        "end do",
+        "pp = max(0.0_real64, min(1.0_real64, p))",
+        "pos = 1.0_real64 + pp * real(n - 1, real64)",
+        "lo = int(floor(pos))",
+        "hi = int(ceiling(pos))",
+        "frac = pos - real(lo, real64)",
+        "quantile_vec_omat = (1.0_real64 - frac) * y(lo) + frac * y(hi)",
+        "end function quantile_vec_omat",
+        "",
+        "function quantile_mat_omat(x, p) result(y)",
+        "real(real64), intent(in) :: x(:,:), p",
+        "real(real64), allocatable :: y(:)",
+        "integer :: j",
+        "allocate(y(size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(j) = quantile_vec_omat(x(:, j), p)",
+        "end do",
+        "end function quantile_mat_omat",
+        "",
+        "real(real64) function prctile_vec_omat(x, p)",
+        "real(real64), intent(in) :: x(:), p",
+        "prctile_vec_omat = quantile_vec_omat(x, p / 100.0_real64)",
+        "end function prctile_vec_omat",
+        "",
+        "function prctile_mat_omat(x, p) result(y)",
+        "real(real64), intent(in) :: x(:,:), p",
+        "real(real64), allocatable :: y(:)",
+        "integer :: j",
+        "allocate(y(size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(j) = prctile_vec_omat(x(:, j), p)",
+        "end do",
+        "end function prctile_mat_omat",
+        "",
+        "real(real64) function iqr_vec_omat(x)",
+        "real(real64), intent(in) :: x(:)",
+        "iqr_vec_omat = quantile_vec_omat(x, 0.75_real64) - quantile_vec_omat(x, 0.25_real64)",
+        "end function iqr_vec_omat",
+        "",
+        "function iqr_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: j",
+        "allocate(y(size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(j) = iqr_vec_omat(x(:, j))",
+        "end do",
+        "end function iqr_mat_omat",
+        "",
+        "real(real64) function skewness_vec_omat(x)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64) :: xmean, m2, m3, g1",
+        "integer :: n",
+        "n = size(x)",
+        "if (n <= 2) then",
+        "  skewness_vec_omat = 0.0_real64",
+        "  return",
+        "end if",
+        "xmean = mean_vec_omat(x)",
+        "m2 = sum((x - xmean)**2) / real(n, real64)",
+        "if (m2 == 0.0_real64) then",
+        "  skewness_vec_omat = 0.0_real64",
+        "else",
+        "  m3 = sum((x - xmean)**3) / real(n, real64)",
+        "  g1 = m3 / (m2**1.5_real64)",
+        "  skewness_vec_omat = sqrt(real(n * (n - 1), real64)) * g1 / real(n - 2, real64)",
+        "end if",
+        "end function skewness_vec_omat",
+        "",
+        "function skewness_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: j",
+        "allocate(y(size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(j) = skewness_vec_omat(x(:, j))",
+        "end do",
+        "end function skewness_mat_omat",
+        "",
+        "real(real64) function kurtosis_vec_omat(x)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64) :: xmean, m2, m4, b2",
+        "integer :: n",
+        "n = size(x)",
+        "if (n <= 1) then",
+        "  kurtosis_vec_omat = 0.0_real64",
+        "  return",
+        "end if",
+        "xmean = mean_vec_omat(x)",
+        "m2 = sum((x - xmean)**2) / real(n, real64)",
+        "if (m2 == 0.0_real64) then",
+        "  kurtosis_vec_omat = 0.0_real64",
+        "else",
+        "  m4 = sum((x - xmean)**4) / real(n, real64)",
+        "  b2 = m4 / (m2 * m2)",
+        "  if (n > 3) then",
+        "    kurtosis_vec_omat = real(n - 1, real64) * (real(n + 1, real64) * b2 - &",
+        "         3.0_real64 * real(n - 1, real64)) / &",
+        "         (real(n - 2, real64) * real(n - 3, real64)) + 3.0_real64",
+        "  else",
+        "    kurtosis_vec_omat = b2",
+        "  end if",
+        "end if",
+        "end function kurtosis_vec_omat",
+        "",
+        "function kurtosis_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: j",
+        "allocate(y(size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(j) = kurtosis_vec_omat(x(:, j))",
+        "end do",
+        "end function kurtosis_mat_omat",
+        "",
+        "function cumsum_vec_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: i",
+        "allocate(y(size(x)))",
+        "if (size(x) >= 1) y(1) = x(1)",
+        "do i = 2, size(x)",
+        "  y(i) = y(i - 1) + x(i)",
+        "end do",
+        "end function cumsum_vec_omat",
+        "",
+        "function cumsum_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:,:)",
+        "integer :: i, j",
+        "allocate(y(size(x, 1), size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  if (size(x, 1) >= 1) y(1, j) = x(1, j)",
+        "  do i = 2, size(x, 1)",
+        "    y(i, j) = y(i - 1, j) + x(i, j)",
+        "  end do",
+        "end do",
+        "end function cumsum_mat_omat",
+        "",
+        "function zscore_vec_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64), allocatable :: y(:)",
+        "real(real64) :: xmean, xsd",
+        "allocate(y(size(x)))",
+        "xmean = mean_vec_omat(x)",
+        "xsd = std_vec_omat(x)",
+        "if (xsd == 0.0_real64) then",
+        "  y = 0.0_real64",
+        "else",
+        "  y = (x - xmean) / xsd",
+        "end if",
+        "end function zscore_vec_omat",
+        "",
+        "function zscore_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:,:)",
+        "integer :: j",
+        "allocate(y(size(x, 1), size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(:, j) = zscore_vec_omat(x(:, j))",
+        "end do",
+        "end function zscore_mat_omat",
+        "",
+        "function movmean_vec_omat(x, k) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "integer, intent(in) :: k",
+        "real(real64), allocatable :: y(:)",
+        "integer :: i, lo, hi, left, right, kk",
+        "kk = max(1, k)",
+        "left = (kk - 1) / 2",
+        "right = kk / 2",
+        "allocate(y(size(x)))",
+        "do i = 1, size(x)",
+        "  lo = max(1, i - left)",
+        "  hi = min(size(x), i + right)",
+        "  y(i) = sum(x(lo:hi)) / real(hi - lo + 1, real64)",
+        "end do",
+        "end function movmean_vec_omat",
+        "",
+        "function movmean_mat_omat(x, k) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "integer, intent(in) :: k",
+        "real(real64), allocatable :: y(:,:)",
+        "integer :: j",
+        "allocate(y(size(x, 1), size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(:, j) = movmean_vec_omat(x(:, j), k)",
+        "end do",
+        "end function movmean_mat_omat",
+        "",
+        "function cov_omat(x) result(c)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: c(:,:)",
+        "real(real64), allocatable :: xmean(:)",
+        "integer :: i, j, k, nobs, nvar",
+        "nobs = size(x, 1)",
+        "nvar = size(x, 2)",
+        "allocate(c(nvar, nvar), xmean(nvar))",
+        "xmean = mean_mat_omat(x)",
+        "c = 0.0_real64",
+        "if (nobs <= 1) return",
+        "do j = 1, nvar",
+        "  do k = j, nvar",
+        "    do i = 1, nobs",
+        "      c(j, k) = c(j, k) + (x(i, j) - xmean(j)) * (x(i, k) - xmean(k))",
+        "    end do",
+        "    c(j, k) = c(j, k) / real(nobs - 1, real64)",
+        "    c(k, j) = c(j, k)",
+        "  end do",
+        "end do",
+        "end function cov_omat",
+        "",
+        "real(real64) function corr_omat(x, y)",
+        "real(real64), intent(in) :: x(:), y(:)",
+        "real(real64) :: xsd, ysd",
+        "if (size(x) /= size(y)) then",
+        "  print *, 'omat corr size mismatch'",
+        "  stop 1",
+        "end if",
+        "xsd = std_vec_omat(x)",
+        "ysd = std_vec_omat(y)",
+        "if (xsd == 0.0_real64 .or. ysd == 0.0_real64) then",
+        "  corr_omat = 0.0_real64",
+        "else",
+        "  corr_omat = sum((x - mean_vec_omat(x)) * (y - mean_vec_omat(y))) / &",
+        "       (real(size(x) - 1, real64) * xsd * ysd)",
+        "end if",
+        "end function corr_omat",
+        "",
+        "function corrcoef_omat(x) result(r)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: r(:,:)",
+        "real(real64), allocatable :: s(:)",
+        "integer :: j, k, nvar",
+        "nvar = size(x, 2)",
+        "allocate(r(nvar, nvar), s(nvar))",
+        "r = cov_omat(x)",
+        "s = std_mat_omat(x)",
+        "do j = 1, nvar",
+        "  do k = 1, nvar",
+        "    if (s(j) == 0.0_real64 .or. s(k) == 0.0_real64) then",
+        "      r(j, k) = 0.0_real64",
+        "    else",
+        "      r(j, k) = r(j, k) / (s(j) * s(k))",
+        "    end if",
+        "  end do",
+        "end do",
+        "end function corrcoef_omat",
     ]
     if include_linspace:
         lines.extend(
@@ -1166,7 +1695,7 @@ def run(argv: list[str] | None = None) -> int:
         return 0
 
     keep_path = source_path.with_suffix(".f90") if args.keep else None
-    if "use ofort_la_mod" in generated:
+    if "use ofort_la_mod" in generated or "use ofort_random_mod" in generated:
         return run_with_ofort(generated, args.ofort, keep_path)
     return compile_and_run(generated, args.gfortran, args.emit_fortran, keep_path)
 
