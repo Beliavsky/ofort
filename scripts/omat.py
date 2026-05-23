@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import random
 import re
 import shutil
 import subprocess
@@ -39,6 +41,8 @@ BUILTINS = {
     "sum",
     "tan",
 }
+
+MATRIX_FUNC_RE = re.compile(r"^(rand|zeros|ones)\s*\((.*)\)$", re.IGNORECASE)
 
 
 @dataclass
@@ -120,7 +124,8 @@ class Translator:
 
         if low.startswith("disp(") and line.endswith(")"):
             arg = line[line.find("(") + 1 : -1]
-            self.statements.append(Statement(f"print *, {self.expr(arg)}", self.indent))
+            if not suppress_output:
+                self.statements.append(Statement(f"print *, {self.expr(arg)}", self.indent))
             return
 
         m = ASSIGN_RE.match(line)
@@ -138,16 +143,40 @@ class Translator:
                 self.statements.append(Statement(f"print *, {name}", self.indent))
             return
 
-        self.statements.append(Statement(f"print *, {self.expr(line)}", self.indent))
+        if not suppress_output:
+            self.statements.append(Statement(f"print *, {self.expr(line)}", self.indent))
 
     def infer_kind(self, rhs: str) -> str:
         low = rhs.strip().lower()
-        if re.match(r"^(sum|mean|min|max|minval|maxval)\s*\(.+\)$", low, re.IGNORECASE):
+        if re.match(r"^(mean|min|max|minval|maxval)\s*\(.+\)$", low, re.IGNORECASE):
             return "real"
+        if re.match(r"^sum\s*\(.+\)$", low, re.IGNORECASE):
+            args = split_args(low[low.find("(") + 1 : -1])
+            if args:
+                sym = self.symbols.get(args[0].lower())
+                if sym is not None and sym.kind == "real_matrix":
+                    return "real_vector"
+            return "real"
+        if is_matrix_expr(low):
+            return "real_matrix"
         if is_vector_expr(low):
             return "real_vector"
+        m = re.match(
+            r"^([A-Za-z_][A-Za-z0-9_]*)\s*\*\s*([A-Za-z_][A-Za-z0-9_]*)$",
+            rhs.strip(),
+        )
+        if m:
+            left = self.symbols.get(m.group(1).lower())
+            right = self.symbols.get(m.group(2).lower())
+            if left is not None and right is not None:
+                if left.kind == "real_matrix" and right.kind == "real_matrix":
+                    return "real_matrix"
+                if "real_matrix" in {left.kind, right.kind}:
+                    return "real_vector"
         for name in IDENT_RE.findall(rhs):
             sym = self.symbols.get(name.lower())
+            if sym is not None and sym.kind == "real_matrix" and rhs.strip().lower() == name.lower():
+                return "real_matrix"
             if sym is not None and sym.kind == "real_vector":
                 return "real_vector"
         return "real"
@@ -157,9 +186,10 @@ class Translator:
         out = convert_vector_literals(out)
         out = convert_elementwise(out)
         out = self.convert_power(out)
-        out = convert_function_names(out)
-        out = convert_rand(out)
-        out = convert_zeros_ones(out)
+        out = self.convert_matrix_multiply(out)
+        out = self.convert_function_names(out)
+        out = self.convert_rand(out)
+        out = self.convert_zeros_ones(out)
         out = self.convert_linspace(out)
         out = convert_numbers(out)
         return out
@@ -172,9 +202,91 @@ class Translator:
             if lhs == "]":
                 raise OmatError("^ is matrix power in MATLAB/Octave; use .^ for elementwise power")
             sym = self.symbols.get(lhs.lower())
-            if sym is not None and sym.kind == "real_vector":
+            if sym is not None and sym.kind in {"real_vector", "real_matrix"}:
                 raise OmatError("^ is matrix power in MATLAB/Octave; use .^ for elementwise power")
         return text.replace("^", "**")
+
+    def convert_matrix_multiply(self, text: str) -> str:
+        pattern = re.compile(
+            r"\b([A-Za-z_][A-Za-z0-9_]*(?:\([^()]*\))?)\s*\*\s*([A-Za-z_][A-Za-z0-9_]*(?:\([^()]*\))?)\b"
+        )
+
+        def base_name(value: str) -> str:
+            return value.split("(", 1)[0].lower()
+
+        def repl(match: re.Match[str]) -> str:
+            left, right = match.groups()
+            left_sym = self.symbols.get(base_name(left))
+            right_sym = self.symbols.get(base_name(right))
+            if (
+                left_sym is not None
+                and right_sym is not None
+                and "real_matrix" in {left_sym.kind, right_sym.kind}
+            ):
+                return f"matmul({left}, {right})"
+            return match.group(0)
+
+        return pattern.sub(repl, text)
+
+    def convert_function_names(self, text: str) -> str:
+        out = text
+        out = self.convert_sum(out)
+        replacements = {
+            "max": "maxval",
+            "min": "minval",
+        }
+        for old, new in replacements.items():
+            out = re.sub(rf"\b{old}\s*\(", f"{new}(", out, flags=re.IGNORECASE)
+        return out
+
+    def convert_sum(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if not args:
+                raise OmatError("sum requires an argument")
+            sym = self.symbols.get(args[0].strip().lower())
+            if sym is None or sym.kind != "real_matrix":
+                return match.group(0)
+            if len(args) == 1:
+                return f"sum({args[0]}, dim=1)"
+            if len(args) == 2 and args[1].strip() in {"1", "2"}:
+                return f"sum({args[0]}, dim={args[1].strip()})"
+            raise OmatError("matrix sum currently supports sum(A), sum(A,1), and sum(A,2)")
+
+        return re.sub(r"\bsum\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_rand(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) == 1:
+                return f"rand_omat(int({args[0]}))"
+            if len(args) == 2:
+                if args[1].strip() == "1":
+                    return f"rand_omat(int({args[0]}))"
+                return f"rand_omat2(int({args[0]}), int({args[1]}))"
+            raise OmatError("rand currently supports rand(n), rand(n,1), and rand(m,n)")
+
+        return re.sub(r"\brand\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_zeros_ones(self, text: str) -> str:
+        def convert(name: str, value: str, current: str) -> str:
+            def repl(match: re.Match[str]) -> str:
+                args = split_args(match.group(1))
+                if len(args) == 1:
+                    return f"{value}_omat(int({args[0]}))"
+                if len(args) == 2:
+                    if args[1].strip() == "1":
+                        return f"{value}_omat(int({args[0]}))"
+                    return f"{value}_omat2(int({args[0]}), int({args[1]}))"
+                raise OmatError(
+                    f"{name} currently supports {name}(n), {name}(n,1), and {name}(m,n)"
+                )
+
+            return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, current, flags=re.IGNORECASE)
+
+        out = convert("zeros", "zeros", text)
+        out = convert("ones", "ones", out)
+        return out
 
     def convert_linspace(self, text: str) -> str:
         def repl(match: re.Match[str]) -> str:
@@ -199,6 +311,8 @@ class Translator:
                 lines.append(f"integer :: {sym.name}")
             elif sym.kind == "real_vector":
                 lines.append(f"real(real64), allocatable :: {sym.name}(:)")
+            elif sym.kind == "real_matrix":
+                lines.append(f"real(real64), allocatable :: {sym.name}(:,:)")
             else:
                 lines.append(f"real(real64) :: {sym.name}")
         if self.symbols:
@@ -234,10 +348,24 @@ def parse_loop_spec(spec: str) -> tuple[str, str, str | None]:
 
 
 def is_vector_expr(text: str) -> bool:
+    m = MATRIX_FUNC_RE.match(text)
+    if m is not None:
+        args = split_args(m.group(2))
+        return len(args) == 1 or (len(args) == 2 and args[1].strip() == "1")
     return (
-        text.startswith("[")
-        or re.match(r"^(rand|zeros|ones|linspace)\s*\(", text, re.IGNORECASE) is not None
+        (text.startswith("[") and ";" not in text)
+        or re.match(r"^linspace\s*\(", text, re.IGNORECASE) is not None
     )
+
+
+def is_matrix_expr(text: str) -> bool:
+    if text.startswith("[") and ";" in text:
+        return True
+    m = MATRIX_FUNC_RE.match(text)
+    if m is not None:
+        args = split_args(m.group(2))
+        return len(args) == 2 and args[1].strip() != "1"
+    return False
 
 
 def convert_elementwise(text: str) -> str:
@@ -287,10 +415,25 @@ def convert_zeros_ones(text: str) -> str:
 def convert_vector_literals(text: str) -> str:
     def repl(match: re.Match[str]) -> str:
         body = match.group(1).strip()
-        if ";" in body:
-            raise OmatError("matrix literals are not supported yet")
-        items = [item for item in re.split(r"[\s,]+", body) if item]
-        return "[" + ", ".join(items) + "]"
+        if ";" not in body:
+            items = [item for item in re.split(r"[\s,]+", body) if item]
+            return "[" + ", ".join(items) + "]"
+        rows = []
+        ncols = None
+        for raw_row in body.split(";"):
+            row = [item for item in re.split(r"[\s,]+", raw_row.strip()) if item]
+            if not row:
+                raise OmatError("matrix literal contains an empty row")
+            if ncols is None:
+                ncols = len(row)
+            elif len(row) != ncols:
+                raise OmatError("matrix literal rows must have the same length")
+            rows.append(row)
+        flat = [item for row in rows for item in row]
+        return (
+            f"reshape([{', '.join(flat)}], [{len(rows)}, {ncols}], "
+            "order=[2, 1])"
+        )
 
     return re.sub(r"\[([^\[\]]+)\]", repl, text)
 
@@ -338,6 +481,99 @@ def split_args(text: str) -> list[str]:
     return args
 
 
+def eval_repl_numeric_expr(text: str, scalar_values: dict[str, float]) -> float:
+    source = text.strip().replace("D", "e").replace("d", "e").replace("^", "**")
+    try:
+        tree = ast.parse(source, mode="eval")
+    except SyntaxError as exc:
+        raise OmatError("REPL rand size must be a scalar numeric expression") from exc
+
+    def visit(node: ast.AST) -> float:
+        if isinstance(node, ast.Expression):
+            return visit(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return float(node.value)
+        if isinstance(node, ast.Name):
+            value = scalar_values.get(node.id.lower())
+            if value is None:
+                raise OmatError(f"unknown scalar size variable '{node.id}'")
+            return value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = visit(node.operand)
+            return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.BinOp):
+            left = visit(node.left)
+            right = visit(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                return left / right
+            if isinstance(node.op, ast.FloorDiv):
+                return left // right
+            if isinstance(node.op, ast.Mod):
+                return left % right
+            if isinstance(node.op, ast.Pow):
+                return left**right
+        raise OmatError("REPL rand size must be a scalar numeric expression")
+
+    return visit(tree)
+
+
+def parse_repl_size_arg(text: str, scalar_values: dict[str, float]) -> int:
+    value = eval_repl_numeric_expr(text, scalar_values)
+    if value >= 0 and float(value).is_integer():
+        return int(value)
+    raise OmatError("REPL rand size must evaluate to a non-negative integer")
+
+
+def format_repl_real(value: float) -> str:
+    return f"{value:.17g}"
+
+
+def materialize_repl_rand(line: str, scalar_values: dict[str, float]) -> str:
+    def repl(match: re.Match[str]) -> str:
+        args = split_args(match.group(1))
+        if len(args) == 1:
+            n = parse_repl_size_arg(args[0], scalar_values)
+            values = ", ".join(format_repl_real(random.random()) for _ in range(n))
+            return f"[{values}]"
+        elif len(args) == 2 and args[1].strip() == "1":
+            n = parse_repl_size_arg(args[0], scalar_values)
+            values = ", ".join(format_repl_real(random.random()) for _ in range(n))
+            return f"[{values}]"
+        elif len(args) == 2:
+            nrow = parse_repl_size_arg(args[0], scalar_values)
+            ncol = parse_repl_size_arg(args[1], scalar_values)
+            rows = []
+            for _ in range(nrow):
+                row = " ".join(format_repl_real(random.random()) for _ in range(ncol))
+                rows.append(row)
+            return "[" + "; ".join(rows) + "]"
+        else:
+            raise OmatError("rand currently supports rand(n), rand(n,1), and rand(m,n)")
+
+    return re.sub(r"\brand\s*\(([^()]*)\)", repl, line, flags=re.IGNORECASE)
+
+
+def update_scalar_values(line: str, scalar_values: dict[str, float]) -> None:
+    stripped = strip_comment(line).strip()
+    if stripped.endswith(";"):
+        stripped = stripped[:-1].rstrip()
+    m = ASSIGN_RE.match(stripped)
+    if not m:
+        return
+    name, rhs = m.groups()
+    rhs = rhs.strip()
+    try:
+        scalar_values[name.lower()] = eval_repl_numeric_expr(rhs, scalar_values)
+    except OmatError:
+        scalar_values.pop(name.lower(), None)
+
+
 def helper_source(include_linspace: bool) -> list[str]:
     lines = [
         "function rand_omat(n) result(x)",
@@ -347,6 +583,13 @@ def helper_source(include_linspace: bool) -> list[str]:
         "call random_number(x)",
         "end function rand_omat",
         "",
+        "function rand_omat2(nrow, ncol) result(x)",
+        "integer, intent(in) :: nrow, ncol",
+        "real(real64), allocatable :: x(:,:)",
+        "allocate(x(nrow, ncol))",
+        "call random_number(x)",
+        "end function rand_omat2",
+        "",
         "function zeros_omat(n) result(x)",
         "integer, intent(in) :: n",
         "real(real64), allocatable :: x(:)",
@@ -354,12 +597,26 @@ def helper_source(include_linspace: bool) -> list[str]:
         "x = 0.0_real64",
         "end function zeros_omat",
         "",
+        "function zeros_omat2(nrow, ncol) result(x)",
+        "integer, intent(in) :: nrow, ncol",
+        "real(real64), allocatable :: x(:,:)",
+        "allocate(x(nrow, ncol))",
+        "x = 0.0_real64",
+        "end function zeros_omat2",
+        "",
         "function ones_omat(n) result(x)",
         "integer, intent(in) :: n",
         "real(real64), allocatable :: x(:)",
         "allocate(x(n))",
         "x = 1.0_real64",
         "end function ones_omat",
+        "",
+        "function ones_omat2(nrow, ncol) result(x)",
+        "integer, intent(in) :: nrow, ncol",
+        "real(real64), allocatable :: x(:,:)",
+        "allocate(x(nrow, ncol))",
+        "x = 1.0_real64",
+        "end function ones_omat2",
         "",
         "real(real64) function mean(x)",
         "real(real64), intent(in) :: x(:)",
@@ -464,9 +721,57 @@ def line_closes_block(line: str) -> bool:
     return strip_comment(line).strip().lower() == "end"
 
 
-def run_repl_buffer(buffer: list[str], ofort: str, previous_stdout: str = "") -> str | None:
+def suppress_repl_output(line: str) -> str:
+    stripped = strip_comment(line).strip()
+    if not stripped or stripped.endswith(";") or line_opens_block(line) or line_closes_block(line):
+        return line
+    return line.rstrip() + ";"
+
+
+def summarize_repl_assignment(line: str) -> str | None:
+    stripped = strip_comment(line).strip()
+    if stripped.endswith(";"):
+        return None
+    m = ASSIGN_RE.match(stripped)
+    if not m:
+        return None
+    _, rhs = m.groups()
+    rhs = rhs.strip()
+    if not (rhs.startswith("[") and rhs.endswith("]")):
+        return None
+    body = rhs[1:-1].strip()
+    if not body:
+        return None
+    if ";" not in body:
+        values = [item for item in re.split(r"[\s,]+", body) if item]
+        if len(values) <= 12:
+            return None
+        shown = values[:6] + ["..."] + values[-3:]
+        return " ".join(shown) + f"  ({len(values)} values)\n"
+
+    rows = [[item for item in re.split(r"[\s,]+", row.strip()) if item] for row in body.split(";")]
+    rows = [row for row in rows if row]
+    if not rows:
+        return None
+    nrow = len(rows)
+    ncol = max(len(row) for row in rows)
+    if nrow <= 6 and ncol <= 8:
+        return None
+    shown_rows = []
+    for row in rows[:3]:
+        if len(row) > 6:
+            shown_rows.append(" ".join(row[:6] + ["..."]))
+        else:
+            shown_rows.append(" ".join(row))
+    if nrow > 3:
+        shown_rows.append("...")
+    shown_rows.append(f"({nrow}x{ncol} matrix)")
+    return "\n".join(shown_rows) + "\n"
+
+
+def run_repl_source(source_lines: list[str], ofort: str, summary: str | None = None) -> str | None:
     try:
-        generated = translate_source("\n".join(buffer))
+        generated = translate_source("\n".join(source_lines))
     except OmatError as exc:
         print(f"omat: {exc}", file=sys.stderr)
         return None
@@ -475,12 +780,22 @@ def run_repl_buffer(buffer: list[str], ofort: str, previous_stdout: str = "") ->
         print(result.stderr, end="", file=sys.stderr)
     if result.returncode != 0:
         return None
-    stdout = result.stdout
-    if previous_stdout and stdout.startswith(previous_stdout):
-        print(stdout[len(previous_stdout):], end="")
+    if summary is not None:
+        print(summary, end="")
     else:
-        print(stdout, end="")
-    return stdout
+        print(result.stdout, end="")
+    return result.stdout
+
+
+def run_repl_buffer(buffer: list[str], ofort: str) -> str | None:
+    return run_repl_source(buffer, ofort)
+
+
+def run_repl_candidate(buffer: list[str], line: str, ofort: str) -> str | None:
+    source_lines = [suppress_repl_output(prior) for prior in buffer]
+    summary = summarize_repl_assignment(line)
+    source_lines.append(suppress_repl_output(line) if summary is not None else line)
+    return run_repl_source(source_lines, ofort, summary)
 
 
 def report_omat_error(exc: OmatError) -> None:
@@ -489,7 +804,7 @@ def report_omat_error(exc: OmatError) -> None:
 
 def repl(ofort: str) -> int:
     buffer: list[str] = []
-    previous_stdout = ""
+    scalar_values: dict[str, float] = {}
     block_depth = 0
     print("omat interactive mode")
     print("Commands: run, fortran, list, clear, quit")
@@ -504,7 +819,7 @@ def repl(ofort: str) -> int:
             return 0
         if command == "clear":
             buffer.clear()
-            previous_stdout = ""
+            scalar_values.clear()
             block_depth = 0
             continue
         if command == "list":
@@ -518,21 +833,25 @@ def repl(ofort: str) -> int:
                 print(f"omat: {exc}", file=sys.stderr)
             continue
         if command in {"run", "."}:
-            stdout = run_repl_buffer(buffer, ofort)
-            if stdout is not None:
-                previous_stdout = stdout
+            run_repl_buffer(buffer, ofort)
             continue
-        candidate = [*buffer, line]
-        if line_opens_block(line):
+        try:
+            materialized_line = materialize_repl_rand(line, scalar_values)
+        except OmatError as exc:
+            report_omat_error(exc)
+            continue
+        candidate = [*buffer, materialized_line]
+        if line_opens_block(materialized_line):
             try:
                 validate_partial_source("\n".join(candidate))
             except OmatError as exc:
                 report_omat_error(exc)
                 continue
             buffer = candidate
+            update_scalar_values(materialized_line, scalar_values)
             block_depth += 1
             continue
-        if line_closes_block(line) and block_depth > 0:
+        if line_closes_block(materialized_line) and block_depth > 0:
             new_block_depth = block_depth - 1
         else:
             new_block_depth = block_depth
@@ -543,13 +862,14 @@ def repl(ofort: str) -> int:
                 report_omat_error(exc)
                 continue
             buffer = candidate
+            update_scalar_values(materialized_line, scalar_values)
             block_depth = new_block_depth
             continue
-        stdout = run_repl_buffer(candidate, ofort, previous_stdout)
+        stdout = run_repl_candidate(buffer, materialized_line, ofort)
         if stdout is not None:
             buffer = candidate
+            update_scalar_values(materialized_line, scalar_values)
             block_depth = new_block_depth
-            previous_stdout = stdout
 
 
 def run(argv: list[str] | None = None) -> int:
