@@ -19,7 +19,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OFORT = ROOT / ("ofort.exe" if sys.platform.startswith("win") else "ofort")
 
 IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
-NUMBER_RE = re.compile(r"(?<![A-Za-z0-9_])(?:\d+\.\d*|\.\d+|\d+)(?:[eEdD][+-]?\d+)?")
+NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:\d+\.\d*|\.\d+|\d+)(?:[eEdD][+-]?\d+)?(?![A-Za-z0-9_])"
+)
 ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
 FOR_RE = re.compile(r"^for\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$", re.IGNORECASE)
 
@@ -30,6 +32,7 @@ BUILTINS = {
     "asin",
     "atan",
     "cos",
+    "equicor",
     "exp",
     "log",
     "maxval",
@@ -43,6 +46,10 @@ BUILTINS = {
 }
 
 MATRIX_FUNC_RE = re.compile(r"^(rand|zeros|ones)\s*\((.*)\)$", re.IGNORECASE)
+LA_SCALAR_FUNCTIONS = {"trace", "det", "cond", "norm", "rank", "is_square", "is_diagonal", "is_symmetric", "is_invertible"}
+LA_VECTOR_FUNCTIONS = {"eig", "svd"}
+LA_MATRIX_FUNCTIONS = {"eye", "triu", "tril", "kron", "inv", "qr", "lu", "pinv", "chol", "outer_product", "transpose2", "matmul2", "crossprod", "tcrossprod"}
+LA_FUNCTIONS = LA_SCALAR_FUNCTIONS | LA_VECTOR_FUNCTIONS | LA_MATRIX_FUNCTIONS | {"diag", "solve", "mldivide", "col_sums", "col_means"}
 
 
 @dataclass
@@ -74,6 +81,8 @@ class Translator:
         self.statements: list[Statement] = []
         self.indent = 0
         self.needs_linstep = False
+        self.needs_la_mod = False
+        self.la_names: set[str] = set()
 
     def translate(self, source: str) -> str:
         for line_no, raw in enumerate(source.splitlines(), start=1):
@@ -125,7 +134,7 @@ class Translator:
         if low.startswith("disp(") and line.endswith(")"):
             arg = line[line.find("(") + 1 : -1]
             if not suppress_output:
-                self.statements.append(Statement(f"print *, {self.expr(arg)}", self.indent))
+                self.emit_display(arg)
             return
 
         m = ASSIGN_RE.match(line)
@@ -140,16 +149,46 @@ class Translator:
             self.symbols[name.lower()] = Symbol(name, kind)
             self.statements.append(Statement(f"{name} = {self.expr(rhs)}", self.indent))
             if not suppress_output:
-                self.statements.append(Statement(f"print *, {name}", self.indent))
+                if kind == "real_matrix":
+                    self.statements.append(Statement(f"call print_matrix_omat({name})", self.indent))
+                else:
+                    self.statements.append(Statement(f"print *, {name}", self.indent))
             return
 
         if not suppress_output:
-            self.statements.append(Statement(f"print *, {self.expr(line)}", self.indent))
+            self.emit_display(line)
+
+    def emit_display(self, value: str) -> None:
+        stripped = value.strip()
+        kind = self.infer_kind(stripped)
+        if kind == "real_matrix":
+            self.statements.append(Statement(f"call print_matrix_omat({self.expr(stripped)})", self.indent))
+        else:
+            self.statements.append(Statement(f"print *, {self.expr(stripped)}", self.indent))
 
     def infer_kind(self, rhs: str) -> str:
         low = rhs.strip().lower()
         if re.match(r"^(mean|min|max|minval|maxval)\s*\(.+\)$", low, re.IGNORECASE):
             return "real"
+        call = parse_simple_call(low)
+        if call is not None:
+            name, args = call
+            if name in LA_SCALAR_FUNCTIONS:
+                return "real"
+            if name in {"col_sums", "col_means", "eig", "svd"}:
+                return "real_vector"
+            if name in LA_MATRIX_FUNCTIONS:
+                return "real_matrix"
+            if name == "diag" and args:
+                sym = self.symbols.get(args[0].strip().lower())
+                if sym is not None and sym.kind == "real_matrix":
+                    return "real_vector"
+                return "real_matrix"
+            if name in {"solve", "mldivide"} and len(args) >= 2:
+                sym = self.symbols.get(args[1].strip().lower())
+                if sym is not None and sym.kind == "real_matrix":
+                    return "real_matrix"
+                return "real_vector"
         if re.match(r"^sum\s*\(.+\)$", low, re.IGNORECASE):
             args = split_args(low[low.find("(") + 1 : -1])
             if args:
@@ -187,9 +226,11 @@ class Translator:
         out = convert_elementwise(out)
         out = self.convert_power(out)
         out = self.convert_matrix_multiply(out)
+        out = self.convert_la_functions(out)
         out = self.convert_function_names(out)
         out = self.convert_rand(out)
         out = self.convert_zeros_ones(out)
+        out = self.convert_equicor(out)
         out = self.convert_linspace(out)
         out = convert_numbers(out)
         return out
@@ -227,6 +268,14 @@ class Translator:
             return match.group(0)
 
         return pattern.sub(repl, text)
+
+    def convert_la_functions(self, text: str) -> str:
+        for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
+            name = match.group(1).lower()
+            if name in LA_FUNCTIONS:
+                self.needs_la_mod = True
+                self.la_names.add(name)
+        return text
 
     def convert_function_names(self, text: str) -> str:
         out = text
@@ -288,6 +337,15 @@ class Translator:
         out = convert("ones", "ones", out)
         return out
 
+    def convert_equicor(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 2:
+                raise OmatError("equicor requires two arguments: equicor(n, rho)")
+            return f"equicor_omat(int({args[0]}), real({self.expr(args[1])}, real64))"
+
+        return re.sub(r"\bequicor\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
     def convert_linspace(self, text: str) -> str:
         def repl(match: re.Match[str]) -> str:
             self.needs_linstep = True
@@ -305,6 +363,9 @@ class Translator:
         lines: list[str] = []
         lines.append("program omat_main")
         lines.append("use, intrinsic :: iso_fortran_env, only: real64")
+        if self.needs_la_mod:
+            names = sorted(self.la_names)
+            lines.append("use ofort_la_mod, only: " + ", ".join(names))
         lines.append("implicit none")
         for sym in self.symbols.values():
             if sym.kind == "integer":
@@ -347,6 +408,15 @@ def parse_loop_spec(spec: str) -> tuple[str, str, str | None]:
     raise OmatError("for loops must use start:stop or start:step:stop")
 
 
+def parse_simple_call(text: str) -> tuple[str, list[str]] | None:
+    stripped = text.strip()
+    m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)$", stripped)
+    if not m:
+        return None
+    name = m.group(1).lower()
+    return name, split_args(m.group(2))
+
+
 def is_vector_expr(text: str) -> bool:
     m = MATRIX_FUNC_RE.match(text)
     if m is not None:
@@ -360,6 +430,8 @@ def is_vector_expr(text: str) -> bool:
 
 def is_matrix_expr(text: str) -> bool:
     if text.startswith("[") and ";" in text:
+        return True
+    if re.match(r"^equicor\s*\(", text, re.IGNORECASE) is not None:
         return True
     m = MATRIX_FUNC_RE.match(text)
     if m is not None:
@@ -618,6 +690,26 @@ def helper_source(include_linspace: bool) -> list[str]:
         "x = 1.0_real64",
         "end function ones_omat2",
         "",
+        "function equicor_omat(n, rho) result(x)",
+        "integer, intent(in) :: n",
+        "real(real64), intent(in) :: rho",
+        "real(real64), allocatable :: x(:,:)",
+        "integer :: i",
+        "allocate(x(n, n))",
+        "x = rho",
+        "do i = 1, n",
+        "  x(i, i) = 1.0_real64",
+        "end do",
+        "end function equicor_omat",
+        "",
+        "subroutine print_matrix_omat(x)",
+        "real(real64), intent(in) :: x(:,:)",
+        "integer :: i",
+        "do i = 1, size(x, 1)",
+        "  print *, x(i, :)",
+        "end do",
+        "end subroutine print_matrix_omat",
+        "",
         "real(real64) function mean(x)",
         "real(real64), intent(in) :: x(:)",
         "mean = sum(x) / real(size(x), real64)",
@@ -689,6 +781,20 @@ def compile_and_run(
     keep_path: Path | None = None,
 ) -> int:
     result = compile_and_run_capture(generated, compiler_name, emit_fortran, keep_path)
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    return result.returncode
+
+
+def run_with_ofort(
+    generated: str,
+    ofort_path: str,
+    keep_path: Path | None = None,
+) -> int:
+    result = run_with_ofort_capture(generated, ofort_path)
+    if keep_path is not None:
+        keep_path.write_text(generated, encoding="utf-8")
+        result.stderr += f"omat: kept generated Fortran in {keep_path}\n"
     print(result.stdout, end="")
     print(result.stderr, end="", file=sys.stderr)
     return result.returncode
@@ -909,6 +1015,8 @@ def run(argv: list[str] | None = None) -> int:
         return 0
 
     keep_path = source_path.with_suffix(".f90") if args.keep else None
+    if "use ofort_la_mod" in generated:
+        return run_with_ofort(generated, args.ofort, keep_path)
     return compile_and_run(generated, args.gfortran, args.emit_fortran, keep_path)
 
 
