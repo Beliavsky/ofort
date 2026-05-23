@@ -38,6 +38,7 @@ BUILTINS = {
     "maxval",
     "mean",
     "minval",
+    "reshape",
     "sqrt",
     "sin",
     "size",
@@ -170,9 +171,19 @@ class Translator:
         low = rhs.strip().lower()
         if re.match(r"^(mean|min|max|minval|maxval)\s*\(.+\)$", low, re.IGNORECASE):
             return "real"
+        if is_flatten_expr(low):
+            return "real_vector"
         call = parse_simple_call(low)
         if call is not None:
             name, args = call
+            if name == "reshape":
+                if len(args) == 3:
+                    return "real_matrix"
+                if len(args) == 2:
+                    shape_rank = shape_literal_rank(args[1])
+                    if shape_rank == 2:
+                        return "real_matrix"
+                    return "real_vector"
             if name in LA_SCALAR_FUNCTIONS:
                 return "real"
             if name in {"col_sums", "col_means", "eig", "svd"}:
@@ -222,6 +233,8 @@ class Translator:
 
     def expr(self, text: str) -> str:
         out = text.strip()
+        out = self.convert_matlab_reshape(out)
+        out = self.convert_colon_flatten(out)
         out = convert_vector_literals(out)
         out = convert_elementwise(out)
         out = self.convert_power(out)
@@ -303,6 +316,68 @@ class Translator:
             raise OmatError("matrix sum currently supports sum(A), sum(A,1), and sum(A,2)")
 
         return re.sub(r"\bsum\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_matlab_reshape(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            source = self.expr(args[0]) if args else ""
+            source_kind = self.expr_kind(args[0]) if args else "real_vector"
+            if len(args) == 3:
+                helper = (
+                    "reshape_mat_from_mat_omat"
+                    if source_kind == "real_matrix"
+                    else "reshape_mat_from_vec_omat"
+                )
+                return (
+                    f"{helper}({source}, "
+                    f"int({self.expr(args[1])}), int({self.expr(args[2])}))"
+                )
+            if len(args) == 2:
+                shape_args = shape_literal_args(args[1])
+                if shape_args is None:
+                    raise OmatError("reshape shape currently must be [n] or [m,n]")
+                if len(shape_args) == 1:
+                    helper = (
+                        "reshape_vec_from_mat_omat"
+                        if source_kind == "real_matrix"
+                        else "reshape_vec_from_vec_omat"
+                    )
+                    return f"{helper}({source}, int({self.expr(shape_args[0])}))"
+                if len(shape_args) == 2:
+                    helper = (
+                        "reshape_mat_from_mat_omat"
+                        if source_kind == "real_matrix"
+                        else "reshape_mat_from_vec_omat"
+                    )
+                    return (
+                        f"{helper}({source}, "
+                        f"int({self.expr(shape_args[0])}), int({self.expr(shape_args[1])}))"
+                    )
+                raise OmatError("reshape shape currently must be [n] or [m,n]")
+            raise OmatError("reshape currently supports reshape(x,m,n) and reshape(x,[...])")
+
+        return re.sub(r"\breshape\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_colon_flatten(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            name = match.group(1)
+            sym = self.symbols.get(name.lower())
+            if sym is not None and sym.kind == "real_matrix":
+                return f"reshape_vec_from_mat_omat({name}, size({name}))"
+            return f"reshape_vec_from_vec_omat({name}, size({name}))"
+
+        return re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*:\s*\)", repl, text)
+
+    def expr_kind(self, text: str) -> str:
+        low = text.strip().lower()
+        sym = self.symbols.get(low)
+        if sym is not None:
+            return sym.kind
+        if is_matrix_expr(low):
+            return "real_matrix"
+        if is_vector_expr(low):
+            return "real_vector"
+        return "real_vector"
 
     def convert_rand(self, text: str) -> str:
         def repl(match: re.Match[str]) -> str:
@@ -418,6 +493,8 @@ def parse_simple_call(text: str) -> tuple[str, list[str]] | None:
 
 
 def is_vector_expr(text: str) -> bool:
+    if is_flatten_expr(text):
+        return True
     m = MATRIX_FUNC_RE.match(text)
     if m is not None:
         args = split_args(m.group(2))
@@ -429,6 +506,13 @@ def is_vector_expr(text: str) -> bool:
 
 
 def is_matrix_expr(text: str) -> bool:
+    call = parse_simple_call(text)
+    if call is not None:
+        name, args = call
+        if name == "reshape" and len(args) == 3:
+            return True
+        if name == "reshape" and len(args) == 2 and shape_literal_rank(args[1]) == 2:
+            return True
     if text.startswith("[") and ";" in text:
         return True
     if re.match(r"^equicor\s*\(", text, re.IGNORECASE) is not None:
@@ -438,6 +522,25 @@ def is_matrix_expr(text: str) -> bool:
         args = split_args(m.group(2))
         return len(args) == 2 and args[1].strip() != "1"
     return False
+
+
+def is_flatten_expr(text: str) -> bool:
+    return re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*\(\s*:\s*\)$", text) is not None
+
+
+def shape_literal_rank(text: str) -> int | None:
+    args = shape_literal_args(text)
+    return None if args is None else len(args)
+
+
+def shape_literal_args(text: str) -> list[str] | None:
+    stripped = text.strip()
+    if not (stripped.startswith("[") and stripped.endswith("]")):
+        return None
+    body = stripped[1:-1].strip()
+    if not body:
+        return None
+    return split_args(body)
 
 
 def convert_elementwise(text: str) -> str:
@@ -701,6 +804,54 @@ def helper_source(include_linspace: bool) -> list[str]:
         "  x(i, i) = 1.0_real64",
         "end do",
         "end function equicor_omat",
+        "",
+        "function reshape_vec_from_vec_omat(x, n) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "integer, intent(in) :: n",
+        "real(real64), allocatable :: y(:)",
+        "if (n /= size(x)) then",
+        "  print *, 'omat reshape size mismatch'",
+        "  stop 1",
+        "end if",
+        "allocate(y(n))",
+        "y = reshape(x, [n])",
+        "end function reshape_vec_from_vec_omat",
+        "",
+        "function reshape_vec_from_mat_omat(x, n) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "integer, intent(in) :: n",
+        "real(real64), allocatable :: y(:)",
+        "if (n /= size(x)) then",
+        "  print *, 'omat reshape size mismatch'",
+        "  stop 1",
+        "end if",
+        "allocate(y(n))",
+        "y = reshape(x, [n])",
+        "end function reshape_vec_from_mat_omat",
+        "",
+        "function reshape_mat_from_vec_omat(x, nrow, ncol) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "integer, intent(in) :: nrow, ncol",
+        "real(real64), allocatable :: y(:,:)",
+        "if (nrow * ncol /= size(x)) then",
+        "  print *, 'omat reshape size mismatch'",
+        "  stop 1",
+        "end if",
+        "allocate(y(nrow, ncol))",
+        "y = reshape(x, [nrow, ncol])",
+        "end function reshape_mat_from_vec_omat",
+        "",
+        "function reshape_mat_from_mat_omat(x, nrow, ncol) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "integer, intent(in) :: nrow, ncol",
+        "real(real64), allocatable :: y(:,:)",
+        "if (nrow * ncol /= size(x)) then",
+        "  print *, 'omat reshape size mismatch'",
+        "  stop 1",
+        "end if",
+        "allocate(y(nrow, ncol))",
+        "y = reshape(x, [nrow, ncol])",
+        "end function reshape_mat_from_mat_omat",
         "",
         "subroutine print_matrix_omat(x)",
         "real(real64), intent(in) :: x(:,:)",
