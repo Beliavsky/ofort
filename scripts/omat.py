@@ -28,6 +28,8 @@ NUMBER_RE = re.compile(
 )
 ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
 FOR_RE = re.compile(r"^for\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$", re.IGNORECASE)
+IF_RE = re.compile(r"^if\s+(.+)$", re.IGNORECASE)
+ELSEIF_RE = re.compile(r"^elseif\s+(.+)$", re.IGNORECASE)
 
 
 BUILTINS = {
@@ -38,8 +40,14 @@ BUILTINS = {
     "asin",
     "atan",
     "cos",
+    "ceil",
     "equicor",
     "exp",
+    "fix",
+    "flip",
+    "fliplr",
+    "flipud",
+    "floor",
     "log",
     "mad",
     "maxval",
@@ -50,28 +58,48 @@ BUILTINS = {
     "corrcoef",
     "cov",
     "cumsum",
+    "cumprod",
+    "diag",
     "diff",
+    "eye",
     "find",
     "iqr",
     "isfinite",
     "isinf",
+    "isempty",
+    "ismember",
+    "ismatrix",
     "isnan",
+    "isscalar",
+    "isvector",
     "kurtosis",
     "length",
+    "logspace",
     "movmean",
+    "mod",
+    "nonzeros",
     "numel",
     "prctile",
+    "prod",
     "quantile",
+    "repmat",
     "reshape",
     "rms",
+    "round",
     "sqrt",
     "std",
     "skewness",
     "sin",
+    "sign",
     "size",
     "sum",
     "sort",
     "tan",
+    "transpose",
+    "unique",
+    "intersect",
+    "union",
+    "setdiff",
     "var",
     "zscore",
 }
@@ -81,12 +109,12 @@ STAT_SCALAR_FUNCTIONS = {
     "mean", "std", "var", "median", "skewness", "kurtosis", "rms", "mad",
     "quantile", "prctile", "iqr", "corr"
 }
-STAT_VECTOR_FUNCTIONS = {"cumsum", "zscore", "movmean"}
+STAT_VECTOR_FUNCTIONS = {"cumsum", "cumprod", "zscore", "movmean"}
 STAT_MATRIX_FUNCTIONS = {"cov", "corrcoef"}
 LA_SCALAR_FUNCTIONS = {"trace", "det", "cond", "norm", "rank", "is_square", "is_diagonal", "is_symmetric", "is_invertible"}
 LA_VECTOR_FUNCTIONS = {"eig", "svd"}
-LA_MATRIX_FUNCTIONS = {"eye", "triu", "tril", "kron", "inv", "qr", "lu", "pinv", "chol", "outer_product", "transpose2", "matmul2", "crossprod", "tcrossprod"}
-LA_FUNCTIONS = LA_SCALAR_FUNCTIONS | LA_VECTOR_FUNCTIONS | LA_MATRIX_FUNCTIONS | {"diag", "solve", "mldivide", "col_sums", "col_means"}
+LA_MATRIX_FUNCTIONS = {"triu", "tril", "kron", "inv", "qr", "lu", "pinv", "chol", "outer_product", "transpose2", "matmul2", "crossprod", "tcrossprod"}
+LA_FUNCTIONS = LA_SCALAR_FUNCTIONS | LA_VECTOR_FUNCTIONS | LA_MATRIX_FUNCTIONS | {"solve", "mldivide", "col_sums", "col_means"}
 RANDOM_DIST_PARAM_COUNTS = {
     "randn": 0,
     "normrnd": 2,
@@ -189,9 +217,49 @@ PURE_HELPERS = {
     "cov_omat",
     "corrcoef_omat",
     "linspace_omat",
+    "logspace_omat",
+    "colon2_omat",
+    "colon3_omat",
+    "eye_omat",
+    "diag_vec_omat",
+    "diag_mat_omat",
+    "repmat_vec_omat",
+    "repmat_mat_omat",
+    "min_vec_omat",
+    "min_mat_omat",
+    "max_vec_omat",
+    "max_mat_omat",
+    "prod_vec_omat",
+    "prod_mat_omat",
+    "cumprod_vec_omat",
+    "cumprod_mat_omat",
+    "ceil_vec_omat",
+    "ceil_mat_omat",
+    "floor_vec_omat",
+    "floor_mat_omat",
+    "round_vec_omat",
+    "round_mat_omat",
+    "fix_vec_omat",
+    "fix_mat_omat",
+    "sign_vec_omat",
+    "sign_mat_omat",
+    "flip_vec_omat",
+    "flip_mat_omat",
+    "fliplr_mat_omat",
+    "flipud_mat_omat",
+    "transpose_vec_omat",
+    "transpose_mat_omat",
+    "vcat_vecs_omat",
     "diff_vec_omat",
     "sort_vec_omat",
     "find_vec_omat",
+    "find_k_vec_omat",
+    "unique_vec_omat",
+    "intersect_vec_omat",
+    "union_vec_omat",
+    "setdiff_vec_omat",
+    "ismember_vec_omat",
+    "nonzeros_vec_omat",
     "isnan_vec_omat",
     "isfinite_vec_omat",
     "isinf_vec_omat",
@@ -228,6 +296,7 @@ class Translator:
         self.symbols: dict[str, Symbol] = {}
         self.statements: list[Statement] = []
         self.indent = 0
+        self.block_stack: list[str] = []
         self.needs_linstep = False
         self.needs_la_mod = False
         self.la_names: set[str] = set()
@@ -262,8 +331,11 @@ class Translator:
         if low == "end":
             if self.indent <= 0:
                 raise OmatError(f"line {line_no}: END without a block")
+            if not self.block_stack:
+                raise OmatError(f"line {line_no}: END without a block")
+            block = self.block_stack.pop()
             self.indent -= 1
-            self.statements.append(Statement("end do", self.indent))
+            self.statements.append(Statement("end do" if block == "for" else "end if", self.indent))
             return
 
         m = FOR_RE.match(line)
@@ -286,12 +358,56 @@ class Translator:
                     )
                 )
             self.indent += 1
+            self.block_stack.append("for")
+            return
+
+        m = IF_RE.match(line)
+        if m:
+            condition = m.group(1).strip()
+            self.statements.append(Statement(f"if ({self.expr(condition)}) then", self.indent))
+            self.indent += 1
+            self.block_stack.append("if")
+            return
+
+        m = ELSEIF_RE.match(line)
+        if m:
+            if not self.block_stack or self.block_stack[-1] != "if":
+                raise OmatError(f"line {line_no}: ELSEIF without IF")
+            if self.indent <= 0:
+                raise OmatError(f"line {line_no}: ELSEIF without IF")
+            self.indent -= 1
+            self.statements.append(Statement(f"else if ({self.expr(m.group(1).strip())}) then", self.indent))
+            self.indent += 1
+            return
+
+        if low == "else":
+            if not self.block_stack or self.block_stack[-1] != "if":
+                raise OmatError(f"line {line_no}: ELSE without IF")
+            if self.indent <= 0:
+                raise OmatError(f"line {line_no}: ELSE without IF")
+            self.indent -= 1
+            self.statements.append(Statement("else", self.indent))
+            self.indent += 1
             return
 
         if low.startswith("disp(") and line.endswith(")"):
             arg = line[line.find("(") + 1 : -1]
             if not suppress_output:
                 self.emit_display(arg)
+            return
+
+        mask_assignment = self.parse_logical_index_assignment(line)
+        if mask_assignment is not None:
+            name, mask, rhs = mask_assignment
+            self.statements.append(Statement(f"where ({mask})", self.indent))
+            self.indent += 1
+            self.statements.append(Statement(f"{name} = {rhs}", self.indent))
+            self.indent -= 1
+            self.statements.append(Statement("end where", self.indent))
+            if not suppress_output:
+                sym = self.symbols.get(name.lower())
+                if sym is not None:
+                    self.statements.append(Statement(self.display_statement(name, sym.kind), self.indent))
             return
 
         m = ASSIGN_RE.match(line)
@@ -306,44 +422,124 @@ class Translator:
             self.symbols[name.lower()] = Symbol(name, kind)
             self.statements.append(Statement(f"{name} = {self.expr(rhs)}", self.indent))
             if not suppress_output:
-                if kind == "real_matrix":
-                    self.statements.append(Statement(f"call print_matrix_omat({name})", self.indent))
-                else:
-                    self.statements.append(Statement(f"print *, {name}", self.indent))
+                self.statements.append(Statement(self.display_statement(name, kind), self.indent))
             return
 
         if not suppress_output:
             self.emit_display(line)
 
+    def parse_logical_index_assignment(self, line: str) -> tuple[str, str, str] | None:
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s*=\s*(.+)$", line)
+        if not m:
+            return None
+        name, index, rhs = m.groups()
+        sym = self.symbols.get(name.lower())
+        if sym is None or sym.kind not in {"real_vector", "real_matrix", "integer_vector", "logical_vector", "logical_matrix"}:
+            return None
+        args = split_args(index)
+        if len(args) != 1 or not self.is_logical_selector(args[0]):
+            return None
+        rhs_kind = self.infer_kind(rhs)
+        if rhs_kind.endswith("_vector") or rhs_kind.endswith("_matrix"):
+            raise OmatError("logical-index assignment currently requires a scalar right-hand side")
+        return name, self.expr(args[0]), self.expr(rhs)
+
     def emit_display(self, value: str) -> None:
         stripped = value.strip()
         kind = self.infer_kind(stripped)
+        self.statements.append(Statement(self.display_statement(self.expr(stripped), kind), self.indent))
+
+    def display_statement(self, expr: str, kind: str) -> str:
         if kind == "real_matrix":
-            self.statements.append(Statement(f"call print_matrix_omat({self.expr(stripped)})", self.indent))
-        else:
-            self.statements.append(Statement(f"print *, {self.expr(stripped)}", self.indent))
+            return f"call print_real_matrix_omat({expr})"
+        if kind == "real_vector":
+            return f"call {'disp_omat' if self.generic else 'print_real_vector_omat'}({expr})"
+        if kind == "integer_vector":
+            return f"call {'disp_omat' if self.generic else 'print_integer_vector_omat'}({expr})"
+        if kind == "logical_vector":
+            return f"call {'disp_omat' if self.generic else 'print_logical_vector_omat'}({expr})"
+        if kind == "logical_matrix":
+            return f"call print_logical_matrix_omat({expr})"
+        if kind == "integer":
+            return f"call print_integer_scalar_omat({expr})"
+        if kind == "logical":
+            return f"call print_logical_scalar_omat({expr})"
+        return f"call print_real_scalar_omat({expr})"
 
     def infer_kind(self, rhs: str) -> str:
         low = rhs.strip().lower()
-        if self.is_logical_expr(rhs):
-            return self.logical_expr_kind(rhs)
-        if re.match(r"^(min|max|minval|maxval)\s*\(.+\)$", low, re.IGNORECASE):
-            return "real"
         if is_flatten_expr(low):
             return "real_vector"
+        indexed = self.indexed_expr_kind(low)
+        if indexed is not None:
+            return indexed
         call = parse_simple_call(low)
         if call is not None:
             name, args = call
+            if name == "size":
+                if len(args) == 1:
+                    return "integer_vector"
+                return "integer"
             if name in {"length", "numel"}:
                 return "integer"
             if name in {"any", "all"}:
                 return "logical"
+            if name in {"isvector", "ismatrix", "isscalar", "isempty"}:
+                return "logical"
             if name == "find":
                 return "integer_vector"
+            if name in {"unique", "intersect", "union", "setdiff", "nonzeros"}:
+                return "real_vector"
+            if name == "ismember":
+                return "logical_vector"
             if name in {"isnan", "isfinite", "isinf"}:
                 return "logical_vector"
             if name in {"diff", "sort"}:
                 return "real_vector"
+            if name == "logspace":
+                return "real_vector"
+            if name in {"floor", "ceil", "round", "fix", "sign", "flip", "fliplr", "flipud"} and args:
+                sym = self.symbols.get(args[0].strip().lower())
+                if sym is not None and sym.kind == "real_matrix":
+                    return "real_matrix"
+                if sym is not None and sym.kind == "real_vector":
+                    return "real_vector"
+                if is_matrix_expr(args[0].strip().lower()):
+                    return "real_matrix"
+                if is_vector_expr(args[0].strip().lower()):
+                    return "real_vector"
+                return "real"
+            if name == "mod" and args:
+                saw_integer_vector = False
+                for arg in args:
+                    sym = self.symbols.get(arg.strip().lower())
+                    if sym is not None and sym.kind == "real_matrix":
+                        return "real_matrix"
+                    if sym is not None and sym.kind == "real_vector":
+                        return "real_vector"
+                    if sym is not None and sym.kind == "integer_vector":
+                        saw_integer_vector = True
+                if saw_integer_vector:
+                    return "integer_vector"
+                return "real"
+            if name == "transpose" and args:
+                sym = self.symbols.get(args[0].strip().lower())
+                if sym is not None and sym.kind == "real_vector":
+                    return "real_matrix"
+                if sym is not None and sym.kind == "real_matrix":
+                    return "real_matrix"
+                if is_vector_expr(args[0].strip().lower()) or is_matrix_expr(args[0].strip().lower()):
+                    return "real_matrix"
+                return "real"
+            if name == "eye":
+                return "real_matrix"
+            if name == "diag" and args:
+                sym = self.symbols.get(args[0].strip().lower())
+                if sym is not None and sym.kind == "real_matrix":
+                    return "real_vector"
+                return "real_matrix"
+            if name == "repmat":
+                return "real_matrix"
             if name == "reshape":
                 if len(args) == 3:
                     return "real_matrix"
@@ -379,17 +575,14 @@ class Translator:
                 return "real_vector"
             if name in LA_MATRIX_FUNCTIONS:
                 return "real_matrix"
-            if name == "diag" and args:
-                sym = self.symbols.get(args[0].strip().lower())
-                if sym is not None and sym.kind == "real_matrix":
-                    return "real_vector"
-                return "real_matrix"
             if name in {"solve", "mldivide"} and len(args) >= 2:
                 sym = self.symbols.get(args[1].strip().lower())
                 if sym is not None and sym.kind == "real_matrix":
                     return "real_matrix"
                 return "real_vector"
-        if re.match(r"^sum\s*\(.+\)$", low, re.IGNORECASE):
+        if self.is_logical_expr(rhs):
+            return self.logical_expr_kind(rhs)
+        if re.match(r"^(sum|min|max|prod)\s*\(.+\)$", low, re.IGNORECASE):
             args = split_args(low[low.find("(") + 1 : -1])
             if args:
                 sym = self.symbols.get(args[0].lower())
@@ -399,7 +592,7 @@ class Translator:
         if is_matrix_expr(low):
             return "real_matrix"
         if is_vector_expr(low):
-            return "real_vector"
+            return self.vector_expr_kind(rhs)
         m = re.match(
             r"^([A-Za-z_][A-Za-z0-9_]*)\s*\*\s*([A-Za-z_][A-Za-z0-9_]*)$",
             rhs.strip(),
@@ -413,18 +606,63 @@ class Translator:
                 if "real_matrix" in {left.kind, right.kind}:
                     return "real_vector"
         for name in IDENT_RE.findall(rhs):
+            if identifier_is_indexed(rhs, name):
+                continue
             sym = self.symbols.get(name.lower())
-            if sym is not None and sym.kind == "real_matrix" and rhs.strip().lower() == name.lower():
-                return "real_matrix"
-            if sym is not None and sym.kind == "real_vector":
-                return "real_vector"
+            if sym is not None and rhs.strip().lower() == name.lower():
+                return sym.kind
+            if sym is not None and sym.kind in {"real_vector", "integer_vector", "logical_vector"}:
+                return sym.kind
         return "real"
+
+    def indexed_expr_kind(self, text: str) -> str | None:
+        parsed = parse_index_expr(text)
+        if parsed is None:
+            return None
+        name, args = parsed
+        sym = self.symbols.get(name.lower())
+        if sym is None:
+            return None
+        if sym.kind in {"real_vector", "integer_vector", "logical_vector"}:
+            if len(args) != 1:
+                return None
+            if self.is_logical_selector(args[0]):
+                return sym.kind
+            return sym.kind if index_selects_many(args[0]) else vector_element_kind(sym.kind)
+        if sym.kind in {"real_matrix", "logical_matrix"}:
+            if len(args) == 1:
+                if self.is_logical_selector(args[0]):
+                    return "real_vector" if sym.kind == "real_matrix" else "logical_vector"
+                return "real_vector" if sym.kind == "real_matrix" else "logical_vector"
+            if len(args) != 2:
+                return None
+            row_many = index_selects_many(args[0])
+            col_many = index_selects_many(args[1])
+            if row_many and col_many:
+                return sym.kind
+            if row_many or col_many:
+                return "real_vector" if sym.kind == "real_matrix" else "logical_vector"
+            return "real" if sym.kind == "real_matrix" else "logical"
+        return None
+
+    def vector_expr_kind(self, rhs: str) -> str:
+        text = rhs.strip()
+        if not (text.startswith("[") and text.endswith("]") and ";" not in text):
+            return "real_vector"
+        kinds = [self.infer_kind(item) for item in split_matlab_literal_row(text[1:-1].strip())]
+        if kinds and all(kind in {"integer", "integer_vector"} for kind in kinds):
+            return "integer_vector"
+        if kinds and all(kind in {"logical", "logical_vector"} for kind in kinds):
+            return "logical_vector"
+        return "real_vector"
 
     def is_logical_expr(self, rhs: str) -> bool:
         return re.search(r"(==|~=|<=|>=|<|>)", rhs) is not None
 
     def logical_expr_kind(self, rhs: str) -> str:
         for name in IDENT_RE.findall(rhs):
+            if identifier_is_indexed(rhs, name):
+                continue
             sym = self.symbols.get(name.lower())
             if sym is not None and sym.kind == "real_matrix":
                 return "logical_matrix"
@@ -437,34 +675,328 @@ class Translator:
         self.reject_unimplemented_matlab_functions(out)
         out = self.convert_matlab_reshape(out)
         out = self.convert_colon_flatten(out)
+        out = self.convert_logical_indexing(out)
+        out = self.convert_index_triplets(out)
+        out = self.convert_colon_vector(out)
+        out = self.convert_vertical_vector_concat(out)
         out = convert_vector_literals(out)
         out = convert_elementwise(out)
         out = self.convert_power(out)
         out = self.convert_matrix_multiply(out)
+        out = self.convert_basic_array_functions(out)
         out = self.convert_la_functions(out)
         out = self.convert_random_dist_functions(out)
-        out = self.convert_basic_array_functions(out)
         out = self.convert_stats_functions(out)
         out = self.convert_function_names(out)
         out = self.convert_rand(out)
         out = self.convert_zeros_ones(out)
         out = self.convert_equicor(out)
         out = self.convert_linspace(out)
+        out = self.convert_logspace(out)
         out = convert_numbers(out)
         return out
 
+    def convert_logical_indexing(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            name = match.group(1)
+            if name.lower() in BUILTINS or name.lower() in LA_FUNCTIONS or name.lower() in RANDOM_DIST_PARAM_COUNTS:
+                return match.group(0)
+            sym = self.symbols.get(name.lower())
+            if sym is None or sym.kind not in {"real_vector", "real_matrix", "integer_vector", "logical_vector", "logical_matrix"}:
+                return match.group(0)
+            args = split_args(match.group(2))
+            if len(args) != 1 or not self.is_logical_selector(args[0]):
+                return match.group(0)
+            return f"pack({name}, {self.expr(args[0])})"
+
+        return re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(([^()]*)\)", repl, text)
+
+    def is_logical_selector(self, text: str) -> bool:
+        stripped = text.strip()
+        sym = self.symbols.get(stripped.lower())
+        if sym is not None and sym.kind in {"logical_vector", "logical_matrix"}:
+            return True
+        return self.is_logical_expr(stripped) and self.logical_expr_kind(stripped) in {
+            "logical_vector",
+            "logical_matrix",
+        }
+
+    def convert_index_triplets(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            name = match.group(1)
+            if name.lower() in BUILTINS or name.lower() in LA_FUNCTIONS or name.lower() in RANDOM_DIST_PARAM_COUNTS:
+                return match.group(0)
+            args = split_args(match.group(2))
+            converted = []
+            changed = False
+            for arg in args:
+                parts = split_top_level_colon(arg.strip())
+                if len(parts) == 3:
+                    converted.append(f"{parts[0]}:{parts[2]}:{parts[1]}")
+                    changed = True
+                else:
+                    converted.append(arg.strip())
+            if not changed:
+                return match.group(0)
+            return f"{name}({', '.join(converted)})"
+
+        return re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(([^()]*)\)", repl, text)
+
     def convert_basic_array_functions(self, text: str) -> str:
         out = text
+        out = self.convert_eye(out)
+        out = self.convert_diag(out)
+        out = self.convert_repmat(out)
+        out = self.convert_numeric_unary_functions(out)
+        out = self.convert_mod_function(out)
+        out = self.convert_flip_functions(out)
+        out = self.convert_transpose_function(out)
+        out = self.convert_size_function(out)
+        out = self.convert_shape_predicates(out)
         out = self.convert_length_numel(out)
         out = self.convert_one_arg_kind_function(out, "diff", "diff_vec_omat")
         out = self.convert_one_arg_kind_function(out, "sort", "sort_vec_omat")
-        out = self.convert_one_arg_kind_function(out, "find", "find_vec_omat")
+        out = self.convert_find_function(out)
+        out = self.convert_one_arg_kind_function(out, "unique", "unique_vec_omat")
+        out = self.convert_one_arg_kind_function(out, "nonzeros", "nonzeros_vec_omat")
+        out = self.convert_two_arg_vector_function(out, "intersect", "intersect_vec_omat")
+        out = self.convert_two_arg_vector_function(out, "union", "union_vec_omat")
+        out = self.convert_two_arg_vector_function(out, "setdiff", "setdiff_vec_omat")
+        out = self.convert_two_arg_vector_function(out, "ismember", "ismember_vec_omat")
         out = self.convert_one_arg_kind_function(out, "isnan", "isnan_vec_omat")
         out = self.convert_one_arg_kind_function(out, "isfinite", "isfinite_vec_omat")
         out = self.convert_one_arg_kind_function(out, "isinf", "isinf_vec_omat")
         out = self.convert_one_arg_kind_function(out, "any", "any_vec_omat")
         out = self.convert_one_arg_kind_function(out, "all", "all_vec_omat")
         return out
+
+    def convert_size_function(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) not in {1, 2}:
+                raise OmatError("size currently supports size(x) and size(x, dim)")
+            arg = args[0].strip()
+            expr = self.expr(arg)
+            sym = self.symbols.get(arg.lower())
+            kind = sym.kind if sym is not None else self.argument_kind(arg)
+            if len(args) == 1:
+                if kind == "real_matrix":
+                    return f"[size({expr}, 1), size({expr}, 2)]"
+                if kind.endswith("_vector"):
+                    return f"[1, size({expr})]"
+                return "[1, 1]"
+            dim = self.integer_arg(args[1])
+            if kind == "real_matrix":
+                return f"size({expr}, {dim})"
+            if kind.endswith("_vector"):
+                if dim == "1":
+                    return "1"
+                if dim == "2":
+                    return f"size({expr})"
+                return "1"
+            return "1"
+
+        return re.sub(r"\bsize\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_shape_predicates(self, text: str) -> str:
+        for name in ["isvector", "ismatrix", "isscalar", "isempty"]:
+            text = self.convert_one_shape_predicate(text, name)
+        return text
+
+    def convert_vertical_vector_concat(self, text: str) -> str:
+        stripped = text.strip()
+        if not (stripped.startswith("[") and stripped.endswith("]") and ";" in stripped):
+            return text
+        rows = [row.strip() for row in stripped[1:-1].split(";")]
+        if len(rows) < 2:
+            return text
+        names: list[str] = []
+        for row in rows:
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", row):
+                return text
+            sym = self.symbols.get(row.lower())
+            if sym is None or sym.kind != "real_vector":
+                return text
+            names.append(row)
+        return f"vcat_vecs_omat({', '.join(names)})"
+
+    def convert_one_shape_predicate(self, text: str, name: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 1:
+                raise OmatError(f"{name} currently supports one argument")
+            arg = args[0].strip()
+            expr = self.expr(arg)
+            sym = self.symbols.get(arg.lower())
+            kind = sym.kind if sym is not None else self.argument_kind(arg)
+            if name == "isscalar":
+                return ".false." if kind.endswith("_vector") or kind.endswith("_matrix") else ".true."
+            if name == "ismatrix":
+                return ".true."
+            if name == "isempty":
+                if kind.endswith("_matrix") or kind.endswith("_vector"):
+                    return f"size({expr}) == 0"
+                return ".false."
+            if kind.endswith("_vector"):
+                return ".true."
+            if kind.endswith("_matrix"):
+                return f"(size({expr}, 1) == 1 .or. size({expr}, 2) == 1)"
+            return ".true."
+
+        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_numeric_unary_functions(self, text: str) -> str:
+        out = text
+        for name in ["floor", "ceil", "round", "fix", "sign"]:
+            out = self.convert_one_arg_shape_function(out, name)
+        return out
+
+    def convert_one_arg_shape_function(self, text: str, name: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 1:
+                raise OmatError(f"{name} currently supports one argument")
+            arg = args[0].strip()
+            expr = self.real_helper_expr(arg)
+            sym = self.symbols.get(arg.lower())
+            if sym is not None and sym.kind == "real_matrix":
+                return f"{name}_mat_omat({expr})"
+            if sym is not None and sym.kind == "real_vector":
+                return f"{name}_vec_omat({expr})"
+            if is_matrix_expr(arg.lower()):
+                return f"{name}_mat_omat({expr})"
+            if is_vector_expr(arg.lower()):
+                return f"{name}_vec_omat({expr})"
+            if name == "ceil":
+                return f"real(ceiling({expr}), real64)"
+            if name == "round":
+                return f"anint({expr})"
+            if name == "fix":
+                return f"aint({expr})"
+            if name == "sign":
+                return f"merge(1.0_real64, merge(-1.0_real64, 0.0_real64, {expr} < 0.0_real64), {expr} > 0.0_real64)"
+            return f"real(floor({expr}), real64)"
+
+        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_mod_function(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 2:
+                raise OmatError("mod currently supports two arguments")
+            lhs = args[0].strip()
+            rhs = args[1].strip()
+            lhs_sym = self.symbols.get(lhs.lower())
+            rhs_sym = self.symbols.get(rhs.lower())
+            lhs_expr = self.expr(lhs)
+            rhs_expr = self.expr(rhs)
+            if (
+                (lhs_sym is not None and lhs_sym.kind in {"real_vector", "real_matrix"})
+                or (rhs_sym is not None and rhs_sym.kind in {"real_vector", "real_matrix"})
+            ):
+                if rhs_sym is None:
+                    rhs_expr = f"real({rhs_expr}, real64)"
+                if lhs_sym is None:
+                    lhs_expr = f"real({lhs_expr}, real64)"
+            return f"mod({lhs_expr}, {rhs_expr})"
+
+        return re.sub(r"\bmod\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_flip_functions(self, text: str) -> str:
+        out = text
+        out = self.convert_flip_like_function(out, "fliplr")
+        out = self.convert_flip_like_function(out, "flipud")
+        out = self.convert_flip_like_function(out, "flip")
+        return out
+
+    def convert_flip_like_function(self, text: str, name: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 1:
+                raise OmatError(f"{name} currently supports one argument")
+            arg = args[0].strip()
+            expr = self.real_helper_expr(arg)
+            sym = self.symbols.get(arg.lower())
+            if sym is not None and sym.kind == "real_matrix":
+                helper = "fliplr_mat_omat" if name == "fliplr" else "flipud_mat_omat"
+                if name == "flip":
+                    helper = "flip_mat_omat"
+                return f"{helper}({expr})"
+            if is_matrix_expr(arg.lower()):
+                helper = "fliplr_mat_omat" if name == "fliplr" else "flipud_mat_omat"
+                if name == "flip":
+                    helper = "flip_mat_omat"
+                return f"{helper}({expr})"
+            if name != "flip" and not is_matrix_expr(arg.lower()):
+                raise OmatError(f"{name} currently requires a matrix argument")
+            return f"flip_vec_omat({expr})"
+
+        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_transpose_function(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 1:
+                raise OmatError("transpose currently supports one argument")
+            arg = args[0].strip()
+            expr = self.real_helper_expr(arg)
+            sym = self.symbols.get(arg.lower())
+            if sym is not None and sym.kind == "real_vector":
+                return f"transpose_vec_omat({expr})"
+            if sym is not None and sym.kind == "real_matrix":
+                return f"transpose_mat_omat({expr})"
+            if is_vector_expr(arg.lower()):
+                return f"transpose_vec_omat({expr})"
+            if is_matrix_expr(arg.lower()):
+                return f"transpose_mat_omat({expr})"
+            return expr
+
+        return re.sub(r"\btranspose\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def real_helper_expr(self, arg: str) -> str:
+        expr = self.expr(arg)
+        sym = self.symbols.get(arg.strip().lower())
+        if sym is not None:
+            return expr
+        low = arg.strip().lower()
+        if is_vector_expr(low) or is_matrix_expr(low):
+            return f"real({expr}, real64)"
+        return expr
+
+    def convert_eye(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) == 1:
+                return f"eye_omat({self.integer_arg(args[0])}, {self.integer_arg(args[0])})"
+            if len(args) == 2:
+                return f"eye_omat({self.integer_arg(args[0])}, {self.integer_arg(args[1])})"
+            raise OmatError("eye currently supports eye(n) and eye(m,n)")
+
+        return re.sub(r"\beye\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_diag(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 1:
+                raise OmatError("diag currently supports one argument")
+            arg = args[0].strip()
+            sym = self.symbols.get(arg.lower())
+            helper = "diag_mat_omat" if sym is not None and sym.kind == "real_matrix" else "diag_vec_omat"
+            return f"{helper}({self.expr(arg)})"
+
+        return re.sub(r"\bdiag\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_repmat(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 3:
+                raise OmatError("repmat currently supports repmat(x,m,n)")
+            arg = args[0].strip()
+            sym = self.symbols.get(arg.lower())
+            helper = "repmat_mat_omat" if sym is not None and sym.kind == "real_matrix" else "repmat_vec_omat"
+            return f"{helper}({self.expr(arg)}, {self.integer_arg(args[1])}, {self.integer_arg(args[2])})"
+
+        return re.sub(r"\brepmat\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
 
     def convert_length_numel(self, text: str) -> str:
         def repl_length(match: re.Match[str]) -> str:
@@ -503,6 +1035,26 @@ class Translator:
             return f"{helper}({self.expr(args[0])})"
 
         return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_two_arg_vector_function(self, text: str, name: str, helper: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 2:
+                raise OmatError(f"{name} currently supports two vector arguments")
+            return f"{helper}({self.expr(args[0])}, {self.expr(args[1])})"
+
+        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_find_function(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) == 1:
+                return f"find_vec_omat({self.expr(args[0])})"
+            if len(args) == 2:
+                return f"find_k_vec_omat({self.expr(args[0])}, {self.integer_arg(args[1])})"
+            raise OmatError("find currently supports find(mask) and find(mask,k)")
+
+        return re.sub(r"\bfind\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
 
     def reject_unimplemented_matlab_functions(self, text: str) -> None:
         for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
@@ -581,34 +1133,46 @@ class Translator:
 
     def convert_function_names(self, text: str) -> str:
         out = text
-        out = self.convert_sum(out)
-        replacements = {
-            "max": "maxval",
-            "min": "minval",
-        }
-        for old, new in replacements.items():
-            out = re.sub(rf"\b{old}\s*\(", f"{new}(", out, flags=re.IGNORECASE)
+        out = self.convert_reduction(out, "sum", "sum")
+        out = self.convert_reduction(out, "prod", "prod")
+        out = self.convert_reduction(out, "min", "min")
+        out = self.convert_reduction(out, "max", "max")
         return out
 
-    def convert_sum(self, text: str) -> str:
+    def convert_reduction(self, text: str, name: str, helper_base: str) -> str:
         def repl(match: re.Match[str]) -> str:
             args = split_args(match.group(1))
             if not args:
-                raise OmatError("sum requires an argument")
-            sym = self.symbols.get(args[0].strip().lower())
+                raise OmatError(f"{name} requires an argument")
+            arg = args[0].strip()
+            sym = self.symbols.get(arg.lower())
             if sym is None or sym.kind != "real_matrix":
-                return match.group(0)
+                if len(args) == 1:
+                    if name == "prod":
+                        return f"prod_vec_omat({self.expr(arg)})"
+                    if name == "min":
+                        return f"min_vec_omat({self.expr(arg)})"
+                    if name == "max":
+                        return f"max_vec_omat({self.expr(arg)})"
+                    return match.group(0)
+                raise OmatError(f"{name} currently supports one argument for vectors")
+            farg = self.expr(arg)
             if len(args) == 1:
-                return f"sum({args[0]}, dim=1)"
+                if name == "sum":
+                    return f"sum({farg}, dim=1)"
+                return f"{helper_base}_mat_omat({farg})"
             if len(args) == 2 and args[1].strip() in {"1", "2"}:
-                return f"sum({args[0]}, dim={args[1].strip()})"
-            raise OmatError("matrix sum currently supports sum(A), sum(A,1), and sum(A,2)")
+                if name == "sum":
+                    return f"sum({farg}, dim={args[1].strip()})"
+                if args[1].strip() == "1":
+                    return f"{helper_base}_mat_omat({farg})"
+            raise OmatError(f"matrix {name} currently supports {name}(A) and {name}(A,1)")
 
-        return re.sub(r"\bsum\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
 
     def convert_stats_functions(self, text: str) -> str:
         out = text
-        for name in ["mean", "std", "var", "median", "skewness", "kurtosis", "rms", "mad", "iqr", "cumsum", "zscore"]:
+        for name in ["mean", "std", "var", "median", "skewness", "kurtosis", "rms", "mad", "iqr", "cumsum", "cumprod", "zscore"]:
             out = self.convert_one_stats_function(out, name)
         out = self.convert_quantile_function(out, "quantile", "quantile")
         out = self.convert_quantile_function(out, "prctile", "prctile")
@@ -719,7 +1283,7 @@ class Translator:
             name = match.group(1)
             sym = self.symbols.get(name.lower())
             if sym is not None and sym.kind == "real_matrix":
-                return f"reshape_vec_from_mat_omat({name}, size({name}))"
+                return f"reshape_vec_from_mat_omat({name}, size({name}, 1) * size({name}, 2))"
             return f"reshape_vec_from_vec_omat({name}, size({name}))"
 
         return re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*:\s*\)", repl, text)
@@ -734,6 +1298,17 @@ class Translator:
         if is_vector_expr(low):
             return "real_vector"
         return "real_vector"
+
+    def argument_kind(self, text: str) -> str:
+        low = text.strip().lower()
+        sym = self.symbols.get(low)
+        if sym is not None:
+            return sym.kind
+        if is_matrix_expr(low):
+            return "real_matrix"
+        if is_vector_expr(low):
+            return "real_vector"
+        return "real"
 
     def convert_rand(self, text: str) -> str:
         def repl(match: re.Match[str]) -> str:
@@ -790,6 +1365,39 @@ class Translator:
 
         return re.sub(r"\blinspace\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
 
+    def convert_logspace(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            self.needs_linstep = True
+            args = split_args(match.group(1))
+            if len(args) == 2:
+                args.append("50")
+            if len(args) != 3:
+                raise OmatError("logspace requires two or three arguments")
+            return (
+                f"logspace_omat(real({self.expr(args[0])}, real64), "
+                f"real({self.expr(args[1])}, real64), {self.integer_arg(args[2])})"
+            )
+
+        return re.sub(r"\blogspace\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+
+    def convert_colon_vector(self, text: str) -> str:
+        stripped = text.strip()
+        parts = split_top_level_colon(stripped)
+        if len(parts) == 2:
+            self.needs_linstep = True
+            return (
+                f"colon2_omat(real({self.expr(parts[0])}, real64), "
+                f"real({self.expr(parts[1])}, real64))"
+            )
+        if len(parts) == 3:
+            self.needs_linstep = True
+            return (
+                f"colon3_omat(real({self.expr(parts[0])}, real64), "
+                f"real({self.expr(parts[1])}, real64), "
+                f"real({self.expr(parts[2])}, real64))"
+            )
+        return text
+
     def integer_arg(self, text: str) -> str:
         expr = self.expr(text)
         if is_integer_expr(expr, self.symbols):
@@ -804,9 +1412,25 @@ class Translator:
         helper_lines: list[str] = []
         helper_public_names: list[str] = []
         if any(re.search(r"\b[A-Za-z_][A-Za-z0-9_]*_omat[0-9]*\s*\(", line) for line in body_lines):
-            helper_lines = helper_source(self.needs_linstep, body_lines)
+            helper_lines = helper_source(self.needs_linstep, body_lines, use_generic_print=self.generic)
             helper_public_names = [name for name, _ in split_helper_blocks(helper_lines)]
-        module_public_names = [kind_alias, *helper_public_names]
+        main_uses_print_vector = self.generic and any(re.search(r"\bdisp_omat\s*\(", line) for line in body_lines)
+        needs_print_vector_interface = self.generic and (main_uses_print_vector or any(
+            re.search(r"\bprint_vector_omat\s*\(", line) for line in helper_lines
+        ))
+        vector_print_specifics = {
+            "print_real_vector_omat",
+            "print_integer_vector_omat",
+            "print_logical_vector_omat",
+        }
+        public_helper_names = helper_public_names.copy()
+        if needs_print_vector_interface:
+            public_helper_names = [name for name in public_helper_names if name not in vector_print_specifics]
+        if main_uses_print_vector and "disp_omat" not in public_helper_names:
+            public_helper_names.insert(0, "disp_omat")
+        main_helper_names = direct_helper_names(body_lines, public_helper_names)
+        main_use_names = [kind_alias, *main_helper_names]
+        module_public_names = main_use_names
 
         lines: list[str] = []
         if self.generic and self.random_names:
@@ -817,13 +1441,17 @@ class Translator:
         lines.append("implicit none")
         lines.append("private")
         lines.append("public :: " + ", ".join(module_public_names))
+        if needs_print_vector_interface:
+            lines.append("interface print_vector_omat")
+            lines.append("  module procedure print_real_vector_omat, print_integer_vector_omat, print_logical_vector_omat")
+            lines.append("end interface print_vector_omat")
         if helper_lines:
             lines.append("contains")
             lines.extend(helper_lines)
         lines.append("end module m_mod")
         lines.append("")
         lines.append("program omat_main")
-        lines.append("use m_mod, only: " + ", ".join(module_public_names))
+        lines.append("use m_mod, only: " + ", ".join(main_use_names))
         if self.needs_la_mod:
             names = sorted(self.la_names)
             lines.append("use ofort_la_mod, only: " + ", ".join(names))
@@ -853,7 +1481,7 @@ class Translator:
             lines.append("")
         lines.extend(body_lines)
         lines.append("end program omat_main")
-        return self.apply_real64_alias(lines, kind_alias) + "\n"
+        return wrap_fortran_source(self.apply_real64_alias(lines, kind_alias)) + "\n"
 
     def real64_alias(self) -> str:
         used = set(self.symbols)
@@ -887,6 +1515,50 @@ def strip_comment(line: str) -> str:
     return line
 
 
+def wrap_fortran_source(source: str, limit: int = 80) -> str:
+    return "\n".join(wrap_fortran_line(line, limit) for line in source.splitlines())
+
+
+def wrap_fortran_line(line: str, limit: int = 80) -> str:
+    if len(line) <= limit or line.lstrip().startswith("!"):
+        return line
+
+    out: list[str] = []
+    current = line
+    base_indent = re.match(r"^\s*", line).group(0)
+    continuation_prefix = base_indent + "  & "
+    while len(current) > limit:
+        break_pos = find_fortran_wrap_position(current, limit - 2)
+        if break_pos <= 0:
+            break
+        out.append(current[: break_pos + 1].rstrip() + " &")
+        current = continuation_prefix + current[break_pos + 1 :].lstrip()
+    out.append(current)
+    return "\n".join(out)
+
+
+def find_fortran_wrap_position(line: str, max_pos: int) -> int:
+    in_single = False
+    in_double = False
+    candidates: list[int] = []
+    for i, ch in enumerate(line):
+        if i > max_pos:
+            break
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double and ch in {",", " ", "+", "-", "*", "/"}:
+            candidates.append(i)
+    if not candidates:
+        return -1
+    for ch in (",", " ", "+", "-", "*", "/"):
+        for pos in reversed(candidates):
+            if line[pos] == ch:
+                return pos
+    return candidates[-1]
+
+
 def parse_loop_spec(spec: str) -> tuple[str, str, str | None]:
     parts = [part.strip() for part in spec.split(":")]
     if len(parts) == 2:
@@ -905,8 +1577,38 @@ def parse_simple_call(text: str) -> tuple[str, list[str]] | None:
     return name, split_args(m.group(2))
 
 
+def parse_index_expr(text: str) -> tuple[str, list[str]] | None:
+    stripped = text.strip()
+    m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)$", stripped)
+    if not m:
+        return None
+    name = m.group(1)
+    if name.lower() in BUILTINS or name.lower() in LA_FUNCTIONS or name.lower() in RANDOM_DIST_PARAM_COUNTS:
+        return None
+    return name, split_args(m.group(2))
+
+
+def index_selects_many(index: str) -> bool:
+    text = index.strip()
+    return (
+        text == ":"
+        or len(split_top_level_colon(text)) in {2, 3}
+        or (text.startswith("[") and text.endswith("]"))
+    )
+
+
+def vector_element_kind(kind: str) -> str:
+    if kind == "integer_vector":
+        return "integer"
+    if kind == "logical_vector":
+        return "logical"
+    return "real"
+
+
 def is_vector_expr(text: str) -> bool:
     if is_flatten_expr(text):
+        return True
+    if len(split_top_level_colon(text.strip())) in {2, 3}:
         return True
     m = MATRIX_FUNC_RE.match(text)
     if m is not None:
@@ -915,6 +1617,7 @@ def is_vector_expr(text: str) -> bool:
     return (
         (text.startswith("[") and ";" not in text)
         or re.match(r"^linspace\s*\(", text, re.IGNORECASE) is not None
+        or re.match(r"^logspace\s*\(", text, re.IGNORECASE) is not None
     )
 
 
@@ -984,12 +1687,34 @@ def is_integer_expr(text: str, symbols: dict[str, Symbol]) -> bool:
     return visit(tree)
 
 
+def identifier_is_indexed(text: str, name: str) -> bool:
+    return re.search(rf"\b{re.escape(name)}\s*\(", text) is not None
+
+
 def clean_emitted_helper_names(source: str) -> str:
+    lines: list[str] = []
+    for line in source.splitlines():
+        stripped = line.lstrip().lower()
+        if stripped.startswith("public ::"):
+            line = line.replace("disp_omat", "print_vector")
+        elif stripped.startswith("use m_mod, only:"):
+            line = line.replace("disp_omat", "disp => print_vector")
+        else:
+            line = re.sub(r"\bcall\s+disp_omat\s*\(", "call disp(", line)
+        lines.append(line)
+    source = "\n".join(lines)
     return re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)_omat([0-9]*)\b", r"\1\2", source)
 
 
 def convert_elementwise(text: str) -> str:
-    return text.replace(".^", "**").replace(".*", "*").replace("./", "/").replace("~=", "/=")
+    return (
+        text.replace(".^", "**")
+        .replace(".*", "*")
+        .replace("./", "/")
+        .replace("~=", "/=")
+        .replace("&&", ".and.")
+        .replace("||", ".or.")
+    )
 
 
 def convert_function_names(text: str) -> str:
@@ -1036,12 +1761,12 @@ def convert_vector_literals(text: str) -> str:
     def repl(match: re.Match[str]) -> str:
         body = match.group(1).strip()
         if ";" not in body:
-            items = split_matlab_literal_row(body)
+            items = coerce_real_literal_items(split_matlab_literal_row(body))
             return "[" + ", ".join(items) + "]"
         rows = []
         ncols = None
         for raw_row in body.split(";"):
-            row = split_matlab_literal_row(raw_row.strip())
+            row = coerce_real_literal_items(split_matlab_literal_row(raw_row.strip()))
             if not row:
                 raise OmatError("matrix literal contains an empty row")
             if ncols is None:
@@ -1056,6 +1781,20 @@ def convert_vector_literals(text: str) -> str:
         )
 
     return re.sub(r"\[([^\[\]]+)\]", repl, text)
+
+
+def coerce_real_literal_items(items: list[str]) -> list[str]:
+    if not any(is_real_numeric_literal(item) for item in items):
+        return items
+    return [f"{item}.0" if is_integer_numeric_literal(item) else item for item in items]
+
+
+def is_integer_numeric_literal(text: str) -> bool:
+    return re.fullmatch(r"[+-]?\d+", text.strip()) is not None
+
+
+def is_real_numeric_literal(text: str) -> bool:
+    return re.fullmatch(r"[+-]?(?:\d+\.\d*|\.\d+|\d+(?:[eEdD][+-]?\d+))", text.strip()) is not None
 
 
 def split_matlab_literal_row(text: str) -> list[str]:
@@ -1119,6 +1858,28 @@ def split_args(text: str) -> list[str]:
     if current:
         args.append("".join(current).strip())
     return args
+
+
+def split_top_level_colon(text: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    for ch in text:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        if depth == 0 and ch == ":":
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    if not parts:
+        return []
+    parts.append("".join(current).strip())
+    if len(parts) not in {2, 3} or any(not part for part in parts):
+        return []
+    return parts
 
 
 def eval_repl_numeric_expr(text: str, scalar_values: dict[str, float]) -> float:
@@ -1768,6 +2529,9 @@ def split_helper_blocks(lines: list[str]) -> list[tuple[str, list[str]]]:
 
 
 def helper_block_name(block: list[str]) -> str | None:
+    m_interface = re.match(r"^interface\s+([A-Za-z_][A-Za-z0-9_]*)\b", block[0])
+    if m_interface is not None:
+        return m_interface.group(1)
     m = re.match(r"^(?:[A-Za-z0-9_(), ]+\s+)?(?:function|subroutine)\s+([A-Za-z_][A-Za-z0-9_]*)\b", block[0])
     return None if m is None else m.group(1)
 
@@ -1777,7 +2541,26 @@ def helper_references(text: str, helper_names: set[str]) -> set[str]:
     for name in helper_names:
         if re.search(rf"\b{re.escape(name)}\s*\(", text):
             refs.add(name)
+    if re.search(r"\bdisp_omat\s*\(", text):
+        refs.add("disp_omat")
+        if {
+            "print_real_vector_omat",
+            "print_integer_vector_omat",
+            "print_logical_vector_omat",
+        } <= helper_names:
+            refs.update({"print_real_vector_omat", "print_integer_vector_omat", "print_logical_vector_omat"})
+    if re.search(r"\bprint_vector_omat\s*\(", text) and {
+        "print_real_vector_omat",
+        "print_integer_vector_omat",
+        "print_logical_vector_omat",
+    } <= helper_names:
+        refs.update({"print_real_vector_omat", "print_integer_vector_omat", "print_logical_vector_omat"})
     return refs
+
+
+def direct_helper_names(body_lines: list[str], helper_names: list[str]) -> list[str]:
+    refs = helper_references("\n".join(body_lines), set(helper_names))
+    return [name for name in helper_names if name in refs]
 
 
 def mark_helper_pure(block: list[str]) -> list[str]:
@@ -1818,7 +2601,14 @@ def select_helper_source(lines: list[str], body_lines: list[str] | None) -> list
     return selected
 
 
-def helper_source(include_linspace: bool, body_lines: list[str] | None = None) -> list[str]:
+def helper_source(
+    include_linspace: bool,
+    body_lines: list[str] | None = None,
+    *,
+    use_generic_print: bool = False,
+) -> list[str]:
+    real_vector_printer = "print_vector_omat" if use_generic_print else "print_real_vector_omat"
+    logical_vector_printer = "print_vector_omat" if use_generic_print else "print_logical_vector_omat"
     lines = [
         "function rand_omat(n) result(x)",
         "integer, intent(in) :: n",
@@ -1874,6 +2664,68 @@ def helper_source(include_linspace: bool, body_lines: list[str] | None = None) -
         "end do",
         "end function equicor_omat",
         "",
+        "function eye_omat(nrow, ncol) result(x)",
+        "integer, intent(in) :: nrow, ncol",
+        "real(real64), allocatable :: x(:,:)",
+        "integer :: i, n",
+        "n = min(nrow, ncol)",
+        "allocate(x(nrow, ncol))",
+        "x = 0.0_real64",
+        "do i = 1, n",
+        "  x(i, i) = 1.0_real64",
+        "end do",
+        "end function eye_omat",
+        "",
+        "function diag_vec_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64), allocatable :: y(:,:)",
+        "integer :: i",
+        "allocate(y(size(x), size(x)))",
+        "y = 0.0_real64",
+        "do i = 1, size(x)",
+        "  y(i, i) = x(i)",
+        "end do",
+        "end function diag_vec_omat",
+        "",
+        "function diag_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: i, n",
+        "n = min(size(x, 1), size(x, 2))",
+        "allocate(y(n))",
+        "do i = 1, n",
+        "  y(i) = x(i, i)",
+        "end do",
+        "end function diag_mat_omat",
+        "",
+        "function repmat_vec_omat(x, nrow, ncol) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "integer, intent(in) :: nrow, ncol",
+        "real(real64), allocatable :: y(:,:)",
+        "integer :: i, j",
+        "allocate(y(nrow, size(x) * ncol))",
+        "do i = 1, nrow",
+        "  do j = 1, ncol",
+        "    y(i, (j - 1) * size(x) + 1:j * size(x)) = x",
+        "  end do",
+        "end do",
+        "end function repmat_vec_omat",
+        "",
+        "function repmat_mat_omat(x, nrow, ncol) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "integer, intent(in) :: nrow, ncol",
+        "real(real64), allocatable :: y(:,:)",
+        "integer :: i, j, nr, nc",
+        "nr = size(x, 1)",
+        "nc = size(x, 2)",
+        "allocate(y(nr * nrow, nc * ncol))",
+        "do i = 1, nrow",
+        "  do j = 1, ncol",
+        "    y((i - 1) * nr + 1:i * nr, (j - 1) * nc + 1:j * nc) = x",
+        "  end do",
+        "end do",
+        "end function repmat_mat_omat",
+        "",
         "function reshape_vec_from_vec_omat(x, n) result(y)",
         "real(real64), intent(in) :: x(:)",
         "integer, intent(in) :: n",
@@ -1922,13 +2774,84 @@ def helper_source(include_linspace: bool, body_lines: list[str] | None = None) -
         "y = reshape(x, [nrow, ncol])",
         "end function reshape_mat_from_mat_omat",
         "",
-        "subroutine print_matrix_omat(x)",
+        "subroutine print_real_scalar_omat(x)",
+        "real(real64), intent(in) :: x",
+        "write(*,'(a)') trim(real_text_omat(x))",
+        "end subroutine print_real_scalar_omat",
+        "",
+        "function real_text_omat(x) result(text)",
+        "real(real64), intent(in) :: x",
+        "character(len=32) :: text",
+        "integer :: last",
+        "if (x /= x) then",
+        "  text = 'NaN'",
+        "  return",
+        "end if",
+        "if (x == 0.0_real64) then",
+        "  text = '0'",
+        "  return",
+        "end if",
+        "if (x /= 0.0_real64 .and. (abs(x) < 1.0e-4_real64 .or. abs(x) >= 1.0e7_real64)) then",
+        "  write(text,'(es14.6)') x",
+        "else",
+        "  write(text,'(f0.8)') x",
+        "  text = adjustl(text)",
+        "  if (text(1:1) == '.') text = '0' // trim(text)",
+        "  if (text(1:2) == '-.') text = '-0' // trim(text(2:))",
+        "  last = len_trim(text)",
+        "  do while (last > 1 .and. text(last:last) == '0')",
+        "    text(last:last) = ' '",
+        "    last = last - 1",
+        "  end do",
+        "  if (last > 1 .and. text(last:last) == '.') text(last:last) = ' '",
+        "end if",
+        "end function real_text_omat",
+        "",
+        "subroutine print_integer_scalar_omat(x)",
+        "integer, intent(in) :: x",
+        "write(*,'(i0)') x",
+        "end subroutine print_integer_scalar_omat",
+        "",
+        "subroutine print_logical_scalar_omat(x)",
+        "logical, intent(in) :: x",
+        "write(*,'(l1)') x",
+        "end subroutine print_logical_scalar_omat",
+        "",
+        "subroutine print_real_vector_omat(x)",
+        "real(real64), intent(in) :: x(:)",
+        "integer :: i",
+        "do i = 1, size(x)",
+        "  if (i > 1) write(*,'(1x)', advance='no')",
+        "  write(*,'(a)', advance='no') trim(real_text_omat(x(i)))",
+        "end do",
+        "write(*,*)",
+        "end subroutine print_real_vector_omat",
+        "",
+        "subroutine print_integer_vector_omat(x)",
+        "integer, intent(in) :: x(:)",
+        "write(*,'(*(1x,i0))') x",
+        "end subroutine print_integer_vector_omat",
+        "",
+        "subroutine print_logical_vector_omat(x)",
+        "logical, intent(in) :: x(:)",
+        "write(*,'(*(1x,l1))') x",
+        "end subroutine print_logical_vector_omat",
+        "",
+        "subroutine print_real_matrix_omat(x)",
         "real(real64), intent(in) :: x(:,:)",
         "integer :: i",
         "do i = 1, size(x, 1)",
-        "  print *, x(i, :)",
+        f"  call {real_vector_printer}(x(i, :))",
         "end do",
-        "end subroutine print_matrix_omat",
+        "end subroutine print_real_matrix_omat",
+        "",
+        "subroutine print_logical_matrix_omat(x)",
+        "logical, intent(in) :: x(:,:)",
+        "integer :: i",
+        "do i = 1, size(x, 1)",
+        f"  call {logical_vector_printer}(x(i, :))",
+        "end do",
+        "end subroutine print_logical_matrix_omat",
         "",
         "real(real64) function mean(x)",
         "real(real64), intent(in) :: x(:)",
@@ -2215,6 +3138,30 @@ def helper_source(include_linspace: bool, body_lines: list[str] | None = None) -
         "end do",
         "end function cumsum_mat_omat",
         "",
+        "function cumprod_vec_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: i",
+        "allocate(y(size(x)))",
+        "if (size(x) >= 1) y(1) = x(1)",
+        "do i = 2, size(x)",
+        "  y(i) = y(i - 1) * x(i)",
+        "end do",
+        "end function cumprod_vec_omat",
+        "",
+        "function cumprod_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:,:)",
+        "integer :: i, j",
+        "allocate(y(size(x, 1), size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  if (size(x, 1) >= 1) y(1, j) = x(1, j)",
+        "  do i = 2, size(x, 1)",
+        "    y(i, j) = y(i - 1, j) * x(i, j)",
+        "  end do",
+        "end do",
+        "end function cumprod_mat_omat",
+        "",
         "function zscore_vec_omat(x) result(y)",
         "real(real64), intent(in) :: x(:)",
         "real(real64), allocatable :: y(:)",
@@ -2266,6 +3213,183 @@ def helper_source(include_linspace: bool, body_lines: list[str] | None = None) -
         "end do",
         "end function movmean_mat_omat",
         "",
+        "function floor_vec_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64), allocatable :: y(:)",
+        "allocate(y(size(x)))",
+        "y = real(floor(x), real64)",
+        "end function floor_vec_omat",
+        "",
+        "function floor_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:,:)",
+        "allocate(y(size(x, 1), size(x, 2)))",
+        "y = real(floor(x), real64)",
+        "end function floor_mat_omat",
+        "",
+        "function ceil_vec_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64), allocatable :: y(:)",
+        "allocate(y(size(x)))",
+        "y = real(ceiling(x), real64)",
+        "end function ceil_vec_omat",
+        "",
+        "function ceil_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:,:)",
+        "allocate(y(size(x, 1), size(x, 2)))",
+        "y = real(ceiling(x), real64)",
+        "end function ceil_mat_omat",
+        "",
+        "function round_vec_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64), allocatable :: y(:)",
+        "allocate(y(size(x)))",
+        "y = anint(x)",
+        "end function round_vec_omat",
+        "",
+        "function round_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:,:)",
+        "allocate(y(size(x, 1), size(x, 2)))",
+        "y = anint(x)",
+        "end function round_mat_omat",
+        "",
+        "function fix_vec_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64), allocatable :: y(:)",
+        "allocate(y(size(x)))",
+        "y = aint(x)",
+        "end function fix_vec_omat",
+        "",
+        "function fix_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:,:)",
+        "allocate(y(size(x, 1), size(x, 2)))",
+        "y = aint(x)",
+        "end function fix_mat_omat",
+        "",
+        "function sign_vec_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64), allocatable :: y(:)",
+        "allocate(y(size(x)))",
+        "y = merge(1.0_real64, merge(-1.0_real64, 0.0_real64, x < 0.0_real64), x > 0.0_real64)",
+        "end function sign_vec_omat",
+        "",
+        "function sign_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:,:)",
+        "allocate(y(size(x, 1), size(x, 2)))",
+        "y = merge(1.0_real64, merge(-1.0_real64, 0.0_real64, x < 0.0_real64), x > 0.0_real64)",
+        "end function sign_mat_omat",
+        "",
+        "function flip_vec_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: i, n",
+        "n = size(x)",
+        "allocate(y(n))",
+        "do i = 1, n",
+        "  y(i) = x(n + 1 - i)",
+        "end do",
+        "end function flip_vec_omat",
+        "",
+        "function flip_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:,:)",
+        "integer :: i, nrow",
+        "nrow = size(x, 1)",
+        "allocate(y(size(x, 1), size(x, 2)))",
+        "do i = 1, nrow",
+        "  y(i, :) = x(nrow + 1 - i, :)",
+        "end do",
+        "end function flip_mat_omat",
+        "",
+        "function flipud_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:,:)",
+        "y = flip_mat_omat(x)",
+        "end function flipud_mat_omat",
+        "",
+        "function fliplr_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:,:)",
+        "integer :: j, ncol",
+        "ncol = size(x, 2)",
+        "allocate(y(size(x, 1), size(x, 2)))",
+        "do j = 1, ncol",
+        "  y(:, j) = x(:, ncol + 1 - j)",
+        "end do",
+        "end function fliplr_mat_omat",
+        "",
+        "function transpose_vec_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64), allocatable :: y(:,:)",
+        "allocate(y(size(x), 1))",
+        "y(:, 1) = x",
+        "end function transpose_vec_omat",
+        "",
+        "function transpose_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:,:)",
+        "allocate(y(size(x, 2), size(x, 1)))",
+        "y = transpose(x)",
+        "end function transpose_mat_omat",
+        "",
+        "function vcat_vecs_omat(x, y) result(z)",
+        "real(real64), intent(in) :: x(:), y(:)",
+        "real(real64), allocatable :: z(:,:)",
+        "if (size(x) /= size(y)) error stop 'vertical concatenation requires equal row lengths'",
+        "allocate(z(2, size(x)))",
+        "z(1, :) = x",
+        "z(2, :) = y",
+        "end function vcat_vecs_omat",
+        "",
+        "real(real64) function min_vec_omat(x)",
+        "real(real64), intent(in) :: x(:)",
+        "min_vec_omat = minval(x)",
+        "end function min_vec_omat",
+        "",
+        "function min_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: j",
+        "allocate(y(size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(j) = minval(x(:, j))",
+        "end do",
+        "end function min_mat_omat",
+        "",
+        "real(real64) function max_vec_omat(x)",
+        "real(real64), intent(in) :: x(:)",
+        "max_vec_omat = maxval(x)",
+        "end function max_vec_omat",
+        "",
+        "function max_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: j",
+        "allocate(y(size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(j) = maxval(x(:, j))",
+        "end do",
+        "end function max_mat_omat",
+        "",
+        "real(real64) function prod_vec_omat(x)",
+        "real(real64), intent(in) :: x(:)",
+        "prod_vec_omat = product(x)",
+        "end function prod_vec_omat",
+        "",
+        "function prod_mat_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:,:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: j",
+        "allocate(y(size(x, 2)))",
+        "do j = 1, size(x, 2)",
+        "  y(j) = product(x(:, j))",
+        "end do",
+        "end function prod_mat_omat",
+        "",
         "function diff_vec_omat(x) result(y)",
         "real(real64), intent(in) :: x(:)",
         "real(real64), allocatable :: y(:)",
@@ -2307,6 +3431,79 @@ def helper_source(include_linspace: bool, body_lines: list[str] | None = None) -
         "  end if",
         "end do",
         "end function find_vec_omat",
+        "",
+        "function find_k_vec_omat(mask, k) result(idx)",
+        "logical, intent(in) :: mask(:)",
+        "integer, intent(in) :: k",
+        "integer, allocatable :: idx(:)",
+        "integer :: i, n, nkeep",
+        "nkeep = min(max(0, k), count(mask))",
+        "allocate(idx(nkeep))",
+        "n = 0",
+        "do i = 1, size(mask)",
+        "  if (mask(i)) then",
+        "    n = n + 1",
+        "    if (n <= nkeep) idx(n) = i",
+        "    if (n >= nkeep) exit",
+        "  end if",
+        "end do",
+        "end function find_k_vec_omat",
+        "",
+        "function unique_vec_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64), allocatable :: y(:)",
+        "real(real64), allocatable :: s(:)",
+        "integer :: i, n",
+        "s = sort_vec_omat(x)",
+        "n = 0",
+        "do i = 1, size(s)",
+        "  if (i == 1 .or. s(i) /= s(i - 1)) n = n + 1",
+        "end do",
+        "allocate(y(n))",
+        "n = 0",
+        "do i = 1, size(s)",
+        "  if (i == 1 .or. s(i) /= s(i - 1)) then",
+        "    n = n + 1",
+        "    y(n) = s(i)",
+        "  end if",
+        "end do",
+        "end function unique_vec_omat",
+        "",
+        "function ismember_vec_omat(x, y) result(mask)",
+        "real(real64), intent(in) :: x(:), y(:)",
+        "logical, allocatable :: mask(:)",
+        "integer :: i",
+        "allocate(mask(size(x)))",
+        "do i = 1, size(x)",
+        "  mask(i) = any(y == x(i))",
+        "end do",
+        "end function ismember_vec_omat",
+        "",
+        "function intersect_vec_omat(x, y) result(z)",
+        "real(real64), intent(in) :: x(:), y(:)",
+        "real(real64), allocatable :: z(:)",
+        "z = pack(unique_vec_omat(x), ismember_vec_omat(unique_vec_omat(x), unique_vec_omat(y)))",
+        "end function intersect_vec_omat",
+        "",
+        "function union_vec_omat(x, y) result(z)",
+        "real(real64), intent(in) :: x(:), y(:)",
+        "real(real64), allocatable :: z(:)",
+        "z = unique_vec_omat([x, y])",
+        "end function union_vec_omat",
+        "",
+        "function setdiff_vec_omat(x, y) result(z)",
+        "real(real64), intent(in) :: x(:), y(:)",
+        "real(real64), allocatable :: ux(:)",
+        "real(real64), allocatable :: z(:)",
+        "ux = unique_vec_omat(x)",
+        "z = pack(ux, .not. ismember_vec_omat(ux, unique_vec_omat(y)))",
+        "end function setdiff_vec_omat",
+        "",
+        "function nonzeros_vec_omat(x) result(y)",
+        "real(real64), intent(in) :: x(:)",
+        "real(real64), allocatable :: y(:)",
+        "y = pack(x, x /= 0.0_real64)",
+        "end function nonzeros_vec_omat",
         "",
         "function isnan_vec_omat(x) result(mask)",
         "real(real64), intent(in) :: x(:)",
@@ -2416,6 +3613,36 @@ def helper_source(include_linspace: bool, body_lines: list[str] | None = None) -
                 "  end do",
                 "end if",
                 "end function linspace_omat",
+                "",
+                "function logspace_omat(a, b, n) result(x)",
+                "real(real64), intent(in) :: a, b",
+                "integer, intent(in) :: n",
+                "real(real64), allocatable :: x(:)",
+                "x = 10.0_real64 ** linspace_omat(a, b, n)",
+                "end function logspace_omat",
+                "",
+                "function colon2_omat(a, b) result(x)",
+                "real(real64), intent(in) :: a, b",
+                "real(real64), allocatable :: x(:)",
+                "x = colon3_omat(a, 1.0_real64, b)",
+                "end function colon2_omat",
+                "",
+                "function colon3_omat(a, step, b) result(x)",
+                "real(real64), intent(in) :: a, step, b",
+                "real(real64), allocatable :: x(:)",
+                "integer :: i, n",
+                "if (step == 0.0_real64) then",
+                "  n = 0",
+                "else if ((step > 0.0_real64 .and. a > b) .or. (step < 0.0_real64 .and. a < b)) then",
+                "  n = 0",
+                "else",
+                "  n = int(floor((b - a) / step)) + 1",
+                "end if",
+                "allocate(x(max(0, n)))",
+                "do i = 1, size(x)",
+                "  x(i) = a + step * real(i - 1, real64)",
+                "end do",
+                "end function colon3_omat",
             ]
         )
     return select_helper_source(lines, body_lines)
@@ -2503,7 +3730,7 @@ def run_with_ofort_capture(generated: str, ofort_path: str) -> ExecResult:
 
 def line_opens_block(line: str) -> bool:
     stripped = strip_comment(line).strip()
-    return FOR_RE.match(stripped) is not None
+    return FOR_RE.match(stripped) is not None or IF_RE.match(stripped) is not None
 
 
 def line_closes_block(line: str) -> bool:
