@@ -14,6 +14,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,9 +29,7 @@ NUMBER_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:\d+\.\d*|\.\d+|\d+)(?:[eEdD][+-]?\d+)?(?![A-Za-z0-9_])"
 )
 ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
-MULTI_ASSIGN_RE = re.compile(
-    r"^\[\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\]\s*=\s*(.+)$"
-)
+MULTI_ASSIGN_RE = re.compile(r"^\[\s*([^\]]+?)\s*\]\s*=\s*(.+)$")
 CONST_ASSIGN_RE = re.compile(r"^const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$", re.IGNORECASE)
 FOR_RE = re.compile(r"^for\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$", re.IGNORECASE)
 IF_RE = re.compile(r"^if\s+(.+)$", re.IGNORECASE)
@@ -315,6 +314,7 @@ class Statement:
 class LocalFunction:
     name: str
     result: str
+    results: list[str]
     args: list[str]
     body: list[tuple[int, str]]
 
@@ -350,8 +350,12 @@ class Translator:
         self.loading_functions: set[str] = set()
         self.local_functions: dict[str, LocalFunction] = {}
         self.local_function_signatures: dict[str, tuple[list[str], str]] = {}
+        self.local_function_output_kinds: dict[str, list[str]] = {}
         self.textscan_units: dict[str, str] = {}
         self.textscan_columns: dict[str, dict[int, str]] = {}
+        self.function_result_name: str | None = None
+        self.function_result_names: set[str] = set()
+        self.loop_counter = 0
 
     def bind_symbol(
         self,
@@ -368,6 +372,11 @@ class Translator:
             prefix = f"line {line_no}: " if line_no is not None else ""
             raise OmatError(f"{prefix}cannot assign to constant '{name}'")
         if existing is not None and existing.kind == kind:
+            existing.constant = constant
+            existing.value = value if constant else None
+            return existing
+        if existing is not None and (key == self.function_result_name or key in self.function_result_names):
+            existing.kind = kind
             existing.constant = constant
             existing.value = value if constant else None
             return existing
@@ -435,20 +444,37 @@ class Translator:
         m = FOR_RE.match(line)
         if m:
             var, spec = m.groups()
+            parsed_loop = parse_loop_spec(spec)
+            if parsed_loop is None:
+                loop_kind = self.argument_kind(spec)
+                loop_var_kind = vector_element_kind(loop_kind) if loop_kind.endswith("_vector") else "real"
+                var_sym = self.bind_symbol(var, loop_var_kind)
+                self.loop_counter += 1
+                values_name = f"omat_loop_{self.loop_counter}"
+                index_name = f"omat_loop_i_{self.loop_counter}"
+                values_sym = self.bind_symbol(values_name, loop_kind if loop_kind.endswith("_vector") else "real_vector")
+                index_sym = self.bind_symbol(index_name, "integer")
+                self.statements.append(Statement(f"{values_sym.name} = {self.expr(spec)}", self.indent))
+                self.statements.append(Statement(f"do {index_sym.name} = 1, size({values_sym.name})", self.indent))
+                self.indent += 1
+                self.statements.append(Statement(f"{var_sym.name} = {values_sym.name}({index_sym.name})", self.indent))
+                self.block_stack.append("for")
+                return
             if var.lower() not in self.symbols:
                 self.bind_symbol(var, "integer")
-            start, stop, step = parse_loop_spec(spec)
+            var_sym = self.symbols[var.lower()]
+            start, stop, step = parsed_loop
             if step is None:
                 self.statements.append(
                     Statement(
-                        f"do {var} = {self.expr(start)}, {self.expr(stop)}",
+                        f"do {var_sym.name} = {self.expr(start)}, {self.expr(stop)}",
                         self.indent,
                     )
                 )
             else:
                 self.statements.append(
                     Statement(
-                        f"do {var} = {self.expr(start)}, {self.expr(stop)}, {self.expr(step)}",
+                        f"do {var_sym.name} = {self.expr(start)}, {self.expr(stop)}, {self.expr(step)}",
                         self.indent,
                     )
                 )
@@ -632,16 +658,42 @@ class Translator:
 
         multi = MULTI_ASSIGN_RE.match(line)
         if multi:
-            left_name, right_name, rhs = multi.groups()
+            left_names = [item.strip() for item in split_args(multi.group(1)) if item.strip()]
+            rhs = multi.group(2)
             call = parse_simple_call(rhs.strip().lower())
-            if call is None or call[0] != "eig" or len(call[1]) != 1:
-                raise OmatError(f"line {line_no}: multi-output assignment currently supports [V,D] = eig(A)")
-            left_sym = self.bind_symbol(left_name, "real_matrix", line_no=line_no)
-            right_sym = self.bind_symbol(right_name, "real_matrix", line_no=line_no)
-            arg = self.expr(call[1][0])
-            self.statements.append(Statement(f"{left_sym.name} = eigvecs_omat({arg})", self.indent))
-            self.statements.append(Statement(f"{right_sym.name} = diag_vec_omat(eigvals_omat({arg}))", self.indent))
-            return
+            if call is not None and call[0] == "eig" and len(call[1]) == 1 and len(left_names) == 2:
+                left_sym = self.bind_symbol(left_names[0], "real_matrix", line_no=line_no)
+                right_sym = self.bind_symbol(left_names[1], "real_matrix", line_no=line_no)
+                arg = self.expr(call[1][0])
+                self.statements.append(Statement(f"{left_sym.name} = eigvecs_omat({arg})", self.indent))
+                self.statements.append(Statement(f"{right_sym.name} = diag_vec_omat(eigvals_omat({arg}))", self.indent))
+                return
+            if call is not None and self.ensure_local_function(call[0]):
+                func = self.local_functions[call[0]]
+                if len(left_names) > len(func.results):
+                    raise OmatError(
+                        f"line {line_no}: function '{func.name}' returns {len(func.results)} value"
+                        f"{'' if len(func.results) == 1 else 's'}, got {len(left_names)}"
+                    )
+                arg_kinds = [self.argument_kind(arg.strip()) for arg in call[1]]
+                output_kinds = self.analyze_local_function_outputs(func, arg_kinds)
+                bound = [
+                    self.bind_symbol(name, output_kinds[i] if i < len(output_kinds) else "real", line_no=line_no)
+                    for i, name in enumerate(left_names)
+                ]
+                self.local_function_signatures.setdefault(call[0], (arg_kinds, output_kinds[0] if output_kinds else "real"))
+                self.local_function_output_kinds[call[0]] = output_kinds
+                actuals = [self.expr(arg) for arg in call[1]]
+                actuals.extend(sym.name for sym in bound)
+                self.statements.append(Statement(f"call {func.name}({', '.join(actuals)})", self.indent))
+                return
+            if call is not None:
+                bound = [self.bind_symbol(name, "real", line_no=line_no) for name in left_names]
+                actuals = [self.expr(arg) for arg in call[1]]
+                actuals.extend(sym.name for sym in bound)
+                self.statements.append(Statement(f"call {call[0]}({', '.join(actuals)})", self.indent))
+                return
+            raise OmatError(f"line {line_no}: multi-output assignment requires a function call")
 
         if not suppress_output:
             self.emit_display(line)
@@ -701,15 +753,18 @@ class Translator:
         if fmt is None:
             raise OmatError(f"line {line_no}: fprintf currently requires a literal format string")
         descriptors, format_args, n_conversions, newline = matlab_fprintf_format(fmt)
-        actuals = [self.expr(arg) for arg in args[fmt_index + 1 :]]
-        if len(actuals) != n_conversions:
+        actual_args = args[fmt_index + 1 :]
+        actuals = [self.expr(arg) for arg in actual_args]
+        if len(actuals) > n_conversions:
             raise OmatError(
                 f"line {line_no}: fprintf format expects {n_conversions} argument"
                 f"{'' if n_conversions == 1 else 's'}, got {len(actuals)}"
         )
-        actual_iter = iter(actuals)
         write_args = []
         write_descriptors = []
+        actual_index = 0
+        conversion_index = 0
+        expansion_queue: list[str] = []
         for item, descriptor in zip(format_args, descriptors):
             if item == "__format_only__":
                 write_descriptors.append(descriptor)
@@ -718,19 +773,28 @@ class Translator:
                 write_descriptors.append(descriptor)
                 write_args.append(item)
                 continue
-            actual = next(actual_iter)
-            if descriptor.startswith("__fixed_"):
-                width, precision = descriptor.removeprefix("__fixed_").split("_", 1)
-                actual = f"trim(adjustl(fixed_text_omat({actual}, {precision})))"
-                descriptor = f"a{width}" if width != "0" else "a"
-            elif descriptor.startswith("__exp_"):
-                width, precision = descriptor.removeprefix("__exp_").split("_", 1)
-                actual = f"trim(adjustl(exp_text_omat({actual}, {precision})))"
-                descriptor = f"a{width}" if width != "0" else "a"
-            elif descriptor.lower().startswith("i"):
-                actual = f"int({actual})"
-            elif descriptor.lower().startswith("a"):
-                actual = f"trim({actual})"
+            conversion_index += 1
+            raw_actual = ""
+            if expansion_queue:
+                actual = expansion_queue.pop(0)
+            elif actual_index >= len(actuals):
+                raise OmatError(
+                    f"line {line_no}: fprintf format expects {n_conversions} argument"
+                    f"{'' if n_conversions == 1 else 's'}, got {len(actuals)}"
+                )
+            else:
+                actual = actuals[actual_index]
+                raw_actual = actual_args[actual_index]
+                remaining_conversions = n_conversions - conversion_index + 1
+                remaining_actuals_after = len(actuals) - actual_index - 1
+                consume = 1
+                if self.format_actual_can_expand(raw_actual) or (len(actuals) == 1 and n_conversions > 1):
+                    consume = max(1, remaining_conversions - remaining_actuals_after)
+                expanded = self.expand_format_actual(raw_actual, actual, consume)
+                actual = expanded[0]
+                expansion_queue.extend(expanded[1:])
+                actual_index += 1
+            actual, descriptor = self.format_actual_for_descriptor(actual, descriptor, raw_actual)
             write_descriptors.append(descriptor)
             write_args.append(actual)
         fmt_literal = fortran_string_literal("(" + ",".join(write_descriptors) + ")")
@@ -738,6 +802,59 @@ class Translator:
         if write_args:
             return f"write({unit_expr},{fmt_literal}{suffix}) {', '.join(write_args)}"
         return f"write({unit_expr},{fmt_literal}{suffix})"
+
+    def format_actuals_can_expand(self, actual_args: list[str], n_conversions: int) -> bool:
+        if len(actual_args) > n_conversions:
+            return False
+        if len(actual_args) == 1 and n_conversions > 1:
+            return True
+        return any(self.format_actual_can_expand(arg) for arg in actual_args)
+
+    def format_actual_can_expand(self, arg: str) -> bool:
+        kind = self.infer_kind(arg)
+        return kind.endswith("_vector") or kind.endswith("_matrix")
+
+    def expand_format_actual(self, raw_arg: str, actual: str, count: int) -> list[str]:
+        if count <= 1:
+            return [actual]
+        stripped = raw_arg.strip()
+        sym = self.symbols.get(stripped.lower())
+        if sym is not None and sym.kind.endswith("_vector"):
+            return [f"{sym.name}({i})" for i in range(1, count + 1)]
+        indexed = parse_index_expr(stripped)
+        if indexed is not None:
+            name, args = indexed
+            sym = self.symbols.get(name.lower())
+            if sym is not None and sym.kind.endswith("_vector") and len(args) == 1:
+                parts = split_top_level_colon(args[0])
+                if len(parts) in {2, 3}:
+                    start = self.expr(parts[0]) if parts[0].strip() else "1"
+                    step = self.expr(parts[1]) if len(parts) == 3 else "1"
+                    return [f"{sym.name}({start} + {i}*({step}))" for i in range(count)]
+        return [actual] + [f"{actual}({i})" for i in range(2, count + 1)]
+
+    def format_actual_for_descriptor(self, actual: str, descriptor: str, raw_actual: str) -> tuple[str, str]:
+        actual_kind = self.infer_kind(raw_actual)
+        expandable = actual_kind.endswith("_vector") or actual_kind.endswith("_matrix")
+        if descriptor.startswith("__fixed_"):
+            width, precision = descriptor.removeprefix("__fixed_").split("_", 1)
+            if not expandable:
+                actual = f"trim(adjustl(fixed_text_omat({actual}, {precision})))"
+                descriptor = f"a{width}" if width != "0" else "a"
+            else:
+                descriptor = f"f{width}.{precision}" if width != "0" else f"f0.{precision}"
+        elif descriptor.startswith("__exp_"):
+            width, precision = descriptor.removeprefix("__exp_").split("_", 1)
+            if not expandable:
+                actual = f"trim(adjustl(exp_text_omat({actual}, {precision})))"
+                descriptor = f"a{width}" if width != "0" else "a"
+            else:
+                descriptor = f"es{width}.{precision}" if width != "0" else f"es14.{precision}"
+        elif descriptor.lower().startswith("i"):
+            actual = f"int({actual})"
+        elif descriptor.lower().startswith("a"):
+            actual = f"trim({actual})"
+        return actual, descriptor
 
     def sprintf_statement(self, target: str, args: list[str], line_no: int) -> str:
         if not args:
@@ -908,6 +1025,12 @@ class Translator:
                     return "real_matrix"
                 return "real"
             if name == "eye":
+                return "real_matrix"
+            if name in {"zeros", "ones", "rand"}:
+                if len(args) <= 1:
+                    return "real_vector"
+                if len(args) == 2 and args[1].strip() == "1":
+                    return "real_vector"
                 return "real_matrix"
             if name == "diag" and args:
                 sym = self.symbols.get(args[0].strip().lower())
@@ -1157,6 +1280,8 @@ class Translator:
         out = self.convert_power(out)
         out = self.convert_matrix_multiply(out)
         out = self.convert_left_divide(out)
+        out = self.convert_linspace(out)
+        out = self.convert_logspace(out)
         out = self.convert_basic_array_functions(out)
         out = self.convert_la_functions(out)
         out = self.convert_random_dist_functions(out)
@@ -1170,8 +1295,6 @@ class Translator:
         out = self.convert_randi(out)
         out = self.convert_zeros_ones(out)
         out = self.convert_equicor(out)
-        out = self.convert_linspace(out)
-        out = self.convert_logspace(out)
         out = convert_pi_constant(out)
         out = convert_logical_literals(out)
         out = convert_numbers(out)
@@ -1470,7 +1593,7 @@ class Translator:
                 return f"(size({expr}, 1) == 1 .or. size({expr}, 2) == 1)"
             return ".true."
 
-        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+        return replace_named_calls(text, name, repl)
 
     def convert_numeric_unary_functions(self, text: str) -> str:
         out = text
@@ -1504,7 +1627,7 @@ class Translator:
                 return f"merge(1.0_real64, merge(-1.0_real64, 0.0_real64, {expr} < 0.0_real64), {expr} > 0.0_real64)"
             return f"real(floor({expr}), real64)"
 
-        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+        return replace_named_calls(text, name, repl)
 
     def convert_mod_function(self, text: str) -> str:
         def repl(match: re.Match[str]) -> str:
@@ -2315,6 +2438,42 @@ class Translator:
             return True
         return any("real64" in line for line in body_lines)
 
+    def analyze_local_function_outputs(self, func: LocalFunction, arg_kinds: list[str]) -> list[str]:
+        existing = self.local_function_output_kinds.get(func.name.lower())
+        if existing is not None:
+            return existing
+        translator = Translator(generic=self.generic)
+        translator.function_search_dir = self.function_search_dir
+        translator.loading_functions = self.loading_functions
+        translator.local_functions = self.local_functions
+        translator.local_function_signatures = self.local_function_signatures
+        translator.local_function_output_kinds = self.local_function_output_kinds
+        translator.needs_linstep = self.needs_linstep
+        translator.function_result_name = func.result.lower() if func.result else None
+        translator.function_result_names = {name.lower() for name in func.results}
+        for arg, kind in zip(func.args, arg_kinds):
+            translator.bind_symbol(arg, kind)
+        for result in func.results:
+            translator.bind_symbol(result, "real")
+        for line_no, raw in func.body:
+            text = strip_comment(raw).strip()
+            if ASSIGN_RE.match(text) and not text.endswith(";"):
+                raw = raw.rstrip() + ";"
+            translator.add_line(raw, line_no)
+        output_kinds = [
+            translator.symbols.get(result.lower(), Symbol(result, "real")).kind
+            for result in func.results
+        ]
+        self.local_function_output_kinds[func.name.lower()] = output_kinds
+        self.needs_linstep = self.needs_linstep or translator.needs_linstep
+        self.needs_la_mod = self.needs_la_mod or translator.needs_la_mod
+        self.la_names.update(translator.la_names)
+        self.needs_random_mod = self.needs_random_mod or translator.needs_random_mod
+        self.random_names.update(translator.random_names)
+        self.random_specific_names.update(translator.random_specific_names)
+        self.integer_env_kinds.update(translator.integer_env_kinds)
+        return output_kinds
+
     def emit_local_function_lines(self) -> list[str]:
         out: list[str] = []
         emitted: set[str] = set()
@@ -2336,11 +2495,15 @@ class Translator:
             translator.loading_functions = self.loading_functions
             translator.local_functions = self.local_functions
             translator.local_function_signatures = self.local_function_signatures
+            translator.local_function_output_kinds = self.local_function_output_kinds
             translator.needs_linstep = self.needs_linstep
+            translator.function_result_name = func.result.lower() if func.result else None
+            translator.function_result_names = {name.lower() for name in func.results}
             for arg, kind in zip(func.args, arg_kinds):
                 translator.bind_symbol(arg, kind)
-            if func.result:
-                translator.bind_symbol(func.result, result_kind)
+            output_kinds = self.local_function_output_kinds.get(name, [result_kind] * len(func.results))
+            for result, kind in zip(func.results, output_kinds):
+                translator.bind_symbol(result, kind)
             for line_no, raw in func.body:
                 text = strip_comment(raw).strip()
                 if ASSIGN_RE.match(text) and not text.endswith(";"):
@@ -2355,9 +2518,18 @@ class Translator:
             self.random_names.update(translator.random_names)
             self.random_specific_names.update(translator.random_specific_names)
             self.integer_env_kinds.update(translator.integer_env_kinds)
+            if func.result:
+                result_sym = translator.symbols.get(func.result.lower())
+                if result_sym is not None:
+                    result_kind = result_sym.kind
+            output_kinds = [
+                translator.symbols.get(result.lower(), Symbol(result, "real")).kind
+                for result in func.results
+            ]
+            self.local_function_output_kinds[name] = output_kinds
             if out:
                 out.append("")
-            out.extend(local_function_fortran(func, translator, arg_kinds, result_kind))
+            out.extend(local_function_fortran(func, translator, arg_kinds, result_kind, output_kinds))
             emitted.add(name)
         return out
 
@@ -2478,7 +2650,7 @@ def join_statement_lines(lines: list[str], start_line: int) -> str:
             text = text.rstrip()
             if text.endswith("..."):
                 text = text[:-3].rstrip()
-            if text.endswith(";") or text.endswith(",") or text.endswith("["):
+            if text.endswith(";") or text.endswith(",") or text.endswith("[") or text.endswith("("):
                 parts.append(text)
             else:
                 parts.append(text + ";")
@@ -2558,13 +2730,18 @@ SUBFUNCTION_RE = re.compile(
 
 
 def first_function_result(text: str) -> str:
+    names = function_results(text)
+    return names[0] if names else ""
+
+
+def function_results(text: str) -> list[str]:
     stripped = text.strip()
     if stripped.startswith("[") and stripped.endswith("]"):
         names = [item.strip() for item in split_args(stripped[1:-1]) if item.strip()]
         if not names:
             raise OmatError("function output list is empty")
-        return names[0]
-    return stripped
+        return names
+    return [stripped] if stripped else []
 
 
 def is_known_function_name(name: str) -> bool:
@@ -2597,6 +2774,7 @@ def read_function_file(path: Path) -> LocalFunction:
         source = path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         raise OmatError(f"could not read function file '{path}': {exc}") from exc
+    source = join_multiline_statements(source)
     main_lines, functions = split_local_functions(source)
     extra = [
         raw
@@ -2626,10 +2804,12 @@ def split_local_functions(source: str) -> tuple[list[tuple[int, str]], list[Loca
             continue
         if match is not None:
             result_text, name, arg_text = match.groups()
-            result = first_function_result(result_text)
+            results = function_results(result_text)
+            result = results[0] if results else ""
         else:
             name, arg_text = sub_match.groups()
             result = ""
+            results = []
         args = [arg.strip() for arg in split_args(arg_text) if arg.strip()]
         body: list[tuple[int, str]] = []
         depth = 0
@@ -2652,7 +2832,7 @@ def split_local_functions(source: str) -> tuple[list[tuple[int, str]], list[Loca
             i += 1
         if i >= len(lines):
             raise OmatError(f"function '{name}' is missing END")
-        functions.append(LocalFunction(name=name, result=result, args=args, body=body))
+        functions.append(LocalFunction(name=name, result=result, results=results, args=args, body=body))
         i += 1
     return main_lines, functions
 
@@ -2697,6 +2877,19 @@ def fortran_result_decl(kind: str, name: str) -> str:
     return fortran_decl(kind, name)
 
 
+def fortran_output_arg_decl(kind: str, name: str) -> str:
+    if kind.endswith("_vector"):
+        if is_typed_integer_vector_kind(kind):
+            base = f"integer({typed_integer_env_kind(kind)})"
+        else:
+            base = "integer" if kind == "integer_vector" else "logical" if kind == "logical_vector" else "real(real64)"
+        return f"{base}, allocatable, intent(out) :: {name}(:)"
+    if kind.endswith("_matrix"):
+        base = "logical" if kind == "logical_matrix" else "real(real64)"
+        return f"{base}, allocatable, intent(out) :: {name}(:,:)"
+    return fortran_decl(kind, name, intent="out")
+
+
 def parameter_declaration(sym: Symbol) -> str:
     if sym.value is None:
         raise OmatError(f"constant '{sym.name}' has no value")
@@ -2716,14 +2909,20 @@ def local_function_fortran(
     translator: Translator,
     arg_kinds: list[str],
     result_kind: str,
+    output_kinds: list[str] | None = None,
 ) -> list[str]:
-    if not func.result:
-        lines = [f"subroutine {func.name}({', '.join(func.args)})"]
+    output_kinds = output_kinds if output_kinds is not None else ([result_kind] if func.result else [])
+    if not func.result or len(func.results) > 1:
+        sub_args = func.args + func.results
+        lines = [f"subroutine {func.name}({', '.join(sub_args)})"]
         for arg, kind in zip(func.args, arg_kinds):
             lines.append(fortran_decl(kind, arg, intent="in"))
+        for result, kind in zip(func.results, output_kinds):
+            lines.append(fortran_output_arg_decl(kind, result))
         arg_names = {arg.lower() for arg in func.args}
+        result_names = {result.lower() for result in func.results}
         for sym in translator.declared_symbols.values():
-            if sym.name.lower() in arg_names:
+            if sym.name.lower() in arg_names or sym.name.lower() in result_names:
                 continue
             lines.append(fortran_result_decl(sym.kind, sym.name))
         if translator.declared_symbols:
@@ -2847,13 +3046,58 @@ def find_fortran_wrap_position(line: str, max_pos: int) -> int:
     return candidates[-1]
 
 
-def parse_loop_spec(spec: str) -> tuple[str, str, str | None]:
+def parse_loop_spec(spec: str) -> tuple[str, str, str | None] | None:
     parts = [part.strip() for part in spec.split(":")]
     if len(parts) == 2:
         return parts[0], parts[1], None
     if len(parts) == 3:
         return parts[0], parts[2], parts[1]
-    raise OmatError("for loops must use start:stop or start:step:stop")
+    return None
+
+
+def replace_named_calls(text: str, name: str, repl: Callable[[re.Match[str]], str]) -> str:
+    pattern = re.compile(rf"\b{re.escape(name)}\s*\(", re.IGNORECASE)
+    out: list[str] = []
+    pos = 0
+    while True:
+        match = pattern.search(text, pos)
+        if match is None:
+            out.append(text[pos:])
+            return "".join(out)
+        open_pos = match.end() - 1
+        depth = 1
+        close_pos = open_pos + 1
+        in_string: str | None = None
+        while close_pos < len(text):
+            ch = text[close_pos]
+            if in_string is not None:
+                if ch == in_string:
+                    if close_pos + 1 < len(text) and text[close_pos + 1] == in_string:
+                        close_pos += 2
+                        continue
+                    in_string = None
+            elif ch in {'"', "'"}:
+                in_string = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            close_pos += 1
+        if close_pos >= len(text) or depth != 0:
+            out.append(text[pos:])
+            return "".join(out)
+        out.append(text[pos:match.start()])
+        call_match = re.match(
+            rf"(?is)\A{re.escape(name)}\s*\((.*)\)\Z",
+            text[match.start() : close_pos + 1],
+        )
+        if call_match is None:
+            out.append(text[match.start() : close_pos + 1])
+        else:
+            out.append(repl(call_match))
+        pos = close_pos + 1
 
 
 def parse_simple_call(text: str) -> tuple[str, list[str]] | None:
@@ -2928,7 +3172,9 @@ def is_vector_expr(text: str) -> bool:
     return (
         (text.startswith("[") and ";" not in text)
         or re.match(r"^linspace\s*\(", text, re.IGNORECASE) is not None
+        or re.match(r"^linspace_omat\s*\(", text, re.IGNORECASE) is not None
         or re.match(r"^logspace\s*\(", text, re.IGNORECASE) is not None
+        or re.match(r"^logspace_omat\s*\(", text, re.IGNORECASE) is not None
     )
 
 
