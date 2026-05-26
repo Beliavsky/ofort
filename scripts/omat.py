@@ -726,6 +726,8 @@ class Translator:
                 return "real_vector"
         if split_top_level_backslash(rhs) is not None:
             return "real_vector"
+        if self.horizontal_matrix_concat_items(rhs) is not None:
+            return "real_matrix"
         if is_matrix_expr(low):
             return "real_matrix"
         if is_vector_expr(low):
@@ -909,6 +911,7 @@ class Translator:
         out = self.convert_index_triplets(out)
         out = self.convert_colon_vector(out)
         out = self.convert_vertical_vector_concat(out)
+        out = self.convert_horizontal_matrix_concat(out)
         out = self.convert_integer_constructors(out)
         out = convert_vector_literals(out)
         out = convert_elementwise(out)
@@ -1098,6 +1101,59 @@ class Translator:
                 return text
             names.append(row)
         return f"vcat_vecs_omat({', '.join(names)})"
+
+    def horizontal_matrix_concat_items(self, text: str) -> list[str] | None:
+        stripped = text.strip()
+        if not (stripped.startswith("[") and stripped.endswith("]") and ";" not in stripped):
+            return None
+        items = split_matlab_literal_row(stripped[1:-1].strip())
+        if len(items) < 2:
+            return None
+        saw_matrix = False
+        for item in items:
+            if self.matrix_concat_expr(item) is None:
+                return None
+            if self.argument_kind(item) == "real_matrix" or self.ones_zeros_size_matrix_expr(item) is not None:
+                saw_matrix = True
+        return items if saw_matrix else None
+
+    def convert_horizontal_matrix_concat(self, text: str) -> str:
+        items = self.horizontal_matrix_concat_items(text)
+        if items is None:
+            return text
+        exprs = [self.matrix_concat_expr(item) for item in items]
+        out = exprs[0]
+        for expr in exprs[1:]:
+            out = f"hcat_mats_omat({out}, {expr})"
+        return out
+
+    def matrix_concat_expr(self, text: str) -> str | None:
+        special = self.ones_zeros_size_matrix_expr(text)
+        if special is not None:
+            return special
+        kind = self.argument_kind(text)
+        if kind == "real_matrix":
+            return self.expr(text)
+        if kind == "real_vector":
+            expr = self.expr(text)
+            return f"reshape_mat_from_vec_omat({expr}, size({expr}), 1)"
+        return None
+
+    def ones_zeros_size_matrix_expr(self, text: str) -> str | None:
+        call = parse_simple_call(text.strip().lower())
+        if call is None:
+            return None
+        name, args = call
+        if name not in {"ones", "zeros"} or len(args) != 1:
+            return None
+        size_call = parse_simple_call(args[0].strip())
+        if size_call is None or size_call[0] != "size" or len(size_call[1]) != 1:
+            return None
+        target = size_call[1][0].strip()
+        sym = self.symbols.get(target.lower())
+        if sym is None or sym.kind != "real_matrix":
+            return None
+        return f"{name}_omat2(size({target}, 1), size({target}, 2))"
 
     def convert_one_shape_predicate(self, text: str, name: str) -> str:
         def repl(match: re.Match[str]) -> str:
@@ -1384,7 +1440,7 @@ class Translator:
         right_sym = self.symbols.get(right.strip().lower())
         if right_sym is not None and right_sym.kind == "real_matrix":
             right_expr = f"{right_expr}(:, 1)"
-        return f"mldivide({self.expr(left)}, {right_expr})"
+        return f"mldivide_omat({self.expr(left)}, {right_expr})"
 
     def convert_la_functions(self, text: str) -> str:
         for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
@@ -3670,6 +3726,87 @@ def helper_source(
         "  end do",
         "end do",
         "end function repmat_mat_omat",
+        "",
+        "function hcat_mats_omat(a, b) result(c)",
+        "real(real64), intent(in) :: a(:,:), b(:,:)",
+        "real(real64), allocatable :: c(:,:)",
+        "integer :: nca, ncb",
+        "if (size(a, 1) /= size(b, 1)) then",
+        "  print *, 'omat horizontal concatenation row mismatch'",
+        "  stop 1",
+        "end if",
+        "nca = size(a, 2)",
+        "ncb = size(b, 2)",
+        "allocate(c(size(a, 1), nca + ncb))",
+        "c(:, 1:nca) = a",
+        "c(:, nca + 1:nca + ncb) = b",
+        "end function hcat_mats_omat",
+        "",
+        "function mldivide_omat(a, b) result(x)",
+        "real(real64), intent(in) :: a(:,:), b(:)",
+        "real(real64), allocatable :: x(:)",
+        "if (size(a, 1) == size(a, 2)) then",
+        "  x = solve_linear_omat(a, b)",
+        "else",
+        "  x = solve_linear_omat(matmul(transpose(a), a), matmul(transpose(a), b))",
+        "end if",
+        "end function mldivide_omat",
+        "",
+        "function solve_linear_omat(a, b) result(x)",
+        "real(real64), intent(in) :: a(:,:), b(:)",
+        "real(real64), allocatable :: x(:)",
+        "real(real64), allocatable :: aa(:,:), bb(:)",
+        "real(real64) :: factor, pivot_value, temp",
+        "integer :: n, i, j, k, pivot",
+        "n = size(a, 1)",
+        "if (size(a, 2) /= n .or. size(b) /= n) then",
+        "  print *, 'omat linear solve shape mismatch'",
+        "  stop 1",
+        "end if",
+        "allocate(aa(n, n), bb(n), x(n))",
+        "aa = a",
+        "bb = b",
+        "do k = 1, n - 1",
+        "  pivot = k",
+        "  pivot_value = abs(aa(k, k))",
+        "  do i = k + 1, n",
+        "    if (abs(aa(i, k)) > pivot_value) then",
+        "      pivot = i",
+        "      pivot_value = abs(aa(i, k))",
+        "    end if",
+        "  end do",
+        "  if (pivot_value == 0.0_real64) then",
+        "    print *, 'omat singular matrix in left divide'",
+        "    stop 1",
+        "  end if",
+        "  if (pivot /= k) then",
+        "    do j = k, n",
+        "      temp = aa(k, j)",
+        "      aa(k, j) = aa(pivot, j)",
+        "      aa(pivot, j) = temp",
+        "    end do",
+        "    temp = bb(k)",
+        "    bb(k) = bb(pivot)",
+        "    bb(pivot) = temp",
+        "  end if",
+        "  do i = k + 1, n",
+        "    factor = aa(i, k) / aa(k, k)",
+        "    aa(i, k:n) = aa(i, k:n) - factor * aa(k, k:n)",
+        "    bb(i) = bb(i) - factor * bb(k)",
+        "  end do",
+        "end do",
+        "if (aa(n, n) == 0.0_real64) then",
+        "  print *, 'omat singular matrix in left divide'",
+        "  stop 1",
+        "end if",
+        "do i = n, 1, -1",
+        "  if (i < n) then",
+        "    x(i) = (bb(i) - sum(aa(i, i + 1:n) * x(i + 1:n))) / aa(i, i)",
+        "  else",
+        "    x(i) = bb(i) / aa(i, i)",
+        "  end if",
+        "end do",
+        "end function solve_linear_omat",
         "",
         "function reshape_vec_from_vec_omat(x, n) result(y)",
         "real(real64), intent(in) :: x(:)",
