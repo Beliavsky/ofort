@@ -35,6 +35,7 @@ CONST_ASSIGN_RE = re.compile(r"^const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$", r
 FOR_RE = re.compile(r"^for\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$", re.IGNORECASE)
 IF_RE = re.compile(r"^if\s+(.+)$", re.IGNORECASE)
 ELSEIF_RE = re.compile(r"^elseif\s+(.+)$", re.IGNORECASE)
+WHILE_RE = re.compile(r"^while\s+(.+)$", re.IGNORECASE)
 
 
 BUILTINS = {
@@ -88,6 +89,9 @@ BUILTINS = {
     "logspace",
     "movmean",
     "mod",
+    "now",
+    "datevec",
+    "datestr",
     "nonzeros",
     "normcdf",
     "numel",
@@ -105,6 +109,7 @@ BUILTINS = {
     "sin",
     "sign",
     "size",
+    "sprintf",
     "sum",
     "sort",
     "tan",
@@ -116,6 +121,22 @@ BUILTINS = {
     "setdiff",
     "var",
     "zscore",
+}
+
+NOOP_CALLS = {
+    "addpath",
+    "axis",
+    "clf",
+    "figure",
+    "grid",
+    "hold",
+    "legend",
+    "plot",
+    "print",
+    "rmpath",
+    "title",
+    "xlabel",
+    "ylabel",
 }
 
 INTEGER_CONSTRUCTORS = {"int8", "int16", "int32", "int64"}
@@ -156,14 +177,12 @@ MATLAB_BUILTINS_NOT_IMPLEMENTED = {
     "conv",
     "conv2",
     "datenum",
-    "datestr",
     "fft",
     "fft2",
     "filter",
     "fminsearch",
     "fplot",
     "fzero",
-    "grid",
     "hist",
     "histogram",
     "ifft",
@@ -171,27 +190,20 @@ MATLAB_BUILTINS_NOT_IMPLEMENTED = {
     "imagesc",
     "interp1",
     "interp2",
-    "legend",
     "meshgrid",
     "ode45",
-    "plot",
     "polyfit",
     "polyval",
     "readmatrix",
     "readtable",
     "roots",
-    "scatter",
     "sortrows",
     "sparse",
-    "sprintf",
     "string",
     "struct",
     "table",
-    "title",
     "writematrix",
     "writetable",
-    "xlabel",
-    "ylabel",
 }
 
 PURE_HELPERS = {
@@ -321,6 +333,8 @@ class OmatError(Exception):
 class Translator:
     def __init__(self, generic: bool = False, source_path: Path | None = None) -> None:
         self.symbols: dict[str, Symbol] = {}
+        self.declared_symbols: dict[str, Symbol] = {}
+        self.symbol_versions: dict[str, int] = {}
         self.statements: list[Statement] = []
         self.indent = 0
         self.block_stack: list[str] = []
@@ -338,6 +352,40 @@ class Translator:
         self.local_function_signatures: dict[str, tuple[list[str], str]] = {}
         self.textscan_units: dict[str, str] = {}
         self.textscan_columns: dict[str, dict[int, str]] = {}
+
+    def bind_symbol(
+        self,
+        name: str,
+        kind: str,
+        *,
+        constant: bool = False,
+        value: str | None = None,
+        line_no: int | None = None,
+    ) -> Symbol:
+        key = name.lower()
+        existing = self.symbols.get(key)
+        if existing is not None and existing.constant:
+            prefix = f"line {line_no}: " if line_no is not None else ""
+            raise OmatError(f"{prefix}cannot assign to constant '{name}'")
+        if existing is not None and existing.kind == kind:
+            existing.constant = constant
+            existing.value = value if constant else None
+            return existing
+
+        if existing is None:
+            fortran_name = name
+            self.symbol_versions.setdefault(key, 1)
+        else:
+            version = self.symbol_versions.get(key, 1) + 1
+            while f"{name}_{version}".lower() in self.declared_symbols:
+                version += 1
+            self.symbol_versions[key] = version
+            fortran_name = f"{name}_{version}"
+
+        sym = Symbol(fortran_name, kind, constant=constant, value=value if constant else None)
+        self.symbols[key] = sym
+        self.declared_symbols[fortran_name.lower()] = sym
+        return sym
 
     def translate(self, source: str) -> str:
         source = join_multiline_statements(source)
@@ -381,13 +429,14 @@ class Translator:
                 raise OmatError(f"line {line_no}: END without a block")
             block = self.block_stack.pop()
             self.indent -= 1
-            self.statements.append(Statement("end do" if block == "for" else "end if", self.indent))
+            self.statements.append(Statement("end if" if block == "if" else "end do", self.indent))
             return
 
         m = FOR_RE.match(line)
         if m:
             var, spec = m.groups()
-            self.symbols.setdefault(var.lower(), Symbol(var, "integer"))
+            if var.lower() not in self.symbols:
+                self.bind_symbol(var, "integer")
             start, stop, step = parse_loop_spec(spec)
             if step is None:
                 self.statements.append(
@@ -407,12 +456,28 @@ class Translator:
             self.block_stack.append("for")
             return
 
+        m = WHILE_RE.match(line)
+        if m:
+            condition = m.group(1).strip()
+            self.statements.append(Statement(f"do while ({self.expr(condition)})", self.indent))
+            self.indent += 1
+            self.block_stack.append("while")
+            return
+
         m = IF_RE.match(line)
         if m:
             condition = m.group(1).strip()
             self.statements.append(Statement(f"if ({self.expr(condition)}) then", self.indent))
             self.indent += 1
             self.block_stack.append("if")
+            return
+
+        if low == "break":
+            self.statements.append(Statement("exit", self.indent))
+            return
+
+        if low == "return":
+            self.statements.append(Statement("return", self.indent))
             return
 
         m = ELSEIF_RE.match(line)
@@ -449,6 +514,21 @@ class Translator:
         if call is not None and call[0] == "fclose" and len(call[1]) == 1:
             self.statements.append(Statement(f"close({self.expr(call[1][0])})", self.indent))
             return
+        if call is not None and call[0] in NOOP_CALLS:
+            return
+        if call is not None and self.ensure_local_function(call[0]):
+            func = self.local_functions[call[0].lower()]
+            if not func.result:
+                if len(call[1]) != len(func.args):
+                    raise OmatError(f"function '{func.name}' expects {len(func.args)} arguments")
+                self.local_function_signatures.setdefault(
+                    call[0].lower(),
+                    ([self.argument_kind(arg.strip()) for arg in call[1]], ""),
+                )
+                self.statements.append(
+                    Statement(f"call {func.name}({', '.join(self.expr(arg) for arg in call[1])})", self.indent)
+                )
+                return
 
         mask_assignment = self.parse_logical_index_assignment(line)
         if mask_assignment is not None:
@@ -458,7 +538,8 @@ class Translator:
                 raise OmatError(f"line {line_no}: cannot assign to constant '{name}'")
             self.statements.append(Statement(f"where ({mask})", self.indent))
             self.indent += 1
-            self.statements.append(Statement(f"{name} = {rhs}", self.indent))
+            target = existing.name if existing is not None else name
+            self.statements.append(Statement(f"{target} = {rhs}", self.indent))
             self.indent -= 1
             self.statements.append(Statement("end where", self.indent))
             if not suppress_output:
@@ -476,12 +557,8 @@ class Translator:
                 col = int(cell.group(2))
                 kind = "string_vector" if col == 1 else "real_vector"
                 existing = self.symbols.get(name.lower())
-                if existing is not None and existing.kind != kind:
-                    raise OmatError(
-                        f"line {line_no}: variable '{name}' changes from {existing.kind} to {kind}"
-                    )
-                self.symbols[name.lower()] = Symbol(name, kind)
-                self.statements.append(Statement(f"{name} = {self.textscan_columns[data_name][col]}", self.indent))
+                sym = self.bind_symbol(name, kind, line_no=line_no)
+                self.statements.append(Statement(f"{sym.name} = {self.textscan_columns[data_name][col]}", self.indent))
                 return
             textscan_call = parse_simple_call(rhs.strip())
             if textscan_call is not None and textscan_call[0].lower() == "textscan":
@@ -490,12 +567,12 @@ class Translator:
                 fmt = matlab_string_literal_value(textscan_call[1][1])
                 if fmt != "%s %f":
                     raise OmatError(f"line {line_no}: textscan currently supports format \"%s %f\"")
-                self.symbols[name.lower()] = Symbol(name, "textscan")
+                self.bind_symbol(name, "textscan", line_no=line_no)
                 self.textscan_units[name.lower()] = self.expr(textscan_call[1][0])
                 labels_name = f"omat_{name}_col1"
                 values_name = f"omat_{name}_col2"
-                self.symbols[labels_name.lower()] = Symbol(labels_name, "string_vector")
-                self.symbols[values_name.lower()] = Symbol(values_name, "real_vector")
+                self.bind_symbol(labels_name, "string_vector", line_no=line_no)
+                self.bind_symbol(values_name, "real_vector", line_no=line_no)
                 self.textscan_columns[name.lower()] = {1: labels_name, 2: values_name}
                 self.statements.append(
                     Statement(
@@ -503,6 +580,11 @@ class Translator:
                         self.indent,
                     )
                 )
+                return
+            sprintf_call = parse_simple_call(rhs.strip())
+            if sprintf_call is not None and sprintf_call[0].lower() == "sprintf":
+                sym = self.bind_symbol(name, "string", line_no=line_no)
+                self.statements.append(Statement(self.sprintf_statement(sym.name, sprintf_call[1], line_no), self.indent))
                 return
             fopen_call = parse_simple_call(rhs.strip())
             if fopen_call is not None and fopen_call[0].lower() == "fopen":
@@ -512,23 +594,18 @@ class Translator:
                 if mode is None:
                     raise OmatError(f"line {line_no}: fopen mode must be a literal string")
                 file_expr = self.expr(fopen_call[1][0])
-                existing = self.symbols.get(name.lower())
-                if existing is not None and existing.kind != "integer":
-                    raise OmatError(
-                        f"line {line_no}: variable '{name}' changes from {existing.kind} to integer"
-                    )
-                self.symbols[name.lower()] = Symbol(name, "integer")
+                sym = self.bind_symbol(name, "integer", line_no=line_no)
                 if mode.startswith("w"):
                     self.statements.append(
                         Statement(
-                            f"open(newunit={name}, file=trim({file_expr}), status='replace', action='write')",
+                            f"open(newunit={sym.name}, file=trim({file_expr}), status='replace', action='write')",
                             self.indent,
                         )
                     )
                 elif mode.startswith("r"):
                     self.statements.append(
                         Statement(
-                            f"open(newunit={name}, file=trim({file_expr}), status='old', action='read')",
+                            f"open(newunit={sym.name}, file=trim({file_expr}), status='old', action='read')",
                             self.indent,
                         )
                     )
@@ -537,28 +614,17 @@ class Translator:
                 return
             fgetl_call = parse_simple_call(rhs.strip())
             if fgetl_call is not None and fgetl_call[0].lower() == "fgetl" and len(fgetl_call[1]) == 1:
-                existing = self.symbols.get(name.lower())
-                if existing is not None and existing.kind != "string":
-                    raise OmatError(
-                        f"line {line_no}: variable '{name}' changes from {existing.kind} to string"
-                    )
-                self.symbols[name.lower()] = Symbol(name, "string")
-                self.statements.append(Statement(f"read({self.expr(fgetl_call[1][0])}, '(a)') {name}", self.indent))
+                sym = self.bind_symbol(name, "string", line_no=line_no)
+                self.statements.append(Statement(f"read({self.expr(fgetl_call[1][0])}, '(a)') {sym.name}", self.indent))
                 return
             kind = self.const_kind(rhs) if const_directive else self.infer_kind(rhs)
             existing = self.symbols.get(name.lower())
-            if existing is not None and existing.constant:
-                raise OmatError(f"line {line_no}: cannot assign to constant '{name}'")
-            if existing is not None and existing.kind != kind:
-                raise OmatError(
-                    f"line {line_no}: variable '{name}' changes from {existing.kind} to {kind}"
-                )
             value = self.expr(rhs)
-            self.symbols[name.lower()] = Symbol(name, kind, constant=const_directive, value=value if const_directive else None)
+            sym = self.bind_symbol(name, kind, constant=const_directive, value=value if const_directive else None, line_no=line_no)
             if not const_directive:
-                self.statements.append(Statement(f"{name} = {value}", self.indent))
+                self.statements.append(Statement(f"{sym.name} = {value}", self.indent))
             if not suppress_output:
-                self.statements.append(Statement(self.display_statement(name, kind), self.indent))
+                self.statements.append(Statement(self.display_statement(sym.name, kind), self.indent))
             return
 
         if const_directive:
@@ -570,11 +636,11 @@ class Translator:
             call = parse_simple_call(rhs.strip().lower())
             if call is None or call[0] != "eig" or len(call[1]) != 1:
                 raise OmatError(f"line {line_no}: multi-output assignment currently supports [V,D] = eig(A)")
-            self.symbols[left_name.lower()] = Symbol(left_name, "real_matrix")
-            self.symbols[right_name.lower()] = Symbol(right_name, "real_matrix")
+            left_sym = self.bind_symbol(left_name, "real_matrix", line_no=line_no)
+            right_sym = self.bind_symbol(right_name, "real_matrix", line_no=line_no)
             arg = self.expr(call[1][0])
-            self.statements.append(Statement(f"{left_name} = eigvecs_omat({arg})", self.indent))
-            self.statements.append(Statement(f"{right_name} = diag_vec_omat(eigvals_omat({arg}))", self.indent))
+            self.statements.append(Statement(f"{left_sym.name} = eigvecs_omat({arg})", self.indent))
+            self.statements.append(Statement(f"{right_sym.name} = diag_vec_omat(eigvals_omat({arg}))", self.indent))
             return
 
         if not suppress_output:
@@ -673,6 +739,50 @@ class Translator:
             return f"write({unit_expr},{fmt_literal}{suffix}) {', '.join(write_args)}"
         return f"write({unit_expr},{fmt_literal}{suffix})"
 
+    def sprintf_statement(self, target: str, args: list[str], line_no: int) -> str:
+        if not args:
+            raise OmatError(f"line {line_no}: sprintf requires a format string")
+        fmt = matlab_string_literal_value(args[0])
+        if fmt is None:
+            raise OmatError(f"line {line_no}: sprintf currently requires a literal format string")
+        descriptors, format_args, n_conversions, _newline = matlab_fprintf_format(fmt)
+        actuals = [self.expr(arg) for arg in args[1:]]
+        if len(actuals) != n_conversions:
+            raise OmatError(
+                f"line {line_no}: sprintf format expects {n_conversions} argument"
+                f"{'' if n_conversions == 1 else 's'}, got {len(actuals)}"
+            )
+        actual_iter = iter(actuals)
+        write_args = []
+        write_descriptors = []
+        for item, descriptor in zip(format_args, descriptors):
+            if item == "__format_only__":
+                write_descriptors.append(descriptor)
+                continue
+            if item is not None:
+                write_descriptors.append(descriptor)
+                write_args.append(item)
+                continue
+            actual = next(actual_iter)
+            if descriptor.startswith("__fixed_"):
+                width, precision = descriptor.removeprefix("__fixed_").split("_", 1)
+                actual = f"trim(adjustl(fixed_text_omat({actual}, {precision})))"
+                descriptor = f"a{width}" if width != "0" else "a"
+            elif descriptor.startswith("__exp_"):
+                width, precision = descriptor.removeprefix("__exp_").split("_", 1)
+                actual = f"trim(adjustl(exp_text_omat({actual}, {precision})))"
+                descriptor = f"a{width}" if width != "0" else "a"
+            elif descriptor.lower().startswith("i"):
+                actual = f"int({actual})"
+            elif descriptor.lower().startswith("a"):
+                actual = f"trim({actual})"
+            write_descriptors.append(descriptor)
+            write_args.append(actual)
+        fmt_literal = fortran_string_literal("(" + ",".join(write_descriptors) + ")")
+        if write_args:
+            return f"write({target},{fmt_literal}) {', '.join(write_args)}"
+        return f"write({target},{fmt_literal})"
+
     def display_statement(self, expr: str, kind: str) -> str:
         if kind == "real_matrix":
             return f"call print_real_matrix_omat({expr})"
@@ -705,6 +815,8 @@ class Translator:
         if call is not None:
             name, args = call
             if self.ensure_local_function(name):
+                if not self.local_functions[name].result:
+                    raise OmatError(f"subroutine '{name}' cannot be used as an expression")
                 return self.register_local_function_call(name, args)
             if name == "size":
                 if len(args) == 1:
@@ -716,6 +828,14 @@ class Translator:
                 return "logical"
             if name == "exist":
                 return "logical"
+            if name == "now":
+                return "real"
+            if name == "datevec":
+                return "real_vector"
+            if name == "datestr":
+                return "string"
+            if name == "sprintf":
+                return "string"
             if name in {"isvector", "ismatrix", "isscalar", "isempty"}:
                 return "logical"
             if name == "find":
@@ -1042,6 +1162,7 @@ class Translator:
         out = self.convert_random_dist_functions(out)
         out = self.convert_stats_functions(out)
         out = self.convert_exist_function(out)
+        out = self.convert_datetime_functions(out)
         out = self.convert_normcdf(out)
         out = self.convert_sqrt_function(out)
         out = self.convert_function_names(out)
@@ -1054,7 +1175,46 @@ class Translator:
         out = convert_pi_constant(out)
         out = convert_logical_literals(out)
         out = convert_numbers(out)
+        out = self.apply_symbol_aliases(out)
         return out
+
+    def apply_symbol_aliases(self, text: str) -> str:
+        if not self.symbols:
+            return text
+
+        def replace_segment(segment: str) -> str:
+            def repl(match: re.Match[str]) -> str:
+                name = match.group(0)
+                sym = self.symbols.get(name.lower())
+                if sym is None:
+                    return name
+                return sym.name
+
+            return IDENT_RE.sub(repl, segment)
+
+        parts: list[str] = []
+        current: list[str] = []
+        quote: str | None = None
+        i = 0
+        while i < len(text):
+            ch = text[i]
+            current.append(ch)
+            if ch in {"'", '"'}:
+                if quote is None:
+                    if len(current) > 1:
+                        prefix = "".join(current[:-1])
+                        parts.append(replace_segment(prefix))
+                        current = [ch]
+                    quote = ch
+                elif quote == ch:
+                    parts.append("".join(current))
+                    current = []
+                    quote = None
+            i += 1
+        if current:
+            tail = "".join(current)
+            parts.append(tail if quote is not None else replace_segment(tail))
+        return "".join(parts)
 
     def convert_integer_constructors(self, text: str) -> str:
         out = text
@@ -1536,6 +1696,27 @@ class Translator:
 
         return re.sub(r"\bexist\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
 
+    def convert_datetime_functions(self, text: str) -> str:
+        out = re.sub(r"\bnow\s*\(\s*\)", "now_omat()", text, flags=re.IGNORECASE)
+
+        def datevec_repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 1:
+                raise OmatError("datevec currently supports one argument")
+            return f"datevec_omat({self.expr(args[0])})"
+
+        def datestr_repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) == 1:
+                return f"datestr_omat({self.expr(args[0])}, 0)"
+            if len(args) == 2:
+                return f"datestr_omat({self.expr(args[0])}, {self.integer_arg(args[1])})"
+            raise OmatError("datestr currently supports datestr(x) and datestr(x,fmt)")
+
+        out = re.sub(r"\bdatevec\s*\(([^()]*)\)", datevec_repl, out, flags=re.IGNORECASE)
+        out = re.sub(r"\bdatestr\s*\(([^()]*)\)", datestr_repl, out, flags=re.IGNORECASE)
+        return out
+
     def reject_unimplemented_matlab_functions(self, text: str) -> None:
         for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
             name = match.group(1).lower()
@@ -1631,6 +1812,16 @@ class Translator:
         return out
 
     def convert_reduction(self, text: str, name: str, helper_base: str) -> str:
+        array_kinds = {
+            "integer_vector",
+            "real_vector",
+            "logical_vector",
+            "string_vector",
+            "integer_matrix",
+            "real_matrix",
+            "logical_matrix",
+        }
+
         def repl(match: re.Match[str]) -> str:
             args = split_args(match.group(1))
             if not args:
@@ -1646,6 +1837,12 @@ class Translator:
                     if name == "max":
                         return f"max_vec_omat({self.expr(arg)})"
                     return match.group(0)
+                if name in {"min", "max"}:
+                    for raw_arg in args:
+                        raw_sym = self.symbols.get(raw_arg.strip().lower())
+                        if raw_sym is not None and raw_sym.kind in array_kinds:
+                            raise OmatError(f"{name} currently supports one argument for vectors")
+                    return f"{name}({', '.join(self.expr(raw_arg.strip()) for raw_arg in args)})"
                 raise OmatError(f"{name} currently supports one argument for vectors")
             farg = self.expr(arg)
             if len(args) == 1:
@@ -2075,7 +2272,7 @@ class Translator:
             module_name = "random_mod" if self.generic else "ofort_random_mod"
             lines.append(f"use {module_name}, only: " + ", ".join(names))
         lines.append("implicit none")
-        for sym in self.symbols.values():
+        for sym in self.declared_symbols.values():
             if sym.constant:
                 lines.append(parameter_declaration(sym))
             elif sym.kind == "integer":
@@ -2106,7 +2303,7 @@ class Translator:
                 lines.append(f"real(real64), allocatable :: {sym.name}(:,:)")
             else:
                 lines.append(f"real(real64) :: {sym.name}")
-        if self.symbols:
+        if self.declared_symbols:
             lines.append("")
         lines.extend(body_lines)
         lines.append("end program omat_main")
@@ -2114,7 +2311,7 @@ class Translator:
         return wrap_fortran_source(self.apply_real64_alias(lines, kind_alias)) + "\n"
 
     def main_needs_kind_alias(self, body_lines: list[str]) -> bool:
-        if any(sym.kind in {"real", "real_vector", "real_matrix"} for sym in self.symbols.values()):
+        if any(sym.kind in {"real", "real_vector", "real_matrix"} for sym in self.declared_symbols.values()):
             return True
         return any("real64" in line for line in body_lines)
 
@@ -2141,8 +2338,9 @@ class Translator:
             translator.local_function_signatures = self.local_function_signatures
             translator.needs_linstep = self.needs_linstep
             for arg, kind in zip(func.args, arg_kinds):
-                translator.symbols[arg.lower()] = Symbol(arg, kind)
-            translator.symbols[func.result.lower()] = Symbol(func.result, result_kind)
+                translator.bind_symbol(arg, kind)
+            if func.result:
+                translator.bind_symbol(func.result, result_kind)
             for line_no, raw in func.body:
                 text = strip_comment(raw).strip()
                 if ASSIGN_RE.match(text) and not text.endswith(";"):
@@ -2350,9 +2548,23 @@ def matlab_fprintf_format(fmt: str) -> tuple[list[str], list[str | None], int, b
 
 
 FUNCTION_RE = re.compile(
-    r"^function\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s*$",
+    r"^function\s+(\[[^\]]+\]|[A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s*$",
     re.IGNORECASE,
 )
+SUBFUNCTION_RE = re.compile(
+    r"^function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s*$",
+    re.IGNORECASE,
+)
+
+
+def first_function_result(text: str) -> str:
+    stripped = text.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        names = [item.strip() for item in split_args(stripped[1:-1]) if item.strip()]
+        if not names:
+            raise OmatError("function output list is empty")
+        return names[0]
+    return stripped
 
 
 def is_known_function_name(name: str) -> bool:
@@ -2407,11 +2619,17 @@ def split_local_functions(source: str) -> tuple[list[tuple[int, str]], list[Loca
         line_no, raw = lines[i]
         stripped = strip_comment(raw).strip().lstrip("\ufeff")
         match = FUNCTION_RE.match(stripped)
-        if match is None:
+        sub_match = None if match is not None else SUBFUNCTION_RE.match(stripped)
+        if match is None and sub_match is None:
             main_lines.append((line_no, raw.lstrip("\ufeff") if line_no == 1 else raw))
             i += 1
             continue
-        result, name, arg_text = match.groups()
+        if match is not None:
+            result_text, name, arg_text = match.groups()
+            result = first_function_result(result_text)
+        else:
+            name, arg_text = sub_match.groups()
+            result = ""
         args = [arg.strip() for arg in split_args(arg_text) if arg.strip()]
         body: list[tuple[int, str]] = []
         depth = 0
@@ -2424,7 +2642,11 @@ def split_local_functions(source: str) -> tuple[list[tuple[int, str]], list[Loca
                 break
             if low in {"end", "endfunction"}:
                 depth = max(0, depth - 1)
-            elif FOR_RE.match(body_stripped) is not None or IF_RE.match(body_stripped) is not None:
+            elif (
+                FOR_RE.match(body_stripped) is not None
+                or IF_RE.match(body_stripped) is not None
+                or WHILE_RE.match(body_stripped) is not None
+            ):
                 depth += 1
             body.append((body_line_no, body_raw))
             i += 1
@@ -2495,15 +2717,31 @@ def local_function_fortran(
     arg_kinds: list[str],
     result_kind: str,
 ) -> list[str]:
+    if not func.result:
+        lines = [f"subroutine {func.name}({', '.join(func.args)})"]
+        for arg, kind in zip(func.args, arg_kinds):
+            lines.append(fortran_decl(kind, arg, intent="in"))
+        arg_names = {arg.lower() for arg in func.args}
+        for sym in translator.declared_symbols.values():
+            if sym.name.lower() in arg_names:
+                continue
+            lines.append(fortran_result_decl(sym.kind, sym.name))
+        if translator.declared_symbols:
+            lines.append("")
+        for stmt in translator.statements:
+            lines.append("  " * stmt.indent + stmt.text)
+        lines.append(f"end subroutine {func.name}")
+        return coalesce_fortran_declarations(lines)
+
     lines = [f"function {func.name}({', '.join(func.args)}) result({func.result})"]
     for arg, kind in zip(func.args, arg_kinds):
         lines.append(fortran_decl(kind, arg, intent="in"))
     lines.append(fortran_result_decl(result_kind, func.result))
-    for sym in translator.symbols.values():
+    for sym in translator.declared_symbols.values():
         if sym.name.lower() in {func.result.lower(), *(arg.lower() for arg in func.args)}:
             continue
         lines.append(fortran_result_decl(sym.kind, sym.name))
-    if translator.symbols:
+    if translator.declared_symbols:
         lines.append("")
     for stmt in translator.statements:
         lines.append("  " * stmt.indent + stmt.text)
@@ -3032,7 +3270,7 @@ def split_args(text: str) -> list[str]:
             current.append(ch)
     if current:
         args.append("".join(current).strip())
-    return args
+    return [arg for arg in args if arg]
 
 
 def split_top_level_colon(text: str) -> list[str]:
@@ -3813,6 +4051,26 @@ def helper_source(
         "character(len=*), intent(in) :: path",
         "inquire(file=trim(path), exist=exist_file_omat)",
         "end function exist_file_omat",
+        "",
+        "real(real64) function now_omat()",
+        "now_omat = 0.0_real64",
+        "end function now_omat",
+        "",
+        "function datevec_omat(t) result(v)",
+        "real(real64), intent(in) :: t",
+        "real(real64), allocatable :: v(:)",
+        "integer :: values(8)",
+        "call date_and_time(values=values)",
+        "allocate(v(6))",
+        "v = real([values(1), values(2), values(3), values(5), values(6), values(7)], real64)",
+        "end function datevec_omat",
+        "",
+        "function datestr_omat(v, fmt) result(text)",
+        "real(real64), intent(in) :: v(:)",
+        "integer, intent(in) :: fmt",
+        "character(len=32) :: text",
+        "write(text,'(i2.2,a,i2.2,a,i4.4,1x,i2.2,a,i2.2,a,i2.2)') int(v(3)), '-', int(v(2)), '-', int(v(1)), int(v(4)), ':', int(v(5)), ':', int(v(6))",
+        "end function datestr_omat",
         "",
         "subroutine read_textscan_string_real_omat(unit, labels, values)",
         "integer, intent(in) :: unit",
