@@ -7,8 +7,11 @@ import argparse
 import ast
 import codeop
 import re
+import subprocess
 import sys
+import time
 import tkinter as tk
+import tempfile
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -20,7 +23,20 @@ from opy import (
     is_setup_only_line,
     run_session,
     session_has_executable_code,
+    translate_session,
 )
+
+
+COMPILER_MODES = [
+    "ofort --fast",
+    "ofort",
+    "gfortran",
+    "gfortran -O2",
+    "gfortran -O3",
+    "ifx",
+    "ifx /O2",
+    "lfortran",
+]
 
 
 class OpyIde:
@@ -31,12 +47,14 @@ class OpyIde:
         xp2f: str,
         ofort: str,
         fast: bool = True,
+        compiler: str | None = None,
         immediate: bool = False,
     ) -> None:
         self.root = root
         self.xp2f = Path(xp2f)
         self.ofort = ofort
-        self.fast = tk.BooleanVar(value=fast)
+        initial_compiler = compiler if compiler in COMPILER_MODES else ("ofort --fast" if fast else "ofort")
+        self.compiler_var = tk.StringVar(value=initial_compiler)
         self.immediate = tk.BooleanVar(value=immediate)
         self.update_job: str | None = None
         self.highlight_job: str | None = None
@@ -46,6 +64,7 @@ class OpyIde:
         self.last_source_text = ""
         self.committed_source_text = ""
         self.last_stdout = ""
+        self.elapsed_var = tk.StringVar(value="")
         self.source_path: Path | None = None
 
         root.title("opy IDE")
@@ -63,7 +82,15 @@ class OpyIde:
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Button(toolbar, text="Run", command=self.run_current).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="Clear All", command=self.clear_all).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Checkbutton(toolbar, text="ofort --fast", variable=self.fast).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(toolbar, text="Run with:").pack(side=tk.LEFT, padx=(12, 4))
+        compiler_box = ttk.Combobox(
+            toolbar,
+            textvariable=self.compiler_var,
+            values=COMPILER_MODES,
+            width=14,
+            state="readonly",
+        )
+        compiler_box.pack(side=tk.LEFT)
         ttk.Checkbutton(toolbar, text="Immediate run", variable=self.immediate).pack(side=tk.LEFT, padx=(12, 0))
 
         pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -104,6 +131,7 @@ class OpyIde:
         output_row = ttk.Frame(self.root)
         output_row.pack(side=tk.TOP, fill=tk.X, padx=6)
         ttk.Label(output_row, text="Output").pack(side=tk.LEFT)
+        ttk.Label(output_row, textvariable=self.elapsed_var).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Button(output_row, text="Clear Output", command=self.clear_output).pack(side=tk.RIGHT)
         self.output_text = tk.Text(self.root, height=10, wrap=tk.WORD, undo=False)
         self.output_text.pack(side=tk.BOTTOM, fill=tk.BOTH, padx=6, pady=(0, 6))
@@ -253,9 +281,84 @@ class OpyIde:
         self.last_stdout = result.stdout
 
     def translate_and_run(self, lines: list[str], *, run: bool) -> RunResult:
-        if run:
-            return run_session(lines, xp2f=self.xp2f, ofort=self.ofort, fast=self.fast.get())
-        return run_session(lines, xp2f=self.xp2f, ofort=self.ofort, fast=self.fast.get())
+        if not run:
+            return translate_session(lines, xp2f=self.xp2f)
+        mode = self.compiler_var.get()
+        if mode in {"ofort --fast", "ofort"}:
+            start = time.perf_counter()
+            result = run_session(
+                lines,
+                xp2f=self.xp2f,
+                ofort=self.ofort,
+                fast=(mode == "ofort --fast"),
+            )
+            self.elapsed_var.set(f"run: {time.perf_counter() - start:.3f} s")
+            return result
+
+        translated = translate_session(lines, xp2f=self.xp2f)
+        if not translated.ok:
+            self.elapsed_var.set("")
+            return translated
+        return self.compile_and_run_fortran(translated.fortran, mode)
+
+    def compile_and_run_fortran(self, fortran: str, mode: str) -> RunResult:
+        with tempfile.TemporaryDirectory(prefix="opy_build_") as td:
+            tmp = Path(td)
+            source = tmp / "opy_session.f90"
+            exe = tmp / ("opy_session.exe" if sys.platform.startswith("win") else "opy_session")
+            source.write_text(fortran, encoding="utf-8")
+            compile_cmd = compiler_command(mode, source, exe)
+            start_compile = time.perf_counter()
+            try:
+                compile_run = subprocess.run(
+                    compile_cmd,
+                    cwd=str(tmp),
+                    text=True,
+                    capture_output=True,
+                )
+            except FileNotFoundError:
+                compile_seconds = time.perf_counter() - start_compile
+                self.elapsed_var.set(f"compile: {compile_seconds:.3f} s")
+                return RunResult(
+                    ok=False,
+                    fortran=fortran,
+                    message=f"{mode} compiler not found",
+                )
+            compile_seconds = time.perf_counter() - start_compile
+            if compile_run.returncode != 0:
+                self.elapsed_var.set(f"compile: {compile_seconds:.3f} s")
+                return RunResult(
+                    ok=False,
+                    stdout=compile_run.stdout,
+                    stderr=compile_run.stderr,
+                    fortran=fortran,
+                    message=f"{mode} compile exited with code {compile_run.returncode}",
+                )
+            start_run = time.perf_counter()
+            try:
+                program_run = subprocess.run(
+                    [str(exe)],
+                    cwd=str(tmp),
+                    text=True,
+                    capture_output=True,
+                )
+            except FileNotFoundError:
+                run_seconds = time.perf_counter() - start_run
+                self.elapsed_var.set(f"compile: {compile_seconds:.3f} s  run: {run_seconds:.3f} s")
+                return RunResult(
+                    ok=False,
+                    fortran=fortran,
+                    message=f"{mode} did not create executable",
+                )
+            run_seconds = time.perf_counter() - start_run
+            self.elapsed_var.set(f"compile: {compile_seconds:.3f} s  run: {run_seconds:.3f} s")
+            return RunResult(
+                ok=program_run.returncode == 0,
+                stdout=program_run.stdout,
+                stderr=program_run.stderr,
+                fortran=fortran,
+                message="" if program_run.returncode == 0 else f"{mode} run exited with code {program_run.returncode}",
+            )
 
     def open_source(self) -> None:
         path = filedialog.askopenfilename(
@@ -309,6 +412,7 @@ class OpyIde:
         self.last_source_text = ""
         self.committed_source_text = ""
         self.last_stdout = ""
+        self.elapsed_var.set("")
         self.source_path = None
         self.set_text(self.source_text, "")
         self.set_text(self.fortran_text, "")
@@ -366,6 +470,28 @@ def display_fortran(fortran: str) -> str:
         fortran,
         count=1,
     )
+
+
+def compiler_command(mode: str, source: Path, exe: Path) -> list[str]:
+    if mode == "gfortran":
+        return ["gfortran", str(source), "-o", str(exe)]
+    if mode == "gfortran -O2":
+        return ["gfortran", "-O2", str(source), "-o", str(exe)]
+    if mode == "gfortran -O3":
+        return ["gfortran", "-O3", str(source), "-o", str(exe)]
+    if mode == "ifx":
+        return ifx_command(source, exe, [])
+    if mode == "ifx /O2":
+        return ifx_command(source, exe, ["/O2"] if sys.platform.startswith("win") else ["-O2"])
+    if mode == "lfortran":
+        return ["lfortran", str(source), "-o", str(exe)]
+    return ["gfortran", str(source), "-o", str(exe)]
+
+
+def ifx_command(source: Path, exe: Path, options: list[str]) -> list[str]:
+    if sys.platform.startswith("win"):
+        return ["ifx", *options, str(source), f"/Fe:{exe}"]
+    return ["ifx", *options, str(source), "-o", str(exe)]
 
 
 PYTHON_KEYWORDS = {
@@ -545,6 +671,7 @@ def run(argv: list[str] | None = None) -> int:
     parser.add_argument("--xp2f", default=str(DEFAULT_XP2F), help="path to xp2f.py")
     parser.add_argument("--ofort", default=str(DEFAULT_OFORT), help="ofort command")
     parser.add_argument("--no-fast", action="store_true", help="start with ofort --fast disabled")
+    parser.add_argument("--compiler", choices=COMPILER_MODES, help="initial compiler dropdown selection")
     parser.add_argument("--immediate", action="store_true", help="start with immediate run enabled")
     args = parser.parse_args(argv)
     xp2f = Path(args.xp2f)
@@ -558,6 +685,7 @@ def run(argv: list[str] | None = None) -> int:
         xp2f=str(xp2f),
         ofort=args.ofort,
         fast=not args.no_fast,
+        compiler=args.compiler,
         immediate=args.immediate,
     )
     root.mainloop()
