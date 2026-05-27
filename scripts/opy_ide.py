@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import codeop
 import re
 import sys
 import tkinter as tk
@@ -37,10 +39,12 @@ class OpyIde:
         self.fast = tk.BooleanVar(value=fast)
         self.immediate = tk.BooleanVar(value=immediate)
         self.update_job: str | None = None
+        self.highlight_job: str | None = None
         self.current_fortran = ""
         self.current_valid = False
         self.last_diagnostic = ""
         self.last_source_text = ""
+        self.committed_source_text = ""
         self.last_stdout = ""
         self.source_path: Path | None = None
 
@@ -58,7 +62,7 @@ class OpyIde:
         ttk.Button(toolbar, text="Save Fortran", command=self.save_fortran).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
         ttk.Button(toolbar, text="Run", command=self.run_current).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="Clear", command=self.clear_all).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(toolbar, text="Clear All", command=self.clear_all).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Checkbutton(toolbar, text="ofort --fast", variable=self.fast).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Checkbutton(toolbar, text="Immediate run", variable=self.immediate).pack(side=tk.LEFT, padx=(12, 0))
 
@@ -72,13 +76,22 @@ class OpyIde:
 
         ttk.Label(left, text="Python input").pack(anchor=tk.W)
         self.source_text = tk.Text(left, wrap=tk.NONE, undo=True)
+        self.source_text.syntax_language = "python"
         self.source_text.pack(fill=tk.BOTH, expand=True)
         self.source_text.bind("<<Modified>>", self.source_modified)
+        self.source_text.bind("<Return>", self.source_return_event)
+        configure_syntax_tags(self.source_text)
 
-        ttk.Label(right, text="Generated Fortran").pack(anchor=tk.W)
+        fortran_header = ttk.Frame(right)
+        fortran_header.pack(fill=tk.X)
+        ttk.Label(fortran_header, text="Generated Fortran").pack(side=tk.LEFT)
+        ttk.Button(fortran_header, text="Top", command=self.scroll_fortran_top).pack(side=tk.RIGHT)
+        ttk.Button(fortran_header, text="Bottom", command=self.scroll_fortran_bottom).pack(side=tk.RIGHT, padx=(0, 4))
         self.fortran_text = tk.Text(right, wrap=tk.NONE, undo=False)
+        self.fortran_text.syntax_language = "fortran"
         self.fortran_text.pack(fill=tk.BOTH, expand=True)
         self.fortran_text.configure(state=tk.DISABLED)
+        configure_syntax_tags(self.fortran_text)
 
         input_row = ttk.Frame(self.root)
         input_row.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 4))
@@ -88,7 +101,10 @@ class OpyIde:
         self.entry.bind("<Return>", self.submit_line_event)
         ttk.Button(input_row, text="Enter", command=self.submit_line).pack(side=tk.LEFT)
 
-        ttk.Label(self.root, text="Output").pack(anchor=tk.W, padx=6)
+        output_row = ttk.Frame(self.root)
+        output_row.pack(side=tk.TOP, fill=tk.X, padx=6)
+        ttk.Label(output_row, text="Output").pack(side=tk.LEFT)
+        ttk.Button(output_row, text="Clear Output", command=self.clear_output).pack(side=tk.RIGHT)
         self.output_text = tk.Text(self.root, height=10, wrap=tk.WORD, undo=False)
         self.output_text.pack(side=tk.BOTTOM, fill=tk.BOTH, padx=6, pady=(0, 6))
         self.entry.focus_set()
@@ -107,35 +123,80 @@ class OpyIde:
         self.source_text.insert(tk.END, line + "\n")
         self.source_text.see(tk.END)
         self.entry.delete(0, tk.END)
-        self.schedule_update_fortran()
+        self.commit_source_change()
 
     def source_modified(self, _event: tk.Event) -> None:
         if not self.source_text.edit_modified():
             return
         self.source_text.edit_modified(False)
-        source = self.source_text.get("1.0", "end-1c")
-        self.schedule_update_fortran()
-        if self.immediate.get() and source.startswith(self.last_source_text):
-            appended = source[len(self.last_source_text):]
-            if appended and appended.endswith("\n"):
-                self.root.after(350, lambda: self.run_current(show_exit=False, incremental=True))
-        elif not source.startswith(self.last_source_text):
-            self.last_stdout = ""
-        self.last_source_text = source
-
-    def schedule_update_fortran(self) -> None:
-        if self.update_job is not None:
-            self.root.after_cancel(self.update_job)
-        self.update_job = self.root.after(300, self.update_fortran)
-
-    def update_fortran(self) -> None:
-        self.update_job = None
+        self.schedule_source_highlight()
         source = self.source_text.get("1.0", "end-1c")
         if not source.strip():
             self.current_fortran = ""
             self.current_valid = False
             self.last_diagnostic = ""
+            self.last_source_text = ""
+            self.committed_source_text = ""
+            self.last_stdout = ""
             self.set_text(self.fortran_text, "", scroll_to_end=True)
+        elif not source.startswith(self.last_source_text):
+            self.last_stdout = ""
+
+    def source_return_event(self, _event: tk.Event) -> None:
+        line = self.source_text.get("insert linestart", "insert lineend")
+        indent = next_line_indent(line)
+        self.source_text.insert(tk.INSERT, "\n" + indent)
+        self.root.after_idle(self.commit_source_change)
+        return "break"
+
+    def commit_source_change(self) -> None:
+        source = self.source_text.get("1.0", "end-1c")
+        self.committed_source_text = source
+        self.schedule_update_fortran(source)
+        if self.immediate.get() and source.startswith(self.last_source_text):
+            appended = source[len(self.last_source_text):]
+            if immediate_run_append(appended):
+                self.root.after(
+                    350,
+                    lambda source=source: self.run_current(
+                        incremental=True,
+                        source_override=source,
+                    ),
+                )
+        elif not source.startswith(self.last_source_text):
+            self.last_stdout = ""
+        self.last_source_text = source
+
+    def schedule_update_fortran(self, source: str | None = None) -> None:
+        if self.update_job is not None:
+            self.root.after_cancel(self.update_job)
+        self.update_job = self.root.after(300, lambda: self.update_fortran(source))
+
+    def schedule_source_highlight(self) -> None:
+        if self.highlight_job is not None:
+            self.root.after_cancel(self.highlight_job)
+        self.highlight_job = self.root.after(120, self.highlight_source)
+
+    def highlight_source(self) -> None:
+        self.highlight_job = None
+        apply_syntax_highlighting(self.source_text)
+
+    def update_fortran(self, source_override: str | None = None) -> None:
+        self.update_job = None
+        source = source_override
+        if source is None:
+            source = self.source_text.get("1.0", "end-1c")
+        if not source.strip():
+            self.current_fortran = ""
+            self.current_valid = False
+            self.last_diagnostic = ""
+            self.set_text(self.fortran_text, "", scroll_to_end=True)
+            return
+        if is_incomplete_python_source(source):
+            self.current_valid = False
+            self.last_diagnostic = ""
+            preview = partial_fortran_preview(source)
+            self.set_text(self.fortran_text, preview, scroll_to_end=True)
             return
         lines = source.splitlines()
         if not session_has_executable_code(lines):
@@ -153,9 +214,21 @@ class OpyIde:
         self.last_diagnostic = ""
         self.set_text(self.fortran_text, display_fortran(self.current_fortran), scroll_to_end=True)
 
-    def run_current(self, *, show_exit: bool = True, incremental: bool = False) -> None:
-        source = self.source_text.get("1.0", "end-1c")
+    def run_current(
+        self,
+        *,
+        incremental: bool = False,
+        source_override: str | None = None,
+    ) -> None:
+        source = source_override
+        if source is None:
+            source = self.source_text.get("1.0", "end-1c")
         if not source.strip():
+            return
+        if is_incomplete_python_source(source):
+            self.current_valid = False
+            preview = partial_fortran_preview(source)
+            self.set_text(self.fortran_text, preview, scroll_to_end=True)
             return
         lines = source.splitlines()
         if not session_has_executable_code(lines):
@@ -177,8 +250,6 @@ class OpyIde:
                 self.append_output(result.stdout)
         if result.stderr:
             self.append_output(result.stderr)
-        if show_exit and (result.stdout or result.stderr):
-            self.append_output("exit code: 0\n")
         self.last_stdout = result.stdout
 
     def translate_and_run(self, lines: list[str], *, run: bool) -> RunResult:
@@ -203,6 +274,7 @@ class OpyIde:
         self.set_text(self.source_text, text)
         self.source_text.edit_modified(False)
         self.last_source_text = text
+        self.committed_source_text = text
         self.update_fortran()
 
     def save_source(self) -> None:
@@ -235,11 +307,21 @@ class OpyIde:
         self.current_valid = False
         self.last_diagnostic = ""
         self.last_source_text = ""
+        self.committed_source_text = ""
         self.last_stdout = ""
         self.source_path = None
         self.set_text(self.source_text, "")
         self.set_text(self.fortran_text, "")
         self.set_text(self.output_text, "")
+
+    def clear_output(self) -> None:
+        self.set_text(self.output_text, "")
+
+    def scroll_fortran_top(self) -> None:
+        self.fortran_text.see("1.0")
+
+    def scroll_fortran_bottom(self) -> None:
+        self.fortran_text.see(tk.END)
 
     def invalidate_current_source(self, result: RunResult) -> None:
         message = result.message or "translation failed"
@@ -271,6 +353,7 @@ class OpyIde:
         widget.configure(state=tk.NORMAL)
         widget.delete("1.0", tk.END)
         widget.insert("1.0", text)
+        apply_syntax_highlighting(widget)
         if scroll_to_end:
             widget.see(tk.END)
         widget.configure(state=previous)
@@ -283,6 +366,178 @@ def display_fortran(fortran: str) -> str:
         fortran,
         count=1,
     )
+
+
+PYTHON_KEYWORDS = {
+    "False", "None", "True", "and", "as", "break", "class", "continue", "def",
+    "elif", "else", "except", "finally", "for", "from", "if", "import", "in",
+    "is", "lambda", "not", "or", "pass", "return", "try", "while", "with",
+}
+
+FORTRAN_KEYWORDS = {
+    "allocatable", "allocate", "call", "contains", "cycle", "deallocate", "do",
+    "else", "end", "function", "if", "implicit", "integer", "intent",
+    "module", "none", "only", "parameter", "print", "program", "real",
+    "result", "return", "subroutine", "then", "use", "while",
+}
+
+STRING_PATTERN = r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\""
+NUMBER_PATTERN = r"\b(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\b"
+
+
+def configure_syntax_tags(widget: tk.Text) -> None:
+    widget.tag_configure("syntax_keyword", foreground="#004c99")
+    widget.tag_configure("syntax_comment", foreground="#667085")
+    widget.tag_configure("syntax_string", foreground="#9a3412")
+    widget.tag_configure("syntax_number", foreground="#7c3aed")
+    widget.tag_raise("syntax_comment")
+    widget.tag_raise("syntax_string")
+
+
+def apply_syntax_highlighting(widget: tk.Text) -> None:
+    language = getattr(widget, "syntax_language", "")
+    if language not in {"python", "fortran"}:
+        return
+    for tag in ("syntax_keyword", "syntax_comment", "syntax_string", "syntax_number"):
+        widget.tag_remove(tag, "1.0", tk.END)
+    text = widget.get("1.0", "end-1c")
+    if not text:
+        return
+    if language == "python":
+        keywords = PYTHON_KEYWORDS
+        comment_pattern = r"#[^\n]*"
+        flags = 0
+    else:
+        keywords = FORTRAN_KEYWORDS
+        comment_pattern = r"![^\n]*"
+        flags = re.IGNORECASE
+    apply_pattern_tag(widget, text, STRING_PATTERN, "syntax_string", flags=0)
+    apply_pattern_tag(widget, text, comment_pattern, "syntax_comment", flags=0)
+    apply_pattern_tag(widget, text, NUMBER_PATTERN, "syntax_number", flags=0)
+    keyword_pattern = r"\b(?:" + "|".join(re.escape(word) for word in sorted(keywords, key=len, reverse=True)) + r")\b"
+    apply_pattern_tag(widget, text, keyword_pattern, "syntax_keyword", flags=flags)
+    widget.tag_raise("syntax_number")
+    widget.tag_raise("syntax_keyword")
+    widget.tag_raise("syntax_comment")
+    widget.tag_raise("syntax_string")
+
+
+def apply_pattern_tag(widget: tk.Text, text: str, pattern: str, tag: str, *, flags: int) -> None:
+    for match in re.finditer(pattern, text, flags):
+        start = f"1.0+{match.start()}c"
+        end = f"1.0+{match.end()}c"
+        widget.tag_add(tag, start, end)
+
+
+def is_incomplete_python_source(source: str) -> bool:
+    try:
+        return codeop.compile_command(source, symbol="exec") is None
+    except (OverflowError, SyntaxError, ValueError):
+        return False
+
+
+def partial_fortran_preview(source: str) -> str:
+    previews = []
+    for raw_line in source.splitlines():
+        preview = preview_block_header(raw_line)
+        if preview:
+            previews.append(preview)
+    if not previews:
+        return "! incomplete Python block; preview only\n"
+    return "! incomplete Python block; preview only\n" + "\n".join(previews) + "\n"
+
+
+def next_line_indent(line: str) -> str:
+    base = re.match(r"[ \t]*", line).group(0)
+    stripped = line.strip()
+    if stripped.endswith(":") and not stripped.startswith("#"):
+        return base + "    "
+    return base
+
+
+def immediate_run_append(appended: str) -> bool:
+    return bool(appended and "\n" in appended)
+
+
+def preview_block_header(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped.endswith(":"):
+        return None
+    try:
+        tree = ast.parse(stripped + "\n    pass\n", mode="exec")
+    except SyntaxError:
+        return None
+    if len(tree.body) != 1:
+        return None
+    node = tree.body[0]
+    if isinstance(node, ast.For):
+        return preview_for_range(node)
+    if isinstance(node, ast.If):
+        return f"if ({python_expr_to_fortran(node.test)}) then"
+    if isinstance(node, ast.While):
+        return f"do while ({python_expr_to_fortran(node.test)})"
+    return None
+
+
+def preview_for_range(node: ast.For) -> str | None:
+    if not isinstance(node.target, ast.Name):
+        return None
+    call = node.iter
+    if not isinstance(call, ast.Call) or dotted_call_name(call.func) != "range":
+        return None
+    if call.keywords or not (1 <= len(call.args) <= 3):
+        return None
+    var = node.target.id
+    if len(call.args) == 1:
+        start = "0"
+        stop = python_expr_to_fortran(call.args[0])
+        step = None
+    else:
+        start = python_expr_to_fortran(call.args[0])
+        stop = python_expr_to_fortran(call.args[1])
+        step = python_expr_to_fortran(call.args[2]) if len(call.args) == 3 else None
+    end = range_end_expr(stop, step)
+    if step is None:
+        loop = f"do {var} = {start}, {end}"
+    else:
+        loop = f"do {var} = {start}, {end}, {step}"
+    return f"integer :: {var}\n{loop}"
+
+
+def dotted_call_name(node: ast.AST) -> str | None:
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    else:
+        return None
+    return ".".join(reversed(parts))
+
+
+def python_expr_to_fortran(node: ast.AST) -> str:
+    text = ast.unparse(node)
+    text = text.replace(" and ", " .and. ")
+    text = text.replace(" or ", " .or. ")
+    text = re.sub(r"\bTrue\b", ".true.", text)
+    text = re.sub(r"\bFalse\b", ".false.", text)
+    return text
+
+
+def range_end_expr(stop: str, step: str | None) -> str:
+    if step is not None and step.strip().startswith("-"):
+        return simplify_integer_offset(stop, 1)
+    return simplify_integer_offset(stop, -1)
+
+
+def simplify_integer_offset(expr: str, offset: int) -> str:
+    try:
+        value = int(expr)
+    except ValueError:
+        sign = "+" if offset > 0 else "-"
+        return f"{expr} {sign} {abs(offset)}"
+    return str(value + offset)
 
 
 def run(argv: list[str] | None = None) -> int:
