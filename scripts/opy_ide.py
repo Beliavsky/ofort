@@ -21,6 +21,7 @@ from opy import (
     RunResult,
     incremental_output_text,
     is_setup_only_line,
+    repl_source,
     run_session,
     session_has_executable_code,
     translate_session,
@@ -56,6 +57,7 @@ class OpyIde:
         initial_compiler = compiler if compiler in COMPILER_MODES else ("ofort --fast" if fast else "ofort")
         self.compiler_var = tk.StringVar(value=initial_compiler)
         self.immediate = tk.BooleanVar(value=immediate)
+        self.show_python_output = tk.BooleanVar(value=False)
         self.update_job: str | None = None
         self.highlight_job: str | None = None
         self.current_fortran = ""
@@ -65,6 +67,7 @@ class OpyIde:
         self.committed_source_text = ""
         self.last_stdout = ""
         self.elapsed_var = tk.StringVar(value="")
+        self.python_elapsed_var = tk.StringVar(value="")
         self.source_path: Path | None = None
 
         root.title("opy IDE")
@@ -80,7 +83,9 @@ class OpyIde:
         ttk.Button(toolbar, text="Save Python", command=self.save_source).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(toolbar, text="Save Fortran", command=self.save_fortran).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Button(toolbar, text="Run", command=self.run_current).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="Run Python", command=self.run_python_current).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="Run Fortran", command=self.run_current).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(toolbar, text="Run Both", command=self.run_both).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(toolbar, text="Clear All", command=self.clear_all).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Label(toolbar, text="Run with:").pack(side=tk.LEFT, padx=(12, 4))
         compiler_box = ttk.Combobox(
@@ -131,10 +136,29 @@ class OpyIde:
         output_row = ttk.Frame(self.root)
         output_row.pack(side=tk.TOP, fill=tk.X, padx=6)
         ttk.Label(output_row, text="Output").pack(side=tk.LEFT)
-        ttk.Label(output_row, textvariable=self.elapsed_var).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(output_row, text="Python").pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(output_row, textvariable=self.python_elapsed_var).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(output_row, text="Fortran").pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(output_row, textvariable=self.elapsed_var).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Checkbutton(
+            output_row,
+            text="Show Python output",
+            variable=self.show_python_output,
+            command=self.update_output_layout,
+        ).pack(side=tk.RIGHT, padx=(0, 8))
         ttk.Button(output_row, text="Clear Output", command=self.clear_output).pack(side=tk.RIGHT)
-        self.output_text = tk.Text(self.root, height=10, wrap=tk.WORD, undo=False)
-        self.output_text.pack(side=tk.BOTTOM, fill=tk.BOTH, padx=6, pady=(0, 6))
+
+        self.output_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        self.output_pane.pack(side=tk.BOTTOM, fill=tk.BOTH, padx=6, pady=(0, 6))
+        self.python_output_frame = ttk.Frame(self.output_pane)
+        self.fortran_output_frame = ttk.Frame(self.output_pane)
+        ttk.Label(self.python_output_frame, text="Python output").pack(anchor=tk.W)
+        self.python_output_text = tk.Text(self.python_output_frame, height=10, wrap=tk.WORD, undo=False)
+        self.python_output_text.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(self.fortran_output_frame, text="Fortran output").pack(anchor=tk.W)
+        self.output_text = tk.Text(self.fortran_output_frame, height=10, wrap=tk.WORD, undo=False)
+        self.output_text.pack(fill=tk.BOTH, expand=True)
+        self.update_output_layout()
         self.entry.focus_set()
 
     def submit_line_event(self, _event: tk.Event) -> str:
@@ -280,6 +304,64 @@ class OpyIde:
             self.append_output(result.stderr)
         self.last_stdout = result.stdout
 
+    def run_python_current(self) -> None:
+        source = self.source_text.get("1.0", "end-1c")
+        if not source.strip():
+            return
+        if is_incomplete_python_source(source):
+            self.current_valid = False
+            preview = partial_fortran_preview(source)
+            self.set_text(self.fortran_text, preview, scroll_to_end=True)
+            return
+        lines = source.splitlines()
+        if not session_has_executable_code(lines):
+            return
+        self.show_python_output.set(True)
+        self.update_output_layout()
+        python_result = self.run_python_source(lines)
+        if python_result.stdout:
+            self.append_python_output(python_result.stdout)
+        if python_result.stderr:
+            self.append_python_output(python_result.stderr)
+        if not python_result.ok and python_result.message:
+            self.append_python_output(f"opy: {python_result.message}\n")
+
+    def run_both(self) -> None:
+        source = self.source_text.get("1.0", "end-1c")
+        if not source.strip():
+            return
+        if is_incomplete_python_source(source):
+            self.current_valid = False
+            preview = partial_fortran_preview(source)
+            self.set_text(self.fortran_text, preview, scroll_to_end=True)
+            return
+        lines = source.splitlines()
+        if not session_has_executable_code(lines):
+            return
+        self.show_python_output.set(True)
+        self.update_output_layout()
+        python_result = self.run_python_source(lines)
+        if python_result.stdout:
+            self.append_python_output(python_result.stdout)
+        if python_result.stderr:
+            self.append_python_output(python_result.stderr)
+        if not python_result.ok and python_result.message:
+            self.append_python_output(f"opy: {python_result.message}\n")
+
+        fortran_result = self.translate_and_run(lines, run=True)
+        if fortran_result.ok:
+            self.current_fortran = fortran_result.fortran
+            self.current_valid = True
+            self.last_diagnostic = ""
+            self.set_text(self.fortran_text, display_fortran(self.current_fortran), scroll_to_end=True)
+            if fortran_result.stdout:
+                self.append_output(fortran_result.stdout)
+            if fortran_result.stderr:
+                self.append_output(fortran_result.stderr)
+            self.last_stdout = fortran_result.stdout
+        else:
+            self.invalidate_current_source(fortran_result)
+
     def translate_and_run(self, lines: list[str], *, run: bool) -> RunResult:
         if not run:
             return translate_session(lines, xp2f=self.xp2f)
@@ -300,6 +382,26 @@ class OpyIde:
             self.elapsed_var.set("")
             return translated
         return self.compile_and_run_fortran(translated.fortran, mode)
+
+    def run_python_source(self, lines: list[str]) -> RunResult:
+        with tempfile.TemporaryDirectory(prefix="opy_python_") as td:
+            tmp = Path(td)
+            source = tmp / "opy_session.py"
+            source.write_text(repl_source(lines), encoding="utf-8")
+            start = time.perf_counter()
+            python_run = subprocess.run(
+                [sys.executable, str(source)],
+                cwd=str(Path.cwd()),
+                text=True,
+                capture_output=True,
+            )
+            self.python_elapsed_var.set(f"run: {time.perf_counter() - start:.3f} s")
+            return RunResult(
+                ok=python_run.returncode == 0,
+                stdout=python_run.stdout,
+                stderr=python_run.stderr,
+                message="" if python_run.returncode == 0 else f"Python exited with code {python_run.returncode}",
+            )
 
     def compile_and_run_fortran(self, fortran: str, mode: str) -> RunResult:
         with tempfile.TemporaryDirectory(prefix="opy_build_") as td:
@@ -413,13 +515,30 @@ class OpyIde:
         self.committed_source_text = ""
         self.last_stdout = ""
         self.elapsed_var.set("")
+        self.python_elapsed_var.set("")
         self.source_path = None
         self.set_text(self.source_text, "")
         self.set_text(self.fortran_text, "")
         self.set_text(self.output_text, "")
+        self.set_text(self.python_output_text, "")
 
     def clear_output(self) -> None:
         self.set_text(self.output_text, "")
+        self.set_text(self.python_output_text, "")
+
+    def update_output_layout(self) -> None:
+        panes = set(self.output_pane.panes())
+        python_name = str(self.python_output_frame)
+        fortran_name = str(self.fortran_output_frame)
+        if python_name in panes:
+            self.output_pane.forget(self.python_output_frame)
+        if fortran_name in panes:
+            self.output_pane.forget(self.fortran_output_frame)
+        if self.show_python_output.get():
+            self.output_pane.add(self.python_output_frame, weight=1)
+            self.output_pane.add(self.fortran_output_frame, weight=1)
+        else:
+            self.output_pane.add(self.fortran_output_frame, weight=1)
 
     def scroll_fortran_top(self) -> None:
         self.fortran_text.see("1.0")
@@ -450,6 +569,11 @@ class OpyIde:
         self.output_text.configure(state=tk.NORMAL)
         self.output_text.insert(tk.END, text)
         self.output_text.see(tk.END)
+
+    def append_python_output(self, text: str) -> None:
+        self.python_output_text.configure(state=tk.NORMAL)
+        self.python_output_text.insert(tk.END, text)
+        self.python_output_text.see(tk.END)
 
     @staticmethod
     def set_text(widget: tk.Text, text: str, *, scroll_to_end: bool = False) -> None:
