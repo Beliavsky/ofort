@@ -98,6 +98,7 @@ class OpyIde:
         self.show_python_output = tk.BooleanVar(value=False)
         self.manual_fortran = tk.BooleanVar(value=False)
         self.explain_helpers = tk.BooleanVar(value=True)
+        self.profile_procs = tk.BooleanVar(value=False)
         self.fortran_title = tk.StringVar(value="Generated Fortran")
         self.output_decimals = tk.StringVar(value="")
         self.update_job: str | None = None
@@ -141,6 +142,13 @@ class OpyIde:
             state="readonly",
         )
         compiler_box.pack(side=tk.LEFT)
+        compiler_box.bind("<<ComboboxSelected>>", lambda _event: self.update_profile_state())
+        self.profile_check = ttk.Checkbutton(
+            toolbar,
+            text="Profile procedures",
+            variable=self.profile_procs,
+        )
+        self.profile_check.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Label(toolbar, text="Fortran:").pack(side=tk.LEFT, padx=(12, 4))
         mode_box = ttk.Combobox(
             toolbar,
@@ -152,6 +160,7 @@ class OpyIde:
         mode_box.pack(side=tk.LEFT)
         mode_box.bind("<<ComboboxSelected>>", lambda _event: self.regenerate_fortran())
         ttk.Checkbutton(toolbar, text="Immediate run", variable=self.immediate).pack(side=tk.LEFT, padx=(12, 0))
+        self.update_profile_state()
 
         pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=(0, 4))
@@ -502,6 +511,7 @@ class OpyIde:
                 fast=(mode == "ofort --fast"),
                 generic=self.use_generic_fortran(),
                 explain_helpers=self.explain_helpers.get(),
+                profile_procs=self.should_profile_procs(mode),
             )
             self.elapsed_var.set(f"run: {time.perf_counter() - start:.3f} s")
             return result
@@ -520,6 +530,15 @@ class OpyIde:
     def use_generic_fortran(self) -> bool:
         return self.fortran_mode.get() == "generic"
 
+    def should_profile_procs(self, mode: str) -> bool:
+        return self.profile_procs.get() and mode in {"ofort --fast", "ofort"}
+
+    def update_profile_state(self) -> None:
+        if self.compiler_var.get() in {"ofort --fast", "ofort"}:
+            self.profile_check.configure(state=tk.NORMAL)
+        else:
+            self.profile_check.configure(state=tk.DISABLED)
+
     def run_fortran_text(self, fortran: str) -> RunResult:
         if not fortran.strip():
             return RunResult(ok=True, fortran=fortran)
@@ -532,6 +551,8 @@ class OpyIde:
                 cmd = [self.ofort]
                 if mode == "ofort --fast":
                     cmd.append("--fast")
+                if self.should_profile_procs(mode):
+                    cmd.append("--profile-procs")
                 cmd.append(str(source))
                 start = time.perf_counter()
                 try:
