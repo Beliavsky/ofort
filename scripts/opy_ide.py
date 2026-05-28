@@ -40,6 +40,42 @@ COMPILER_MODES = [
 ]
 
 
+def make_scrollable_text(
+    parent: tk.Widget,
+    *,
+    wrap: str,
+    undo: bool,
+    height: int | None = None,
+) -> tk.Text:
+    frame = ttk.Frame(parent)
+    frame.pack(fill=tk.BOTH, expand=True)
+    frame.rowconfigure(0, weight=1)
+    frame.columnconfigure(0, weight=1)
+
+    options: dict[str, object] = {"wrap": wrap, "undo": undo}
+    if height is not None:
+        options["height"] = height
+    text = tk.Text(frame, **options)
+
+    yscroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text.yview)
+    text.configure(yscrollcommand=yscroll.set)
+    text.grid(row=0, column=0, sticky="nsew")
+    yscroll.grid(row=0, column=1, sticky="ns")
+
+    text._scroll_frame = frame  # type: ignore[attr-defined]
+    text._yscrollbar = yscroll  # type: ignore[attr-defined]
+    text.bind("<MouseWheel>", lambda event: scroll_text_vertical(text, event))
+    return text
+
+
+def scroll_text_vertical(text: tk.Text, event: tk.Event) -> str:
+    delta = int(-1 * (event.delta / 120))
+    if delta == 0:
+        delta = -1 if event.delta > 0 else 1
+    text.yview_scroll(delta, "units")
+    return "break"
+
+
 class OpyIde:
     def __init__(
         self,
@@ -61,6 +97,7 @@ class OpyIde:
         self.immediate = tk.BooleanVar(value=immediate)
         self.show_python_output = tk.BooleanVar(value=False)
         self.manual_fortran = tk.BooleanVar(value=False)
+        self.explain_helpers = tk.BooleanVar(value=True)
         self.fortran_title = tk.StringVar(value="Generated Fortran")
         self.output_decimals = tk.StringVar(value="")
         self.update_job: str | None = None
@@ -145,11 +182,16 @@ class OpyIde:
             command=self.toggle_manual_fortran,
         ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(fortran_header, text="Regenerate", command=self.regenerate_fortran).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Checkbutton(
+            fortran_header,
+            text="Explain helpers",
+            variable=self.explain_helpers,
+            command=self.regenerate_fortran,
+        ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(fortran_header, text="Top", command=self.scroll_fortran_top).pack(side=tk.RIGHT)
         ttk.Button(fortran_header, text="Bottom", command=self.scroll_fortran_bottom).pack(side=tk.RIGHT, padx=(0, 4))
-        self.fortran_text = tk.Text(right, wrap=tk.NONE, undo=False)
+        self.fortran_text = make_scrollable_text(right, wrap=tk.NONE, undo=False)
         self.fortran_text.syntax_language = "fortran"
-        self.fortran_text.pack(fill=tk.BOTH, expand=True)
         self.fortran_text.configure(state=tk.DISABLED)
         configure_syntax_tags(self.fortran_text)
 
@@ -444,7 +486,12 @@ class OpyIde:
 
     def translate_and_run(self, lines: list[str], *, run: bool) -> RunResult:
         if not run:
-            return translate_session(lines, xp2f=self.xp2f, generic=self.use_generic_fortran())
+            return translate_session(
+                lines,
+                xp2f=self.xp2f,
+                generic=self.use_generic_fortran(),
+                explain_helpers=self.explain_helpers.get(),
+            )
         mode = self.compiler_var.get()
         if mode in {"ofort --fast", "ofort"}:
             start = time.perf_counter()
@@ -454,11 +501,17 @@ class OpyIde:
                 ofort=self.ofort,
                 fast=(mode == "ofort --fast"),
                 generic=self.use_generic_fortran(),
+                explain_helpers=self.explain_helpers.get(),
             )
             self.elapsed_var.set(f"run: {time.perf_counter() - start:.3f} s")
             return result
 
-        translated = translate_session(lines, xp2f=self.xp2f, generic=self.use_generic_fortran())
+        translated = translate_session(
+            lines,
+            xp2f=self.xp2f,
+            generic=self.use_generic_fortran(),
+            explain_helpers=self.explain_helpers.get(),
+        )
         if not translated.ok:
             self.elapsed_var.set("")
             return translated
