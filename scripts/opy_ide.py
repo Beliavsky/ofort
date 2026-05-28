@@ -58,6 +58,8 @@ class OpyIde:
         self.compiler_var = tk.StringVar(value=initial_compiler)
         self.immediate = tk.BooleanVar(value=immediate)
         self.show_python_output = tk.BooleanVar(value=False)
+        self.manual_fortran = tk.BooleanVar(value=False)
+        self.fortran_title = tk.StringVar(value="Generated Fortran")
         self.update_job: str | None = None
         self.highlight_job: str | None = None
         self.current_fortran = ""
@@ -116,7 +118,14 @@ class OpyIde:
 
         fortran_header = ttk.Frame(right)
         fortran_header.pack(fill=tk.X)
-        ttk.Label(fortran_header, text="Generated Fortran").pack(side=tk.LEFT)
+        ttk.Label(fortran_header, textvariable=self.fortran_title).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            fortran_header,
+            text="Edit Fortran",
+            variable=self.manual_fortran,
+            command=self.toggle_manual_fortran,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(fortran_header, text="Regenerate", command=self.regenerate_fortran).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(fortran_header, text="Top", command=self.scroll_fortran_top).pack(side=tk.RIGHT)
         ttk.Button(fortran_header, text="Bottom", command=self.scroll_fortran_bottom).pack(side=tk.RIGHT, padx=(0, 4))
         self.fortran_text = tk.Text(right, wrap=tk.NONE, undo=False)
@@ -136,10 +145,6 @@ class OpyIde:
         output_row = ttk.Frame(self.root)
         output_row.pack(side=tk.TOP, fill=tk.X, padx=6)
         ttk.Label(output_row, text="Output").pack(side=tk.LEFT)
-        ttk.Label(output_row, text="Python").pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Label(output_row, textvariable=self.python_elapsed_var).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(output_row, text="Fortran").pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Label(output_row, textvariable=self.elapsed_var).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Checkbutton(
             output_row,
             text="Show Python output",
@@ -152,10 +157,16 @@ class OpyIde:
         self.output_pane.pack(side=tk.BOTTOM, fill=tk.BOTH, padx=6, pady=(0, 6))
         self.python_output_frame = ttk.Frame(self.output_pane)
         self.fortran_output_frame = ttk.Frame(self.output_pane)
-        ttk.Label(self.python_output_frame, text="Python output").pack(anchor=tk.W)
+        python_output_header = ttk.Frame(self.python_output_frame)
+        python_output_header.pack(fill=tk.X)
+        ttk.Label(python_output_header, text="Python output").pack(side=tk.LEFT)
+        ttk.Label(python_output_header, textvariable=self.python_elapsed_var).pack(side=tk.RIGHT)
         self.python_output_text = tk.Text(self.python_output_frame, height=10, wrap=tk.WORD, undo=False)
         self.python_output_text.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(self.fortran_output_frame, text="Fortran output").pack(anchor=tk.W)
+        fortran_output_header = ttk.Frame(self.fortran_output_frame)
+        fortran_output_header.pack(fill=tk.X)
+        ttk.Label(fortran_output_header, text="Fortran output").pack(side=tk.LEFT)
+        ttk.Label(fortran_output_header, textvariable=self.elapsed_var).pack(side=tk.RIGHT)
         self.output_text = tk.Text(self.fortran_output_frame, height=10, wrap=tk.WORD, undo=False)
         self.output_text.pack(fill=tk.BOTH, expand=True)
         self.update_output_layout()
@@ -190,7 +201,8 @@ class OpyIde:
             self.last_source_text = ""
             self.committed_source_text = ""
             self.last_stdout = ""
-            self.set_text(self.fortran_text, "", scroll_to_end=True)
+            if not self.manual_fortran.get():
+                self.set_text(self.fortran_text, "", scroll_to_end=True)
         elif not source.startswith(self.last_source_text):
             self.last_stdout = ""
 
@@ -204,8 +216,9 @@ class OpyIde:
     def commit_source_change(self) -> None:
         source = self.source_text.get("1.0", "end-1c")
         self.committed_source_text = source
-        self.schedule_update_fortran(source)
-        if self.immediate.get() and source.startswith(self.last_source_text):
+        if not self.manual_fortran.get():
+            self.schedule_update_fortran(source)
+        if self.immediate.get() and not self.manual_fortran.get() and source.startswith(self.last_source_text):
             appended = source[len(self.last_source_text):]
             if immediate_run_append(appended):
                 self.root.after(
@@ -235,6 +248,8 @@ class OpyIde:
 
     def update_fortran(self, source_override: str | None = None) -> None:
         self.update_job = None
+        if self.manual_fortran.get():
+            return
         source = source_override
         if source is None:
             source = self.source_text.get("1.0", "end-1c")
@@ -272,6 +287,17 @@ class OpyIde:
         incremental: bool = False,
         source_override: str | None = None,
     ) -> None:
+        if self.manual_fortran.get() and source_override is None:
+            result = self.run_fortran_text(self.current_fortran_text())
+            if result.ok:
+                if result.stdout:
+                    self.append_output(result.stdout)
+                if result.stderr:
+                    self.append_output(result.stderr)
+                self.last_stdout = result.stdout
+            else:
+                self.invalidate_current_source(result)
+            return
         source = source_override
         if source is None:
             source = self.source_text.get("1.0", "end-1c")
@@ -348,12 +374,16 @@ class OpyIde:
         if not python_result.ok and python_result.message:
             self.append_python_output(f"opy: {python_result.message}\n")
 
-        fortran_result = self.translate_and_run(lines, run=True)
+        if self.manual_fortran.get():
+            fortran_result = self.run_fortran_text(self.current_fortran_text())
+        else:
+            fortran_result = self.translate_and_run(lines, run=True)
         if fortran_result.ok:
             self.current_fortran = fortran_result.fortran
             self.current_valid = True
             self.last_diagnostic = ""
-            self.set_text(self.fortran_text, display_fortran(self.current_fortran), scroll_to_end=True)
+            if not self.manual_fortran.get():
+                self.set_text(self.fortran_text, display_fortran(self.current_fortran), scroll_to_end=True)
             if fortran_result.stdout:
                 self.append_output(fortran_result.stdout)
             if fortran_result.stderr:
@@ -382,6 +412,40 @@ class OpyIde:
             self.elapsed_var.set("")
             return translated
         return self.compile_and_run_fortran(translated.fortran, mode)
+
+    def run_fortran_text(self, fortran: str) -> RunResult:
+        if not fortran.strip():
+            return RunResult(ok=True, fortran=fortran)
+        mode = self.compiler_var.get()
+        if mode in {"ofort --fast", "ofort"}:
+            with tempfile.TemporaryDirectory(prefix="opy_manual_") as td:
+                tmp = Path(td)
+                source = tmp / "opy_manual.f90"
+                source.write_text(fortran, encoding="utf-8")
+                cmd = [self.ofort]
+                if mode == "ofort --fast":
+                    cmd.append("--fast")
+                cmd.append(str(source))
+                start = time.perf_counter()
+                try:
+                    ofort_run = subprocess.run(
+                        cmd,
+                        cwd=str(Path.cwd()),
+                        text=True,
+                        capture_output=True,
+                    )
+                except FileNotFoundError:
+                    self.elapsed_var.set(f"run: {time.perf_counter() - start:.3f} s")
+                    return RunResult(ok=False, fortran=fortran, message="ofort compiler not found")
+                self.elapsed_var.set(f"run: {time.perf_counter() - start:.3f} s")
+                return RunResult(
+                    ok=ofort_run.returncode == 0,
+                    stdout=ofort_run.stdout,
+                    stderr=ofort_run.stderr,
+                    fortran=fortran,
+                    message="" if ofort_run.returncode == 0 else f"ofort exited with code {ofort_run.returncode}",
+                )
+        return self.compile_and_run_fortran(fortran, mode)
 
     def run_python_source(self, lines: list[str]) -> RunResult:
         with tempfile.TemporaryDirectory(prefix="opy_python_") as td:
@@ -495,19 +559,23 @@ class OpyIde:
             Path(path).write_text(text, encoding="utf-8")
 
     def save_fortran(self) -> None:
-        if not self.current_fortran:
+        fortran = self.current_fortran_text()
+        if not fortran and not self.manual_fortran.get():
             self.update_fortran()
-        if not self.current_fortran:
+            fortran = self.current_fortran_text()
+        if not fortran:
             return
         path = filedialog.asksaveasfilename(
-            title="Save generated Fortran",
+            title="Save Fortran",
             defaultextension=".f90",
             filetypes=[("Fortran files", "*.f90"), ("All files", "*.*")],
         )
         if path:
-            Path(path).write_text(self.current_fortran, encoding="utf-8")
+            Path(path).write_text(fortran, encoding="utf-8")
 
     def clear_all(self) -> None:
+        self.manual_fortran.set(False)
+        self.toggle_manual_fortran()
         self.current_fortran = ""
         self.current_valid = False
         self.last_diagnostic = ""
@@ -521,6 +589,24 @@ class OpyIde:
         self.set_text(self.fortran_text, "")
         self.set_text(self.output_text, "")
         self.set_text(self.python_output_text, "")
+
+    def current_fortran_text(self) -> str:
+        text = self.fortran_text.get("1.0", "end-1c")
+        return text if self.manual_fortran.get() else self.current_fortran
+
+    def toggle_manual_fortran(self) -> None:
+        if self.manual_fortran.get():
+            self.fortran_title.set("Fortran (manual edit)")
+            self.fortran_text.configure(state=tk.NORMAL)
+        else:
+            self.fortran_title.set("Generated Fortran")
+            self.current_fortran = self.fortran_text.get("1.0", "end-1c")
+            self.fortran_text.configure(state=tk.DISABLED)
+
+    def regenerate_fortran(self) -> None:
+        self.manual_fortran.set(False)
+        self.toggle_manual_fortran()
+        self.update_fortran()
 
     def clear_output(self) -> None:
         self.set_text(self.output_text, "")
@@ -637,6 +723,8 @@ NUMBER_PATTERN = r"\b(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\b"
 
 def configure_syntax_tags(widget: tk.Text) -> None:
     widget.tag_configure("syntax_keyword", foreground="#004c99")
+    widget.tag_configure("syntax_function", foreground="#0f766e")
+    widget.tag_configure("syntax_module", foreground="#5b21b6")
     widget.tag_configure("syntax_comment", foreground="#667085")
     widget.tag_configure("syntax_string", foreground="#9a3412")
     widget.tag_configure("syntax_number", foreground="#7c3aed")
@@ -648,7 +736,14 @@ def apply_syntax_highlighting(widget: tk.Text) -> None:
     language = getattr(widget, "syntax_language", "")
     if language not in {"python", "fortran"}:
         return
-    for tag in ("syntax_keyword", "syntax_comment", "syntax_string", "syntax_number"):
+    for tag in (
+        "syntax_keyword",
+        "syntax_function",
+        "syntax_module",
+        "syntax_comment",
+        "syntax_string",
+        "syntax_number",
+    ):
         widget.tag_remove(tag, "1.0", tk.END)
     text = widget.get("1.0", "end-1c")
     if not text:
@@ -664,9 +759,22 @@ def apply_syntax_highlighting(widget: tk.Text) -> None:
     apply_pattern_tag(widget, text, STRING_PATTERN, "syntax_string", flags=0)
     apply_pattern_tag(widget, text, comment_pattern, "syntax_comment", flags=0)
     apply_pattern_tag(widget, text, NUMBER_PATTERN, "syntax_number", flags=0)
+    if language == "python":
+        apply_python_call_tags(widget, text)
+    else:
+        apply_pattern_group_tag(
+            widget,
+            text,
+            r"\b([A-Za-z_]\w*)\s*(?=\()",
+            "syntax_function",
+            group=1,
+            flags=re.IGNORECASE,
+        )
     keyword_pattern = r"\b(?:" + "|".join(re.escape(word) for word in sorted(keywords, key=len, reverse=True)) + r")\b"
     apply_pattern_tag(widget, text, keyword_pattern, "syntax_keyword", flags=flags)
     widget.tag_raise("syntax_number")
+    widget.tag_raise("syntax_module")
+    widget.tag_raise("syntax_function")
     widget.tag_raise("syntax_keyword")
     widget.tag_raise("syntax_comment")
     widget.tag_raise("syntax_string")
@@ -677,6 +785,39 @@ def apply_pattern_tag(widget: tk.Text, text: str, pattern: str, tag: str, *, fla
         start = f"1.0+{match.start()}c"
         end = f"1.0+{match.end()}c"
         widget.tag_add(tag, start, end)
+
+
+def apply_pattern_group_tag(
+    widget: tk.Text,
+    text: str,
+    pattern: str,
+    tag: str,
+    *,
+    group: int,
+    flags: int,
+) -> None:
+    for match in re.finditer(pattern, text, flags):
+        start = f"1.0+{match.start(group)}c"
+        end = f"1.0+{match.end(group)}c"
+        widget.tag_add(tag, start, end)
+
+
+def apply_python_call_tags(widget: tk.Text, text: str) -> None:
+    dotted_pattern = r"\b([A-Za-z_]\w*)(?:\s*\.\s*([A-Za-z_]\w*))*\s*(?=\()"
+    for match in re.finditer(dotted_pattern, text):
+        call_text = text[match.start():match.end()]
+        names = list(re.finditer(r"[A-Za-z_]\w*", call_text))
+        if not names:
+            continue
+        if len(names) > 1:
+            for name_match in names[:-1]:
+                start = match.start() + name_match.start()
+                end = match.start() + name_match.end()
+                widget.tag_add("syntax_module", f"1.0+{start}c", f"1.0+{end}c")
+        function_match = names[-1]
+        start = match.start() + function_match.start()
+        end = match.start() + function_match.end()
+        widget.tag_add("syntax_function", f"1.0+{start}c", f"1.0+{end}c")
 
 
 def is_incomplete_python_source(source: str) -> bool:
