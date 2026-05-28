@@ -39,6 +39,85 @@ COMPILER_MODES = [
     "lfortran",
 ]
 
+DOT_COMMAND_SUGGESTIONS = [
+    ".vars",
+    ".info",
+    ".shapes",
+    ".sizes",
+    ".stats",
+    ".decl",
+    ".list",
+    ".list -n",
+]
+
+OPY_IDE_HELP_TEXT = """\
+opy IDE
+
+Workflow
+Write Python/NumPy code in the left pane. The generated Fortran appears in the
+right pane. Use Run Python, Run Fortran, or Run Both to compare behavior.
+
+Compiler
+The default Fortran backend is ofort --fast. The compiler selector can also run
+ofort, gfortran, ifx, or lfortran when they are installed. Compile time and run
+time are shown separately for external compilers.
+
+Fortran Mode
+ofort-optimized mode may use ofort-specific helper modules for speed. Generic
+mode emits more portable Fortran helper procedures where possible.
+
+Immediate Run
+When Immediate run is enabled, complete code entered at the end of the Python
+pane runs automatically. Incomplete blocks, such as a line ending in ':', are
+previewed but not run until complete.
+
+Manual Fortran Editing
+Edit Fortran lets you modify the generated Fortran directly. Regenerate returns
+to generated code from the Python source.
+
+Procedure Profiling
+Profile procedures is available for ofort and ofort --fast. It adds
+--profile-procs and shows procedure timing in the Fortran output.
+
+Dot Commands
+Type inspection commands in the opy> entry box. They are sent to ofort and are
+not saved in the Python source. Results appear in Diagnostics. Type '.' to see
+autocomplete suggestions.
+
+.vars
+  Show current variable values.
+
+.info
+  Show variable details such as type and attributes.
+
+.shapes
+  Show array shapes.
+
+.sizes
+  Show array sizes.
+
+.stats
+  Show numeric array summary statistics.
+
+.decl
+  Show Fortran declarations.
+
+.list
+  Show the generated Fortran source with line numbers.
+
+.list -n
+  Show the generated Fortran source without line numbers.
+
+Diagnostics
+Diagnostics act like a watch window. If visible, the most recent dot command is
+refreshed after a successful Fortran run. Clear Diagnostics clears the watch.
+Hide Diagnostics hides the pane without clearing it.
+
+Limits
+opy supports a numerical Python/NumPy subset, not full Python. Unsupported
+modules and unsupported NumPy calls are diagnosed when possible.
+"""
+
 
 def make_scrollable_text(
     parent: tk.Widget,
@@ -99,6 +178,9 @@ class OpyIde:
         self.manual_fortran = tk.BooleanVar(value=False)
         self.explain_helpers = tk.BooleanVar(value=True)
         self.profile_procs = tk.BooleanVar(value=False)
+        self.diagnostics_visible = False
+        self.dot_suggestions_visible = False
+        self.last_dot_command: str | None = None
         self.fortran_title = tk.StringVar(value="Generated Fortran")
         self.output_decimals = tk.StringVar(value="")
         self.update_job: str | None = None
@@ -112,6 +194,7 @@ class OpyIde:
         self.elapsed_var = tk.StringVar(value="")
         self.python_elapsed_var = tk.StringVar(value="")
         self.source_path: Path | None = None
+        self.help_window: tk.Toplevel | None = None
 
         root.title("opy IDE")
         root.geometry("1100x750")
@@ -133,6 +216,7 @@ class OpyIde:
         ttk.Button(toolbar, text="Run Fortran", command=self.run_current).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(toolbar, text="Run Both", command=self.run_both).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(toolbar, text="Clear All", command=self.clear_all).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(toolbar, text="Help", command=self.show_help).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Label(toolbar, text="Run with:").pack(side=tk.LEFT, padx=(12, 4))
         compiler_box = ttk.Combobox(
             toolbar,
@@ -210,7 +294,15 @@ class OpyIde:
         self.entry = ttk.Entry(input_row)
         self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
         self.entry.bind("<Return>", self.submit_line_event)
+        self.entry.bind("<KeyRelease>", self.entry_key_release)
+        self.entry.bind("<Down>", self.dot_suggestion_down)
+        self.entry.bind("<Up>", self.dot_suggestion_up)
+        self.entry.bind("<Tab>", self.dot_suggestion_tab)
+        self.entry.bind("<Escape>", self.hide_dot_suggestions_event)
         ttk.Button(input_row, text="Enter", command=self.submit_line).pack(side=tk.LEFT)
+        self.dot_suggestion_list = tk.Listbox(self.root, height=5, exportselection=False)
+        self.dot_suggestion_list.bind("<Double-Button-1>", self.dot_suggestion_double_click)
+        self.dot_suggestion_list.bind("<Return>", self.dot_suggestion_return)
 
         output_row = ttk.Frame(self.root)
         output_row.pack(side=tk.TOP, fill=tk.X, padx=6)
@@ -229,12 +321,15 @@ class OpyIde:
             variable=self.show_python_output,
             command=self.update_output_layout,
         ).pack(side=tk.RIGHT, padx=(0, 8))
+        ttk.Button(output_row, text="Hide Diagnostics", command=self.hide_diagnostics).pack(side=tk.RIGHT, padx=(0, 4))
+        ttk.Button(output_row, text="Clear Diagnostics", command=self.clear_diagnostics).pack(side=tk.RIGHT, padx=(0, 4))
         ttk.Button(output_row, text="Clear Output", command=self.clear_output).pack(side=tk.RIGHT)
 
         self.output_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         self.output_pane.pack(side=tk.BOTTOM, fill=tk.BOTH, padx=6, pady=(0, 6))
         self.python_output_frame = ttk.Frame(self.output_pane)
         self.fortran_output_frame = ttk.Frame(self.output_pane)
+        self.diagnostics_frame = ttk.Frame(self.output_pane)
         python_output_header = ttk.Frame(self.python_output_frame)
         python_output_header.pack(fill=tk.X)
         ttk.Label(python_output_header, text="Python output").pack(side=tk.LEFT)
@@ -247,16 +342,28 @@ class OpyIde:
         ttk.Label(fortran_output_header, textvariable=self.elapsed_var).pack(side=tk.RIGHT)
         self.output_text = tk.Text(self.fortran_output_frame, height=10, wrap=tk.WORD, undo=False)
         self.output_text.pack(fill=tk.BOTH, expand=True)
+        diagnostics_header = ttk.Frame(self.diagnostics_frame)
+        diagnostics_header.pack(fill=tk.X)
+        ttk.Label(diagnostics_header, text="Diagnostics").pack(side=tk.LEFT)
+        self.diagnostics_text = tk.Text(self.diagnostics_frame, height=10, wrap=tk.WORD, undo=False)
+        self.diagnostics_text.pack(fill=tk.BOTH, expand=True)
         self.update_output_layout()
         self.entry.focus_set()
 
     def submit_line_event(self, _event: tk.Event) -> str:
+        if self.dot_suggestions_visible and self.accept_dot_suggestion_if_partial():
+            return "break"
         self.submit_line()
         return "break"
 
     def submit_line(self) -> None:
         line = self.entry.get()
         if not line.strip():
+            return
+        if line.lstrip().startswith("."):
+            self.hide_dot_suggestions()
+            self.entry.delete(0, tk.END)
+            self.run_dot_command(line.strip())
             return
         text = self.source_text.get("1.0", "end-1c")
         if text and not text.endswith("\n"):
@@ -265,6 +372,110 @@ class OpyIde:
         self.source_text.see(tk.END)
         self.entry.delete(0, tk.END)
         self.commit_source_change()
+
+    def entry_key_release(self, event: tk.Event) -> None:
+        if event.keysym in {"Up", "Down", "Return", "Tab", "Escape"}:
+            return
+        self.update_dot_suggestions()
+
+    def update_dot_suggestions(self) -> None:
+        text = self.entry.get().strip()
+        if not text.startswith("."):
+            self.hide_dot_suggestions()
+            return
+        matches = [cmd for cmd in DOT_COMMAND_SUGGESTIONS if cmd.startswith(text)]
+        if not matches:
+            self.hide_dot_suggestions()
+            return
+        self.dot_suggestion_list.delete(0, tk.END)
+        for cmd in matches:
+            self.dot_suggestion_list.insert(tk.END, cmd)
+        self.dot_suggestion_list.selection_set(0)
+        self.dot_suggestion_list.activate(0)
+        if not self.dot_suggestions_visible:
+            self.dot_suggestion_list.pack(side=tk.TOP, anchor=tk.W, padx=38, pady=(0, 4))
+            self.dot_suggestions_visible = True
+
+    def hide_dot_suggestions(self) -> None:
+        if self.dot_suggestions_visible:
+            self.dot_suggestion_list.pack_forget()
+            self.dot_suggestions_visible = False
+
+    def hide_dot_suggestions_event(self, _event: tk.Event) -> str:
+        self.hide_dot_suggestions()
+        return "break"
+
+    def selected_dot_suggestion(self) -> str | None:
+        if not self.dot_suggestions_visible:
+            return None
+        selection = self.dot_suggestion_list.curselection()
+        if not selection:
+            return None
+        return str(self.dot_suggestion_list.get(selection[0]))
+
+    def set_entry_to_dot_suggestion(self) -> bool:
+        suggestion = self.selected_dot_suggestion()
+        if suggestion is None:
+            return False
+        self.entry.delete(0, tk.END)
+        self.entry.insert(0, suggestion)
+        self.entry.icursor(tk.END)
+        return True
+
+    def accept_dot_suggestion_if_partial(self) -> bool:
+        suggestion = self.selected_dot_suggestion()
+        if suggestion is None:
+            return False
+        typed = self.entry.get().strip()
+        if typed != suggestion:
+            self.set_entry_to_dot_suggestion()
+            self.hide_dot_suggestions()
+            return True
+        return False
+
+    def dot_suggestion_tab(self, _event: tk.Event) -> str:
+        if self.set_entry_to_dot_suggestion():
+            self.hide_dot_suggestions()
+        return "break"
+
+    def dot_suggestion_return(self, _event: tk.Event) -> str:
+        if self.set_entry_to_dot_suggestion():
+            self.hide_dot_suggestions()
+            self.submit_line()
+        return "break"
+
+    def dot_suggestion_double_click(self, _event: tk.Event) -> None:
+        if self.set_entry_to_dot_suggestion():
+            self.hide_dot_suggestions()
+            self.entry.focus_set()
+
+    def dot_suggestion_down(self, _event: tk.Event) -> str:
+        if not self.dot_suggestions_visible:
+            self.update_dot_suggestions()
+            return "break"
+        size = self.dot_suggestion_list.size()
+        if size <= 0:
+            return "break"
+        selection = self.dot_suggestion_list.curselection()
+        index = selection[0] if selection else 0
+        index = min(index + 1, size - 1)
+        self.dot_suggestion_list.selection_clear(0, tk.END)
+        self.dot_suggestion_list.selection_set(index)
+        self.dot_suggestion_list.activate(index)
+        self.dot_suggestion_list.see(index)
+        return "break"
+
+    def dot_suggestion_up(self, _event: tk.Event) -> str:
+        if not self.dot_suggestions_visible:
+            return "break"
+        selection = self.dot_suggestion_list.curselection()
+        index = selection[0] if selection else 0
+        index = max(index - 1, 0)
+        self.dot_suggestion_list.selection_clear(0, tk.END)
+        self.dot_suggestion_list.selection_set(index)
+        self.dot_suggestion_list.activate(index)
+        self.dot_suggestion_list.see(index)
+        return "break"
 
     def source_modified(self, _event: tk.Event) -> None:
         if not self.source_text.edit_modified():
@@ -396,6 +607,7 @@ class OpyIde:
                 if result.stderr:
                     self.append_output(result.stderr)
                 self.last_stdout = result.stdout
+                self.refresh_diagnostics_watch()
             else:
                 self.invalidate_current_source(result)
             return
@@ -430,6 +642,7 @@ class OpyIde:
         if result.stderr:
             self.append_output(result.stderr)
         self.last_stdout = result.stdout
+        self.refresh_diagnostics_watch()
 
     def run_python_current(self) -> None:
         source = self.source_text.get("1.0", "end-1c")
@@ -452,6 +665,69 @@ class OpyIde:
             self.append_python_output(python_result.stderr)
         if not python_result.ok and python_result.message:
             self.append_python_output(f"opy: {python_result.message}\n")
+
+    def run_dot_command(self, command: str, *, replace: bool = False) -> None:
+        mode = self.compiler_var.get()
+        self.diagnostics_visible = True
+        self.update_output_layout()
+        if mode not in {"ofort --fast", "ofort"}:
+            self.append_diagnostics(f"opy: dot commands require ofort; current compiler is {mode}\n")
+            return
+
+        fortran = self.current_fortran_text()
+        if not fortran.strip() and not self.manual_fortran.get():
+            source = self.source_text.get("1.0", "end-1c")
+            if source.strip() and not is_incomplete_python_source(source):
+                result = self.translate_and_run(source.splitlines(), run=False)
+                if result.ok:
+                    fortran = result.fortran
+                    self.current_fortran = result.fortran
+                    self.current_valid = True
+                    self.show_generated_fortran()
+                else:
+                    self.append_diagnostics(f"opy: cannot run {command}: {result.message or 'translation failed'}\n")
+                    if result.stderr:
+                        self.append_diagnostics(result.stderr)
+                    return
+        if not fortran.strip():
+            self.append_diagnostics(f"opy: cannot run {command}: no generated Fortran is available\n")
+            return
+
+        with tempfile.TemporaryDirectory(prefix="opy_diag_") as td:
+            tmp = Path(td)
+            source_path = tmp / "opy_diagnostics.f90"
+            source_path.write_text(fortran_for_repl_diagnostics(fortran), encoding="utf-8")
+            cmd = [self.ofort, "--nologo", "--repl"]
+            if mode == "ofort --fast":
+                cmd.append("--fast")
+            cmd.extend(["--load-run", str(source_path)])
+            try:
+                run = subprocess.run(
+                    cmd,
+                    input=command + "\n.quit!\n",
+                    cwd=str(Path.cwd()),
+                    text=True,
+                    capture_output=True,
+                )
+            except FileNotFoundError:
+                self.append_diagnostics("opy: ofort compiler not found\n")
+                return
+
+        text = clean_ofort_repl_diagnostics(run.stdout)
+        if run.stderr:
+            text += run.stderr
+        if not text.strip() and run.returncode != 0:
+            text = f"ofort exited with code {run.returncode}\n"
+        self.last_dot_command = command
+        if replace:
+            self.set_text(self.diagnostics_text, "")
+        self.append_diagnostics(f"opy> {command}\n")
+        if text:
+            self.append_diagnostics(text if text.endswith("\n") else text + "\n")
+
+    def refresh_diagnostics_watch(self) -> None:
+        if self.diagnostics_visible and self.last_dot_command:
+            self.run_dot_command(self.last_dot_command, replace=True)
 
     def run_both(self) -> None:
         source = self.source_text.get("1.0", "end-1c")
@@ -490,6 +766,7 @@ class OpyIde:
             if fortran_result.stderr:
                 self.append_output(fortran_result.stderr)
             self.last_stdout = fortran_result.stdout
+            self.refresh_diagnostics_watch()
         else:
             self.invalidate_current_source(fortran_result)
 
@@ -707,6 +984,29 @@ class OpyIde:
         if path:
             Path(path).write_text(fortran, encoding="utf-8")
 
+    def show_help(self) -> None:
+        if self.help_window is not None and self.help_window.winfo_exists():
+            self.help_window.lift()
+            self.help_window.focus_set()
+            return
+        win = tk.Toplevel(self.root)
+        self.help_window = win
+        win.title("opy IDE Help")
+        win.geometry("720x620")
+        text = tk.Text(win, wrap=tk.WORD, padx=10, pady=8)
+        scroll = ttk.Scrollbar(win, orient=tk.VERTICAL, command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        text.insert("1.0", OPY_IDE_HELP_TEXT)
+        format_help_text(text)
+        text.configure(state=tk.DISABLED)
+        win.protocol("WM_DELETE_WINDOW", lambda: self.close_help_window(win))
+
+    def close_help_window(self, win: tk.Toplevel) -> None:
+        self.help_window = None
+        win.destroy()
+
     def clear_all(self) -> None:
         self.manual_fortran.set(False)
         self.toggle_manual_fortran()
@@ -723,6 +1023,10 @@ class OpyIde:
         self.set_text(self.fortran_text, "")
         self.set_text(self.output_text, "")
         self.set_text(self.python_output_text, "")
+        self.set_text(self.diagnostics_text, "")
+        self.diagnostics_visible = False
+        self.last_dot_command = None
+        self.update_output_layout()
 
     def current_fortran_text(self) -> str:
         text = self.fortran_text.get("1.0", "end-1c")
@@ -746,19 +1050,32 @@ class OpyIde:
         self.set_text(self.output_text, "")
         self.set_text(self.python_output_text, "")
 
+    def clear_diagnostics(self) -> None:
+        self.set_text(self.diagnostics_text, "")
+        self.last_dot_command = None
+
+    def hide_diagnostics(self) -> None:
+        self.diagnostics_visible = False
+        self.update_output_layout()
+
     def update_output_layout(self) -> None:
         panes = set(self.output_pane.panes())
         python_name = str(self.python_output_frame)
         fortran_name = str(self.fortran_output_frame)
+        diagnostics_name = str(self.diagnostics_frame)
         if python_name in panes:
             self.output_pane.forget(self.python_output_frame)
         if fortran_name in panes:
             self.output_pane.forget(self.fortran_output_frame)
+        if diagnostics_name in panes:
+            self.output_pane.forget(self.diagnostics_frame)
         if self.show_python_output.get():
             self.output_pane.add(self.python_output_frame, weight=1)
             self.output_pane.add(self.fortran_output_frame, weight=1)
         else:
             self.output_pane.add(self.fortran_output_frame, weight=1)
+        if self.diagnostics_visible:
+            self.output_pane.add(self.diagnostics_frame, weight=1)
 
     def scroll_fortran_top(self) -> None:
         self.fortran_text.see("1.0")
@@ -799,6 +1116,11 @@ class OpyIde:
         self.python_output_text.insert(tk.END, self.format_output_text(text))
         self.python_output_text.see(tk.END)
 
+    def append_diagnostics(self, text: str) -> None:
+        self.diagnostics_text.configure(state=tk.NORMAL)
+        self.diagnostics_text.insert(tk.END, text)
+        self.diagnostics_text.see(tk.END)
+
     def format_output_text(self, text: str) -> str:
         raw = self.output_decimals.get().strip()
         if not raw:
@@ -830,6 +1152,65 @@ def display_fortran(fortran: str) -> str:
         fortran,
         count=1,
     )
+
+
+def clean_ofort_repl_diagnostics(text: str) -> str:
+    marker = "\n> "
+    if marker in text:
+        text = text.split(marker, 1)[1]
+    elif text.startswith("> "):
+        text = text[2:]
+    text = re.sub(r"\n> \Z", "\n", text)
+    text = re.sub(r"^> ", "", text, flags=re.MULTILINE)
+    return text
+
+
+def fortran_for_repl_diagnostics(fortran: str) -> str:
+    lines = fortran.splitlines()
+    if not lines:
+        return fortran
+    start = 0
+    end = len(lines)
+    for i, line in enumerate(lines):
+        if re.match(r"\s*program\b", line, re.IGNORECASE):
+            start = i + 1
+            break
+    for i in range(len(lines) - 1, start - 1, -1):
+        if re.match(r"\s*end\s+program\b", lines[i], re.IGNORECASE):
+            end = i
+            break
+    return "\n".join(lines[start:end]) + ("\n" if fortran.endswith("\n") else "")
+
+
+HELP_HEADINGS = {
+    "opy IDE",
+    "Workflow",
+    "Compiler",
+    "Fortran Mode",
+    "Immediate Run",
+    "Manual Fortran Editing",
+    "Procedure Profiling",
+    "Dot Commands",
+    "Diagnostics",
+    "Limits",
+}
+
+
+def format_help_text(text: tk.Text) -> None:
+    text.tag_configure("help_heading", font=("TkDefaultFont", 10, "bold"), spacing1=4, spacing3=2)
+    text.tag_configure("help_code", font=("TkFixedFont", 10))
+    text.tag_configure("help_dot_description", lmargin1=24, lmargin2=24)
+
+    line_count = int(text.index("end-1c").split(".", 1)[0])
+    for line_no in range(1, line_count + 1):
+        line = text.get(f"{line_no}.0", f"{line_no}.end")
+        stripped = line.strip()
+        if stripped in HELP_HEADINGS:
+            text.tag_add("help_heading", f"{line_no}.0", f"{line_no}.end")
+        elif stripped.startswith("."):
+            text.tag_add("help_code", f"{line_no}.0", f"{line_no}.end")
+        elif line.startswith("  "):
+            text.tag_add("help_dot_description", f"{line_no}.0", f"{line_no}.end")
 
 
 FLOAT_TOKEN_PATTERN = re.compile(
