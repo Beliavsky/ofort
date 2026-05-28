@@ -49,17 +49,20 @@ class OpyIde:
         ofort: str,
         fast: bool = True,
         compiler: str | None = None,
-        immediate: bool = False,
+        immediate: bool = True,
+        source: Path | None = None,
     ) -> None:
         self.root = root
         self.xp2f = Path(xp2f)
         self.ofort = ofort
         initial_compiler = compiler if compiler in COMPILER_MODES else ("ofort --fast" if fast else "ofort")
         self.compiler_var = tk.StringVar(value=initial_compiler)
+        self.fortran_mode = tk.StringVar(value="ofort-optimized")
         self.immediate = tk.BooleanVar(value=immediate)
         self.show_python_output = tk.BooleanVar(value=False)
         self.manual_fortran = tk.BooleanVar(value=False)
         self.fortran_title = tk.StringVar(value="Generated Fortran")
+        self.output_decimals = tk.StringVar(value="")
         self.update_job: str | None = None
         self.highlight_job: str | None = None
         self.current_fortran = ""
@@ -75,7 +78,10 @@ class OpyIde:
         root.title("opy IDE")
         root.geometry("1100x750")
         self.build_ui()
-        self.update_fortran()
+        if source is not None:
+            self.load_source_file(source)
+        else:
+            self.update_fortran()
 
     def build_ui(self) -> None:
         toolbar = ttk.Frame(self.root)
@@ -98,6 +104,16 @@ class OpyIde:
             state="readonly",
         )
         compiler_box.pack(side=tk.LEFT)
+        ttk.Label(toolbar, text="Fortran:").pack(side=tk.LEFT, padx=(12, 4))
+        mode_box = ttk.Combobox(
+            toolbar,
+            textvariable=self.fortran_mode,
+            values=["ofort-optimized", "generic"],
+            width=15,
+            state="readonly",
+        )
+        mode_box.pack(side=tk.LEFT)
+        mode_box.bind("<<ComboboxSelected>>", lambda _event: self.regenerate_fortran())
         ttk.Checkbutton(toolbar, text="Immediate run", variable=self.immediate).pack(side=tk.LEFT, padx=(12, 0))
 
         pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -108,7 +124,10 @@ class OpyIde:
         pane.add(left, weight=1)
         pane.add(right, weight=1)
 
-        ttk.Label(left, text="Python input").pack(anchor=tk.W)
+        python_header = ttk.Frame(left)
+        python_header.pack(fill=tk.X)
+        ttk.Label(python_header, text="Python input").pack(side=tk.LEFT)
+        ttk.Button(python_header, text="Indent Block", command=self.indent_block_at_cursor).pack(side=tk.RIGHT)
         self.source_text = tk.Text(left, wrap=tk.NONE, undo=True)
         self.source_text.syntax_language = "python"
         self.source_text.pack(fill=tk.BOTH, expand=True)
@@ -145,6 +164,14 @@ class OpyIde:
         output_row = ttk.Frame(self.root)
         output_row.pack(side=tk.TOP, fill=tk.X, padx=6)
         ttk.Label(output_row, text="Output").pack(side=tk.LEFT)
+        ttk.Label(output_row, text="Decimals:").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Spinbox(
+            output_row,
+            from_=0,
+            to=16,
+            width=4,
+            textvariable=self.output_decimals,
+        ).pack(side=tk.LEFT)
         ttk.Checkbutton(
             output_row,
             text="Show Python output",
@@ -210,8 +237,31 @@ class OpyIde:
         line = self.source_text.get("insert linestart", "insert lineend")
         indent = next_line_indent(line)
         self.source_text.insert(tk.INSERT, "\n" + indent)
+        if indent:
+            self.auto_indent_existing_block_after_header()
         self.root.after_idle(self.commit_source_change)
         return "break"
+
+    def auto_indent_existing_block_after_header(self) -> None:
+        header_index = self.source_text.index("insert -1 lines linestart")
+        changed = indent_existing_block_after_header(self.source_text, header_index)
+        if changed:
+            self.source_text.edit_modified(True)
+
+    def indent_block_at_cursor(self) -> None:
+        index = self.source_text.index("insert linestart")
+        line = self.source_text.get(f"{index} linestart", f"{index} lineend")
+        if not is_python_block_header(line):
+            previous = self.source_text.index(f"{index} -1 lines linestart")
+            previous_line = self.source_text.get(f"{previous} linestart", f"{previous} lineend")
+            if is_python_block_header(previous_line):
+                index = previous
+            else:
+                return
+        changed = indent_existing_block_after_header(self.source_text, index)
+        if changed:
+            self.source_text.edit_modified(True)
+            self.commit_source_change()
 
     def commit_source_change(self) -> None:
         source = self.source_text.get("1.0", "end-1c")
@@ -279,7 +329,7 @@ class OpyIde:
         self.current_fortran = result.fortran
         self.current_valid = True
         self.last_diagnostic = ""
-        self.set_text(self.fortran_text, display_fortran(self.current_fortran), scroll_to_end=True)
+        self.show_generated_fortran()
 
     def run_current(
         self,
@@ -318,7 +368,7 @@ class OpyIde:
         self.current_fortran = result.fortran
         self.current_valid = True
         self.last_diagnostic = ""
-        self.set_text(self.fortran_text, display_fortran(self.current_fortran), scroll_to_end=True)
+        self.show_generated_fortran()
         if result.stdout:
             if incremental:
                 text = incremental_output_text(self.last_stdout, result.stdout)
@@ -383,7 +433,7 @@ class OpyIde:
             self.current_valid = True
             self.last_diagnostic = ""
             if not self.manual_fortran.get():
-                self.set_text(self.fortran_text, display_fortran(self.current_fortran), scroll_to_end=True)
+                self.show_generated_fortran()
             if fortran_result.stdout:
                 self.append_output(fortran_result.stdout)
             if fortran_result.stderr:
@@ -394,7 +444,7 @@ class OpyIde:
 
     def translate_and_run(self, lines: list[str], *, run: bool) -> RunResult:
         if not run:
-            return translate_session(lines, xp2f=self.xp2f)
+            return translate_session(lines, xp2f=self.xp2f, generic=self.use_generic_fortran())
         mode = self.compiler_var.get()
         if mode in {"ofort --fast", "ofort"}:
             start = time.perf_counter()
@@ -403,15 +453,19 @@ class OpyIde:
                 xp2f=self.xp2f,
                 ofort=self.ofort,
                 fast=(mode == "ofort --fast"),
+                generic=self.use_generic_fortran(),
             )
             self.elapsed_var.set(f"run: {time.perf_counter() - start:.3f} s")
             return result
 
-        translated = translate_session(lines, xp2f=self.xp2f)
+        translated = translate_session(lines, xp2f=self.xp2f, generic=self.use_generic_fortran())
         if not translated.ok:
             self.elapsed_var.set("")
             return translated
         return self.compile_and_run_fortran(translated.fortran, mode)
+
+    def use_generic_fortran(self) -> bool:
+        return self.fortran_mode.get() == "generic"
 
     def run_fortran_text(self, fortran: str) -> RunResult:
         if not fortran.strip():
@@ -533,18 +587,24 @@ class OpyIde:
         )
         if not path:
             return
-        source_path = Path(path)
+        self.load_source_file(Path(path), show_errors=True)
+
+    def load_source_file(self, source_path: Path, *, show_errors: bool = False) -> bool:
         try:
             text = source_path.read_text(encoding="utf-8-sig")
         except OSError as exc:
-            messagebox.showerror("opy IDE", f"Could not read {source_path}:\n{exc}")
-            return
+            if show_errors:
+                messagebox.showerror("opy IDE", f"Could not read {source_path}:\n{exc}")
+            else:
+                print(f"opy IDE: could not read {source_path}: {exc}", file=sys.stderr)
+            return False
         self.source_path = source_path
         self.set_text(self.source_text, text)
         self.source_text.edit_modified(False)
         self.last_source_text = text
         self.committed_source_text = text
         self.update_fortran()
+        return True
 
     def save_source(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -632,6 +692,10 @@ class OpyIde:
     def scroll_fortran_bottom(self) -> None:
         self.fortran_text.see(tk.END)
 
+    def show_generated_fortran(self) -> None:
+        self.set_text(self.fortran_text, display_fortran(self.current_fortran))
+        self.fortran_text.see("1.0")
+
     def invalidate_current_source(self, result: RunResult) -> None:
         message = result.message or "translation failed"
         detail = ""
@@ -653,13 +717,25 @@ class OpyIde:
 
     def append_output(self, text: str) -> None:
         self.output_text.configure(state=tk.NORMAL)
-        self.output_text.insert(tk.END, text)
+        self.output_text.insert(tk.END, self.format_output_text(text))
         self.output_text.see(tk.END)
 
     def append_python_output(self, text: str) -> None:
         self.python_output_text.configure(state=tk.NORMAL)
-        self.python_output_text.insert(tk.END, text)
+        self.python_output_text.insert(tk.END, self.format_output_text(text))
         self.python_output_text.see(tk.END)
+
+    def format_output_text(self, text: str) -> str:
+        raw = self.output_decimals.get().strip()
+        if not raw:
+            return text
+        try:
+            decimals = int(raw)
+        except ValueError:
+            return text
+        if decimals < 0:
+            return text
+        return format_float_tokens(text, decimals)
 
     @staticmethod
     def set_text(widget: tk.Text, text: str, *, scroll_to_end: bool = False) -> None:
@@ -680,6 +756,25 @@ def display_fortran(fortran: str) -> str:
         fortran,
         count=1,
     )
+
+
+FLOAT_TOKEN_PATTERN = re.compile(
+    r"(?<![\w.])([+-]?(?:(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?|\d+[eEdD][+-]?\d+))(?![\w.])"
+)
+
+
+def format_float_tokens(text: str, decimals: int) -> str:
+    def repl(match: re.Match[str]) -> str:
+        token = match.group(1)
+        try:
+            value = float(token.replace("D", "E").replace("d", "e"))
+        except ValueError:
+            return token
+        if "e" in token.lower() or "d" in token.lower():
+            return f"{value:.{decimals}e}"
+        return f"{value:.{decimals}f}"
+
+    return FLOAT_TOKEN_PATTERN.sub(repl, text)
 
 
 def compiler_command(mode: str, source: Path, exe: Path) -> list[str]:
@@ -841,9 +936,43 @@ def partial_fortran_preview(source: str) -> str:
 def next_line_indent(line: str) -> str:
     base = re.match(r"[ \t]*", line).group(0)
     stripped = line.strip()
-    if stripped.endswith(":") and not stripped.startswith("#"):
+    if is_python_block_header(line):
         return base + "    "
     return base
+
+
+def is_python_block_header(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped.endswith(":") and stripped and not stripped.startswith("#"))
+
+
+def indent_existing_block_after_header(widget: tk.Text, header_index: str) -> bool:
+    header_line = widget.get(f"{header_index} linestart", f"{header_index} lineend")
+    if not is_python_block_header(header_line):
+        return False
+    base_indent = re.match(r"[ \t]*", header_line).group(0)
+    child_indent = base_indent + "    "
+    line_no = int(widget.index(f"{header_index} lineend").split(".", 1)[0]) + 1
+    end_line_no = int(widget.index("end-1c").split(".", 1)[0])
+    changed = False
+    while line_no <= end_line_no:
+        start = f"{line_no}.0"
+        line = widget.get(start, f"{line_no}.0 lineend")
+        if not line.strip():
+            break
+        indent = re.match(r"[ \t]*", line).group(0)
+        if len(indent.expandtabs(4)) < len(base_indent.expandtabs(4)):
+            break
+        if indent.startswith(child_indent) or len(indent.expandtabs(4)) > len(base_indent.expandtabs(4)):
+            line_no += 1
+            continue
+        if indent == base_indent:
+            widget.insert(start, "    ")
+            changed = True
+            line_no += 1
+            continue
+        break
+    return changed
 
 
 def immediate_run_append(appended: str) -> bool:
@@ -933,15 +1062,22 @@ def simplify_integer_offset(expr: str, offset: int) -> str:
 
 def run(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Worksheet-style GUI for opy.")
+    parser.add_argument("source_file", nargs="?", help="optional Python source file to open")
+    parser.add_argument("--source", help="Python source file to open; overrides positional source")
     parser.add_argument("--xp2f", default=str(DEFAULT_XP2F), help="path to xp2f.py")
     parser.add_argument("--ofort", default=str(DEFAULT_OFORT), help="ofort command")
     parser.add_argument("--no-fast", action="store_true", help="start with ofort --fast disabled")
     parser.add_argument("--compiler", choices=COMPILER_MODES, help="initial compiler dropdown selection")
-    parser.add_argument("--immediate", action="store_true", help="start with immediate run enabled")
+    parser.add_argument("--no-immediate", action="store_true", help="start with immediate run disabled")
     args = parser.parse_args(argv)
     xp2f = Path(args.xp2f)
     if not xp2f.exists():
         print(f"opy IDE: xp2f.py not found: {xp2f}", file=sys.stderr)
+        return 1
+    source_arg = args.source or args.source_file
+    source = Path(source_arg) if source_arg else None
+    if source is not None and not source.exists():
+        print(f"opy IDE: source file not found: {source}", file=sys.stderr)
         return 1
 
     root = tk.Tk()
@@ -951,7 +1087,8 @@ def run(argv: list[str] | None = None) -> int:
         ofort=args.ofort,
         fast=not args.no_fast,
         compiler=args.compiler,
-        immediate=args.immediate,
+        immediate=not args.no_immediate,
+        source=source,
     )
     root.mainloop()
     return 0
