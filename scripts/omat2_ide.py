@@ -47,6 +47,8 @@ class OmatAdapter:
     default_extension = ".m"
     filetypes = [("Octave files", "*.m"), ("All files", "*.*")]
     help_text = OMAT2_HELP_TEXT
+    source_syntax = "octave"
+    fortran_syntax = "fortran"
 
     def __init__(self, octave: str = "octave") -> None:
         self.octave = octave
@@ -174,6 +176,7 @@ def run(argv: list[str] | None = None) -> int:
     parser.add_argument("--generic", action="store_true", help="start in generic Fortran mode")
     parser.add_argument("--no-immediate", action="store_true", help="start with immediate run disabled")
     parser.add_argument("--source", type=Path, help="open this Octave source at startup")
+    parser.add_argument("--session", type=Path, help="open this saved IDE session at startup")
     parser.add_argument("source_file", nargs="?", type=Path, help="open this Octave source at startup")
     args = parser.parse_args(argv)
 
@@ -185,6 +188,7 @@ def run(argv: list[str] | None = None) -> int:
         compiler=args.compiler,
         immediate=not args.no_immediate,
         source=args.source or args.source_file,
+        session=args.session,
     )
     if args.generic:
         ide.fortran_mode.set("generic")
