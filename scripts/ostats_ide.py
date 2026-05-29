@@ -20,7 +20,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from fortran_ide_base import attach_text_search
+from fortran_ide_base import (
+    DOT_COMMAND_SUGGESTIONS,
+    attach_text_search,
+    clean_ofort_repl_diagnostics,
+    fortran_for_repl_diagnostics,
+)
 
 
 DEFAULT_XR2F = Path(r"c:\python\fortran\xr2f.py")
@@ -40,6 +45,14 @@ COMPILER_MODES = [
 
 R_FILETYPES = [("R files", "*.R *.r"), ("All files", "*.*")]
 FORTRAN_FILETYPES = [("Fortran files", "*.f90 *.f95 *.f03 *.f08"), ("All files", "*.*")]
+
+# Set this false to roll back the compact toolbar styling while keeping the
+# descriptive control labels.
+USE_SMALL_TOOLBAR_FONT = True
+SMALL_TOOLBAR_FONT = ("TkDefaultFont", 8)
+
+# Set this false to disable editor auto-completion of R braces/parentheses.
+AUTO_COMPLETE_R_DELIMITERS = True
 
 R_KEYWORDS = {
     "break",
@@ -165,6 +178,9 @@ R_COMMENT_RE = re.compile(r"#[^\n]*")
 FORTRAN_COMMENT_RE = re.compile(r"![^\n]*")
 FUNC_RE = re.compile(r"\b([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*(?=\()")
 INCOMPLETE_R_TRAILING_RE = re.compile(r"(\^|\+|-|\*|/|%%|%/%|,|<-|=|\(|\[|\{)\s*$")
+INCOMPLETE_R_BLOCK_HEADER_RE = re.compile(
+    r"^\s*(?:for\s*\([^)]*\)|if\s*\([^)]*\)|while\s*\([^)]*\)|repeat|(?:[A-Za-z.]\w*\s*(?:<-|=)\s*)?function\s*\([^)]*\))\s*$"
+)
 FLOAT_TOKEN_PATTERN = re.compile(
     r"(?<![\w.])([+-]?(?:(?:\d+\.\d*|\.\d+)(?:[eEdD][+-]?\d+)?|\d+[eEdD][+-]?\d+))(?![\w.])"
 )
@@ -227,6 +243,8 @@ def r_source_waiting_for_completion(source: str, *, require_enter: bool = True) 
         return True
     if INCOMPLETE_R_TRAILING_RE.search(code):
         return True
+    if INCOMPLETE_R_BLOCK_HEADER_RE.match(code):
+        return True
     pairs = {"(": ")", "[": "]", "{": "}"}
     stack: list[str] = []
     quote = ""
@@ -248,6 +266,83 @@ def r_source_waiting_for_completion(source: str, *, require_enter: bool = True) 
             if stack and stack[-1] == ch:
                 stack.pop()
     return bool(quote or stack)
+
+
+def strip_r_comment(line: str) -> str:
+    quote = ""
+    escape = False
+    for i, ch in enumerate(line):
+        if quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = ""
+            continue
+        if ch in {"'", '"'}:
+            quote = ch
+        elif ch == "#":
+            return line[:i]
+    return line
+
+
+def r_text_has_open_string(line: str) -> bool:
+    quote = ""
+    escape = False
+    for ch in line:
+        if quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = ""
+            continue
+        if ch in {"'", '"'}:
+            quote = ch
+        elif ch == "#":
+            break
+    return bool(quote)
+
+
+def r_line_opens_brace_block(line: str) -> bool:
+    code = strip_r_comment(line).rstrip()
+    return bool(code.endswith("{") and not r_text_has_open_string(line))
+
+
+def leading_whitespace(text: str) -> str:
+    return text[: len(text) - len(text.lstrip(" \t"))]
+
+
+def next_nonblank_line(text: tk.Text) -> str:
+    line_no = int(text.index("insert").split(".", 1)[0])
+    last_line = int(text.index("end-1c").split(".", 1)[0])
+    for candidate in range(line_no + 1, last_line + 1):
+        line = text.get(f"{candidate}.0", f"{candidate}.end")
+        if line.strip():
+            return line
+    return ""
+
+
+def r_cursor_in_string_or_comment(text: tk.Text) -> bool:
+    line = text.get("insert linestart", "insert")
+    quote = ""
+    escape = False
+    for ch in line:
+        if quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = ""
+            continue
+        if ch in {"'", '"'}:
+            quote = ch
+        elif ch == "#":
+            return True
+    return bool(quote)
 
 
 def selected_text_lines(widget: tk.Text) -> list[int]:
@@ -350,6 +445,11 @@ def fortran_mapping_keys(line: str) -> list[str]:
 
 def r_name_to_fortran(name: str) -> str:
     return name.replace(".", "_").lower()
+
+
+def read_text_normalized(path: Path) -> str:
+    text = path.read_bytes().decode("utf-8-sig", errors="replace")
+    return text.replace("\r\r\n", "\n").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def translate_r_to_fortran(
@@ -691,6 +791,7 @@ class OstatsIde:
         self.output_decimals = tk.StringVar(value="")
         self.show_r_output = tk.BooleanVar(value=True)
         self.show_helper_hover = tk.BooleanVar(value=True)
+        self.autocomplete_r = tk.BooleanVar(value=AUTO_COMPLETE_R_DELIMITERS)
         self.source_path: Path | None = None
         self.current_fortran = ""
         self.source_to_fortran_lines: dict[int, set[int]] = {}
@@ -698,6 +799,9 @@ class OstatsIde:
         self.raw_fortran_output = ""
         self.helper_tooltip: TextTooltip | None = None
         self.profile_annotated = False
+        self.diagnostics_visible = False
+        self.dot_suggestions_visible = False
+        self.last_dot_command: str | None = None
         self.update_job: str | None = None
         self.highlight_job: str | None = None
 
@@ -716,41 +820,57 @@ class OstatsIde:
             self.update_fortran()
 
     def build_ui(self) -> None:
+        self.configure_toolbar_styles()
+        button_style = "OstatsToolbar.TButton" if USE_SMALL_TOOLBAR_FONT else "TButton"
+        label_style = "OstatsToolbar.TLabel" if USE_SMALL_TOOLBAR_FONT else "TLabel"
+        check_style = "OstatsToolbar.TCheckbutton" if USE_SMALL_TOOLBAR_FONT else "TCheckbutton"
+        combo_style = "OstatsToolbar.TCombobox" if USE_SMALL_TOOLBAR_FONT else "TCombobox"
+        spin_style = "OstatsToolbar.TSpinbox" if USE_SMALL_TOOLBAR_FONT else "TSpinbox"
         toolbar = ttk.Frame(self.root)
         toolbar.pack(side=tk.TOP, fill=tk.X, padx=6, pady=4)
-        ttk.Button(toolbar, text="Open", command=self.open_source).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="Save R", command=self.save_source).pack(side=tk.LEFT, padx=(3, 0))
-        ttk.Button(toolbar, text="Save F", command=self.save_fortran).pack(side=tk.LEFT, padx=(3, 0))
+        ttk.Button(toolbar, text="Open", command=self.open_source, style=button_style).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="Save R", command=self.save_source, style=button_style).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(toolbar, text="Save Fortran", command=self.save_fortran, style=button_style).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
-        ttk.Button(toolbar, text="Translate", command=self.update_fortran).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="Run R", command=self.run_r_current).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(toolbar, text="Run F", command=self.run_fortran_current).pack(side=tk.LEFT, padx=(3, 0))
-        ttk.Button(toolbar, text="Both", command=self.run_both).pack(side=tk.LEFT, padx=(3, 0))
-        ttk.Button(toolbar, text="Clear", command=self.clear_all).pack(side=tk.LEFT, padx=(3, 0))
-        ttk.Button(toolbar, text="Clear Out", command=self.clear_output).pack(side=tk.LEFT, padx=(3, 0))
+        ttk.Button(toolbar, text="Translate", command=self.update_fortran, style=button_style).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="Run R", command=self.run_r_current, style=button_style).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(toolbar, text="Run Fortran", command=self.run_fortran_current, style=button_style).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(toolbar, text="Run Both", command=self.run_both, style=button_style).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(toolbar, text="Clear All", command=self.clear_all, style=button_style).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(toolbar, text="Clear Output", command=self.clear_output, style=button_style).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Checkbutton(
             toolbar,
-            text="R out",
+            text="Show R output",
             variable=self.show_r_output,
             command=self.update_output_layout,
+            style=check_style,
         ).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Checkbutton(
             toolbar,
-            text="Hover",
+            text="Helper hover",
             variable=self.show_helper_hover,
             command=self.update_helper_hover_tags,
+            style=check_style,
         ).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(toolbar, text="Help", command=self.show_help).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Label(toolbar, text="compiler").pack(side=tk.LEFT, padx=(8, 3))
+        ttk.Button(toolbar, text="Help", command=self.show_help, style=button_style).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(toolbar, text="Compiler", style=label_style).pack(side=tk.LEFT, padx=(8, 3))
         ttk.Combobox(
             toolbar,
             textvariable=self.compiler_var,
             values=COMPILER_MODES,
             state="readonly",
-            width=12,
+            width=14,
+            style=combo_style,
         ).pack(side=tk.LEFT)
-        ttk.Label(toolbar, text="max time (s)").pack(side=tk.LEFT, padx=(6, 2))
-        ttk.Spinbox(toolbar, from_=0, to=999999, width=5, textvariable=self.timeout_var).pack(side=tk.LEFT)
+        ttk.Label(toolbar, text="Timeout:", style=label_style).pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Spinbox(
+            toolbar,
+            from_=0,
+            to=999999,
+            width=6,
+            textvariable=self.timeout_var,
+            style=spin_style,
+        ).pack(side=tk.LEFT)
 
         pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=(0, 4))
@@ -762,6 +882,12 @@ class OstatsIde:
         r_code_header = ttk.Frame(left)
         r_code_header.pack(fill=tk.X)
         ttk.Label(r_code_header, text="R input").pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            r_code_header,
+            text="Autocomplete",
+            variable=self.autocomplete_r,
+            style=check_style,
+        ).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(r_code_header, text="Top", command=lambda: self.r_text.see("1.0")).pack(side=tk.RIGHT)
         ttk.Button(r_code_header, text="Bottom", command=lambda: self.r_text.see(tk.END)).pack(side=tk.RIGHT, padx=(0, 4))
         self.r_text = make_scrollable_text(left, undo=True)
@@ -770,6 +896,10 @@ class OstatsIde:
         self.r_text.bind("<<Modified>>", self.source_modified)
         self.r_text.bind("<ButtonRelease-1>", self.source_selection_changed)
         self.r_text.bind("<KeyRelease>", self.source_selection_changed)
+        self.r_text.bind("<Return>", self.r_return_event)
+        self.r_text.bind("(", self.r_open_paren_event)
+        self.r_text.bind("<KeyPress-quotedbl>", lambda event: self.r_quote_event(event, '"'))
+        self.r_text.bind("<KeyPress-apostrophe>", lambda event: self.r_quote_event(event, "'"))
 
         fortran_code_header = ttk.Frame(right)
         fortran_code_header.pack(fill=tk.X)
@@ -788,10 +918,27 @@ class OstatsIde:
         self.fortran_text.bind("<Leave>", lambda _event: self.hide_helper_tooltip())
         self.fortran_text.configure(state=tk.DISABLED)
 
+        input_row = ttk.Frame(self.root)
+        input_row.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 4))
+        ttk.Label(input_row, text="ostats>").pack(side=tk.LEFT)
+        self.entry = ttk.Entry(input_row)
+        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 4))
+        self.entry.bind("<Return>", self.submit_line_event)
+        self.entry.bind("<KeyRelease>", self.entry_key_release)
+        self.entry.bind("<Down>", self.dot_suggestion_down)
+        self.entry.bind("<Up>", self.dot_suggestion_up)
+        self.entry.bind("<Tab>", self.dot_suggestion_tab)
+        self.entry.bind("<Escape>", self.hide_dot_suggestions_event)
+        ttk.Button(input_row, text="Enter", command=self.submit_line).pack(side=tk.LEFT)
+        self.dot_suggestion_list = tk.Listbox(self.root, height=5, exportselection=False)
+        self.dot_suggestion_list.bind("<Double-Button-1>", self.dot_suggestion_double_click)
+        self.dot_suggestion_list.bind("<Return>", self.dot_suggestion_return)
+
         self.output_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         self.output_pane.pack(side=tk.BOTTOM, fill=tk.BOTH, padx=6, pady=(0, 6))
         self.r_output_frame = ttk.Frame(self.output_pane)
         self.fortran_output_frame = ttk.Frame(self.output_pane)
+        self.diagnostics_frame = ttk.Frame(self.output_pane)
 
         r_header = ttk.Frame(self.r_output_frame)
         r_header.pack(fill=tk.X)
@@ -815,7 +962,24 @@ class OstatsIde:
         ttk.Label(f_header, text="Fortran Output").pack(side=tk.LEFT)
         ttk.Label(f_header, textvariable=self.elapsed_f_var).pack(side=tk.RIGHT)
         self.fortran_output = make_scrollable_text(self.fortran_output_frame, wrap=tk.WORD, height=8)
+
+        d_header = ttk.Frame(self.diagnostics_frame)
+        d_header.pack(fill=tk.X)
+        ttk.Label(d_header, text="Diagnostics").pack(side=tk.LEFT)
+        ttk.Button(d_header, text="Hide", command=self.hide_diagnostics).pack(side=tk.RIGHT)
+        ttk.Button(d_header, text="Clear", command=self.clear_diagnostics).pack(side=tk.RIGHT, padx=(0, 4))
+        self.diagnostics_text = make_scrollable_text(self.diagnostics_frame, wrap=tk.WORD, height=8)
         self.update_output_layout()
+
+    def configure_toolbar_styles(self) -> None:
+        if not USE_SMALL_TOOLBAR_FONT:
+            return
+        style = ttk.Style(self.root)
+        style.configure("OstatsToolbar.TButton", font=SMALL_TOOLBAR_FONT)
+        style.configure("OstatsToolbar.TLabel", font=SMALL_TOOLBAR_FONT)
+        style.configure("OstatsToolbar.TCheckbutton", font=SMALL_TOOLBAR_FONT)
+        style.configure("OstatsToolbar.TCombobox", font=SMALL_TOOLBAR_FONT)
+        style.configure("OstatsToolbar.TSpinbox", font=SMALL_TOOLBAR_FONT)
 
     def source_modified(self, _event: tk.Event) -> None:
         if not self.r_text.edit_modified():
@@ -823,6 +987,180 @@ class OstatsIde:
         self.r_text.edit_modified(False)
         self.schedule_highlight()
         self.schedule_update()
+
+    def submit_line_event(self, _event: tk.Event) -> str:
+        self.submit_line()
+        return "break"
+
+    def submit_line(self) -> None:
+        if self.dot_suggestions_visible and self.accept_dot_suggestion_if_partial():
+            return
+        line = self.entry.get()
+        if not line.strip():
+            return
+        if line.strip().startswith("."):
+            self.hide_dot_suggestions()
+            self.entry.delete(0, tk.END)
+            self.run_dot_command(line.strip())
+            return
+        self.entry.delete(0, tk.END)
+        self.set_output(self.fortran_output, "Only dot commands are accepted in the ostats> line, for example .vars or .shapes")
+
+    def entry_key_release(self, event: tk.Event) -> None:
+        if event.keysym in {"Up", "Down", "Return", "Escape", "Tab"}:
+            return
+        self.update_dot_suggestions()
+
+    def update_dot_suggestions(self) -> None:
+        text = self.entry.get().strip()
+        if not text.startswith("."):
+            self.hide_dot_suggestions()
+            return
+        matches = [cmd for cmd in DOT_COMMAND_SUGGESTIONS if cmd.startswith(text)]
+        if not matches:
+            self.hide_dot_suggestions()
+            return
+        self.dot_suggestion_list.delete(0, tk.END)
+        for cmd in matches:
+            self.dot_suggestion_list.insert(tk.END, cmd)
+        self.dot_suggestion_list.selection_set(0)
+        self.dot_suggestion_list.activate(0)
+        if not self.dot_suggestions_visible:
+            self.dot_suggestion_list.pack(side=tk.TOP, anchor=tk.W, padx=58, pady=(0, 4))
+            self.dot_suggestions_visible = True
+
+    def hide_dot_suggestions(self) -> None:
+        if self.dot_suggestions_visible:
+            self.dot_suggestion_list.pack_forget()
+            self.dot_suggestions_visible = False
+
+    def hide_dot_suggestions_event(self, _event: tk.Event) -> str:
+        self.hide_dot_suggestions()
+        return "break"
+
+    def selected_dot_suggestion(self) -> str | None:
+        if not self.dot_suggestions_visible:
+            return None
+        selection = self.dot_suggestion_list.curselection()
+        if not selection:
+            return None
+        return str(self.dot_suggestion_list.get(selection[0]))
+
+    def set_entry_to_dot_suggestion(self) -> bool:
+        suggestion = self.selected_dot_suggestion()
+        if suggestion is None:
+            return False
+        self.entry.delete(0, tk.END)
+        self.entry.insert(0, suggestion)
+        self.entry.icursor(tk.END)
+        return True
+
+    def accept_dot_suggestion_if_partial(self) -> bool:
+        suggestion = self.selected_dot_suggestion()
+        if suggestion is None:
+            return False
+        typed = self.entry.get().strip()
+        if typed != suggestion:
+            self.set_entry_to_dot_suggestion()
+            self.hide_dot_suggestions()
+            return True
+        return False
+
+    def dot_suggestion_tab(self, _event: tk.Event) -> str:
+        if self.set_entry_to_dot_suggestion():
+            self.hide_dot_suggestions()
+        return "break"
+
+    def dot_suggestion_return(self, _event: tk.Event) -> str:
+        if self.set_entry_to_dot_suggestion():
+            self.hide_dot_suggestions()
+            self.submit_line()
+        return "break"
+
+    def dot_suggestion_double_click(self, _event: tk.Event) -> None:
+        if self.set_entry_to_dot_suggestion():
+            self.hide_dot_suggestions()
+            self.entry.focus_set()
+
+    def dot_suggestion_down(self, _event: tk.Event) -> str:
+        if not self.dot_suggestions_visible:
+            self.update_dot_suggestions()
+            return "break"
+        size = self.dot_suggestion_list.size()
+        if size <= 0:
+            return "break"
+        selection = self.dot_suggestion_list.curselection()
+        index = selection[0] if selection else 0
+        index = min(index + 1, size - 1)
+        self.dot_suggestion_list.selection_clear(0, tk.END)
+        self.dot_suggestion_list.selection_set(index)
+        self.dot_suggestion_list.activate(index)
+        self.dot_suggestion_list.see(index)
+        return "break"
+
+    def dot_suggestion_up(self, _event: tk.Event) -> str:
+        if not self.dot_suggestions_visible:
+            return "break"
+        selection = self.dot_suggestion_list.curselection()
+        index = selection[0] if selection else 0
+        index = max(index - 1, 0)
+        self.dot_suggestion_list.selection_clear(0, tk.END)
+        self.dot_suggestion_list.selection_set(index)
+        self.dot_suggestion_list.activate(index)
+        self.dot_suggestion_list.see(index)
+        return "break"
+
+    def r_autocomplete_enabled(self) -> bool:
+        return AUTO_COMPLETE_R_DELIMITERS and self.autocomplete_r.get()
+
+    def r_return_event(self, _event: tk.Event) -> str | None:
+        if not self.r_autocomplete_enabled():
+            return None
+        line = self.r_text.get("insert linestart", "insert lineend")
+        if not r_line_opens_brace_block(line):
+            return None
+        if next_nonblank_line(self.r_text).strip().startswith("}"):
+            return None
+        indent = leading_whitespace(line)
+        inner = indent + "    "
+        self.r_text.insert(tk.INSERT, "\n" + inner + "\n" + indent + "}")
+        self.r_text.mark_set(tk.INSERT, "insert - 1 lines lineend")
+        self.r_text.edit_modified(True)
+        self.root.after_idle(self.source_modified, None)
+        return "break"
+
+    def r_open_paren_event(self, _event: tk.Event) -> str | None:
+        if not self.r_autocomplete_enabled():
+            return None
+        if self.r_text.tag_ranges(tk.SEL):
+            return None
+        if r_cursor_in_string_or_comment(self.r_text):
+            return None
+        next_char = self.r_text.get("insert", "insert + 1c")
+        if next_char == ")":
+            return None
+        self.r_text.insert(tk.INSERT, "()")
+        self.r_text.mark_set(tk.INSERT, "insert - 1c")
+        self.r_text.edit_modified(True)
+        self.root.after_idle(self.source_modified, None)
+        return "break"
+
+    def r_quote_event(self, _event: tk.Event, quote: str) -> str | None:
+        if not self.r_autocomplete_enabled():
+            return None
+        if self.r_text.tag_ranges(tk.SEL):
+            return None
+        if r_cursor_in_string_or_comment(self.r_text):
+            return None
+        previous_char = self.r_text.get("insert - 1c", "insert")
+        next_char = self.r_text.get("insert", "insert + 1c")
+        if previous_char == "\\" or next_char == quote:
+            return None
+        self.r_text.insert(tk.INSERT, quote + quote)
+        self.r_text.mark_set(tk.INSERT, "insert - 1c")
+        self.r_text.edit_modified(True)
+        self.root.after_idle(self.source_modified, None)
+        return "break"
 
     def schedule_highlight(self) -> None:
         if self.highlight_job is not None:
@@ -906,6 +1244,7 @@ class OstatsIde:
         )
         self.elapsed_f_var.set(f"{result.elapsed:.3f}s")
         self.set_output(self.fortran_output, self.format_run_output(result))
+        self.refresh_diagnostics_watch()
 
     def profile_lines_current(self) -> None:
         if not self.ensure_fortran():
@@ -940,6 +1279,60 @@ class OstatsIde:
         self.update_output_layout()
         self.run_r_current()
         self.run_fortran_current()
+
+    def run_dot_command(self, command: str, *, replace: bool = False) -> None:
+        mode = self.compiler_var.get()
+        self.diagnostics_visible = True
+        self.update_output_layout()
+        if mode not in {"ofort --fast", "ofort"}:
+            self.append_diagnostics(f"ostats: dot commands require ofort; current compiler is {mode}\n")
+            return
+        if not self.ensure_fortran():
+            self.append_diagnostics(f"ostats: cannot run {command}: no generated Fortran is available\n")
+            return
+
+        with tempfile.TemporaryDirectory(prefix="ostats_diag_") as td:
+            source_path = Path(td) / "ostats_diagnostics.f90"
+            helper_text = DEFAULT_R_HELPER.read_text(encoding="utf-8", errors="replace") if DEFAULT_R_HELPER.exists() else ""
+            source_path.write_text(
+                helper_text + "\n" + fortran_for_repl_diagnostics(self.current_fortran),
+                encoding="utf-8",
+            )
+            cmd = ["ofort", "--nologo", "--repl"]
+            if mode == "ofort --fast":
+                cmd.append("--fast")
+            cmd.extend(["--load-run", str(source_path)])
+            try:
+                run = subprocess.run(
+                    cmd,
+                    input=command + "\n.quit!\n",
+                    cwd=str(self.run_dir()),
+                    text=True,
+                    capture_output=True,
+                    timeout=self.timeout_seconds(),
+                )
+            except FileNotFoundError:
+                self.append_diagnostics("ostats: ofort compiler not found\n")
+                return
+            except subprocess.TimeoutExpired as exc:
+                self.append_diagnostics(f"ostats: dot command timed out after {exc.timeout} seconds\n")
+                return
+
+        text = clean_ofort_repl_diagnostics(run.stdout)
+        if run.stderr:
+            text += run.stderr
+        if not text.strip() and run.returncode != 0:
+            text = f"ofort exited with code {run.returncode}\n"
+        self.last_dot_command = command
+        if replace:
+            self.set_text(self.diagnostics_text, "")
+        self.append_diagnostics(f"ostats> {command}\n")
+        if text:
+            self.append_diagnostics(text if text.endswith("\n") else text + "\n")
+
+    def refresh_diagnostics_watch(self) -> None:
+        if self.diagnostics_visible and self.last_dot_command:
+            self.run_dot_command(self.last_dot_command, replace=True)
 
     def ensure_fortran(self) -> bool:
         if self.current_fortran.strip():
@@ -1048,6 +1441,11 @@ class OstatsIde:
         if text:
             text_widget.insert("1.0", text)
 
+    def append_diagnostics(self, text: str) -> None:
+        self.diagnostics_text.configure(state=tk.NORMAL)
+        self.diagnostics_text.insert(tk.END, text)
+        self.diagnostics_text.see(tk.END)
+
     def set_readonly_text(self, text_widget: tk.Text, text: str) -> None:
         previous = str(text_widget.cget("state"))
         text_widget.configure(state=tk.NORMAL)
@@ -1111,21 +1509,34 @@ class OstatsIde:
         self.elapsed_r_var.set("")
         self.elapsed_f_var.set("")
 
+    def clear_diagnostics(self) -> None:
+        self.set_text(self.diagnostics_text, "")
+        self.last_dot_command = None
+
+    def hide_diagnostics(self) -> None:
+        self.diagnostics_visible = False
+        self.update_output_layout()
+
     def update_output_layout(self) -> None:
         if not hasattr(self, "output_pane"):
             return
         panes = set(self.output_pane.panes())
         r_name = str(self.r_output_frame)
         fortran_name = str(self.fortran_output_frame)
+        diagnostics_name = str(self.diagnostics_frame)
         if r_name in panes:
             self.output_pane.forget(self.r_output_frame)
         if fortran_name in panes:
             self.output_pane.forget(self.fortran_output_frame)
+        if diagnostics_name in panes:
+            self.output_pane.forget(self.diagnostics_frame)
         if self.show_r_output.get():
             self.output_pane.add(self.r_output_frame, weight=1)
             self.output_pane.add(self.fortran_output_frame, weight=1)
         else:
             self.output_pane.add(self.fortran_output_frame, weight=1)
+        if self.diagnostics_visible:
+            self.output_pane.add(self.diagnostics_frame, weight=1)
 
     def clear_all(self) -> None:
         if self.update_job is not None:
@@ -1141,6 +1552,8 @@ class OstatsIde:
         self.r_text.edit_modified(False)
         self.set_fortran_text("")
         self.clear_output()
+        self.clear_diagnostics()
+        self.diagnostics_visible = False
         self.show_r_output.set(True)
         self.update_output_layout()
         self.status_var.set("Ready")
@@ -1153,7 +1566,7 @@ class OstatsIde:
 
     def load_source(self, path: Path) -> None:
         self.source_path = path
-        self.set_text(self.r_text, path.read_text(encoding="utf-8-sig", errors="replace"))
+        self.set_text(self.r_text, read_text_normalized(path))
         self.r_text.edit_modified(False)
         self.root.title(f"ostats IDE - {path}")
         apply_syntax(self.r_text)
