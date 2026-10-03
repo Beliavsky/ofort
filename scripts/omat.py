@@ -95,12 +95,16 @@ BUILTINS = {
     "normcdf",
     "numel",
     "prctile",
+    "poly",
+    "polyfit",
+    "polyval",
     "prod",
     "quantile",
     "randi",
     "repmat",
     "reshape",
     "rms",
+    "roots",
     "round",
     "sqrt",
     "std",
@@ -191,11 +195,8 @@ MATLAB_BUILTINS_NOT_IMPLEMENTED = {
     "interp2",
     "meshgrid",
     "ode45",
-    "polyfit",
-    "polyval",
     "readmatrix",
     "readtable",
-    "roots",
     "sortrows",
     "sparse",
     "string",
@@ -353,6 +354,7 @@ class Translator:
         self.local_function_output_kinds: dict[str, list[str]] = {}
         self.textscan_units: dict[str, str] = {}
         self.textscan_columns: dict[str, dict[int, str]] = {}
+        self.empty_matrix_symbols: set[str] = set()
         self.function_result_name: str | None = None
         self.function_result_names: set[str] = set()
         self.loop_counter = 0
@@ -431,7 +433,7 @@ class Translator:
         low = line.lower()
         if low in {"clear", "clc"}:
             return
-        if low == "end":
+        if low in {"end", "endfor", "endif", "endwhile"}:
             if self.indent <= 0:
                 raise OmatError(f"line {line_no}: END without a block")
             if not self.block_stack:
@@ -529,12 +531,11 @@ class Translator:
 
         if low.startswith("disp(") and line.endswith(")"):
             arg = line[line.find("(") + 1 : -1]
-            if not suppress_output:
-                self.emit_display(arg)
+            self.emit_display(arg)
             return
 
         call = parse_simple_call(line)
-        if call is not None and call[0] == "fprintf":
+        if call is not None and call[0] in {"fprintf", "printf"}:
             self.statements.append(Statement(self.fprintf_statement(call[1], line_no), self.indent))
             return
         if call is not None and call[0] == "fclose" and len(call[1]) == 1:
@@ -614,11 +615,14 @@ class Translator:
                 return
             fopen_call = parse_simple_call(rhs.strip())
             if fopen_call is not None and fopen_call[0].lower() == "fopen":
-                if len(fopen_call[1]) < 2:
-                    raise OmatError(f"line {line_no}: fopen currently requires filename and mode")
-                mode = matlab_string_literal_value(fopen_call[1][1].strip())
-                if mode is None:
-                    raise OmatError(f"line {line_no}: fopen mode must be a literal string")
+                if len(fopen_call[1]) not in {1, 2}:
+                    raise OmatError(f"line {line_no}: fopen currently supports filename and optional mode")
+                mode = "r"
+                if len(fopen_call[1]) == 2:
+                    mode_value = matlab_string_literal_value(fopen_call[1][1].strip())
+                    if mode_value is None:
+                        raise OmatError(f"line {line_no}: fopen mode must be a literal string")
+                    mode = mode_value
                 file_expr = self.expr(fopen_call[1][0])
                 sym = self.bind_symbol(name, "integer", line_no=line_no)
                 if mode.startswith("w"):
@@ -648,6 +652,11 @@ class Translator:
             value = self.expr(rhs)
             sym = self.bind_symbol(name, kind, constant=const_directive, value=value if const_directive else None, line_no=line_no)
             if not const_directive:
+                if rhs.strip() == "[]":
+                    self.empty_matrix_symbols.add(sym.name.lower())
+                else:
+                    self.empty_matrix_symbols.discard(sym.name.lower())
+            if not const_directive:
                 self.statements.append(Statement(f"{sym.name} = {value}", self.indent))
             if not suppress_output:
                 self.statements.append(Statement(self.display_statement(sym.name, kind), self.indent))
@@ -667,6 +676,37 @@ class Translator:
                 arg = self.expr(call[1][0])
                 self.statements.append(Statement(f"{left_sym.name} = eigvecs_omat({arg})", self.indent))
                 self.statements.append(Statement(f"{right_sym.name} = diag_vec_omat(eigvals_omat({arg}))", self.indent))
+                return
+            if call is not None and call[0] == "polyfit" and len(call[1]) == 3 and len(left_names) in {2, 3}:
+                p_sym = self.bind_symbol(left_names[0], "real_vector", line_no=line_no)
+                s_sym = self.bind_symbol(left_names[1], "real_vector", line_no=line_no)
+                actuals = [self.real_helper_expr(call[1][0]), self.real_helper_expr(call[1][1]), self.integer_arg(call[1][2])]
+                if len(left_names) == 2:
+                    self.statements.append(
+                        Statement(
+                            f"call polyfit2_omat({', '.join(actuals)}, {p_sym.name}, {s_sym.name})",
+                            self.indent,
+                        )
+                    )
+                    return
+                mu_sym = self.bind_symbol(left_names[2], "real_vector", line_no=line_no)
+                self.statements.append(
+                    Statement(
+                        f"call polyfit3_omat({', '.join(actuals)}, {p_sym.name}, {s_sym.name}, {mu_sym.name})",
+                        self.indent,
+                    )
+                )
+                return
+            if call is not None and call[0] == "polyval" and len(call[1]) == 3 and len(left_names) == 2:
+                y_sym = self.bind_symbol(left_names[0], "real_vector", line_no=line_no)
+                dy_sym = self.bind_symbol(left_names[1], "real_vector", line_no=line_no)
+                actuals = [self.real_helper_expr(call[1][0]), self.real_helper_expr(call[1][1]), self.expr(call[1][2])]
+                self.statements.append(
+                    Statement(
+                        f"call polyval2_omat({', '.join(actuals)}, {y_sym.name}, {dy_sym.name})",
+                        self.indent,
+                    )
+                )
                 return
             if call is not None and self.ensure_local_function(call[0]):
                 func = self.local_functions[call[0]]
@@ -738,6 +778,12 @@ class Translator:
 
     def emit_display(self, value: str) -> None:
         stripped = value.strip()
+        literal = matlab_string_literal_value(stripped)
+        if literal is not None:
+            self.statements.append(
+                Statement(f"write(*,'(a)') {fortran_string_literal(literal)}", self.indent)
+            )
+            return
         kind = self.infer_kind(stripped)
         self.statements.append(Statement(self.display_statement(self.expr(stripped), kind), self.indent))
 
@@ -748,18 +794,21 @@ class Translator:
         fmt_index = 0
         if len(args) >= 2 and matlab_string_literal_value(args[0]) is None:
             unit_expr = self.expr(args[0])
+            if unit_expr == "1":
+                unit_expr = "*"
             fmt_index = 1
         fmt = matlab_string_literal_value(args[fmt_index])
         if fmt is None:
             raise OmatError(f"line {line_no}: fprintf currently requires a literal format string")
+        fmt = decode_matlab_format_escapes(fmt)
         descriptors, format_args, n_conversions, newline = matlab_fprintf_format(fmt)
         actual_args = args[fmt_index + 1 :]
         actuals = [self.expr(arg) for arg in actual_args]
-        if len(actuals) > n_conversions:
+        if len(actuals) > n_conversions and not self.format_actuals_can_expand(actual_args, n_conversions):
             raise OmatError(
                 f"line {line_no}: fprintf format expects {n_conversions} argument"
                 f"{'' if n_conversions == 1 else 's'}, got {len(actuals)}"
-        )
+            )
         write_args = []
         write_descriptors = []
         actual_index = 0
@@ -793,6 +842,8 @@ class Translator:
                 expanded = self.expand_format_actual(raw_actual, actual, consume)
                 actual = expanded[0]
                 expansion_queue.extend(expanded[1:])
+                if len(expanded) > 1:
+                    raw_actual = actual
                 actual_index += 1
             actual, descriptor = self.format_actual_for_descriptor(actual, descriptor, raw_actual)
             write_descriptors.append(descriptor)
@@ -811,6 +862,10 @@ class Translator:
         return any(self.format_actual_can_expand(arg) for arg in actual_args)
 
     def format_actual_can_expand(self, arg: str) -> bool:
+        indexed = parse_index_expr(arg.strip())
+        if indexed is not None:
+            _name, args = indexed
+            return any(index_selects_many(item) for item in args)
         kind = self.infer_kind(arg)
         return kind.endswith("_vector") or kind.endswith("_matrix")
 
@@ -825,17 +880,18 @@ class Translator:
         if indexed is not None:
             name, args = indexed
             sym = self.symbols.get(name.lower())
-            if sym is not None and sym.kind.endswith("_vector") and len(args) == 1:
+            if len(args) == 1:
                 parts = split_top_level_colon(args[0])
                 if len(parts) in {2, 3}:
                     start = self.expr(parts[0]) if parts[0].strip() else "1"
                     step = self.expr(parts[1]) if len(parts) == 3 else "1"
-                    return [f"{sym.name}({start} + {i}*({step}))" for i in range(count)]
+                    target = sym.name if sym is not None else name
+                    return [f"{target}({start} + {i}*({step}))" for i in range(count)]
         return [actual] + [f"{actual}({i})" for i in range(2, count + 1)]
 
     def format_actual_for_descriptor(self, actual: str, descriptor: str, raw_actual: str) -> tuple[str, str]:
         actual_kind = self.infer_kind(raw_actual)
-        expandable = actual_kind.endswith("_vector") or actual_kind.endswith("_matrix")
+        expandable = actual_kind.endswith("_vector") or actual_kind.endswith("_matrix") or self.format_actual_can_expand(raw_actual)
         if descriptor.startswith("__fixed_"):
             width, precision = descriptor.removeprefix("__fixed_").split("_", 1)
             if not expandable:
@@ -862,6 +918,7 @@ class Translator:
         fmt = matlab_string_literal_value(args[0])
         if fmt is None:
             raise OmatError(f"line {line_no}: sprintf currently requires a literal format string")
+        fmt = decode_matlab_format_escapes(fmt)
         descriptors, format_args, n_conversions, _newline = matlab_fprintf_format(fmt)
         actuals = [self.expr(arg) for arg in args[1:]]
         if len(actuals) != n_conversions:
@@ -903,6 +960,8 @@ class Translator:
     def display_statement(self, expr: str, kind: str) -> str:
         if kind == "real_matrix":
             return f"call print_real_matrix_omat({expr})"
+        if kind == "complex_vector":
+            return f"call print_complex_vector_omat({expr})"
         if kind == "real_vector":
             return f'print "(*(f0.8,:,1x))", {expr}'
         if kind == "integer_vector":
@@ -923,6 +982,13 @@ class Translator:
 
     def infer_kind(self, rhs: str) -> str:
         low = rhs.strip().lower()
+        if low == "[]":
+            return "real_matrix"
+        transpose_inner = parenthesized_postfix_transpose_inner(rhs)
+        if transpose_inner is not None:
+            return self.infer_kind(transpose_inner)
+        if contains_colon_outside_strings(rhs):
+            return "real_vector"
         if is_flatten_expr(low):
             return "real_vector"
         indexed = self.indexed_expr_kind(low)
@@ -943,6 +1009,15 @@ class Translator:
                 return "integer"
             if name in {"any", "all"}:
                 return "logical"
+            if name in {"min", "max"} and len(args) >= 2:
+                if len(args) == 3 and args[1].strip() == "[]" and args[2].strip() in {"1", "2"}:
+                    return "real_vector"
+                kinds = [self.argument_kind(arg.strip()) for arg in args]
+                if any(kind.endswith("_matrix") for kind in kinds):
+                    return "real_matrix"
+                if any(kind.endswith("_vector") for kind in kinds):
+                    return "real_vector"
+                return "real"
             if name == "exist":
                 return "logical"
             if name == "now":
@@ -963,8 +1038,25 @@ class Translator:
                 return "logical_vector"
             if name in {"isnan", "isfinite", "isinf"}:
                 return "logical_vector"
-            if name in {"diff", "sort"}:
+            if name == "sort" and args:
+                arg_kind = self.argument_kind(args[0].strip())
+                return "complex_vector" if arg_kind == "complex_vector" else "real_vector"
+            if name == "diff":
                 return "real_vector"
+            if name == "roots":
+                return "complex_vector"
+            if name == "poly":
+                return "real_vector"
+            if name == "polyfit":
+                return "real_vector"
+            if name == "polyval" and len(args) >= 2:
+                value_kind = self.argument_kind(args[1].strip())
+                if value_kind == "complex_vector":
+                    return "complex_vector"
+                return "real_vector" if value_kind.endswith("_vector") else "real"
+            if name == "abs" and args:
+                arg_kind = self.argument_kind(args[0].strip())
+                return "real_vector" if arg_kind.endswith("_vector") else "real"
             if name == "randi":
                 if len(args) == 1:
                     return "integer"
@@ -1027,6 +1119,8 @@ class Translator:
             if name == "eye":
                 return "real_matrix"
             if name in {"zeros", "ones", "rand"}:
+                if name == "rand" and len(args) == 0:
+                    return "real"
                 if len(args) <= 1:
                     return "real_vector"
                 if len(args) == 2 and args[1].strip() == "1":
@@ -1067,6 +1161,8 @@ class Translator:
                     return "real"
                 if n_size_args == 1:
                     return "real_vector"
+                if n_size_args == 2 and (args[-2].strip() == "1" or args[-1].strip() == "1"):
+                    return "real_vector"
                 return "real_matrix"
             if name in LA_SCALAR_FUNCTIONS:
                 return "real"
@@ -1081,12 +1177,17 @@ class Translator:
                 return "real_vector"
         if split_top_level_backslash(rhs) is not None:
             return "real_vector"
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.(normr|df)", low):
+            return "real"
         if matlab_string_literal_value(rhs) is not None:
             return "string"
         if self.horizontal_matrix_concat_items(rhs) is not None:
             return "real_matrix"
         if contains_vector_randi_call(rhs):
             return "real_vector"
+        constructor_kind = contained_array_constructor_kind(rhs)
+        if constructor_kind is not None:
+            return constructor_kind
         if is_matrix_expr(low):
             return "real_matrix"
         if is_vector_expr(low):
@@ -1141,6 +1242,7 @@ class Translator:
 
     def expression_container_kind(self, rhs: str) -> str | None:
         saw_vector = False
+        saw_complex_vector = False
         for name in IDENT_RE.findall(rhs):
             if identifier_only_occurs_as_argument_to_scalar_function(rhs, name):
                 continue
@@ -1149,8 +1251,12 @@ class Translator:
                 continue
             if sym.kind == "real_matrix":
                 return "real_matrix"
-            if sym.kind in {"real_vector", "integer_vector", "logical_vector"} or is_typed_integer_vector_kind(sym.kind):
+            if sym.kind == "complex_vector":
+                saw_complex_vector = True
+            elif sym.kind in {"real_vector", "integer_vector", "logical_vector"} or is_typed_integer_vector_kind(sym.kind):
                 saw_vector = True
+        if saw_complex_vector:
+            return "complex_vector"
         return "real_vector" if saw_vector else None
 
     def register_local_function_call(self, name: str, args: list[str]) -> str:
@@ -1205,6 +1311,11 @@ class Translator:
             if len(args) != 1:
                 return None
             if self.is_logical_selector(args[0]):
+                return sym.kind
+            selector = self.symbols.get(args[0].strip().lower())
+            if selector is not None and (
+                selector.kind in {"integer_vector", "logical_vector"} or is_typed_integer_vector_kind(selector.kind)
+            ):
                 return sym.kind
             if sym.kind == "string_vector":
                 return sym.kind if index_selects_many(args[0]) else "string"
@@ -1264,14 +1375,20 @@ class Translator:
 
     def expr(self, text: str) -> str:
         out = text.strip()
+        if out == "[]":
+            return "zeros_omat2(0, 0)"
         self.reject_unimplemented_matlab_functions(out)
+        out = self.convert_polyfit_field_access(out)
         out = self.convert_matlab_reshape(out)
         out = self.convert_colon_flatten(out)
         out = self.convert_logical_indexing(out)
         out = self.convert_cell_indexing(out)
+        out = self.convert_parenthesized_postfix_transpose(out)
         out = self.convert_end_indices(out)
         out = self.convert_index_triplets(out)
+        out = self.convert_parenthesized_colon_vectors(out)
         out = self.convert_colon_vector(out)
+        out = self.convert_matrix_concat(out)
         out = self.convert_vertical_vector_concat(out)
         out = self.convert_horizontal_matrix_concat(out)
         out = self.convert_integer_constructors(out)
@@ -1286,6 +1403,8 @@ class Translator:
         out = self.convert_la_functions(out)
         out = self.convert_random_dist_functions(out)
         out = self.convert_stats_functions(out)
+        out = self.convert_polynomial_functions(out)
+        out = self.convert_postfix_transpose(out)
         out = self.convert_exist_function(out)
         out = self.convert_datetime_functions(out)
         out = self.convert_normcdf(out)
@@ -1300,6 +1419,20 @@ class Translator:
         out = convert_numbers(out)
         out = self.apply_symbol_aliases(out)
         return out
+
+    def convert_polyfit_field_access(self, text: str) -> str:
+        def repl(match: re.Match[str]) -> str:
+            name = match.group(1)
+            field = match.group(2).lower()
+            sym = self.symbols.get(name.lower())
+            target = sym.name if sym is not None else name
+            if field == "normr":
+                return f"{target}(1)"
+            if field == "df":
+                return f"{target}(2)"
+            return match.group(0)
+
+        return re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(normr|df)\b", repl, text, flags=re.IGNORECASE)
 
     def apply_symbol_aliases(self, text: str) -> str:
         if not self.symbols:
@@ -1356,7 +1489,7 @@ class Translator:
                     return vector_literal
                 return f"int({self.expr(arg)}, {name})"
 
-            out = re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, out, flags=re.IGNORECASE)
+            out = replace_named_calls(out, name, repl)
         return out
 
     def convert_logical_indexing(self, text: str) -> str:
@@ -1384,6 +1517,60 @@ class Translator:
             return match.group(0)
 
         return re.sub(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\{\s*([^{}]+)\s*\}", repl, text)
+
+    def convert_parenthesized_postfix_transpose(self, text: str) -> str:
+        stripped = text.strip()
+        inner = parenthesized_postfix_transpose_inner(stripped)
+        if inner is None:
+            return text
+        kind = self.argument_kind(inner)
+        if kind == "real_matrix":
+            return f"transpose_mat_omat({self.expr(inner)})"
+        return self.expr(inner)
+
+    def convert_parenthesized_colon_vectors(self, text: str) -> str:
+        replacements: list[tuple[int, int, str]] = []
+        stack: list[int] = []
+        in_single = False
+        in_double = False
+        for i, ch in enumerate(text):
+            if ch == "'" and not in_double:
+                in_single = not in_single
+            elif ch == '"' and not in_single:
+                in_double = not in_double
+            elif not in_single and not in_double:
+                if ch == "(":
+                    stack.append(i)
+                elif ch == ")" and stack:
+                    start = stack.pop()
+                    prev = start - 1
+                    while prev >= 0 and text[prev].isspace():
+                        prev -= 1
+                    if prev >= 0 and (text[prev].isalnum() or text[prev] == "_"):
+                        continue
+                    inner = text[start + 1 : i].strip()
+                    if len(split_args(inner)) > 1:
+                        continue
+                    parts = split_top_level_colon(inner)
+                    if len(parts) == 2:
+                        repl = (
+                            f"colon2_omat(real({self.expr(parts[0])}, real64), "
+                            f"real({self.expr(parts[1])}, real64))"
+                        )
+                        replacements.append((start, i + 1, repl))
+                    elif len(parts) == 3:
+                        repl = (
+                            f"colon3_omat(real({self.expr(parts[0])}, real64), "
+                            f"real({self.expr(parts[1])}, real64), "
+                            f"real({self.expr(parts[2])}, real64))"
+                        )
+                        replacements.append((start, i + 1, repl))
+        if not replacements:
+            return text
+        out = text
+        for start, end, repl in reversed(replacements):
+            out = out[:start] + repl + out[end:]
+        return out
 
     def is_logical_selector(self, text: str) -> bool:
         stripped = text.strip()
@@ -1517,6 +1704,53 @@ class Translator:
             names.append(row)
         return f"vcat_vecs_omat({', '.join(names)})"
 
+    def convert_matrix_concat(self, text: str) -> str:
+        stripped = text.strip()
+        if not (stripped.startswith("[") and stripped.endswith("]") and ";" in stripped):
+            return text
+        rows = split_top_level_semicolon(stripped[1:-1].strip())
+        if len(rows) < 2:
+            return text
+        row_exprs: list[str] = []
+        saw_matrix_row = False
+        for row in rows:
+            row_expr = self.matrix_row_concat_expr(row.strip())
+            if row_expr is None:
+                return text
+            row_exprs.append(row_expr)
+            if self.row_is_matrix_concat(row.strip()):
+                saw_matrix_row = True
+        if not saw_matrix_row:
+            return text
+        out = row_exprs[0]
+        for expr in row_exprs[1:]:
+            if is_empty_matrix_expr(out):
+                out = expr
+            else:
+                out = f"vcat_mats_omat({out}, {expr})"
+        return out
+
+    def matrix_row_concat_expr(self, row: str) -> str | None:
+        items = split_matlab_literal_row(row)
+        if len(items) <= 1:
+            return self.matrix_concat_expr(row)
+        exprs = [self.matrix_concat_expr(item) for item in items]
+        if any(expr is None for expr in exprs):
+            return None
+        out = exprs[0]
+        for expr in exprs[1:]:
+            out = f"hcat_mats_omat({out}, {expr})"
+        return out
+
+    def row_is_matrix_concat(self, row: str) -> bool:
+        items = split_matlab_literal_row(row)
+        if len(items) > 1:
+            return (
+                all(self.matrix_concat_expr(item) is not None for item in items)
+                and any(self.argument_kind(item) in {"real_vector", "real_matrix"} for item in items)
+            )
+        return self.argument_kind(row) == "real_matrix"
+
     def horizontal_matrix_concat_items(self, text: str) -> list[str] | None:
         stripped = text.strip()
         if not (stripped.startswith("[") and stripped.endswith("]") and ";" not in stripped):
@@ -1530,7 +1764,9 @@ class Translator:
                 return None
             if self.argument_kind(item) == "real_matrix" or self.ones_zeros_size_matrix_expr(item) is not None:
                 saw_matrix = True
-        return items if saw_matrix else None
+        if not saw_matrix:
+            return None
+        return items
 
     def convert_horizontal_matrix_concat(self, text: str) -> str:
         items = self.horizontal_matrix_concat_items(text)
@@ -1548,10 +1784,15 @@ class Translator:
             return special
         kind = self.argument_kind(text)
         if kind == "real_matrix":
+            sym = self.symbols.get(text.strip().lower())
+            if sym is not None and sym.name.lower() in self.empty_matrix_symbols:
+                return "zeros_omat2(0, 0)"
             return self.expr(text)
         if kind == "real_vector":
             expr = self.expr(text)
-            return f"reshape_mat_from_vec_omat({expr}, size({expr}), 1)"
+            return f"reshape_mat_from_vec_omat({expr}, ubound({expr}, 1), 1)"
+        if kind in {"real", "integer"} or is_typed_integer_kind(kind):
+            return f"reshape([real({self.expr(text)}, real64)], [1, 1])"
         return None
 
     def ones_zeros_size_matrix_expr(self, text: str) -> str | None:
@@ -1681,7 +1922,7 @@ class Translator:
                 raise OmatError(f"{name} currently requires a matrix argument")
             return f"flip_vec_omat({expr})"
 
-        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+        return replace_named_calls(text, name, repl)
 
     def convert_transpose_function(self, text: str) -> str:
         def repl(match: re.Match[str]) -> str:
@@ -1707,6 +1948,8 @@ class Translator:
         expr = self.expr(arg)
         sym = self.symbols.get(arg.strip().lower())
         if sym is not None:
+            if sym.kind == "complex_vector":
+                return expr
             if sym.kind == "integer_vector":
                 return f"real({expr}, real64)"
             return expr
@@ -1784,9 +2027,11 @@ class Translator:
             args = split_args(match.group(1))
             if len(args) != 1:
                 raise OmatError(f"{name} currently supports one argument")
+            if name == "sort" and self.argument_kind(args[0].strip()) == "complex_vector":
+                return f"sort_complex_vec_omat({self.expr(args[0])})"
             return f"{helper}({self.expr(args[0])})"
 
-        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+        return replace_named_calls(text, name, repl)
 
     def convert_two_arg_vector_function(self, text: str, name: str, helper: str) -> str:
         def repl(match: re.Match[str]) -> str:
@@ -1795,7 +2040,7 @@ class Translator:
                 raise OmatError(f"{name} currently supports two vector arguments")
             return f"{helper}({self.expr(args[0])}, {self.expr(args[1])})"
 
-        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+        return replace_named_calls(text, name, repl)
 
     def convert_find_function(self, text: str) -> str:
         def repl(match: re.Match[str]) -> str:
@@ -1815,6 +2060,9 @@ class Translator:
                 return f"exist_file_omat({self.expr(args[0])})"
             if len(args) == 2 and matlab_string_literal_value(args[1].strip()) == "file":
                 return f"exist_file_omat({self.expr(args[0])})"
+            if len(args) == 2 and matlab_string_literal_value(args[1].strip()) == "builtin":
+                name = matlab_string_literal_value(args[0].strip())
+                return ".true." if name == "OCTAVE_VERSION" else ".false."
             raise OmatError("exist currently supports exist(name,'file')")
 
         return re.sub(r"\bexist\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
@@ -1843,12 +2091,26 @@ class Translator:
     def reject_unimplemented_matlab_functions(self, text: str) -> None:
         for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
             name = match.group(1).lower()
+            if name in self.symbols:
+                continue
             if name in MATLAB_BUILTINS_NOT_IMPLEMENTED:
                 raise OmatError(f"MATLAB built-in '{name}' is not implemented yet")
 
     def convert_power(self, text: str) -> str:
         if "^" not in text:
             return text
+        matrix_power = split_top_level_power(text)
+        if matrix_power is not None:
+            lhs, rhs = matrix_power
+            lhs_kind = self.argument_kind(lhs)
+            if lhs_kind == "real_matrix":
+                if not is_integer_expr(rhs, self.symbols):
+                    raise OmatError("matrix power currently requires an integer exponent")
+                if re.fullmatch(r"\s*-\s*\d+\s*", rhs):
+                    raise OmatError("negative matrix powers are not implemented yet")
+                return f"matpow_int_omat({self.expr(lhs)}, {self.integer_arg(rhs)})"
+            if lhs_kind.endswith("_vector"):
+                raise OmatError("^ is matrix power in MATLAB/Octave; use .^ for elementwise power")
         for match in re.finditer(r"([A-Za-z_][A-Za-z0-9_]*|\]|\))\s*\^", text):
             lhs = match.group(1)
             if lhs == "]":
@@ -1913,10 +2175,15 @@ class Translator:
                     f"real({convert_numbers(convert_elementwise(arg.strip()))}, real64)"
                     for arg in args[:nparam]
                 ]
-                sizes = [self.integer_arg(arg) for arg in args[nparam:]]
+                raw_sizes = args[nparam:]
+                if len(raw_sizes) == 2 and raw_sizes[0].strip() == "1":
+                    raw_sizes = [raw_sizes[1]]
+                elif len(raw_sizes) == 2 and raw_sizes[1].strip() == "1":
+                    raw_sizes = [raw_sizes[0]]
+                sizes = [self.random_size_arg(arg) for arg in raw_sizes]
                 return f"{name}({', '.join(params + sizes)})"
 
-            out = re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, out, flags=re.IGNORECASE)
+            out = replace_named_calls(out, name, repl)
         for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", out):
             name = match.group(1).lower()
             if name in RANDOM_DIST_PARAM_COUNTS:
@@ -1925,6 +2192,27 @@ class Translator:
                 if not any(specific.startswith(f"{name}_") for specific in self.random_specific_names):
                     self.random_specific_names.update(random_specific_names_for_family(name))
         return out
+
+    def random_size_arg(self, text: str) -> str:
+        stripped = text.strip()
+        shape_args = shape_literal_args(stripped)
+        if shape_args is not None:
+            if len(shape_args) == 2 and shape_args[0].strip() == "1":
+                return self.scalar_size_arg(shape_args[1])
+            if len(shape_args) == 2 and shape_args[1].strip() == "1":
+                return self.scalar_size_arg(shape_args[0])
+            raise OmatError("random vector size currently requires a scalar size or shape [1,n]/[n,1]")
+        return self.scalar_size_arg(text)
+
+    def scalar_size_arg(self, text: str) -> str:
+        stripped = text.strip()
+        size_call = parse_simple_call(stripped.lower())
+        if size_call is not None and size_call[0] == "size" and len(size_call[1]) == 1:
+            target = size_call[1][0].strip()
+            sym = self.symbols.get(target.lower())
+            if sym is not None and sym.kind.endswith("_vector"):
+                return f"size({sym.name})"
+        return self.integer_arg(text)
 
     def convert_function_names(self, text: str) -> str:
         out = text
@@ -1935,16 +2223,6 @@ class Translator:
         return out
 
     def convert_reduction(self, text: str, name: str, helper_base: str) -> str:
-        array_kinds = {
-            "integer_vector",
-            "real_vector",
-            "logical_vector",
-            "string_vector",
-            "integer_matrix",
-            "real_matrix",
-            "logical_matrix",
-        }
-
         def repl(match: re.Match[str]) -> str:
             args = split_args(match.group(1))
             if not args:
@@ -1961,10 +2239,6 @@ class Translator:
                         return f"max_vec_omat({self.expr(arg)})"
                     return match.group(0)
                 if name in {"min", "max"}:
-                    for raw_arg in args:
-                        raw_sym = self.symbols.get(raw_arg.strip().lower())
-                        if raw_sym is not None and raw_sym.kind in array_kinds:
-                            raise OmatError(f"{name} currently supports one argument for vectors")
                     return f"{name}({', '.join(self.expr(raw_arg.strip()) for raw_arg in args)})"
                 raise OmatError(f"{name} currently supports one argument for vectors")
             farg = self.expr(arg)
@@ -1992,7 +2266,7 @@ class Translator:
                 f" {name}(A,2) for sum/prod, and {name}(A,[],dim) for min/max"
             )
 
-        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+        return replace_named_calls(text, name, repl)
 
     def convert_stats_functions(self, text: str) -> str:
         out = text
@@ -2006,6 +2280,58 @@ class Translator:
         out = self.convert_binary_vector_function(out, "trapz", "trapz_omat")
         out = self.convert_matrix_stats_function(out, "cov", "cov_omat")
         out = self.convert_matrix_stats_function(out, "corrcoef", "corrcoef_omat")
+        return out
+
+    def convert_polynomial_functions(self, text: str) -> str:
+        out = text
+        for name in ["roots", "poly"]:
+            def repl(match: re.Match[str], name: str = name) -> str:
+                args = split_args(match.group(1))
+                if len(args) != 1:
+                    raise OmatError(f"{name} currently supports one vector argument")
+                return f"{name}_omat({self.real_helper_expr(args[0])})"
+
+            out = replace_named_calls(out, name, repl)
+
+        def polyfit_repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) != 3:
+                raise OmatError("polyfit currently supports polyfit(x,y,n)")
+            return (
+                f"polyfit_omat({self.real_helper_expr(args[0])}, "
+                f"{self.real_helper_expr(args[1])}, {self.integer_arg(args[2])})"
+            )
+
+        out = replace_named_calls(out, "polyfit", polyfit_repl)
+
+        def polyval_repl(match: re.Match[str]) -> str:
+            args = split_args(match.group(1))
+            if len(args) not in {2, 3, 4}:
+                raise OmatError("polyval currently supports polyval(c,x), polyval(c,x,s), and polyval(c,x,s,mu)")
+            x_kind = self.argument_kind(args[1].strip())
+            if len(args) == 4:
+                if x_kind.endswith("_vector"):
+                    return (
+                        f"polyval_mu_vec_omat({self.real_helper_expr(args[0])}, "
+                        f"{self.real_helper_expr(args[1])}, {self.expr(args[3])})"
+                    )
+                return (
+                    f"polyval_scalar_omat({self.real_helper_expr(args[0])}, "
+                    f"(({self.real_helper_expr(args[1])}) - ({self.expr(args[3])})(1)) / ({self.expr(args[3])})(2))"
+                )
+            if x_kind == "complex_vector":
+                helper = "polyval_complex_vec_omat"
+            else:
+                helper = "polyval_vec_omat" if x_kind.endswith("_vector") else "polyval_scalar_omat"
+            return f"{helper}({self.real_helper_expr(args[0])}, {self.real_helper_expr(args[1])})"
+
+        return replace_named_calls(out, "polyval", polyval_repl)
+
+    def convert_postfix_transpose(self, text: str) -> str:
+        out = re.sub(r"(\b[A-Za-z_][A-Za-z0-9_]*_vec_omat\s*\([^()]*\))\s*\.'", r"\1", text)
+        for sym in self.symbols.values():
+            if sym.kind.endswith("_vector"):
+                out = re.sub(rf"\b{re.escape(sym.name)}\s*\.'", sym.name, out)
         return out
 
     def convert_normcdf(self, text: str) -> str:
@@ -2059,7 +2385,7 @@ class Translator:
             helper = f"{name}_{suffix}_omat"
             return f"{helper}({self.expr(arg)})"
 
-        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+        return replace_named_calls(text, name, repl)
 
     def convert_quantile_function(self, text: str, name: str, helper_base: str) -> str:
         def repl(match: re.Match[str]) -> str:
@@ -2071,7 +2397,7 @@ class Translator:
             suffix = "mat" if sym is not None and sym.kind == "real_matrix" else "vec"
             return f"{helper_base}_{suffix}_omat({self.expr(arg)}, real({self.expr(args[1])}, real64))"
 
-        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+        return replace_named_calls(text, name, repl)
 
     def convert_movmean_function(self, text: str) -> str:
         def repl(match: re.Match[str]) -> str:
@@ -2103,7 +2429,7 @@ class Translator:
                 raise OmatError(f"{name} currently supports two vector arguments")
             return f"{helper}({self.expr(args[0])}, {self.expr(args[1])})"
 
-        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+        return replace_named_calls(text, name, repl)
 
     def convert_matrix_stats_function(self, text: str, name: str, helper: str) -> str:
         def repl(match: re.Match[str]) -> str:
@@ -2112,7 +2438,7 @@ class Translator:
                 raise OmatError(f"{name} currently supports one matrix argument")
             return f"{helper}({self.expr(args[0])})"
 
-        return re.sub(rf"\b{name}\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
+        return replace_named_calls(text, name, repl)
 
     def convert_matlab_reshape(self, text: str) -> str:
         def repl(match: re.Match[str]) -> str:
@@ -2190,13 +2516,15 @@ class Translator:
     def convert_rand(self, text: str) -> str:
         def repl(match: re.Match[str]) -> str:
             args = split_args(match.group(1))
+            if len(args) == 0:
+                return "rand_scalar_omat()"
             if len(args) == 1:
                 return f"rand_omat({self.integer_arg(args[0])})"
             if len(args) == 2:
                 if args[1].strip() == "1":
                     return f"rand_omat({self.integer_arg(args[0])})"
                 return f"rand_omat2({self.integer_arg(args[0])}, {self.integer_arg(args[1])})"
-            raise OmatError("rand currently supports rand(n), rand(n,1), and rand(m,n)")
+            raise OmatError("rand currently supports rand(), rand(n), rand(n,1), and rand(m,n)")
 
         return re.sub(r"\brand\s*\(([^()]*)\)", repl, text, flags=re.IGNORECASE)
 
@@ -2418,6 +2746,8 @@ class Translator:
                 )
             elif sym.kind == "logical_vector":
                 lines.append(f"logical, allocatable :: {sym.name}(:)")
+            elif sym.kind == "complex_vector":
+                lines.append(f"complex(real64), allocatable :: {sym.name}(:)")
             elif sym.kind == "logical_matrix":
                 lines.append(f"logical, allocatable :: {sym.name}(:,:)")
             elif sym.kind == "real_vector":
@@ -2434,7 +2764,7 @@ class Translator:
         return wrap_fortran_source(self.apply_real64_alias(lines, kind_alias)) + "\n"
 
     def main_needs_kind_alias(self, body_lines: list[str]) -> bool:
-        if any(sym.kind in {"real", "real_vector", "real_matrix"} for sym in self.declared_symbols.values()):
+        if any(sym.kind in {"real", "real_vector", "real_matrix", "complex_vector"} for sym in self.declared_symbols.values()):
             return True
         return any("real64" in line for line in body_lines)
 
@@ -2596,6 +2926,10 @@ def matlab_string_literal_value(text: str) -> str | None:
     return bytes(body, "utf-8").decode("unicode_escape")
 
 
+def decode_matlab_format_escapes(text: str) -> str:
+    return bytes(text, "utf-8").decode("unicode_escape")
+
+
 def fortran_string_literal(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
@@ -2693,7 +3027,7 @@ def matlab_fprintf_format(fmt: str) -> tuple[list[str], list[str | None], int, b
             i += 2
             continue
         flush_literal()
-        match = re.match(r"%([-+0 #]*)(\d*)(?:\.(\d+))?([fFeEgGdiIs])", fmt[i:])
+        match = re.match(r"%([-+0 #]*)(\d*)(?:\.(\d+))?([fFeEgGdiIsc])", fmt[i:])
         if match is None:
             raise OmatError(f"unsupported fprintf format near '{fmt[i:]}'")
         width = match.group(2) or "0"
@@ -2707,7 +3041,7 @@ def matlab_fprintf_format(fmt: str) -> tuple[list[str], list[str | None], int, b
             descriptors.append(f"g{width}.{precision or '6'}")
         elif code in {"d", "i"}:
             descriptors.append(f"i{width}")
-        elif code == "s":
+        elif code in {"s", "c"}:
             descriptors.append("a")
         format_args.append(None)
         conversions += 1
@@ -2855,6 +3189,8 @@ def fortran_decl(kind: str, name: str, *, intent: str | None = None) -> str:
         return f"integer({typed_integer_env_kind(kind)}){attr} :: {name}(:)"
     if kind == "logical_vector":
         return f"logical{attr} :: {name}(:)"
+    if kind == "complex_vector":
+        return f"complex(real64){attr} :: {name}(:)"
     if kind == "logical_matrix":
         return f"logical{attr} :: {name}(:,:)"
     if kind == "real_vector":
@@ -2869,7 +3205,12 @@ def fortran_result_decl(kind: str, name: str) -> str:
         if is_typed_integer_vector_kind(kind):
             base = f"integer({typed_integer_env_kind(kind)})"
         else:
-            base = "integer" if kind == "integer_vector" else "logical" if kind == "logical_vector" else "real(real64)"
+            base = (
+                "integer" if kind == "integer_vector"
+                else "logical" if kind == "logical_vector"
+                else "complex(real64)" if kind == "complex_vector"
+                else "real(real64)"
+            )
         return f"{base}, allocatable :: {name}(:)"
     if kind.endswith("_matrix"):
         base = "logical" if kind == "logical_matrix" else "real(real64)"
@@ -2882,7 +3223,12 @@ def fortran_output_arg_decl(kind: str, name: str) -> str:
         if is_typed_integer_vector_kind(kind):
             base = f"integer({typed_integer_env_kind(kind)})"
         else:
-            base = "integer" if kind == "integer_vector" else "logical" if kind == "logical_vector" else "real(real64)"
+            base = (
+                "integer" if kind == "integer_vector"
+                else "logical" if kind == "logical_vector"
+                else "complex(real64)" if kind == "complex_vector"
+                else "real(real64)"
+            )
         return f"{base}, allocatable, intent(out) :: {name}(:)"
     if kind.endswith("_matrix"):
         base = "logical" if kind == "logical_matrix" else "real(real64)"
@@ -3100,6 +3446,32 @@ def replace_named_calls(text: str, name: str, repl: Callable[[re.Match[str]], st
         pos = close_pos + 1
 
 
+def find_matching_close_paren(text: str, open_pos: int) -> int | None:
+    if open_pos < 0 or open_pos >= len(text) or text[open_pos] != "(":
+        return None
+    depth = 1
+    in_string: str | None = None
+    pos = open_pos + 1
+    while pos < len(text):
+        ch = text[pos]
+        if in_string is not None:
+            if ch == in_string:
+                if pos + 1 < len(text) and text[pos + 1] == in_string:
+                    pos += 2
+                    continue
+                in_string = None
+        elif ch in {'"', "'"}:
+            in_string = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return pos
+        pos += 1
+    return None
+
+
 def parse_simple_call(text: str) -> tuple[str, list[str]] | None:
     stripped = text.strip()
     m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)$", stripped)
@@ -3201,12 +3573,35 @@ def is_flatten_expr(text: str) -> bool:
     return re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*\(\s*:\s*\)$", text) is not None
 
 
+def is_empty_matrix_expr(text: str) -> bool:
+    return re.fullmatch(r"zeros_omat2\(\s*0\s*,\s*0\s*\)", text.strip(), re.IGNORECASE) is not None
+
+
 def contains_vector_randi_call(text: str) -> bool:
     for match in re.finditer(r"\brandi\s*\(([^()]*)\)", text, re.IGNORECASE):
         args = split_args(match.group(1))
         if len(args) >= 2:
             return True
     return False
+
+
+def contained_array_constructor_kind(text: str) -> str | None:
+    saw_vector = False
+    for match in re.finditer(r"\b(rand|zeros|ones)\s*\(", text, re.IGNORECASE):
+        close = find_matching_close_paren(text, match.end() - 1)
+        if close is None:
+            continue
+        args = split_args(text[match.end() : close])
+        if match.group(1).lower() == "rand" and not args:
+            continue
+        if len(args) == 1:
+            saw_vector = True
+        elif len(args) == 2:
+            if args[1].strip() == "1":
+                saw_vector = True
+            else:
+                return "real_matrix"
+    return "real_vector" if saw_vector else None
 
 
 def shape_literal_rank(text: str) -> int | None:
@@ -3454,12 +3849,38 @@ def split_matlab_literal_row(text: str) -> list[str]:
     items: list[str] = []
     current: list[str] = []
     depth = 0
-    for ch in text:
+    operators = set("+-*/^<>=&|")
+    for i, ch in enumerate(text):
         if ch in "([":
             depth += 1
         elif ch in ")]":
             depth -= 1
-        if depth == 0 and (ch == "," or ch.isspace()):
+        split_here = ch == ","
+        if depth == 0 and ch.isspace():
+            prev_ch = previous_nonspace(text, i)
+            next_idx = next_nonspace_index(text, i)
+            next_ch = text[next_idx] if next_idx is not None else None
+            split_here = (
+                prev_ch is not None
+                and next_ch is not None
+                and prev_ch not in operators
+                and next_ch not in operators
+                and prev_ch not in "([,"
+                and next_ch not in ")],;"
+            )
+            if (
+                not split_here
+                and prev_ch is not None
+                and next_idx is not None
+                and next_ch in "+-"
+                and next_idx == i + 1
+                and next_idx + 1 < len(text)
+                and not text[next_idx + 1].isspace()
+                and prev_ch not in operators
+                and prev_ch not in "([,"
+            ):
+                split_here = True
+        if depth == 0 and split_here:
             if current:
                 items.append("".join(current).strip())
                 current = []
@@ -3468,6 +3889,25 @@ def split_matlab_literal_row(text: str) -> list[str]:
     if current:
         items.append("".join(current).strip())
     return [item for item in items if item]
+
+
+def previous_nonspace(text: str, pos: int) -> str | None:
+    for i in range(pos - 1, -1, -1):
+        if not text[i].isspace():
+            return text[i]
+    return None
+
+
+def next_nonspace(text: str, pos: int) -> str | None:
+    idx = next_nonspace_index(text, pos)
+    return text[idx] if idx is not None else None
+
+
+def next_nonspace_index(text: str, pos: int) -> int | None:
+    for i in range(pos + 1, len(text)):
+        if not text[i].isspace():
+            return i
+    return None
 
 
 def convert_numbers(text: str) -> str:
@@ -3541,6 +3981,45 @@ def split_top_level_colon(text: str) -> list[str]:
     return parts
 
 
+def contains_colon_outside_strings(text: str) -> bool:
+    in_single = False
+    in_double = False
+    for ch in text:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == ":" and not in_single and not in_double:
+            return True
+    return False
+
+
+def split_top_level_semicolon(text: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    in_single = False
+    in_double = False
+    for ch in text:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch in "([":
+                depth += 1
+            elif ch in ")]":
+                depth -= 1
+        if ch == ";" and depth == 0 and not in_single and not in_double:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+    return [part for part in parts if part]
+
+
 def split_top_level_backslash(text: str) -> tuple[str, str] | None:
     in_single = False
     in_double = False
@@ -3561,6 +4040,45 @@ def split_top_level_backslash(text: str) -> tuple[str, str] | None:
                 if left and right:
                     return left, right
     return None
+
+
+def split_top_level_power(text: str) -> tuple[str, str] | None:
+    in_single = False
+    in_double = False
+    depth = 0
+    for i, ch in enumerate(text):
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if ch in "([":
+                depth += 1
+            elif ch in ")]":
+                depth -= 1
+            elif ch == "^" and depth == 0:
+                left = text[:i].strip()
+                right = text[i + 1 :].strip()
+                if left and right:
+                    return left, right
+    return None
+
+
+def balanced_outer_parens(text: str) -> bool:
+    if not (text.startswith("(") and text.endswith(")")):
+        return False
+    close = find_matching_close_paren(text, 0)
+    return close == len(text) - 1
+
+
+def parenthesized_postfix_transpose_inner(text: str) -> str | None:
+    stripped = text.strip()
+    if not stripped.endswith("'"):
+        return None
+    body = stripped[:-1].strip()
+    if not (body.startswith("(") and body.endswith(")") and balanced_outer_parens(body)):
+        return None
+    return body[1:-1].strip()
 
 
 def eval_repl_numeric_expr(text: str, scalar_values: dict[str, float]) -> float:
@@ -4357,6 +4875,10 @@ def helper_source(
         "call move_alloc(new_values, values)",
         "end subroutine grow_textscan_string_real_omat",
         "",
+        "real(real64) function rand_scalar_omat() result(x)",
+        "call random_number(x)",
+        "end function rand_scalar_omat",
+        "",
         "function rand_omat(n) result(x)",
         "integer, intent(in) :: n",
         "real(real64), allocatable :: x(:)",
@@ -4441,6 +4963,25 @@ def helper_source(
         "end do",
         "end function eye_omat",
         "",
+        "function matpow_int_omat(a, n) result(b)",
+        "real(real64), intent(in) :: a(:,:)",
+        "integer, intent(in) :: n",
+        "real(real64), allocatable :: b(:,:), base(:,:)",
+        "integer :: e, m",
+        "m = size(a, 1)",
+        "if (size(a, 2) /= m) error stop 'omat matrix power requires a square matrix'",
+        "if (n < 0) error stop 'omat negative matrix powers are not implemented yet'",
+        "allocate(b(m, m), base(m, m))",
+        "b = eye_omat(m, m)",
+        "base = a",
+        "e = n",
+        "do while (e > 0)",
+        "  if (mod(e, 2) == 1) b = matmul(b, base)",
+        "  e = e / 2",
+        "  if (e > 0) base = matmul(base, base)",
+        "end do",
+        "end function matpow_int_omat",
+        "",
         "function diag_vec_omat(x) result(y)",
         "real(real64), intent(in) :: x(:)",
         "real(real64), allocatable :: y(:,:)",
@@ -4505,6 +5046,21 @@ def helper_source(
         "c(:, 1:nca) = a",
         "c(:, nca + 1:nca + ncb) = b",
         "end function hcat_mats_omat",
+        "",
+        "function vcat_mats_omat(a, b) result(c)",
+        "real(real64), intent(in) :: a(:,:), b(:,:)",
+        "real(real64), allocatable :: c(:,:)",
+        "integer :: nra, nrb",
+        "if (size(a, 2) /= size(b, 2)) then",
+        "  print *, 'omat vertical concatenation column mismatch'",
+        "  stop 1",
+        "end if",
+        "nra = size(a, 1)",
+        "nrb = size(b, 1)",
+        "allocate(c(nra + nrb, size(a, 2)))",
+        "c(1:nra, :) = a",
+        "c(nra + 1:nra + nrb, :) = b",
+        "end function vcat_mats_omat",
         "",
         "function eigvals_omat(a) result(vals)",
         "real(real64), intent(in) :: a(:,:)",
@@ -4810,6 +5366,23 @@ def helper_source(
         "end do",
         "write(*,*)",
         "end subroutine print_real_vector_omat",
+        "",
+        "subroutine print_complex_vector_omat(x)",
+        "complex(real64), intent(in) :: x(:)",
+        "real(real64) :: xr, xi",
+        "integer :: i",
+        "do i = 1, size(x)",
+        "  xr = real(x(i), real64)",
+        "  xi = aimag(x(i))",
+        "  if (abs(xi) < 1.0e-10_real64) then",
+        "    write(*,'(a)') trim(real_text_omat(xr))",
+        "  else if (xi >= 0.0_real64) then",
+        "    write(*,'(a,1x,a,1x,a)') trim(real_text_omat(xr)), '+', trim(real_text_omat(xi)) // 'i'",
+        "  else",
+        "    write(*,'(a,1x,a,1x,a)') trim(real_text_omat(xr)), '-', trim(real_text_omat(abs(xi))) // 'i'",
+        "  end if",
+        "end do",
+        "end subroutine print_complex_vector_omat",
         "",
         "subroutine print_integer_vector_omat(x)",
         "integer, intent(in) :: x(:)",
@@ -5229,6 +5802,180 @@ def helper_source(
         "end do",
         "end function zscore_mat_omat",
         "",
+        "function poly_omat(r) result(c)",
+        "real(real64), intent(in) :: r(:)",
+        "real(real64), allocatable :: c(:), next(:)",
+        "integer :: i, n",
+        "n = size(r)",
+        "allocate(c(1))",
+        "c = [1.0_real64]",
+        "do i = 1, n",
+        "  allocate(next(size(c) + 1))",
+        "  next = 0.0_real64",
+        "  next(1:size(c)) = next(1:size(c)) + c",
+        "  next(2:size(c) + 1) = next(2:size(c) + 1) - r(i) * c",
+        "  call move_alloc(next, c)",
+        "end do",
+        "end function poly_omat",
+        "",
+        "real(real64) function polyval_scalar_omat(c, x)",
+        "real(real64), intent(in) :: c(:), x",
+        "integer :: i",
+        "polyval_scalar_omat = 0.0_real64",
+        "do i = 1, size(c)",
+        "  polyval_scalar_omat = polyval_scalar_omat * x + c(i)",
+        "end do",
+        "end function polyval_scalar_omat",
+        "",
+        "function polyval_vec_omat(c, x) result(y)",
+        "real(real64), intent(in) :: c(:), x(:)",
+        "real(real64), allocatable :: y(:)",
+        "integer :: i",
+        "allocate(y(size(x)))",
+        "do i = 1, size(x)",
+        "  y(i) = polyval_scalar_omat(c, x(i))",
+        "end do",
+        "end function polyval_vec_omat",
+        "",
+        "function polyval_complex_vec_omat(c, x) result(y)",
+        "real(real64), intent(in) :: c(:)",
+        "complex(real64), intent(in) :: x(:)",
+        "complex(real64), allocatable :: y(:)",
+        "integer :: i",
+        "allocate(y(size(x)))",
+        "do i = 1, size(x)",
+        "  y(i) = poly_complex_omat(c, x(i))",
+        "end do",
+        "end function polyval_complex_vec_omat",
+        "",
+        "function polyfit_omat(x, y, degree) result(p)",
+        "real(real64), intent(in) :: x(:), y(:)",
+        "integer, intent(in) :: degree",
+        "real(real64), allocatable :: p(:)",
+        "real(real64), allocatable :: a(:,:), ata(:,:), aty(:)",
+        "integer :: i, j, m, k",
+        "m = size(x)",
+        "k = degree + 1",
+        "if (size(y) /= m) error stop 'polyfit: x and y must have the same length'",
+        "if (degree < 0) error stop 'polyfit: degree must be nonnegative'",
+        "if (m < k) error stop 'polyfit: not enough data points for requested degree'",
+        "allocate(a(m, k))",
+        "do i = 1, m",
+        "  do j = 1, k",
+        "    a(i, j) = x(i) ** real(degree - j + 1, real64)",
+        "  end do",
+        "end do",
+        "ata = matmul(transpose(a), a)",
+        "aty = matmul(transpose(a), y)",
+        "p = solve_linear_omat(ata, aty)",
+        "end function polyfit_omat",
+        "",
+        "subroutine polyfit2_omat(x, y, degree, p, s)",
+        "real(real64), intent(in) :: x(:), y(:)",
+        "integer, intent(in) :: degree",
+        "real(real64), allocatable, intent(out) :: p(:), s(:)",
+        "real(real64), allocatable :: yfit(:), resid(:)",
+        "p = polyfit_omat(x, y, degree)",
+        "yfit = polyval_vec_omat(p, x)",
+        "resid = y - yfit",
+        "allocate(s(2))",
+        "s(1) = sqrt(sum(resid * resid))",
+        "s(2) = real(max(0, size(x) - degree - 1), real64)",
+        "end subroutine polyfit2_omat",
+        "",
+        "subroutine polyfit3_omat(x, y, degree, p, s, mu)",
+        "real(real64), intent(in) :: x(:), y(:)",
+        "integer, intent(in) :: degree",
+        "real(real64), allocatable, intent(out) :: p(:), s(:), mu(:)",
+        "real(real64), allocatable :: xs(:)",
+        "allocate(mu(2))",
+        "mu(1) = sum(x) / real(size(x), real64)",
+        "if (size(x) > 1) then",
+        "  mu(2) = sqrt(sum((x - mu(1))**2) / real(size(x) - 1, real64))",
+        "else",
+        "  mu(2) = 1.0_real64",
+        "end if",
+        "if (mu(2) == 0.0_real64) mu(2) = 1.0_real64",
+        "xs = (x - mu(1)) / mu(2)",
+        "call polyfit2_omat(xs, y, degree, p, s)",
+        "end subroutine polyfit3_omat",
+        "",
+        "function polyval_mu_vec_omat(c, x, mu) result(y)",
+        "real(real64), intent(in) :: c(:), x(:), mu(:)",
+        "real(real64), allocatable :: y(:)",
+        "y = polyval_vec_omat(c, (x - mu(1)) / mu(2))",
+        "end function polyval_mu_vec_omat",
+        "",
+        "subroutine polyval2_omat(c, x, s, yfit, dy)",
+        "real(real64), intent(in) :: c(:), x(:), s(:)",
+        "real(real64), allocatable, intent(out) :: yfit(:), dy(:)",
+        "real(real64) :: dy_scale",
+        "yfit = polyval_vec_omat(c, x)",
+        "allocate(dy(size(x)))",
+        "if (size(s) >= 1 .and. size(x) > 0) then",
+        "  dy_scale = s(1) / sqrt(real(size(x), real64))",
+        "else",
+        "  dy_scale = 0.0_real64",
+        "end if",
+        "dy = dy_scale",
+        "end subroutine polyval2_omat",
+        "",
+        "function roots_omat(c_in) result(r)",
+        "real(real64), intent(in) :: c_in(:)",
+        "complex(real64), allocatable :: r(:)",
+        "complex(real64), allocatable :: z(:)",
+        "complex(real64) :: prod, delta, zi",
+        "real(real64), allocatable :: c(:)",
+        "real(real64) :: radius, step_max, pi",
+        "integer :: first, n, i, j, iter, max_iter",
+        "first = 1",
+        "do while (first <= size(c_in) .and. c_in(first) == 0.0_real64)",
+        "  first = first + 1",
+        "end do",
+        "if (first > size(c_in)) then",
+        "  allocate(r(0))",
+        "  return",
+        "end if",
+        "c = c_in(first:) / c_in(first)",
+        "n = size(c) - 1",
+        "allocate(r(n))",
+        "if (n <= 0) return",
+        "allocate(z(n))",
+        "pi = acos(-1.0_real64)",
+        "radius = 1.0_real64 + maxval(abs(c(2:)))",
+        "do i = 1, n",
+        "  z(i) = cmplx(radius * cos(2.0_real64*pi*real(i - 1, real64)/real(n, real64)), &",
+        "               radius * sin(2.0_real64*pi*real(i - 1, real64)/real(n, real64)), real64)",
+        "end do",
+        "max_iter = 300",
+        "do iter = 1, max_iter",
+        "  step_max = 0.0_real64",
+        "  do i = 1, n",
+        "    zi = z(i)",
+        "    prod = (1.0_real64, 0.0_real64)",
+        "    do j = 1, n",
+        "      if (j /= i) prod = prod * (zi - z(j))",
+        "    end do",
+        "    if (abs(prod) == 0.0_real64) prod = cmplx(1.0e-12_real64, 0.0_real64, real64)",
+        "    delta = poly_complex_omat(c, zi) / prod",
+        "    z(i) = zi - delta",
+        "    step_max = max(step_max, abs(delta))",
+        "  end do",
+        "  if (step_max < 1.0e-10_real64) exit",
+        "end do",
+        "r = z",
+        "end function roots_omat",
+        "",
+        "complex(real64) function poly_complex_omat(c, z)",
+        "real(real64), intent(in) :: c(:)",
+        "complex(real64), intent(in) :: z",
+        "integer :: i",
+        "poly_complex_omat = (0.0_real64, 0.0_real64)",
+        "do i = 1, size(c)",
+        "  poly_complex_omat = poly_complex_omat * z + cmplx(c(i), 0.0_real64, real64)",
+        "end do",
+        "end function poly_complex_omat",
+        "",
         "function movmean_vec_omat(x, k) result(y)",
         "real(real64), intent(in) :: x(:)",
         "integer, intent(in) :: k",
@@ -5459,6 +6206,25 @@ def helper_source(
         "  end do",
         "end do",
         "end function sort_vec_omat",
+        "",
+        "function sort_complex_vec_omat(x) result(y)",
+        "complex(real64), intent(in) :: x(:)",
+        "complex(real64), allocatable :: y(:)",
+        "complex(real64) :: tmp",
+        "integer :: i, j",
+        "allocate(y(size(x)))",
+        "y = x",
+        "do i = 1, size(y) - 1",
+        "  do j = i + 1, size(y)",
+        "    if (real(y(j), real64) < real(y(i), real64) .or. &",
+        "        (real(y(j), real64) == real(y(i), real64) .and. aimag(y(j)) < aimag(y(i)))) then",
+        "      tmp = y(i)",
+        "      y(i) = y(j)",
+        "      y(j) = tmp",
+        "    end if",
+        "  end do",
+        "end do",
+        "end function sort_complex_vec_omat",
         "",
         "function find_vec_omat(mask) result(idx)",
         "logical, intent(in) :: mask(:)",
@@ -5843,6 +6609,30 @@ def run_with_ofort_capture(
         ofort = Path(found)
     with tempfile.TemporaryDirectory(prefix="omat_") as tmp:
         source = Path(tmp) / "omat_main.f90"
+        if fast:
+            # Preserve portable emitted source; optimize only the execution copy.
+            # Avoid nested interpreted array argument copies, while retaining
+            # MATLAB's zero variance and standard deviation for singletons.
+            def native_stat(match: re.Match[str]) -> str:
+                kind, name = match.groups()
+                routine = "variance" if name == "var_vec" else "sd"
+                return (
+                    f"pure real({kind}) function {name}(x)\n"
+                    f"use ofort_statistics_mod, only: omat_native_stat => {routine}\n"
+                    f"real({kind}), intent(in) :: x(:)\n"
+                    "if (size(x) <= 1) then\n"
+                    f"  {name} = 0.0_{kind}\n"
+                    "else\n"
+                    f"  {name} = omat_native_stat(x)\n"
+                    "end if\n"
+                    f"end function {name}"
+                )
+            generated = re.sub(
+                r"(?ms)^pure real\((dp|real64)\) function (var_vec|std_vec)\(x\)\n"
+                r".*?^end function \2[ \t]*$",
+                native_stat,
+                generated,
+            )
         start = time.perf_counter()
         source.write_text(generated, encoding="utf-8")
         add_timing(timings, "setup", time.perf_counter() - start)
@@ -6094,7 +6884,7 @@ def repl(
                 print(f"omat: {exc}", file=sys.stderr)
             continue
         if command in {"run", "."}:
-            run_repl_buffer(buffer, ofort)
+            run_repl_buffer(buffer, ofort, fast=True)
             continue
         try:
             materialized_line = materialize_repl_rand(line, scalar_values, materialize_rand_limit)
@@ -6128,7 +6918,7 @@ def repl(
             update_scalar_values(materialized_line, scalar_values)
             block_depth = new_block_depth
             continue
-        stdout = run_repl_candidate(buffer, materialized_line, ofort, scalar_values, materialize_rand_limit)
+        stdout = run_repl_candidate(buffer, materialized_line, ofort, scalar_values, materialize_rand_limit, fast=True)
         if stdout is not None:
             buffer = candidate
             update_scalar_values(materialized_line, scalar_values)
