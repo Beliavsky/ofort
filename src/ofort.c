@@ -297,6 +297,9 @@ struct OfortInterpreter {
     int command_argc;
     char command_args[OFORT_MAX_PARAMS][OFORT_MAX_STRLEN];
     int procedure_depth;
+    OfortNode **initialized_data;
+    int n_initialized_data;
+    int initialized_data_cap;
     int check_mode;
     int consumed_bare_end;
     int in_spec_section;
@@ -13381,8 +13384,33 @@ static OfortValue sequence_actual_from_array_element(OfortInterpreter *I, OfortN
     return out;
 }
 
+static int sequence_element_unchanged(const OfortValue *a, const OfortValue *b) {
+    /* DOUBLE PRECISION and REAL(kind=8) may use different internal tags
+       when an actual is rebound to its dummy declaration. */
+    if ((a->type == FVAL_REAL || a->type == FVAL_DOUBLE) &&
+        (b->type == FVAL_REAL || b->type == FVAL_DOUBLE)) {
+        return memcmp(&a->v.r, &b->v.r, sizeof(a->v.r)) == 0;
+    }
+    if (a->type != b->type || a->kind != b->kind) return 0;
+    switch (a->type) {
+    case FVAL_INTEGER:
+        return a->kind == 16 ? a->v.i128 == b->v.i128 : a->v.i == b->v.i;
+    case FVAL_REAL: case FVAL_DOUBLE:
+        return memcmp(&a->v.r, &b->v.r, sizeof(a->v.r)) == 0;
+    case FVAL_COMPLEX:
+        return memcmp(&a->v.cx, &b->v.cx, sizeof(a->v.cx)) == 0;
+    case FVAL_LOGICAL:
+        return a->v.b == b->v.b;
+    case FVAL_CHARACTER:
+        return a->v.s && b->v.s && strcmp(a->v.s, b->v.s) == 0;
+    default:
+        return 0;
+    }
+}
+
 static int copy_array_element_sequence_back(OfortInterpreter *I, OfortNode *actual,
-                                            const OfortValue *dummy) {
+                                            const OfortValue *dummy,
+                                            const OfortValue *before) {
     OfortVar *var = NULL;
     int index;
     if (!actual || !dummy || dummy->type != FVAL_ARRAY) return 0;
@@ -13400,6 +13428,18 @@ static int copy_array_element_sequence_back(OfortInterpreter *I, OfortNode *actu
         ofort_error(I, "Array element sequence is too short for dummy argument");
     for (int j = 0; j < dummy->v.arr.len; j++) {
         OfortValue elem = array_element_value(dummy, j);
+        /* An assumed-size actual contains the entire remaining storage, not
+           just the elements the procedure uses. Do not restore untouched
+           storage over outputs passed through another dummy argument. */
+        if (before && before->type == FVAL_ARRAY && j < before->v.arr.len) {
+            OfortValue old = array_element_value(before, j);
+            int unchanged = sequence_element_unchanged(&elem, &old);
+            free_value(&old);
+            if (unchanged) {
+                free_value(&elem);
+                continue;
+            }
+        }
         elem = coerce_assignment_value(I, var->name, var->val.v.arr.elem_type, elem);
         if (!assign_packed_array_element(&var->val, index + j, elem)) {
             free_value(&var->val.v.arr.data[index + j]);
@@ -25487,7 +25527,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
             }
         }
-        if (existing && (n->is_save || (I->procedure_depth > 0 && n->is_implicit_save))) {
+        if (existing && (n->is_save || (I->procedure_depth > 0 && n->is_implicit_save) ||
+                         (existing == existing_current && existing->is_save))) {
             existing->is_save = 1;
             existing->is_implicit_save = n->is_implicit_save;
             existing->is_protected = n->is_protected;
@@ -26602,6 +26643,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     }
 
     case FND_DATA: {
+        int save_data = I->procedure_depth > 0 && !I->check_mode;
+        if (save_data) {
+            for (int i = 0; i < I->n_initialized_data; i++) {
+                if (I->initialized_data[i] == n) return;
+            }
+        }
         for (int pair_idx = 0; pair_idx < n->n_stmts; pair_idx++) {
             OfortNode *pair = n->stmts[pair_idx];
             OfortNode *targets = pair->children[0];
@@ -26621,6 +26668,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
             for (int ti = 0; ti < n_targets; ti++) {
                 int needed = target_list[ti].count;
+                if (save_data) {
+                    OfortNode *root = target_list[ti].target;
+                    while (root && (root->type == FND_MEMBER || root->type == FND_ARRAY_REF))
+                        root = root->children[0];
+                    if (root && (root->type == FND_IDENT || root->type == FND_FUNC_CALL)) {
+                        OfortVar *var = find_var(I, root->name);
+                        if (var) var->is_save = 1;
+                    }
+                }
                 if (needed <= 0) needed = 1;
                 if (value_pos + needed > n_vals) {
                     if (I->check_mode) {
@@ -26686,6 +26742,17 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             for (int i = 0; i < n_vals; i++) free_value(&vals[i]);
             free(vals);
             free(target_list);
+        }
+        if (save_data) {
+            if (I->n_initialized_data == I->initialized_data_cap) {
+                int cap = I->initialized_data_cap ? I->initialized_data_cap * 2 : 16;
+                OfortNode **nodes = (OfortNode **)realloc(I->initialized_data,
+                                                        (size_t)cap * sizeof(*nodes));
+                if (!nodes) ofort_error(I, "Out of memory recording DATA initialization");
+                I->initialized_data = nodes;
+                I->initialized_data_cap = cap;
+            }
+            I->initialized_data[I->n_initialized_data++] = n;
         }
         break;
     }
@@ -29161,6 +29228,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int pointer_copyback_slice_end[OFORT_MAX_PARAMS] = {0};
         int pointer_copyback_slice_stride[OFORT_MAX_PARAMS] = {0};
         int param_copyback_initialized[OFORT_MAX_PARAMS] = {0};
+        OfortValue *sequence_before = NULL;
         if (!pointer_copyback_target) ofort_error(I, "Out of memory");
 
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
@@ -29271,7 +29339,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                             pointer_copyback_slice_stride[i] = pv->pointer_slice_stride;
                         }
                     }
-                    free_value(&args[i]);
+                    if (fn->param_n_dims[i] > 0 && args[i].type == FVAL_ARRAY &&
+                        (actual_node->type == FND_FUNC_CALL || actual_node->type == FND_ARRAY_REF)) {
+                        if (!sequence_before) {
+                            sequence_before = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*sequence_before));
+                            if (!sequence_before) ofort_error(I, "Out of memory");
+                        }
+                        sequence_before[i] = args[i];
+                    } else {
+                        free_value(&args[i]);
+                    }
                     args[i] = copy_value(pv->val);
                 }
                 if (pv && pv->present && fn->param_allocatables[i] && actual_node &&
@@ -29293,7 +29370,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (!actual_node && !arg_present[i]) continue;
             if (!arg_alias[i] && fn->param_intents[i] != 1 &&
                 fn->param_n_dims[i] > 0 &&
-                copy_array_element_sequence_back(I, actual_node, &args[i])) continue;
+                copy_array_element_sequence_back(I, actual_node, &args[i],
+                                                 sequence_before ? &sequence_before[i] : NULL)) continue;
             if (!arg_alias[i] && actual_node && actual_node->type == FND_IDENT && fn->param_intents[i] != 1 &&
                 fn->param_pointers[i]) {
                 OfortVar *actual = find_var(I, actual_node->name);
@@ -29443,6 +29521,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
         }
         for (int i = 0; i < nargs; i++) free_value(&args[i]);
+        if (sequence_before) {
+            for (int i = 0; i < nargs; i++) free_value(&sequence_before[i]);
+            free(sequence_before);
+        }
         free(pointer_copyback_target);
         free(args);
 unresolved_external_call_done:
@@ -37939,6 +38021,7 @@ void ofort_destroy(OfortInterpreter *interp) {
     free(interp->tokens);
     free(interp->cached_source_text);
     free(interp->cached_processed_source);
+    free(interp->initialized_data);
     free(interp);
 }
 
