@@ -9,7 +9,7 @@ FFLAGS ?= -O2
 LDLIBS ?= -lm
 
 TARGET = $(BINDIR)demo_eval.exe
-C_OBJECTS = $(BINDIR)ofort.o $(BINDIR)ofort_values.o $(BINDIR)ofort_c_api.o $(BINDIR)ofort_stats.o
+C_OBJECTS = $(BINDIR)ofort.o $(BINDIR)ofort_values.o $(BINDIR)ofort_c_api.o $(BINDIR)ofort_stats.o $(BINDIR)ofort_lapack.o
 F_OBJECTS = $(BINDIR)ofort_binding.o $(BINDIR)demo_eval.o
 STATS_OBJECTS = $(BINDIR)ofort_stats.o $(BINDIR)ofort_statistics_mod.o
 
@@ -17,7 +17,7 @@ STATS_OBJECTS = $(BINDIR)ofort_stats.o $(BINDIR)ofort_statistics_mod.o
 
 all: $(TARGET)
 
-$(BINDIR)ofort.o: $(ROOT)/src/ofort.c $(ROOT)/include/ofort.h $(ROOT)/src/ofort_internal.h
+$(BINDIR)ofort.o: $(ROOT)/src/ofort.c $(ROOT)/include/ofort.h $(ROOT)/src/ofort_internal.h $(ROOT)/include/ofort_lapack.h $(ROOT)/src/ofort_lapack_runtime.inc
 	$(CC) $(CFLAGS) -c $(ROOT)/src/ofort.c -o $@
 
 $(BINDIR)ofort_values.o: $(ROOT)/src/ofort_values.c $(ROOT)/include/ofort.h $(ROOT)/src/ofort_internal.h
@@ -28,6 +28,9 @@ $(BINDIR)ofort_c_api.o: $(ROOT)/src/ofort_c_api.c $(ROOT)/include/ofort.h $(ROOT
 
 $(BINDIR)ofort_stats.o: $(ROOT)/src/ofort_stats.c $(ROOT)/include/ofort_stats.h
 	$(CC) $(CFLAGS) -c $(ROOT)/src/ofort_stats.c -o $@
+
+$(BINDIR)ofort_lapack.o: $(ROOT)/src/ofort_lapack.c $(ROOT)/include/ofort_lapack.h $(ROOT)/src/ofort_lapack_signatures.inc
+	$(CC) $(CFLAGS) -c $(ROOT)/src/ofort_lapack.c -o $@
 
 $(BINDIR)ofort_statistics_mod.o: $(BINDIR)ofort_statistics_mod.f90
 	$(FC) $(FFLAGS) -J$(BINDIR) -c $(BINDIR)ofort_statistics_mod.f90 -o $@

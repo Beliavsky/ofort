@@ -11,6 +11,7 @@
 
 #include "ofort.h"
 #include "ofort_stats.h"
+#include "ofort_lapack.h"
 #include "ofort_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -23633,7 +23634,8 @@ static void check_semantics_block(OfortInterpreter *I, OfortNode *block) {
 }
 
 static int ofort_extension_module_exists(const char *module_name) {
-    return str_eq_nocase(module_name, "ofort_random_mod") ||
+    return str_eq_nocase(module_name, "ofort_lapack_mod") ||
+           str_eq_nocase(module_name, "ofort_random_mod") ||
            str_eq_nocase(module_name, "ofort_sorting_mod") ||
            str_eq_nocase(module_name, "ofort_la_mod") ||
            str_eq_nocase(module_name, "ofort_io_mod") ||
@@ -23646,6 +23648,7 @@ static int ofort_extension_module_exists(const char *module_name) {
 }
 
 static int ofort_extension_module_exports(const char *module_name, const char *name) {
+    if (str_eq_nocase(module_name, "ofort_lapack_mod")) return ofort_lapack_find(name) >= 0;
     if (str_eq_nocase(module_name, "ofort_random_mod")) {
         return str_eq_nocase(name, "rnorm") ||
                str_eq_nocase(name, "rnorm_fill") ||
@@ -24644,7 +24647,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         import_ofort_extension_intrinsic(I, local, remote);
                     }
                 } else {
-                    if (str_eq_nocase(n->name, "ofort_random_mod")) {
+                    if (str_eq_nocase(n->name, "ofort_lapack_mod")) {
+                        for (int id = 0; ofort_lapack_routine(id); id++) {
+                            const char *name = ofort_lapack_routine(id)->name;
+                            import_ofort_extension_intrinsic(I, name, name);
+                        }
+                    } else if (str_eq_nocase(n->name, "ofort_random_mod")) {
                         import_ofort_extension_intrinsic(I, "rnorm", "rnorm");
                         import_ofort_extension_intrinsic(I, "rnorm_fill", "rnorm_fill");
                         import_ofort_extension_intrinsic(I, "randn", "randn");
@@ -33722,11 +33730,15 @@ static void ofort_io_savetxt(OfortInterpreter *I, OfortNode *n) {
     ofort_savetxt_options_free(&opts);
 }
 
+#include "ofort_lapack_runtime.inc"
+
 static int call_ofort_extension_subroutine(OfortInterpreter *I, OfortNode *n) {
     const char *extension_name;
     if (!n || !find_imported_extension_intrinsic(I, n->name)) return 0;
     extension_name = resolve_imported_extension_intrinsic(I, n->name);
     if (!extension_name) extension_name = n->name;
+
+    if (call_ofort_lapack_subroutine(I, n, extension_name)) return 1;
 
     if (str_eq_nocase(extension_name, "sort")) {
         int x_idx = -1;

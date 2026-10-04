@@ -25,5 +25,9 @@ __pycache__/
 # Benchmark output
 benchmarks/benchmark_results.csv
 
+# Optional LAPACK generated build files
+bindings/lapack/python_native.f90
+bindings/lapack/*.mod
+
 # Local helper scripts
 gpush.bat
