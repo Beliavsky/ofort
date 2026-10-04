@@ -215,6 +215,7 @@ struct OfortInterpreter {
     char warnings[4096];
     int warn_len;
     int warnings_enabled;
+    int warn_empty_sequence;
     int warn_intrinsic_shadow;
     OfortStandardMode standard_mode;
     int fast_mode;
@@ -13347,7 +13348,8 @@ static int array_ref_scalar_linear_index(OfortInterpreter *I, OfortValue *array,
     return 1;
 }
 
-static OfortValue sequence_actual_from_array_element(OfortInterpreter *I, OfortNode *actual) {
+static OfortValue sequence_actual_from_array_element(OfortInterpreter *I, OfortNode *actual,
+                                                      int allow_empty) {
     OfortVar *var = NULL;
     OfortNode *ref = actual;
     int index;
@@ -13364,9 +13366,16 @@ static OfortValue sequence_actual_from_array_element(OfortInterpreter *I, OfortN
     }
     if (!var || var->val.type != FVAL_ARRAY) return make_void_val();
     if (!array_ref_scalar_linear_index(I, &var->val, ref, &index)) return make_void_val();
-    if (index < 0 || index >= var->val.v.arr.len)
+    if (index < 0 || (index >= var->val.v.arr.len && !allow_empty))
         ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, var->val.v.arr.len);
-    dims[0] = var->val.v.arr.len - index;
+    /* Legacy BLAS/LAPACK calls may pass an address beyond the end when
+       there are zero elements to process. Do not dereference that address:
+       an empty dummy still rejects any subsequent element access. */
+    dims[0] = index < var->val.v.arr.len ? var->val.v.arr.len - index : 0;
+    if (index >= var->val.v.arr.len && I->warn_empty_sequence) {
+        ofort_warning(I, actual->line > 0 ? actual->line : I->current_line,
+                      "warning: out-of-bounds array element passed as an empty storage sequence");
+    }
     out = make_array(var->val.v.arr.elem_type, dims, 1);
     copy_cstr(out.v.arr.elem_type_name, sizeof(out.v.arr.elem_type_name), var->val.v.arr.elem_type_name);
     out.kind = var->val.kind;
@@ -13422,6 +13431,7 @@ static int copy_array_element_sequence_back(OfortInterpreter *I, OfortNode *actu
         var = find_var(I, actual->children[0]->name);
     }
     if (!var || var->val.type != FVAL_ARRAY || var->is_parameter) return 0;
+    if (dummy->v.arr.len == 0) return 1;
     if (!array_ref_scalar_linear_index(I, &var->val, actual, &index)) return 0;
     if (index < 0 || index >= var->val.v.arr.len ||
         dummy->v.arr.len > var->val.v.arr.len - index)
@@ -18277,7 +18287,28 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         args = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*args));
         if (!args) ofort_error(I, "Out of memory");
         OfortFunc *pre_func = find_func(I, procedure_call_name[0] ? procedure_call_name : n->name);
+        int param_uninitialized[OFORT_MAX_PARAMS] = {0};
         for (int i = 0; i < nargs; i++) {
+            /* Association does not read a variable actual. Preserve its
+               undefined status on the dummy and check only if it is used.
+               VALUE arguments, expressions and statement functions still
+               require evaluation at the call site. */
+            if (pre_func && pre_func->is_function && pre_func->node &&
+                pre_func->node->type != FND_STMT_FUNCTION &&
+                n->stmts[i]->type == FND_IDENT) {
+                OfortNode *pre_fn = pre_func->node;
+                int dummy_i = n->param_names[i][0]
+                    ? procedure_dummy_index(pre_fn, n->param_names[i]) : i;
+                OfortVar *actual = find_var(I, n->stmts[i]->name);
+                if (dummy_i >= 0 && dummy_i < pre_fn->n_params &&
+                    !pre_fn->param_values[dummy_i] && actual &&
+                    !actual->is_initialized &&
+                    !(actual->is_optional && !actual->present)) {
+                    args[i] = copy_value(actual->val);
+                    param_uninitialized[dummy_i] = 1;
+                    continue;
+                }
+            }
             if (pre_func && pre_func->is_function && pre_func->node &&
                 i < pre_func->node->n_params && pre_func->node->param_intents[i] == 2 &&
                 n->stmts[i]->type == FND_IDENT) {
@@ -18379,7 +18410,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                         args[i].type != FVAL_ARRAY && args[i].type != FVAL_VOID &&
                         (n->stmts[i]->type == FND_FUNC_CALL ||
                          n->stmts[i]->type == FND_ARRAY_REF)) {
-                        OfortValue sequence = sequence_actual_from_array_element(I, n->stmts[i]);
+                        OfortValue sequence = sequence_actual_from_array_element(I, n->stmts[i], 0);
                         if (sequence.type != FVAL_VOID) {
                             free_value(&args[i]);
                             args[i] = sequence;
@@ -18448,6 +18479,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 if (i < nargs && args[i].type != FVAL_VOID) {
                     OfortVar *pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
                     pv->is_optional = fn->param_optional[i];
+                    if (param_uninitialized[i]) pv->is_initialized = 0;
                 } else if (i < nargs && n->stmts[i]->type == FND_IDENT) {
                     OfortVar *actual = find_var(I, n->stmts[i]->name);
                     if (actual && actual->is_optional && !actual->present) {
@@ -26809,12 +26841,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 set_var(I, n->name, make_integer(iter));
             }
             exec_node(I, n->children[3]);
-            if (I->returning || I->stopping) break;
+            if (I->returning || I->stopping || I->goto_active) break;
             if (I->exiting) { I->exiting = 0; break; }
             if (I->cycling) { I->cycling = 0; }
             iter += st;
         }
-        if (!I->returning && !I->stopping) {
+        if (!I->returning && !I->stopping && !I->goto_active) {
             if (loop_var && loop_var->val.type == FVAL_INTEGER && !loop_var->is_parameter && !loop_var->is_protected) {
                 loop_var->val.v.i = iter;
                 loop_var->is_initialized = 1;
@@ -26860,7 +26892,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             free_value(&cond);
             if (!is_true) break;
             exec_node(I, n->children[1]);
-            if (I->returning || I->stopping) break;
+            if (I->returning || I->stopping || I->goto_active) break;
             if (I->exiting) { I->exiting = 0; break; }
             if (I->cycling) { I->cycling = 0; }
         }
@@ -26870,7 +26902,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_DO_FOREVER: {
         for (;;) {
             exec_node(I, n->children[0]);
-            if (I->returning || I->stopping) break;
+            if (I->returning || I->stopping || I->goto_active) break;
             if (I->exiting) { I->exiting = 0; break; }
             if (I->cycling) { I->cycling = 0; }
         }
@@ -29013,7 +29045,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             } else if (fn && dummy_i < fn->n_params && fn->param_n_dims[dummy_i] > 0 &&
                        (n->stmts[i]->type == FND_FUNC_CALL ||
                         n->stmts[i]->type == FND_ARRAY_REF)) {
-                args[i] = sequence_actual_from_array_element(I, n->stmts[i]);
+                args[i] = sequence_actual_from_array_element(I, n->stmts[i], 1);
                 if (args[i].type == FVAL_VOID) args[i] = eval_node(I, n->stmts[i]);
             } else {
                 args[i] = eval_node(I, n->stmts[i]);
@@ -38449,6 +38481,12 @@ void ofort_set_warnings_enabled(OfortInterpreter *interp, int enabled) {
 void ofort_set_warn_intrinsic_shadow(OfortInterpreter *interp, int enabled) {
     if (interp) {
         interp->warn_intrinsic_shadow = enabled ? 1 : 0;
+    }
+}
+
+void ofort_set_warn_empty_sequence(OfortInterpreter *interp, int enabled) {
+    if (interp) {
+        interp->warn_empty_sequence = enabled ? 1 : 0;
     }
 }
 

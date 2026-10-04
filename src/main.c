@@ -2075,6 +2075,21 @@ typedef struct {
     int keep;
 } ReachableModule;
 
+static int reachable_module_index(ReachableModule *modules, int n_modules, const char *name) {
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < n_modules; i++) {
+        if (string_eq_nocase(modules[i].name, name)) return i;
+    }
+    return -1;
+}
+
+static int reachable_mark_module(ReachableModule *modules, int n_modules, const char *name) {
+    int index = reachable_module_index(modules, n_modules, name);
+    if (index < 0 || modules[index].keep) return 0;
+    modules[index].keep = 1;
+    return 1;
+}
+
 static void copy_trimmed_lower_line(char *dst, size_t dst_size, const char *start, const char *end) {
     const char *first = start;
     const char *last = end;
@@ -2149,6 +2164,80 @@ static int parse_decl_name_after_keyword(const char *line, const char *keyword, 
     return n > 0;
 }
 
+static const char *reachable_skip_parens(const char *p) {
+    int depth = 0;
+
+    if (*p != '(') return p;
+    while (*p) {
+        if (*p == '(') {
+            depth++;
+        } else if (*p == ')') {
+            depth--;
+            p++;
+            if (depth == 0) return p;
+            continue;
+        }
+        p++;
+    }
+    return p;
+}
+
+static const char *reachable_skip_function_type_spec(const char *p) {
+    const char *q = skip_space(p);
+
+    if (starts_with_word_nocase(q, "double")) {
+        q += 6;
+        q = skip_space(q);
+        if (!starts_with_word_nocase(q, "precision")) return NULL;
+        q += 9;
+    } else if (starts_with_word_nocase(q, "integer")) {
+        q += 7;
+    } else if (starts_with_word_nocase(q, "real")) {
+        q += 4;
+    } else if (starts_with_word_nocase(q, "complex")) {
+        q += 7;
+    } else if (starts_with_word_nocase(q, "logical")) {
+        q += 7;
+    } else if (starts_with_word_nocase(q, "character")) {
+        q += 9;
+    } else if (starts_with_word_nocase(q, "type")) {
+        q += 4;
+    } else if (starts_with_word_nocase(q, "class")) {
+        q += 5;
+    } else {
+        return NULL;
+    }
+
+    q = skip_space(q);
+    if (*q == '(') {
+        q = reachable_skip_parens(q);
+        q = skip_space(q);
+    } else if (*q == '*') {
+        q++;
+        while (*q && !isspace((unsigned char)*q)) q++;
+        q = skip_space(q);
+    }
+    return q;
+}
+
+static const char *reachable_skip_proc_prefixes(const char *p) {
+    const char *prefixes[] = {"recursive", "pure", "impure", "elemental", "module"};
+    int advanced = 1;
+
+    while (advanced) {
+        advanced = 0;
+        for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+            size_t len = strlen(prefixes[i]);
+            if (starts_with_word_nocase(p, prefixes[i])) {
+                p += len;
+                p = skip_space(p);
+                advanced = 1;
+            }
+        }
+    }
+    return p;
+}
+
 static int line_is_end_module(const char *line) {
     const char *p = skip_space(line);
     if (!starts_with_word_nocase(p, "end")) return 0;
@@ -2177,33 +2266,22 @@ static int line_is_end_program_reachable(const char *line) {
 
 static int line_is_proc_start_reachable(const char *line, char *name, size_t name_size) {
     const char *p = skip_space(line);
-    const char *prefixes[] = {"recursive", "pure", "impure", "elemental", "module"};
-    int advanced = 1;
-    while (advanced) {
-        advanced = 0;
-        for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
-            size_t len = strlen(prefixes[i]);
-            if (starts_with_word_nocase(p, prefixes[i])) {
-                p += len;
-                while (*p && isspace((unsigned char)*p)) p++;
-                advanced = 1;
-            }
-        }
-    }
+    const char *after_type;
+    if (starts_with_word_nocase(p, "end")) return 0;
+    p = reachable_skip_proc_prefixes(p);
     if (starts_with_word_nocase(p, "subroutine")) {
         return parse_decl_name_after_keyword(p, "subroutine", name, name_size);
     }
-    if (strstr(p, " function ") || starts_with_word_nocase(p, "function")) {
-        const char *f = strstr(p, "function");
-        size_t n = 0;
-        if (!f) return 0;
-        f += 8;
-        while (*f && isspace((unsigned char)*f)) f++;
-        if (!isalpha((unsigned char)*f) && *f != '_') return 0;
-        while ((isalnum((unsigned char)*f) || *f == '_') && n + 1 < name_size)
-            name[n++] = (char)tolower((unsigned char)*f++);
-        name[n] = '\0';
-        return n > 0;
+    if (starts_with_word_nocase(p, "function")) {
+        return parse_decl_name_after_keyword(p, "function", name, name_size);
+    }
+
+    after_type = reachable_skip_function_type_spec(p);
+    if (after_type) {
+        after_type = reachable_skip_proc_prefixes(after_type);
+        if (starts_with_word_nocase(after_type, "function")) {
+            return parse_decl_name_after_keyword(after_type, "function", name, name_size);
+        }
     }
     return 0;
 }
@@ -2214,6 +2292,21 @@ static int line_is_end_proc_reachable(const char *line) {
     p += 3;
     while (*p && isspace((unsigned char)*p)) p++;
     return starts_with_word_nocase(p, "function") || starts_with_word_nocase(p, "subroutine");
+}
+
+static int reachable_find_proc_end(SourceLine *lines, int start, int limit) {
+    int depth = 1;
+    char nested_name[128];
+
+    for (int i = start + 1; i < limit; i++) {
+        if (line_is_proc_start_reachable(lines[i].text, nested_name, sizeof(nested_name))) {
+            depth++;
+        } else if (line_is_end_proc_reachable(lines[i].text)) {
+            depth--;
+            if (depth == 0) return i;
+        }
+    }
+    return start;
 }
 
 static int reachable_name_index(ReachableName *names, int n_names, const char *name) {
@@ -2238,11 +2331,12 @@ static int reachable_line_has_trailing_amp(SourceLine *line) {
     return len > 0 && line->text[len - 1] == '&';
 }
 
-static int reachable_line_is_public_access(SourceLine *line) {
+static int reachable_line_is_named_access(SourceLine *line) {
     const char *p;
     if (!line) return 0;
     p = skip_space(line->text);
-    return starts_with_word_nocase(p, "public") && strstr(p, "::") != NULL;
+    return (starts_with_word_nocase(p, "public") || starts_with_word_nocase(p, "private")) &&
+           strstr(p, "::") != NULL;
 }
 
 static int reachable_line_is_interface_start(SourceLine *line) {
@@ -2592,6 +2686,43 @@ static void reachable_collect_identifiers(const char *text, ReachableName *names
     }
 }
 
+static int reachable_use_module_name(SourceLine *line, char *name, size_t name_size) {
+    const char *p;
+    size_t n = 0;
+    if (!line || !name || name_size == 0) return 0;
+    name[0] = '\0';
+    p = skip_space(line->text);
+    if (!starts_with_word_nocase(p, "use")) return 0;
+    p += 3;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p == ',') {
+        while (*p && *p != ':') p++;
+        if (p[0] == ':' && p[1] == ':') p += 2;
+        else return 0;
+    } else if (p[0] == ':' && p[1] == ':') {
+        p += 2;
+    }
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (!isalpha((unsigned char)*p) && *p != '_') return 0;
+    while ((isalnum((unsigned char)*p) || *p == '_') && n + 1 < name_size) {
+        name[n++] = (char)tolower((unsigned char)*p++);
+    }
+    name[n] = '\0';
+    return n > 0;
+}
+
+static int reachable_mark_use_deps(SourceLine *lines, int start, int end,
+                                   ReachableModule *modules, int n_modules) {
+    int changed = 0;
+    for (int i = start; i <= end; i++) {
+        char use_name[128];
+        if (reachable_use_module_name(&lines[i], use_name, sizeof(use_name))) {
+            changed |= reachable_mark_module(modules, n_modules, use_name);
+        }
+    }
+    return changed;
+}
+
 static char *prune_source_to_reachable(const char *source) {
     SourceLine *lines;
     ReachableModule modules[1024];
@@ -2646,10 +2777,7 @@ static char *prune_source_to_reachable(const char *source) {
     }
 
     for (int i = 0; i < n_modules; i++) {
-        if (!modules[i].has_contains) {
-            modules[i].keep = 1;
-            continue;
-        }
+        if (!modules[i].has_contains) continue;
         for (int j = modules[i].line_contains + 1; j < modules[i].line_end; j++) {
             char proc_name[128];
             if (line_is_proc_start_reachable(lines[j].text, proc_name, sizeof(proc_name)) &&
@@ -2659,21 +2787,16 @@ static char *prune_source_to_reachable(const char *source) {
                 snprintf(procs[pi].module_name, sizeof(procs[pi].module_name), "%.127s", modules[i].name);
                 procs[pi].module_index = i;
                 procs[pi].line_start = j;
-                procs[pi].line_end = j;
-                for (int k = j + 1; k < modules[i].line_end; k++) {
-                    if (line_is_end_proc_reachable(lines[k].text)) {
-                        procs[pi].line_end = k;
-                        j = k;
-                        break;
-                    }
-                }
+                procs[pi].line_end = reachable_find_proc_end(lines, j, modules[i].line_end);
+                j = procs[pi].line_end;
             }
         }
     }
 
+    reachable_mark_use_deps(lines, program_start, program_end, modules, n_modules);
+
     for (int i = program_start; i <= program_end; i++) {
-        if (starts_with_word_nocase(lines[i].text, "use") ||
-            starts_with_word_nocase(lines[i].text, "implicit")) {
+        if (starts_with_word_nocase(lines[i].text, "implicit")) {
             continue;
         }
         reachable_collect_identifiers(lines[i].text, names, &n_names, (int)(sizeof(names) / sizeof(names[0])));
@@ -2683,6 +2806,7 @@ static char *prune_source_to_reachable(const char *source) {
         changed = 0;
         for (int mi = 0; mi < n_modules; mi++) {
             int spec_end = modules[mi].has_contains ? modules[mi].line_contains : modules[mi].line_end;
+            if (!modules[mi].keep) continue;
             for (int j = modules[mi].line_start; j <= spec_end; j++) {
                 char interface_name[128];
                 int interface_end;
@@ -2706,12 +2830,22 @@ static char *prune_source_to_reachable(const char *source) {
                 j = interface_end;
             }
         }
+        for (int mi = 0; mi < n_modules; mi++) {
+            int spec_end;
+            if (!modules[mi].keep) continue;
+            spec_end = modules[mi].has_contains ? modules[mi].line_contains : modules[mi].line_end;
+            changed |= reachable_mark_use_deps(lines, modules[mi].line_start, spec_end,
+                                               modules, n_modules);
+        }
         for (int i = 0; i < n_names; i++) {
             for (int pi = 0; pi < n_procs; pi++) {
+                if (!modules[procs[pi].module_index].keep) continue;
                 if (!string_eq_nocase(procs[pi].name, names[i].name) || procs[pi].keep) continue;
                 procs[pi].keep = 1;
                 modules[procs[pi].module_index].keep = 1;
                 changed = 1;
+                changed |= reachable_mark_use_deps(lines, procs[pi].line_start, procs[pi].line_end,
+                                                   modules, n_modules);
                 for (int j = procs[pi].line_start; j <= procs[pi].line_end; j++) {
                     reachable_collect_identifiers(lines[j].text, names, &n_names,
                                                   (int)(sizeof(names) / sizeof(names[0])));
@@ -2760,6 +2894,7 @@ static char *prune_source_to_reachable(const char *source) {
         changed = 0;
         for (int mi = 0; mi < n_modules; mi++) {
             int spec_end = modules[mi].line_contains >= 0 ? modules[mi].line_contains : modules[mi].line_end;
+            if (!modules[mi].keep) continue;
             for (int j = modules[mi].line_start + 1; j < spec_end; j++) {
                 char interface_name[128];
                 int interface_end;
@@ -2783,12 +2918,22 @@ static char *prune_source_to_reachable(const char *source) {
                 j = interface_end;
             }
         }
+        for (int mi = 0; mi < n_modules; mi++) {
+            int spec_end;
+            if (!modules[mi].keep) continue;
+            spec_end = modules[mi].has_contains ? modules[mi].line_contains : modules[mi].line_end;
+            changed |= reachable_mark_use_deps(lines, modules[mi].line_start, spec_end,
+                                               modules, n_modules);
+        }
         for (int i = 0; i < n_names; i++) {
             for (int pi = 0; pi < n_procs; pi++) {
+                if (!modules[procs[pi].module_index].keep) continue;
                 if (!string_eq_nocase(procs[pi].name, names[i].name) || procs[pi].keep) continue;
                 procs[pi].keep = 1;
                 modules[procs[pi].module_index].keep = 1;
                 changed = 1;
+                changed |= reachable_mark_use_deps(lines, procs[pi].line_start, procs[pi].line_end,
+                                                   modules, n_modules);
                 for (int j = procs[pi].line_start; j <= procs[pi].line_end; j++) {
                     reachable_collect_identifiers(lines[j].text, names, &n_names,
                                                   (int)(sizeof(names) / sizeof(names[0])));
@@ -2803,7 +2948,7 @@ static char *prune_source_to_reachable(const char *source) {
             for (int j = modules[i].line_start; j <= modules[i].line_end; j++) {
                 char type_name[128];
                 if (j != modules[i].line_start && j != modules[i].line_end &&
-                    reachable_line_is_public_access(&lines[j])) {
+                    reachable_line_is_named_access(&lines[j])) {
                     int access_end = j;
                     while (access_end < modules[i].line_end &&
                            reachable_line_has_trailing_amp(&lines[access_end])) {
@@ -2875,7 +3020,7 @@ static char *prune_source_to_reachable(const char *source) {
         } else {
             for (int j = modules[i].line_start; j <= modules[i].line_contains; j++) {
                 char type_name[128];
-                if (reachable_line_is_public_access(&lines[j])) {
+                if (reachable_line_is_named_access(&lines[j])) {
                     int access_end = j;
                     while (access_end < modules[i].line_contains &&
                            reachable_line_has_trailing_amp(&lines[access_end])) {
@@ -4609,7 +4754,7 @@ static int is_trace_assign_immediate_line(const char *line) {
     return 1;
 }
 
-static int g_implicit_typing = 1;
+static int g_implicit_typing = 0;
 static int g_warnings_enabled = 1;
 static int g_warnings_as_errors = 0;
 static int g_time_detail = 0;
@@ -4620,6 +4765,8 @@ static int g_procedure_profile = 0;
 static int g_trace_assign = 0;
 static int g_check_uninitialized = 1;
 static int g_warn_unused = 1;
+static int g_warn_empty_sequence = 0;
+static int g_warn_intrinsic_shadow = 1;
 static int g_no_logo = 0;
 static int g_init_integer_enabled = 0;
 static long long g_init_integer_value = 0;
@@ -4666,6 +4813,8 @@ static OfortInterpreter *create_ofort_interpreter(void) {
     if (interp) {
         ofort_set_implicit_typing(interp, g_implicit_typing);
         ofort_set_warnings_enabled(interp, g_warnings_enabled);
+        ofort_set_warn_empty_sequence(interp, g_warn_empty_sequence);
+        ofort_set_warn_intrinsic_shadow(interp, g_warn_intrinsic_shadow);
         ofort_set_fast_mode(interp, g_fast_mode);
         ofort_set_specialized_fast_paths(interp, g_specialized_fast_paths);
         ofort_set_line_profile_enabled(interp, g_line_profile);
@@ -8652,7 +8801,7 @@ static char *maybe_wrap_loose_source(char *source) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [-Werror|--warn-error] [--quiet] [--std=f2023|--std=legacy] [--fast] [--reachable] [--write-reachable file] [--cache] [--no-specialize] [--native name=dll:symbol[,abi]] [--fixed-form|--free-form] [--save-free] [--dep] [--check-gfortran] [--unused-procs] [--time|--time-detail] [--profile-lines|--profile-procs] [--trace-assign] [--warn-unused|--no-warn-unused] [--check-uninitialized|--check-uninit|--no-check-uninitialized] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
+    fprintf(stderr, "usage: %s [--version] [--nologo] [--repl] [--prompt text] [--auto-end] [--defer-check] [--autorun] [-w] [-Werror|--warn-error] [--quiet] [--std=f2023|--std=legacy] [--fast] [--reachable] [--write-reachable file] [--cache] [--no-specialize] [--native name=dll:symbol[,abi]] [--fixed-form|--free-form] [--save-free] [--dep] [--check-gfortran] [--unused-procs] [--time|--time-detail] [--profile-lines|--profile-procs] [--trace-assign] [--warn-unused|--no-warn-unused] [--no-warn-intrinsic-shadow] [--check-uninitialized|--check-uninit|--no-check-uninitialized] [--init-int value] [--init-real value|nan] [--init-char text] [--implicit-typing|--no-implicit-typing] [file1.f90 [file2.f90 ...]] [-- args...]\n", program);
     fprintf(stderr, "       %s --each [--dep] [--check] [--quiet] [--limit n] [--max-fail n] [options] file-or-glob [file-or-glob ...] [-- args...]\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
@@ -8683,6 +8832,8 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --trace-assign prints assignment trace diagnostics\n");
     fprintf(stderr, "       --warn-unused warns about simple declarations whose variables are never read (default unless --fast or -w)\n");
     fprintf(stderr, "       --no-warn-unused disables declared-but-unused variable warnings\n");
+    fprintf(stderr, "       --warn-empty-sequence warns about out-of-bounds array elements passed as empty storage sequences (off by default; -w suppresses)\n");
+    fprintf(stderr, "       --no-warn-intrinsic-shadow disables warnings for user names that shadow intrinsics\n");
     fprintf(stderr, "       --check-uninitialized, --check-uninit rejects reads of declared variables before assignment (default)\n");
     fprintf(stderr, "       --no-check-uninitialized permits reads of otherwise uninitialized variables\n");
     fprintf(stderr, "       --init-int value initializes otherwise uninitialized INTEGER variables to value\n");
@@ -8697,8 +8848,8 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --limit n checks at most n files in --each mode\n");
     fprintf(stderr, "       --max-fail n stops --each mode after n failed files; 0 means no limit\n");
     fprintf(stderr, "       @file reads source file names from a manifest, one path per line\n");
-    fprintf(stderr, "       --implicit-typing, --legacy-implicit uses I-N integer/rest real implicit typing (default)\n");
-    fprintf(stderr, "       --no-implicit-typing rejects undeclared variables unless declared or covered by IMPLICIT\n");
+    fprintf(stderr, "       --implicit-typing, --legacy-implicit uses standard I-N integer/rest real implicit typing\n");
+    fprintf(stderr, "       --no-implicit-typing rejects undeclared variables unless declared or covered by IMPLICIT (default)\n");
     fprintf(stderr, "       with no file in a console, start an interactive session\n");
 }
 
@@ -8877,8 +9028,12 @@ int main(int argc, char **argv) {
             g_specialized_fast_paths = 0;
         } else if (strcmp(argv[i], "--warn-unused") == 0) {
             g_warn_unused = 1;
+        } else if (strcmp(argv[i], "--warn-empty-sequence") == 0) {
+            g_warn_empty_sequence = 1;
         } else if (strcmp(argv[i], "--no-warn-unused") == 0) {
             g_warn_unused = 0;
+        } else if (strcmp(argv[i], "--no-warn-intrinsic-shadow") == 0) {
+            g_warn_intrinsic_shadow = 0;
         } else if (strcmp(argv[i], "--check-uninitialized") == 0 ||
                    strcmp(argv[i], "--check-uninit") == 0) {
             g_check_uninitialized = 1;
