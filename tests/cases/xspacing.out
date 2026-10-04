@@ -1,13 +1,13 @@
 spacing(x) returns the absolute spacing of model numbers near x.
 
 default real examples:
-x = -10  spacing(x) = 9.536743e-07
-x = -1  spacing(x) = 1.192093e-07
+x = -10.0  spacing(x) = 9.536743e-07
+x = -1.0  spacing(x) = 1.192093e-07
 x = -0.5  spacing(x) = 5.960464e-08
-x = 0  spacing(x) = 1.175494e-38
+x = 0.0  spacing(x) = 1.175494e-38
 x = 0.5  spacing(x) = 5.960464e-08
-x = 1  spacing(x) = 1.192093e-07
-x = 10  spacing(x) = 9.536743e-07
+x = 1.0  spacing(x) = 1.192093e-07
+x = 10.0  spacing(x) = 9.536743e-07
 
 kind examples:
 spacing(1.0)   = 1.192093e-07

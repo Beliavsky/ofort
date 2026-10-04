@@ -1,5 +1,6 @@
 integer :: a1(1,1)
 integer :: a2(2)
+integer :: k1, k2, k3
 
 data ((a1(k1,k2), k1 = 1, 1), k2 = 1, 1) /1/
 data (a2(k3), k3 = 1, 2) /2, 3/

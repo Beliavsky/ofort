@@ -1,0 +1,30 @@
+program xprocedure_pointer_component_actual
+implicit none
+type :: holder
+  procedure(f_int), pointer, nopass :: p => null()
+end type holder
+abstract interface
+  integer function f_int(x)
+    integer, intent(in) :: x
+  end function f_int
+end interface
+type(holder) :: obj
+obj%p => add_ten
+call apply(obj%p, 5)
+obj%p => double_it
+call apply(obj%p, 5)
+contains
+integer function add_ten(x)
+  integer, intent(in) :: x
+  add_ten = x + 10
+end function add_ten
+integer function double_it(x)
+  integer, intent(in) :: x
+  double_it = 2*x
+end function double_it
+subroutine apply(f, x)
+  procedure(f_int), pointer :: f
+  integer, intent(in) :: x
+  print *, associated(f), f(x)
+end subroutine apply
+end program xprocedure_pointer_component_actual

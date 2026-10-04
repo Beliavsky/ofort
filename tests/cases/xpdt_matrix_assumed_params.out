@@ -1,0 +1,7 @@
+shape(df%x), size(df%row_names), size(df%col_names) = 2 3 2 3
+df%n1, df%n2, df%wp= 2 3 8
+ds%n1, ds%n2, ds%wp= 100 100 4
+shape(da%x), kind(da%x) = 2 3 4
+                    c1      c2      c3
+      r1  0.1000  0.3000  0.5000
+      r2  0.2000  0.4000  0.6000

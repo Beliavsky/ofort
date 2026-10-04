@@ -15,10 +15,10 @@ huge(0_4) = 2147483647
 huge(0_8) = 9223372036854775807
 
 real huge and tiny examples:
-ra(i) = 0  huge(ra(i)) = 3.402823e+38  tiny(ra(i)) = 1.175494e-38
-ra(i) = 1  huge(ra(i)) = 3.402823e+38  tiny(ra(i)) = 1.175494e-38
-ra(i) = -1  huge(ra(i)) = 3.402823e+38  tiny(ra(i)) = 1.175494e-38
-ra(i) = 100  huge(ra(i)) = 3.402823e+38  tiny(ra(i)) = 1.175494e-38
+ra(i) = 0.0  huge(ra(i)) = 3.402823e+38  tiny(ra(i)) = 1.175494e-38
+ra(i) = 1.0  huge(ra(i)) = 3.402823e+38  tiny(ra(i)) = 1.175494e-38
+ra(i) = -1.0  huge(ra(i)) = 3.402823e+38  tiny(ra(i)) = 1.175494e-38
+ra(i) = 100.0  huge(ra(i)) = 3.402823e+38  tiny(ra(i)) = 1.175494e-38
 
 real kind examples:
 huge(1.0)   = 3.402823e+38

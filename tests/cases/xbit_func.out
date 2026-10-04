@@ -1,0 +1,12 @@
+bit representation of 8-bit integers
+              bit position
+         i    7  6  5  4  3  2  1  0
+        -2    1  1  1  1  1  1  1  0
+        -1    1  1  1  1  1  1  1  1
+         0    0  0  0  0  0  0  0  0
+         1    0  0  0  0  0  0  0  1
+         2    0  0  0  0  0  0  1  0
+         3    0  0  0  0  0  0  1  1
+         4    0  0  0  0  0  1  0  0
+
+not(1), iand(2,3), ior(2,3), ieor(2,3) = -2 2 3 1

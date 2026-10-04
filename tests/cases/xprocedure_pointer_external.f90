@@ -3,6 +3,7 @@ print *,"pass "
 end
 
 function iiii(ii)
+ integer :: iiii, ii
  iiii=1
 end
 
@@ -18,10 +19,12 @@ subroutine test01()
     end function
     subroutine isub(ip)
       integer  :: ip
+      integer  :: i, ii
       external :: ip
       pointer  :: ip
       target   :: ii
       intent(in) :: ip
+      ii = 0
       i=ip(ii)
       if (i.ne.1) print *,"error"
     end subroutine

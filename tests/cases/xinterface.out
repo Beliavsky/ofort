@@ -6,5 +6,5 @@ integer array:
 ia =  1 2 3 4
 twice(ia) =  2 4 6 8
 real array:
-ra =  1 2.5 -3 4.25
-twice(ra) =  2 5 -6 8.5
+ra =  1.0 2.5 -3.0 4.25
+twice(ra) =  2.0 5.0 -6.0 8.5

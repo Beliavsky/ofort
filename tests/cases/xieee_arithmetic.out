@@ -1,0 +1,6 @@
+Infinity Infinity
+NaN == NaN? F
+ieee_is_nan T F F F F F
+ieee_is_negative F F T F T F
+ieee_is_finite F T T F F T
+ieee_is_normal F T T F F F

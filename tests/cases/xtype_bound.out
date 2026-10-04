@@ -1,9 +1,9 @@
 initial point:
-x = 3
-y = 4
-norm = 5
+x = 3.0
+y = 4.0
+norm = 5.0
 
 after scaling by 2:
-x = 6
-y = 8
-norm = 10
+x = 6.0
+y = 8.0
+norm = 10.0
