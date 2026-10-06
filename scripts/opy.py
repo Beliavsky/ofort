@@ -679,6 +679,8 @@ def inline_ofort_helpers(
         "cumsum_real",
         "linspace",
         "mean_1d",
+        "np_amin",
+        "np_amax",
         "ones_real",
         "rnorm",
         "runif",
@@ -721,6 +723,18 @@ def inline_ofort_helpers(
         updated = add_contains_helper(updated, VAR_1D_HELPER, explain_helpers=explain_helpers)
     if "std" in helpers:
         updated = add_contains_helper(updated, STD_HELPER, explain_helpers=explain_helpers)
+    for name, intrinsic in (("np_amin", "minval"), ("np_amax", "maxval")):
+        if name in helpers:
+            helper = f"""pure real(dp) function {name}(x)
+use, intrinsic :: ieee_arithmetic, only: ieee_is_nan, ieee_value, ieee_quiet_nan
+real(dp), intent(in) :: x(:)
+if (any(ieee_is_nan(x))) then
+  {name} = ieee_value(1.0_dp, ieee_quiet_nan)
+else
+  {name} = {intrinsic}(x)
+end if
+end function {name}"""
+            updated = add_contains_helper(updated, helper, explain_helpers=explain_helpers)
     return updated, []
 
 
