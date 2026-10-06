@@ -24396,20 +24396,34 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
     case FND_ASSOCIATE: {
         OfortValue *assoc_vals = (OfortValue *)calloc(OFORT_MAX_PARAMS, sizeof(*assoc_vals));
         int *assignable = (int *)calloc(OFORT_MAX_PARAMS, sizeof(*assignable));
+        int initialized[OFORT_MAX_PARAMS];
         int n_assoc = n->n_params;
         if (!assoc_vals || !assignable) ofort_error(I, "Out of memory");
         for (int i = 0; i < n_assoc; i++) {
-            assoc_vals[i] = eval_node(I, n->stmts[i]);
             assignable[i] = associate_selector_is_assignable(I, n->stmts[i]);
+            OfortNode *root = n->stmts[i];
+            OfortVar *selector_var = NULL;
+            while (root && (root->type == FND_MEMBER || root->type == FND_ARRAY_REF) &&
+                   root->children[0]) root = root->children[0];
+            if (assignable[i] && root &&
+                (root->type == FND_IDENT || root->type == FND_FUNC_CALL))
+                selector_var = find_var(I, root->name);
+            initialized[i] = selector_var ? selector_var->is_initialized : 1;
+            /* Association does not read the selector's elements. Keep checks
+               active for expressions used as subscripts or section bounds. */
+            if (selector_var) selector_var->is_initialized = 1;
+            assoc_vals[i] = eval_node(I, n->stmts[i]);
+            if (selector_var) selector_var->is_initialized = initialized[i];
         }
         push_scope(I);
         for (int i = 0; i < n_assoc; i++) {
-            declare_var(I, n->param_names[i], copy_value(assoc_vals[i]));
+            OfortVar *av = declare_var(I, n->param_names[i], copy_value(assoc_vals[i]));
+            av->is_initialized = initialized[i];
         }
         exec_node(I, n->children[0]);
         for (int i = 0; i < n_assoc; i++) {
             OfortVar *av = find_var_in_current_scope(I, n->param_names[i]);
-            if (assignable[i] && av && av->present) {
+            if (assignable[i] && av && av->present && av->is_initialized) {
                 OfortNode *assign = alloc_node(I, FND_ASSIGN);
                 assign->children[0] = n->stmts[i];
                 assign->children[1] = data_node_from_value(I, &av->val);
