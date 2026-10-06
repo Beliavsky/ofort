@@ -13271,13 +13271,22 @@ static int subscript_spec_value(OfortSubscriptSpec *spec, int pos) {
     return spec->range.start + pos * spec->range.step;
 }
 
+static void check_selected_array_element(OfortInterpreter *I, OfortVar *var,
+                                         int index, int line) {
+    if (var && I->strict_uninitialized && !array_element_is_initialized(var, index))
+        ofort_error(I, "Variable '%s' is used before it is fully set; selected element at linear index %d is unset at line %d",
+                    var->name, index + 1, line);
+}
+
 static void copy_subscripted_recursive(OfortInterpreter *I, OfortValue *src, OfortValue *dst,
                                        OfortSubscriptSpec *specs, int nargs,
-                                       int dim, int *subscripts, int *out_index) {
+                                       int dim, int *subscripts, int *out_index,
+                                       OfortVar *var, int line) {
     if (dim < 0) {
         int src_index = section_linear_index(src, subscripts, nargs);
         if (src_index < 0 || src_index >= src->v.arr.len)
             ofort_error(I, "Array section index out of bounds");
+        check_selected_array_element(I, var, src_index, line);
         free_value(&dst->v.arr.data[*out_index]);
         dst->v.arr.data[*out_index] = array_element_value(src, src_index);
         (*out_index)++;
@@ -13285,11 +13294,12 @@ static void copy_subscripted_recursive(OfortInterpreter *I, OfortValue *src, Ofo
     }
     for (int pos = 0; pos < specs[dim].count; pos++) {
         subscripts[dim] = subscript_spec_value(&specs[dim], pos);
-        copy_subscripted_recursive(I, src, dst, specs, nargs, dim - 1, subscripts, out_index);
+        copy_subscripted_recursive(I, src, dst, specs, nargs, dim - 1, subscripts, out_index, var, line);
     }
 }
 
-static OfortValue eval_subscripted_array(OfortInterpreter *I, OfortValue *array, OfortNode *n) {
+static OfortValue eval_subscripted_array_checked(OfortInterpreter *I, OfortValue *array,
+                                                OfortNode *n, OfortVar *var) {
     int nargs = n->n_stmts;
     OfortSubscriptSpec specs[7];
     int result_dims[7];
@@ -13321,6 +13331,7 @@ static OfortValue eval_subscripted_array(OfortInterpreter *I, OfortValue *array,
             free_value(&lo);
             if (index < 0 || index >= array->v.arr.len)
                 ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, array->v.arr.len);
+            check_selected_array_element(I, var, index, n->line);
             return array_element_value(array, index);
         }
 
@@ -13357,7 +13368,7 @@ static OfortValue eval_subscripted_array(OfortInterpreter *I, OfortValue *array,
         result.kind = array->kind;
         copy_cstr(result.v.arr.elem_type_name, sizeof(result.v.arr.elem_type_name),
                   array->v.arr.elem_type_name);
-        copy_subscripted_recursive(I, array, &result, specs, rank, rank - 1, subscripts, &out_index);
+        copy_subscripted_recursive(I, array, &result, specs, rank, rank - 1, subscripts, &out_index, var, n->line);
         return result;
     }
 
@@ -13376,6 +13387,7 @@ static OfortValue eval_subscripted_array(OfortInterpreter *I, OfortValue *array,
         index = section_linear_index(array, subscripts, nargs);
         if (index < 0 || index >= array->v.arr.len)
             ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, array->v.arr.len);
+        check_selected_array_element(I, var, index, n->line);
         return array_element_value(array, index);
     }
 
@@ -13384,9 +13396,13 @@ static OfortValue eval_subscripted_array(OfortInterpreter *I, OfortValue *array,
     result.kind = array->kind;
     copy_cstr(result.v.arr.elem_type_name, sizeof(result.v.arr.elem_type_name),
               array->v.arr.elem_type_name);
-    copy_subscripted_recursive(I, array, &result, specs, nargs, nargs - 1, subscripts, &out_index);
+    copy_subscripted_recursive(I, array, &result, specs, nargs, nargs - 1, subscripts, &out_index, var, n->line);
     free_subscript_specs(specs, nargs);
     return result;
+}
+
+static OfortValue eval_subscripted_array(OfortInterpreter *I, OfortValue *array, OfortNode *n) {
+    return eval_subscripted_array_checked(I, array, n, NULL);
 }
 
 static int array_ref_scalar_linear_index(OfortInterpreter *I, OfortValue *array,
@@ -13403,7 +13419,7 @@ static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNo
             return array_element_value(&var->val, index);
         }
     }
-    return eval_subscripted_array(I, &var->val, n);
+    return eval_subscripted_array_checked(I, &var->val, n, var);
 }
 
 static OfortValue eval_array_section_value(OfortInterpreter *I, OfortValue *array, OfortNode *n) {
