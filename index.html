@@ -18,6 +18,7 @@
       <select id="example" aria-label="Example program"><option value="hello">Hello, Fortran</option><option value="arrays">Array calculations</option><option value="input">Reading input</option></select>
       <button id="download">Download source</button>
       <button id="focus" aria-pressed="false">Focus mode</button>
+      <button id="report">Report a bug</button>
     </div>
     <div class="workspace">
       <section class="panel editor-panel"><div class="panel-heading"><label for="source">01 / SOURCE</label><span>Free-form Fortran</span></div><textarea id="source" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Fortran source"></textarea></section>
@@ -26,6 +27,18 @@
     <section class="panel input-panel"><div class="panel-heading"><label for="stdin">03 / STANDARD INPUT</label><span>Supply input before running</span></div><textarea id="stdin" rows="3" spellcheck="false" placeholder="Values for READ(*, ...) go here"></textarea></section>
     <footer>Experimental browser build. Native LAPACK libraries, external commands and compilers are unavailable. Each run starts fresh; files are temporary. Runs stop after 30 seconds.</footer>
   </main>
+  <dialog id="report-dialog" aria-labelledby="report-heading">
+    <h2 id="report-heading">Report a playground bug</h2>
+    <p class="privacy-warning">GitHub issues are public. Remove private code, data, and credentials, including anything printed in the output.</p>
+    <p>Describe what went wrong and what you expected. Prefer the smallest program that reproduces the problem. Standard input is not included automatically.</p>
+    <label for="report-title">Issue title</label>
+    <input id="report-title" type="text" value="Browser playground: unexpected behavior" maxlength="160">
+    <label class="report-option"><input id="report-source" type="checkbox"> Include Fortran source (from the last run, or the editor if not run)</label>
+    <label for="report-preview">Editable report preview</label>
+    <textarea id="report-preview" rows="14" spellcheck="false"></textarea>
+    <p id="report-note" role="status"></p>
+    <div class="report-actions"><button id="report-open" class="primary">Open GitHub issue</button><button id="report-download">Download report</button><button id="report-close">Cancel</button></div>
+  </dialog>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.20/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.20/mode/fortran/fortran.min.js"></script>
   <script src="app.js"></script>

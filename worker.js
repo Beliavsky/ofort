@@ -13,7 +13,8 @@ self.onmessage = async ({data}) => {
       print: text => stdout.push(text),
       printErr: text => stderr.push(text)
     });
-    self.postMessage({type:"status", text:"Running..."});
+    const build = module.ccall("ofort_web_build_info", "string", [], []);
+    self.postMessage({type:"status", text:"Running...", build});
     interpreter = module.ccall("ofort_c_create", "number", [], []);
     if (!interpreter) throw new Error("Unable to allocate the interpreter: browser memory allocation failed. Close memory-heavy tabs and try again.");
     module.ccall("ofort_c_set_fast_mode", null, ["number", "number"], [interpreter, Number(data.fast)]);
