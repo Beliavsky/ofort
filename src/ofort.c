@@ -48,6 +48,12 @@
  *  Interpreter state
  * â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• */
 
+typedef struct OfortArrayInitialization {
+    struct OfortArrayInitialization *next;
+    int len;
+    int count;
+    unsigned char bits[1];
+} OfortArrayInitialization;
 typedef struct {
     char name[256];
     OfortValue val;
@@ -56,6 +62,7 @@ typedef struct {
     int is_value;
     int is_initialized;
     int initialized_prefix_len;
+    OfortArrayInitialization *array_initialization;
     int char_len;     /* declared CHARACTER length, 0 if not CHARACTER */
     int present;      /* 0 for absent OPTIONAL dummy arguments */
     int is_optional;
@@ -300,6 +307,7 @@ struct OfortInterpreter {
     int command_argc;
     char command_args[OFORT_MAX_PARAMS][OFORT_MAX_STRLEN];
     int procedure_depth;
+    OfortArrayInitialization *array_initializations;
     OfortNode **initialized_data;
     int n_initialized_data;
     int initialized_data_cap;
@@ -1385,6 +1393,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
             if (s->vars[i].is_pointer && val.type == FVAL_VOID) {
                 if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
                 s->vars[i].val = val;
+            s->vars[i].array_initialization = NULL;
                 s->vars[i].is_alias = 0;
                 s->vars[i].is_initialized = 0;
                 s->vars[i].initialized_prefix_len = 0;
@@ -1405,6 +1414,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 if (s->vars[i].declared_kind > 0) val.kind = s->vars[i].declared_kind;
                 if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
                 s->vars[i].val = val;
+            s->vars[i].array_initialization = NULL;
                 s->vars[i].is_alias = 0;
                 s->vars[i].scalar_allocated = 0;
                 s->vars[i].is_initialized = 1;
@@ -1427,6 +1437,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
             if (target_kind > 0 && (is_numeric_type(val.type) || val.type == FVAL_LOGICAL)) val.kind = target_kind;
             if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
             s->vars[i].val = val;
+            s->vars[i].array_initialization = NULL;
             if (s->vars[i].is_allocatable) {
                 s->vars[i].scalar_allocated = s->vars[i].val.type != FVAL_VOID &&
                                               s->vars[i].val.type != FVAL_ARRAY;
@@ -1483,6 +1494,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 if (ps->vars[i].is_pointer && val.type == FVAL_VOID) {
                     if (!ps->vars[i].is_alias) free_value(&ps->vars[i].val);
                     ps->vars[i].val = val;
+                ps->vars[i].array_initialization = NULL;
                     ps->vars[i].is_alias = 0;
                     ps->vars[i].is_initialized = 0;
                     ps->vars[i].initialized_prefix_len = 0;
@@ -1503,6 +1515,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                     if (ps->vars[i].declared_kind > 0) val.kind = ps->vars[i].declared_kind;
                     if (!ps->vars[i].is_alias) free_value(&ps->vars[i].val);
                     ps->vars[i].val = val;
+                ps->vars[i].array_initialization = NULL;
                     ps->vars[i].is_alias = 0;
                     ps->vars[i].scalar_allocated = 0;
                     ps->vars[i].is_initialized = 1;
@@ -1525,6 +1538,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
                 if (target_kind > 0 && (is_numeric_type(val.type) || val.type == FVAL_LOGICAL)) val.kind = target_kind;
                 if (!ps->vars[i].is_alias) free_value(&ps->vars[i].val);
                 ps->vars[i].val = val;
+                ps->vars[i].array_initialization = NULL;
                 if (ps->vars[i].is_allocatable) {
                     ps->vars[i].scalar_allocated = ps->vars[i].val.type != FVAL_VOID &&
                                                    ps->vars[i].val.type != FVAL_ARRAY;
@@ -1568,6 +1582,7 @@ static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val) 
     OfortVar *v = &s->vars[s->n_vars++];
     copy_cstr(v->name, sizeof(v->name), name);
     v->val = val;
+    v->array_initialization = NULL;
     v->is_parameter = 0;
     v->intent = 0;
     v->is_value = 0;
@@ -1615,6 +1630,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
         if (strcmp(upper, vu) == 0) {
             if (!s->vars[i].is_alias) free_value(&s->vars[i].val);
             s->vars[i].val = val;
+            s->vars[i].array_initialization = NULL;
             s->vars[i].is_alias = 0;
             s->vars[i].is_initialized = val.type != FVAL_VOID;
             s->vars[i].initialized_prefix_len =
@@ -1638,6 +1654,7 @@ static OfortVar *declare_var(OfortInterpreter *I, const char *name, OfortValue v
     OfortVar *v = &s->vars[s->n_vars++];
     copy_cstr(v->name, sizeof(v->name), name);
     v->val = val;
+    v->array_initialization = NULL;
     v->is_parameter = 0;
     v->intent = 0;
     v->is_value = 0;
@@ -1686,6 +1703,7 @@ static OfortVar *declare_alias_var(OfortInterpreter *I, const char *name, OfortV
     v->is_value = target->is_value;
     v->is_initialized = target->is_initialized;
     v->initialized_prefix_len = target->initialized_prefix_len;
+    v->array_initialization = target->array_initialization;
     v->char_len = target->char_len;
     v->present = target->present;
     v->is_optional = target->is_optional;
@@ -2578,6 +2596,7 @@ static void copy_imported_var_attrs(OfortVar *dst, const OfortVar *src) {
     dst->is_value = src->is_value;
     dst->is_initialized = src->is_initialized;
     dst->initialized_prefix_len = src->initialized_prefix_len;
+    dst->array_initialization = src->array_initialization;
     dst->char_len = src->char_len;
     dst->present = src->present;
     dst->is_optional = src->is_optional;
@@ -11501,9 +11520,56 @@ static int copy_sequence_associated_array_back(OfortInterpreter *I, const char *
     return 1;
 }
 
+static int array_element_is_initialized(const OfortVar *var, int index) {
+    if (!var || var->val.type != FVAL_ARRAY || index < 0 || index >= var->val.v.arr.len)
+        return 0;
+    if (var->is_initialized) return 1;
+    if (var->array_initialization && var->array_initialization->len == var->val.v.arr.len)
+        return (var->array_initialization->bits[index / 8] & (1u << (index % 8))) != 0;
+    return index < var->initialized_prefix_len;
+}
+
+static void prepare_array_initialization(OfortInterpreter *I, OfortVar *var) {
+    OfortArrayInitialization *state;
+    size_t bytes;
+    int prefix;
+    if (!I->strict_uninitialized || var->is_initialized || var->val.type != FVAL_ARRAY ||
+        var->val.v.arr.len <= 0) return;
+    if (var->array_initialization && var->array_initialization->len == var->val.v.arr.len)
+        return;
+    bytes = ((size_t)var->val.v.arr.len + 7) / 8;
+    state = (OfortArrayInitialization *)calloc(1, sizeof(*state) + bytes - 1);
+    if (!state) ofort_error(I, "Out of memory tracking array initialization");
+    state->len = var->val.v.arr.len;
+    state->next = I->array_initializations;
+    I->array_initializations = state;
+    var->array_initialization = state;
+    prefix = var->initialized_prefix_len;
+    if (prefix < 0) prefix = 0;
+    if (prefix > state->len) prefix = state->len;
+    for (int i = 0; i < prefix; i++) state->bits[i / 8] |= (unsigned char)(1u << (i % 8));
+    state->count = prefix;
+}
+
+static void mark_tracked_array_element(OfortVar *var, int index) {
+    OfortArrayInitialization *state = var->array_initialization;
+    unsigned char bit;
+    if (!state || var->is_initialized || state->len != var->val.v.arr.len ||
+        index < 0 || index >= state->len) return;
+    bit = (unsigned char)(1u << (index % 8));
+    if (!(state->bits[index / 8] & bit)) {
+        state->bits[index / 8] |= bit;
+        state->count++;
+    }
+    while (var->initialized_prefix_len < state->len &&
+           array_element_is_initialized(var, var->initialized_prefix_len))
+        var->initialized_prefix_len++;
+    var->is_initialized = state->count == state->len;
+}
 static void error_uninitialized_var(OfortInterpreter *I, OfortVar *var, int line) {
     if (var && var->val.type == FVAL_ARRAY &&
-        var->initialized_prefix_len > 0 &&
+        (var->initialized_prefix_len > 0 ||
+         (var->array_initialization && var->array_initialization->count > 0)) &&
         var->initialized_prefix_len < var->val.v.arr.len) {
         int linear = var->initialized_prefix_len;
         int rem = linear;
@@ -13323,17 +13389,21 @@ static OfortValue eval_subscripted_array(OfortInterpreter *I, OfortValue *array,
     return result;
 }
 
+static int array_ref_scalar_linear_index(OfortInterpreter *I, OfortValue *array,
+                                         OfortNode *n, int *index_out);
+
 static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNode *n) {
-    OfortValue result = eval_subscripted_array(I, &var->val, n);
-    /* Section association and inquiries need only the descriptor. A scalar
-       result, however, reads an element and cannot use wholly unset storage. */
-    if (I->strict_uninitialized && !var->is_initialized &&
-        var->initialized_prefix_len == 0 && result.type != FVAL_ARRAY &&
-        result.type != FVAL_VOID) {
-        free_value(&result);
-        error_uninitialized_var(I, var, n->line);
+    if (I->strict_uninitialized && !var->is_initialized) {
+        int index;
+        if (array_ref_scalar_linear_index(I, &var->val, n, &index)) {
+            if (index < 0 || index >= var->val.v.arr.len)
+                ofort_error(I, "Array index out of bounds: %d (size %d)", index + 1, var->val.v.arr.len);
+            if (!array_element_is_initialized(var, index))
+                error_uninitialized_var(I, var, n->line);
+            return array_element_value(&var->val, index);
+        }
     }
-    return result;
+    return eval_subscripted_array(I, &var->val, n);
 }
 
 static OfortValue eval_array_section_value(OfortInterpreter *I, OfortValue *array, OfortNode *n) {
@@ -13800,10 +13870,12 @@ static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs,
             value.kind = var->val.v.arr.data[index].kind;
         if (assign_packed_array_element(&var->val, index, value)) {
             free_value(&value);
+            mark_tracked_array_element(var, index);
             return;
         }
         free_value(&var->val.v.arr.data[index]);
         var->val.v.arr.data[index] = value;
+        mark_tracked_array_element(var, index);
         return;
     }
 
@@ -13815,6 +13887,16 @@ static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs,
     int subscripts[7] = {0};
     int rhs_index = 0;
     assign_subscripted_recursive(I, &var->val, rhs, specs, nargs, nargs - 1, subscripts, &rhs_index);
+    if (var->array_initialization && !var->is_initialized) {
+        for (int i = 0; i < selected; i++) {
+            int rem = i;
+            for (int d = 0; d < nargs; d++) {
+                subscripts[d] = subscript_spec_value(&specs[d], rem % specs[d].count);
+                rem /= specs[d].count;
+            }
+            mark_tracked_array_element(var, section_linear_index(&var->val, subscripts, nargs));
+        }
+    }
     free_subscript_specs(specs, nargs);
 }
 
@@ -18227,6 +18309,9 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             n->stmts[0]->type == FND_IDENT) {
             OfortVar *array_var = find_var(I, n->stmts[0]->name);
             if (array_var && array_var->val.type == FVAL_ARRAY) {
+                if (I->strict_uninitialized && !array_var->is_initialized &&
+                    array_var->val.v.arr.len > 0)
+                    error_uninitialized_var(I, array_var, n->line);
                 OfortValue *array = &array_var->val;
                 if (array->v.arr.int_data && array->v.arr.elem_type == FVAL_INTEGER) {
                     long long isum = 0;
@@ -18403,11 +18488,10 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                         args[i] = copy_value(actual->val);
                         param_uninitialized[dummy_i] = 1;
                     } else {
-                        /* Evaluate section bounds, but retain undefined
-                           element status on the associated array dummy. */
-                        args[i] = eval_node(I, n->stmts[i]);
-                        if (args[i].type == FVAL_ARRAY)
-                            param_uninitialized[dummy_i] = 1;
+                        /* Association needs storage, not its current value.
+                           Subscripts are still evaluated normally. */
+                        args[i] = eval_subscripted_array(I, &actual->val, n->stmts[i]);
+                        param_uninitialized[dummy_i] = 1;
                     }
                     continue;
                 }
@@ -18518,6 +18602,25 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                             free_value(&args[i]);
                             args[i] = sequence;
                         }
+                    }
+                }
+            }
+            OfortNode *copyback_actuals[OFORT_MAX_PARAMS] = {0};
+            int copyback_initialized[OFORT_MAX_PARAMS] = {0};
+            {
+                int used[OFORT_MAX_PARAMS] = {0};
+                int next_pos = 0;
+                for (int i = 0; i < nargs; i++) {
+                    int target;
+                    if (n->param_names[i][0]) {
+                        target = procedure_dummy_index(fn, n->param_names[i]);
+                    } else {
+                        while (next_pos < fn->n_params && used[next_pos]) next_pos++;
+                        target = next_pos++;
+                    }
+                    if (target >= 0 && target < fn->n_params && target < OFORT_MAX_PARAMS) {
+                        used[target] = 1;
+                        copyback_actuals[target] = n->stmts[i];
                     }
                 }
             }
@@ -18673,7 +18776,11 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             for (int i = 0; i < fn->n_params && i < nargs; i++) {
                 if (fn->param_intents[i] == 2 || fn->param_intents[i] == 3) {
                     OfortVar *pv = find_var(I, fn->param_names[i]);
-                    if (pv && pv->present && n->stmts[i]->type == FND_IDENT) {
+                    OfortNode *actual = copyback_actuals[i];
+                    if (pv && pv->present && actual &&
+                        (actual->type == FND_IDENT || actual->type == FND_FUNC_CALL ||
+                         actual->type == FND_ARRAY_REF || actual->type == FND_MEMBER)) {
+                        copyback_initialized[i] = pv->is_initialized;
                         free_value(&args[i]);
                         args[i] = copy_value(pv->val);
                     }
@@ -18689,8 +18796,33 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             for (int i = 0; i < fn->n_params && i < nargs; i++) {
                 if (fn->param_intents[i] == 2 || fn->param_intents[i] == 3) {
                     if (procedure_ref_name(&args[i])) continue;
-                    if (n->stmts[i]->type == FND_IDENT && args[i].type != FVAL_VOID) {
-                        set_var(I, n->stmts[i]->name, copy_value(args[i]));
+                    OfortNode *actual = copyback_actuals[i];
+                    if (!actual || args[i].type == FVAL_VOID) continue;
+                    if (actual->type == FND_IDENT) {
+                        OfortVar *target = set_var(I, actual->name, copy_value(args[i]));
+                        target->is_initialized = copyback_initialized[i];
+                        if (!target->is_initialized) target->initialized_prefix_len = 0;
+                    } else if (copyback_initialized[i] && actual->type == FND_FUNC_CALL) {
+                        OfortVar *target = find_var(I, actual->name);
+                        if (target && target->val.type == FVAL_ARRAY) {
+                            prepare_array_initialization(I, target);
+                            assign_array_ref(I, target, actual, &args[i]);
+                            if (!I->strict_uninitialized) target->is_initialized = 1;
+                        }
+                    } else if (copyback_initialized[i] && actual->type == FND_ARRAY_REF &&
+                               actual->children[0]) {
+                        OfortValue *target = member_lvalue(I, actual->children[0]);
+                        if (target && target->type == FVAL_ARRAY) {
+                            assign_array_ref_value(I, target, actual, &args[i]);
+                            mark_assignment_root_initialized(I, actual);
+                        }
+                    } else if (copyback_initialized[i] && actual->type == FND_MEMBER) {
+                        OfortValue *target = member_lvalue(I, actual);
+                        if (target) {
+                            free_value(target);
+                            *target = copy_value(args[i]);
+                            mark_assignment_root_initialized(I, actual);
+                        }
                     }
                 }
             }
@@ -20299,8 +20431,7 @@ static int fast_numeric_expr_value_node(OfortInterpreter *I, OfortNode *n, doubl
         }
         if (!fast_array_ref_index(I, n, &var, &index)) return 0;
         /* Undefined element reads must use the checked evaluator. */
-        if (I->strict_uninitialized && !var->is_initialized &&
-            var->initialized_prefix_len == 0)
+        if (I->strict_uninitialized && !array_element_is_initialized(var, index))
             return 0;
         if (var->val.v.arr.real_data &&
             (var->val.v.arr.elem_type == FVAL_REAL || var->val.v.arr.elem_type == FVAL_DOUBLE)) {
@@ -38315,6 +38446,11 @@ void ofort_destroy(OfortInterpreter *interp) {
     free(interp->cached_source_text);
     free(interp->cached_processed_source);
     free(interp->initialized_data);
+    while (interp->array_initializations) {
+        OfortArrayInitialization *state = interp->array_initializations;
+        interp->array_initializations = state->next;
+        free(state);
+    }
     free(interp);
 }
 
