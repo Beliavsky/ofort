@@ -18490,8 +18490,19 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     } else {
                         /* Association needs storage, not its current value.
                            Subscripts are still evaluated normally. */
-                        args[i] = eval_subscripted_array(I, &actual->val, n->stmts[i]);
-                        param_uninitialized[dummy_i] = 1;
+                        int index;
+                        if (pre_fn->param_n_dims[dummy_i] == 0 &&
+                            array_ref_scalar_linear_index(I, &actual->val, n->stmts[i], &index)) {
+                            if (index < 0 || index >= actual->val.v.arr.len)
+                                ofort_error(I, "Array index out of bounds: %d (size %d)",
+                                            index + 1, actual->val.v.arr.len);
+                            args[i] = array_element_value(&actual->val, index);
+                            param_uninitialized[dummy_i] =
+                                !array_element_is_initialized(actual, index);
+                        } else {
+                            args[i] = eval_subscripted_array(I, &actual->val, n->stmts[i]);
+                            param_uninitialized[dummy_i] = 1;
+                        }
                     }
                     continue;
                 }
@@ -29349,6 +29360,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         /* Passing an element is storage association, even
                            for scalar dummies. Subscripts still undergo normal
                            evaluation; reading the dummy later remains checked. */
+                        int index;
+                        if (fn->param_n_dims[dummy_i] == 0 &&
+                            array_ref_scalar_linear_index(I, &actual->val, n->stmts[i], &index)) {
+                            if (index < 0 || index >= actual->val.v.arr.len)
+                                ofort_error(I, "Array index out of bounds: %d (size %d)",
+                                            index + 1, actual->val.v.arr.len);
+                            args[i] = array_element_value(&actual->val, index);
+                            actual_initialized[i] = array_element_is_initialized(actual, index);
+                            continue;
+                        }
                         if (fn->param_n_dims[dummy_i] > 0)
                             args[i] = sequence_actual_from_array_element(I, n->stmts[i], 1);
                         if (args[i].type == FVAL_VOID)
