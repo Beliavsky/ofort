@@ -21,7 +21,7 @@
       <button id="report">Report a bug</button>
     </div>
     <div class="workspace">
-      <section class="panel editor-panel"><div class="panel-heading"><label for="source">01 / SOURCE</label><span>Free-form Fortran</span></div><textarea id="source" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Fortran source"></textarea></section>
+      <section class="panel editor-panel"><div class="panel-heading"><label for="source">01 / SOURCE</label><button id="clear-code" type="button">Clear code</button><span>Free-form Fortran</span></div><textarea id="source" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Fortran source"></textarea></section>
       <section class="panel results"><div class="panel-heading"><span>02 / RESULTS</span><span id="status" role="status">Ready</span></div><h2>Output</h2><pre id="output" tabindex="0"></pre><h2>Warnings &amp; errors</h2><pre id="errors" tabindex="0"></pre></section>
     </div>
     <section class="panel input-panel"><div class="panel-heading"><label for="stdin">03 / STANDARD INPUT</label><span>Supply input before running</span></div><textarea id="stdin" rows="3" spellcheck="false" placeholder="Values for READ(*, ...) go here"></textarea></section>

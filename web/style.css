@@ -11,6 +11,8 @@ main { max-width:1500px; margin:auto; padding:34px 5vw; }.intro { animation:reve
 textarea { display:block; width:100%; resize:vertical; border:0; background:transparent; color:var(--ink); padding:22px; font:14px/1.8 var(--mono); tab-size:4; }#source { min-height:410px; }textarea:focus { outline:2px solid #8eac60; outline-offset:-2px; }h2 { font:11px var(--mono); color:var(--muted); text-transform:uppercase; letter-spacing:1px; margin:20px 22px 8px; }pre { font:13px/1.7 var(--mono); margin:0; padding:0 22px 18px; white-space:pre-wrap; overflow-wrap:anywhere; max-height:250px; overflow:auto; }#output { min-height:130px; }#errors { color:#a44331; }.input-panel { margin-top:18px; }footer { color:var(--muted); font-size:12px; line-height:1.8; margin:22px 0; }
 .intro .eyebrow { font-size:clamp(22px,3vw,34px); letter-spacing:-.5px; color:var(--ink); }
 .editor-panel .CodeMirror { height:410px; background:transparent; color:var(--ink); font:14px/1.8 var(--mono); }
+.editor-panel .panel-heading { align-items:center; }
+#clear-code { padding:5px 10px; font-size:11px; letter-spacing:0; }
 .editor-panel .CodeMirror-gutters { background:#edf2e8; border-right:1px solid var(--line); }
 .editor-panel .CodeMirror-linenumber { color:#718474; padding:0 10px; }
 .editor-panel .CodeMirror-lines { padding:18px 0; }

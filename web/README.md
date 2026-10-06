@@ -24,6 +24,7 @@ the application/wasm MIME type. No server-side program execution is needed.
 ## Initial scope
 
 - Free-form complete programs, examples, and source download.
+- Clear code empties only the source editor; the editor's Undo restores it.
 - A Focus mode toggle hides the header and introduction and expands the editor
   and results panes without hiding the toolbar or standard input.
 - Report a bug opens an editable preview with output, diagnostics, browser
