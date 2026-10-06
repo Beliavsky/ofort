@@ -29906,6 +29906,19 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                        (actual_node->type == FND_FUNC_CALL || actual_node->type == FND_ARRAY_REF) &&
                        fn->param_intents[i] != 1 &&
                        args[i].type != FVAL_VOID && !procedure_ref_name(&args[i])) {
+                /* Copying a defined dummy to an array element defines only
+                   that element, not the other elements of the actual array. */
+                if (param_copyback_initialized[i] &&
+                    (actual_node->type == FND_FUNC_CALL ||
+                     (actual_node->type == FND_ARRAY_REF && !actual_node->children[0]))) {
+                    OfortVar *actual = find_var(I, actual_node->name);
+                    if (actual && actual->val.type == FVAL_ARRAY && !actual->is_parameter) {
+                        prepare_array_initialization(I, actual);
+                        assign_array_ref(I, actual, actual_node, &args[i]);
+                        if (!I->strict_uninitialized) actual->is_initialized = 1;
+                        continue;
+                    }
+                }
                 OfortValue *target = member_lvalue(I, actual_node);
                 if (target) {
                     free_value(target);
