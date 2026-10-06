@@ -16761,6 +16761,49 @@ static int write_to_internal_target(OfortInterpreter *I, OfortNode *target_node,
 
     if (target_node->type == FND_IDENT) {
         OfortVar *target = find_var(I, target_node->name);
+        if (target && target->val.type == FVAL_ARRAY &&
+            target->val.v.arr.elem_type == FVAL_CHARACTER) {
+            char saved_output[OFORT_MAX_OUTPUT];
+            char records[OFORT_MAX_OUTPUT];
+            int saved_len = I->out_len;
+            int saved_preserve = I->preserve_format_trailing_blanks;
+            int record_index = 0;
+            char *record;
+
+            target_len = target->char_len > 0 ? target->char_len :
+                         array_character_len(&target->val);
+            copy_cstr(saved_output, sizeof(saved_output), I->output);
+            I->out_len = 0;
+            I->output[0] = '\0';
+            I->preserve_format_trailing_blanks = 1;
+            format_output(I, fmt, vals, nvals);
+            copy_cstr(records, sizeof(records), I->output);
+            I->preserve_format_trailing_blanks = saved_preserve;
+            I->out_len = saved_len;
+            copy_cstr(I->output, sizeof(I->output), saved_output);
+
+            record = records;
+            while (*record) {
+                char *next = strchr(record, '\n');
+                if (next) *next = '\0';
+                if (record_index >= target->val.v.arr.len) {
+                    if (status_out) { *status_out = -1; return 1; }
+                    ofort_error(I, "End of file in internal WRITE");
+                }
+                if ((int)strlen(record) > target_len) {
+                    if (status_out) { *status_out = -2; return 1; }
+                    ofort_error(I, "End of record");
+                }
+                text = make_character(record);
+                text = resize_character_value(text, target_len);
+                free_value(&target->val.v.arr.data[record_index]);
+                target->val.v.arr.data[record_index++] = text;
+                if (!next) break;
+                record = next + 1;
+            }
+            target->is_initialized = 1;
+            return 1;
+        }
         if (!target || target->val.type != FVAL_CHARACTER) return 0;
         render_write_to_string(I, fmt, vals, nvals, text_buf, sizeof(text_buf), 0);
         target_len = target->char_len > 0 ? target->char_len :
