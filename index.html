@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ofort / Fortran playground</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.20/codemirror.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header><a class="brand" href="./">ofort<span> / playground</span></a><span class="badge">LOCAL EXECUTION</span></header>
+  <main>
+    <section class="intro"><p class="eyebrow">Fortran, without the installation</p><p>Your code runs in your browser. No source is sent to a server.</p></section>
+    <div class="toolbar">
+      <button id="run" class="primary">Run program <span>Ctrl + Enter</span></button>
+      <button id="stop" disabled>Stop</button>
+      <label><input id="fast" type="checkbox" checked> Fast mode</label>
+      <select id="example" aria-label="Example program"><option value="hello">Hello, Fortran</option><option value="arrays">Array calculations</option><option value="input">Reading input</option></select>
+      <button id="download">Download source</button>
+      <button id="focus" aria-pressed="false">Focus mode</button>
+    </div>
+    <div class="workspace">
+      <section class="panel editor-panel"><div class="panel-heading"><label for="source">01 / SOURCE</label><span>Free-form Fortran</span></div><textarea id="source" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Fortran source"></textarea></section>
+      <section class="panel results"><div class="panel-heading"><span>02 / RESULTS</span><span id="status" role="status">Ready</span></div><h2>Output</h2><pre id="output" tabindex="0"></pre><h2>Warnings &amp; errors</h2><pre id="errors" tabindex="0"></pre></section>
+    </div>
+    <section class="panel input-panel"><div class="panel-heading"><label for="stdin">03 / STANDARD INPUT</label><span>Supply input before running</span></div><textarea id="stdin" rows="3" spellcheck="false" placeholder="Values for READ(*, ...) go here"></textarea></section>
+    <footer>Experimental browser build. Native LAPACK libraries, external commands and compilers are unavailable. Each run starts fresh; files are temporary. Runs stop after 30 seconds.</footer>
+  </main>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.20/codemirror.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.20/mode/fortran/fortran.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
