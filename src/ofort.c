@@ -13324,7 +13324,16 @@ static OfortValue eval_subscripted_array(OfortInterpreter *I, OfortValue *array,
 }
 
 static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNode *n) {
-    return eval_subscripted_array(I, &var->val, n);
+    OfortValue result = eval_subscripted_array(I, &var->val, n);
+    /* Section association and inquiries need only the descriptor. A scalar
+       result, however, reads an element and cannot use wholly unset storage. */
+    if (I->strict_uninitialized && !var->is_initialized &&
+        var->initialized_prefix_len == 0 && result.type != FVAL_ARRAY &&
+        result.type != FVAL_VOID) {
+        free_value(&result);
+        error_uninitialized_var(I, var, n->line);
+    }
+    return result;
 }
 
 static OfortValue eval_array_section_value(OfortInterpreter *I, OfortValue *array, OfortNode *n) {
@@ -18371,17 +18380,35 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                require evaluation at the call site. */
             if (pre_func && pre_func->is_function && pre_func->node &&
                 pre_func->node->type != FND_STMT_FUNCTION &&
-                n->stmts[i]->type == FND_IDENT) {
+                (n->stmts[i]->type == FND_IDENT ||
+                 n->stmts[i]->type == FND_FUNC_CALL ||
+                 n->stmts[i]->type == FND_ARRAY_REF)) {
                 OfortNode *pre_fn = pre_func->node;
+                OfortNode *root = n->stmts[i];
                 int dummy_i = n->param_names[i][0]
                     ? procedure_dummy_index(pre_fn, n->param_names[i]) : i;
-                OfortVar *actual = find_var(I, n->stmts[i]->name);
+                while ((root->type == FND_ARRAY_REF || root->type == FND_MEMBER) &&
+                       root->children[0])
+                    root = root->children[0];
+                OfortVar *actual = (root->type == FND_IDENT ||
+                                    root->type == FND_FUNC_CALL)
+                                       ? find_var(I, root->name) : NULL;
                 if (dummy_i >= 0 && dummy_i < pre_fn->n_params &&
                     !pre_fn->param_values[dummy_i] && actual &&
                     !actual->is_initialized &&
-                    !(actual->is_optional && !actual->present)) {
-                    args[i] = copy_value(actual->val);
-                    param_uninitialized[dummy_i] = 1;
+                    !(actual->is_optional && !actual->present) &&
+                    (n->stmts[i]->type == FND_IDENT ||
+                     actual->val.type == FVAL_ARRAY)) {
+                    if (n->stmts[i]->type == FND_IDENT) {
+                        args[i] = copy_value(actual->val);
+                        param_uninitialized[dummy_i] = 1;
+                    } else {
+                        /* Evaluate section bounds, but retain undefined
+                           element status on the associated array dummy. */
+                        args[i] = eval_node(I, n->stmts[i]);
+                        if (args[i].type == FVAL_ARRAY)
+                            param_uninitialized[dummy_i] = 1;
+                    }
                     continue;
                 }
             }
@@ -18556,7 +18583,10 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 if (i < nargs && args[i].type != FVAL_VOID) {
                     OfortVar *pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
                     pv->is_optional = fn->param_optional[i];
-                    if (param_uninitialized[i]) pv->is_initialized = 0;
+                    if (param_uninitialized[i]) {
+                        pv->is_initialized = 0;
+                        pv->initialized_prefix_len = 0;
+                    }
                 } else if (i < nargs && n->stmts[i]->type == FND_IDENT) {
                     OfortVar *actual = find_var(I, n->stmts[i]->name);
                     if (actual && actual->is_optional && !actual->present) {
@@ -19371,6 +19401,8 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
             if (fn->param_intents[i] == 2 && !fn->param_allocatables[i]) {
                 pv->is_initialized = 0;
             }
+            if (!pv->is_initialized)
+                pv->initialized_prefix_len = 0;
         }
         restore_saved_vars(I, func);
         double proc_profile_start = begin_procedure_profile(I, func);
@@ -20148,6 +20180,7 @@ static int simple_numeric_node_value(OfortInterpreter *I, OfortNode *owner, int 
     case FND_IDENT: {
         OfortVar *v = owner ? cached_ident_var(I, owner, slot, n) : cached_node_var(I, n, n->name);
         if (!v) return 0;
+        if (I->strict_uninitialized && !v->is_initialized) return 0;
         if (v->val.type == FVAL_INTEGER) {
             *value = (double)v->val.v.i;
             return 1;
@@ -20180,6 +20213,7 @@ static int fast_numeric_expr_value_node(OfortInterpreter *I, OfortNode *n, doubl
     case FND_IDENT: {
         OfortVar *v = cached_node_var(I, n, n->name);
         if (!v) return 0;
+        if (I->strict_uninitialized && !v->is_initialized) return 0;
         if (v->val.type == FVAL_INTEGER) {
             *value = (double)v->val.v.i;
             return 1;
@@ -20264,6 +20298,10 @@ static int fast_numeric_expr_value_node(OfortInterpreter *I, OfortNode *n, doubl
             return 1;
         }
         if (!fast_array_ref_index(I, n, &var, &index)) return 0;
+        /* Undefined element reads must use the checked evaluator. */
+        if (I->strict_uninitialized && !var->is_initialized &&
+            var->initialized_prefix_len == 0)
+            return 0;
         if (var->val.v.arr.real_data &&
             (var->val.v.arr.elem_type == FVAL_REAL || var->val.v.arr.elem_type == FVAL_DOUBLE)) {
             *value = var->val.v.arr.real_data[index];
@@ -29163,6 +29201,32 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 continue;
             }
             if (fn && dummy_i >= 0 && dummy_i < fn->n_params &&
+                (n->stmts[i]->type == FND_FUNC_CALL ||
+                 n->stmts[i]->type == FND_ARRAY_REF)) {
+                OfortNode *root = n->stmts[i];
+                while ((root->type == FND_ARRAY_REF || root->type == FND_MEMBER) &&
+                       root->children[0])
+                    root = root->children[0];
+                OfortVar *actual = (root->type == FND_IDENT ||
+                                    root->type == FND_FUNC_CALL)
+                                       ? find_var(I, root->name) : NULL;
+                /* A section associates storage, not initialized values.
+                   Keep inquiries valid, but do not legitimize element reads. */
+                if (actual && actual->val.type == FVAL_ARRAY) {
+                    actual_initialized[i] = actual->is_initialized;
+                    if (!actual->is_initialized) {
+                        /* Passing an element is storage association, even
+                           for scalar dummies. Subscripts still undergo normal
+                           evaluation; reading the dummy later remains checked. */
+                        if (fn->param_n_dims[dummy_i] > 0)
+                            args[i] = sequence_actual_from_array_element(I, n->stmts[i], 1);
+                        if (args[i].type == FVAL_VOID)
+                            args[i] = eval_subscripted_array(I, &actual->val, n->stmts[i]);
+                        continue;
+                    }
+                }
+            }
+            if (fn && dummy_i >= 0 && dummy_i < fn->n_params &&
                 (n->stmts[i]->type == FND_IDENT || n->stmts[i]->type == FND_MEMBER)) {
                 OfortNode *root = n->stmts[i];
                 while (root->type == FND_MEMBER && root->children[0])
@@ -29428,6 +29492,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (fn->param_intents[i] == 2 && !fn->param_allocatables[i]) {
                 pv->is_initialized = 0;
             }
+            if (!pv->is_initialized)
+                pv->initialized_prefix_len = 0;
         }
         restore_saved_vars(I, func);
 
