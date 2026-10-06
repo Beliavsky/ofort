@@ -20913,12 +20913,14 @@ static int exec_fast_scalar_numeric_assignment(OfortInterpreter *I, OfortNode *n
         if (array_var->is_parameter || array_var->is_protected) return 0;
         if (!array_has_packed_numeric(&array_var->val)) return 0;
         if (!fast_numeric_expr_value_node(I, rhs, &result)) return 0;
+        prepare_array_initialization(I, array_var);
         if (array_var->val.v.arr.real_data) {
             array_var->val.v.arr.real_data[index] = result;
         } else {
             array_var->val.v.arr.int_data[index] = (long long)result;
         }
-        array_var->is_initialized = 1;
+        mark_tracked_array_element(array_var, index);
+        if (!I->strict_uninitialized) array_var->is_initialized = 1;
         return 1;
     }
     if (lhs->type != FND_IDENT) return 0;
@@ -26800,8 +26802,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (var->val.type != FVAL_ARRAY)
                 ofort_error(I, "'%s' is not an array", lhs->name);
 
+            prepare_array_initialization(I, var);
             assign_array_ref(I, var, lhs, &rhs);
-            var->is_initialized = 1;
+            if (!I->strict_uninitialized) var->is_initialized = 1;
             trace_assignment_value(I, lhs, rhs);
             free_value(&rhs);
         } else if (lhs->type == FND_ARRAY_REF) {
