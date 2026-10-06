@@ -36,6 +36,19 @@ const editor = typeof CodeMirror === "function" ? CodeMirror.fromTextArea(byId("
   }
 }) : null;
 const sourceText = () => editor ? editor.getValue() : byId("source").value;
+byId("clear-code").addEventListener("click", () => {
+  if (editor) {
+    const last = editor.lastLine();
+    editor.replaceRange("", {line:0, ch:0}, {line:last, ch:editor.getLine(last).length}, "+clear");
+    editor.focus();
+  } else {
+    const source = byId("source");
+    source.focus();
+    source.select();
+    // Use the browser's editing history when the rich editor is unavailable.
+    document.execCommand("delete");
+  }
+});
 byId("focus").addEventListener("click", () => {
   const focused = document.body.classList.toggle("focus-mode");
   byId("focus").textContent = focused ? "Exit focus mode" : "Focus mode";
