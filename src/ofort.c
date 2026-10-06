@@ -27559,6 +27559,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             I->preserve_output_on_error = 1;
             ofort_error(I, "Cannot open file '%s': No such file", open_path);
         }
+        if (!find_unit_file(I, unit) &&
+            I->n_unit_files >= (int)(sizeof(I->unit_files) / sizeof(I->unit_files[0]))) {
+            free_value(&fv);
+            if (n->children[4]) {
+                inquire_assign_target(I, n->children[4], make_integer(1));
+                break;
+            }
+            I->preserve_output_on_error = 1;
+            ofort_error(I, "Too many open units");
+        }
         set_unit_file(I, unit, open_path);
         entry = find_unit_file(I, unit);
         if (entry) {
