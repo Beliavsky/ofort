@@ -1,5 +1,6 @@
 #include "ofort.h"
 #include "ofort_fixed_form.h"
+#include "ofort_build_version.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1268,9 +1269,48 @@ static int source_line_reads_name(const char *line, size_t line_len, const char 
     return 0;
 }
 
+static char g_repl_read_names[OFORT_MAX_VARS][256];
+static int g_repl_n_read_names = 0;
+static int g_repl_tracking_reads = 0;
+
+static void remember_repl_expression_reads(const char *expression) {
+    const char *p = expression;
+    const char *end = p + strlen(p);
+    while (p < end) {
+        if (*p == '!') break;
+        if (*p == '\'' || *p == '"') {
+            p = skip_fortran_string(p, end);
+        } else if (isalpha((unsigned char)*p) || *p == '_') {
+            const char *start = p++;
+            int found = 0;
+            while (p < end && identifier_char((unsigned char)*p)) p++;
+            size_t length = (size_t)(p - start);
+            if (length >= sizeof(g_repl_read_names[0])) continue;
+            for (int i = 0; i < g_repl_n_read_names; i++) {
+                if (token_equals_nocase(start, length, g_repl_read_names[i])) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found && g_repl_n_read_names < OFORT_MAX_VARS) {
+                memcpy(g_repl_read_names[g_repl_n_read_names], start, length);
+                g_repl_read_names[g_repl_n_read_names++][length] = '\0';
+            }
+        } else {
+            p++;
+        }
+    }
+}
+
 static int source_reads_name_outside_line(const char *source, int skip_line_no, const char *name) {
     const char *line = source;
     int line_no = 1;
+
+    if (g_repl_tracking_reads) {
+        for (int i = 0; i < g_repl_n_read_names; i++) {
+            if (string_eq_nocase(g_repl_read_names[i], name)) return 1;
+        }
+    }
 
     while (*line) {
         const char *end = strchr(line, '\n');
@@ -7427,6 +7467,9 @@ static int run_interactive(const char *load_path, int run_after_load) {
     char auto_end_texts[128][128];
     int auto_end_depth = 0;
 
+    g_repl_tracking_reads = 1;
+    g_repl_n_read_names = 0;
+
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
@@ -7752,6 +7795,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
         }
 
         if (is_command(line, ".clear")) {
+            g_repl_n_read_names = 0;
             free(buf);
             free(footer);
             buf = NULL;
@@ -7863,6 +7907,11 @@ static int run_interactive(const char *load_path, int run_after_load) {
                         fprintf(stderr, ".rename requires old and new names\n");
                         last_rc = 1;
                     } else if (rename_source_identifier(&buf, &len, &cap, rename_args[0], rename_args[1])) {
+                        for (int i = 0; i < g_repl_n_read_names; i++) {
+                            if (string_eq_nocase(g_repl_read_names[i], rename_args[0])) {
+                                snprintf(g_repl_read_names[i], sizeof(g_repl_read_names[i]), "%s", rename_args[1]);
+                            }
+                        }
                         executed_len = 0;
                         ofort_destroy(repl_interp);
                         repl_interp = create_repl_interpreter();
@@ -8141,6 +8190,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
                                                  &repl_interp, &executed_len)) {
                     last_rc = 1;
                 } else {
+                    g_repl_n_read_names = 0;
                     last_rc = 0;
                     auto_end_depth = 0;
                 }
@@ -8155,6 +8205,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
                 snprintf(local_path, sizeof(local_path), "%s", path);
                 trim_line_end(local_path);
                 if (load_interactive_file(local_path, &buf, &len, &cap, &footer)) {
+                    g_repl_n_read_names = 0;
                     ofort_destroy(repl_interp);
                     repl_interp = create_repl_interpreter();
                     if (!repl_interp) {
@@ -8189,6 +8240,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
                 if (!load_interactive_file(local_path, &buf, &len, &cap, &footer)) {
                     last_rc = 1;
                 } else {
+                    g_repl_n_read_names = 0;
                     executed_len = 0;
                     ofort_destroy(repl_interp);
                     repl_interp = create_repl_interpreter();
@@ -8205,6 +8257,7 @@ static int run_interactive(const char *load_path, int run_after_load) {
 
         if (is_immediate_expression_line(line)) {
             last_rc = execute_repl_expression(repl_interp, buf ? buf : "", &executed_len, line);
+            if (last_rc == 0) remember_repl_expression_reads(line);
             continue;
         }
 
@@ -8893,12 +8946,12 @@ static void print_version(void) {
     sscanf(__TIME__, "%d:%d", &hour, &minute);
 
     if (month > 0 && day > 0 && year > 0) {
-        printf("ofort %s (built on %04d-%02d-%02d %02d:%02d by %s %s)\n",
-               OFORT_VERSION, year, month, day, hour, minute,
+        printf("ofort %s (commit %s, built on %04d-%02d-%02d %02d:%02d by %s %s)\n",
+               OFORT_VERSION, OFORT_BUILD_COMMIT, year, month, day, hour, minute,
                build_compiler_name(), OFORT_BUILD_FLAGS);
     } else {
-        printf("ofort %s (built on %s %s by %s %s)\n",
-               OFORT_VERSION, __DATE__, __TIME__,
+        printf("ofort %s (commit %s, built on %s %s by %s %s)\n",
+               OFORT_VERSION, OFORT_BUILD_COMMIT, __DATE__, __TIME__,
                build_compiler_name(), OFORT_BUILD_FLAGS);
     }
 }
