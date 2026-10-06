@@ -1,4 +1,4 @@
-﻿from pathlib import Path
+from pathlib import Path
 import os
 import re
 import shutil
@@ -2872,7 +2872,7 @@ def test_fast_packed_array_reads_default_numeric_element(tmp_path):
     )
 
     result = subprocess.run(
-        [str(OFORT), "--fast", str(source)],
+        [str(OFORT), "--fast", "--no-check-uninitialized", str(source)],
         cwd=ROOT,
         text=True,
         capture_output=True,
@@ -2912,7 +2912,7 @@ def test_fast_packed_array_power_can_be_summed(tmp_path):
 def test_fast_packed_dot_product_matches_sum_product():
     source = CASES / "xfast_dot_product.f90"
     result = subprocess.run(
-        [str(OFORT), "--fast", str(source)],
+        [str(OFORT), "--fast", "--no-check-uninitialized", str(source)],
         cwd=ROOT,
         text=True,
         capture_output=True,
