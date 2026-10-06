@@ -111,6 +111,7 @@ typedef struct {
     OfortVar *saved_vars;
     int n_saved_vars;
     int saved_var_cap;
+    OfortScope *host_scope; /* active lexical host of an internal procedure */
 } OfortFunc;
 
 static OfortVar *set_var(OfortInterpreter *I, const char *name, OfortValue val);
@@ -1722,6 +1723,9 @@ static OfortVar *declare_alias_value_var(OfortInterpreter *I, const char *name, 
     copy_cstr(v->name, sizeof(v->name), name);
     v->val = *target;
     v->intent = 0;
+    v->is_initialized = target->type != FVAL_VOID;
+    v->initialized_prefix_len = v->is_initialized && target->type == FVAL_ARRAY ?
+                                target->v.arr.len : 0;
     v->char_len = target->type == FVAL_CHARACTER && target->v.s ? (int)strlen(target->v.s) : 0;
     v->present = 1;
     v->is_optional = 0;
@@ -2261,6 +2265,7 @@ static OfortFunc *register_func_with_module(OfortInterpreter *I, const char *nam
     f->saved_vars = NULL;
     f->n_saved_vars = 0;
     f->saved_var_cap = 0;
+    f->host_scope = NULL;
     return f;
 }
 
@@ -2280,11 +2285,29 @@ static void register_contained_procedures(OfortInterpreter *I, OfortNode *body, 
         if (s && (s->type == FND_SUBROUTINE || s->type == FND_FUNCTION ||
                   s->type == FND_STMT_FUNCTION)) {
             annotate_procedure_params(I, s);
-            (void)register_func_with_module(I, s->name, s,
+            OfortFunc *contained = register_func_with_module(I, s->name, s,
                                             s->type == FND_FUNCTION || s->type == FND_STMT_FUNCTION,
                                             module_name);
+            contained->host_scope = I->current_scope;
         }
     }
+}
+
+static int module_name_is_host_associated(OfortInterpreter *I, OfortFunc *func,
+                                           const char *name) {
+    OfortScope *scope;
+    if (!func || !func->host_scope) return 0;
+    /* A saved host pointer may outlive its activation. Only inspect it when
+       that activation is still in the current scope chain. */
+    for (scope = I->current_scope ? I->current_scope->parent : NULL;
+         scope && scope != func->host_scope; scope = scope->parent) {}
+    if (!scope) return 0;
+    for (; scope; scope = scope->parent) {
+        for (int i = 0; i < scope->n_vars; i++) {
+            if (str_eq_nocase(scope->vars[i].name, name)) return 1;
+        }
+    }
+    return 0;
 }
 
 static void remember_module_proc_spec(OfortInterpreter *I, OfortNode *node) {
@@ -2507,7 +2530,7 @@ static void store_saved_vars(OfortInterpreter *I, OfortFunc *func, OfortScope *s
         OfortVar *src = &scope->vars[i];
         OfortVar *dst;
         if (!src->is_save) continue;
-        if (module_defines_var(I, func_exec_module_name(func), src->name)) continue;
+        if (src->is_imported_module_var) continue;
         dst = find_saved_var(func, src->name);
         if (!dst) {
             dst = append_saved_var(I, func);
@@ -2842,7 +2865,7 @@ static void sync_module_vars_from_scope_except_params(OfortInterpreter *I, const
         if (procedure_has_param_name(proc, mod->vars[i].name)) continue;
         OfortVar *local = find_var_in_current_scope(I, mod->vars[i].name);
         if (!local) continue;
-        if (!str_eq_nocase(I->active_module_name, module_name) &&
+        if ((proc || !str_eq_nocase(I->active_module_name, module_name)) &&
             !(local->is_imported_module_var &&
               local->import_module_index == mod_index &&
               local->import_var_index == i)) {
@@ -6064,6 +6087,7 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                             decl_dim_exprs[dim_index] = NULL;
                         } else if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
                             decl_dims[dim_index] = 0;
+                            decl_dim_exprs[dim_index] = NULL;
                         } else {
                             OfortNode *hi = parse_expr_until_colon(I);
                             int hi_value = 0;
@@ -6302,10 +6326,13 @@ static OfortNode *parse_declaration(OfortInterpreter *I) {
                         if (check(I, FTOK_STAR)) {
                             advance(I);
                             decl->dims[dim_index] = 0;
+                            decl->stmts[dim_index] = NULL;
                         } else if (check(I, FTOK_RPAREN) || check(I, FTOK_COMMA)) {
                             decl->dims[dim_index] = 0;
+                            decl->stmts[dim_index] = NULL;
                         } else {
                             OfortNode *dh = parse_expr_until_colon(I);
+                            decl->stmts[dim_index] = dh;
                             if (dh->type == FND_INT_LIT) {
                                 decl->dims[dim_index] = (int)dh->int_val;
                                 if (dh->int_val <= 0 && dim_index < decl->n_stmts) decl->stmts[dim_index] = dh;
@@ -10977,6 +11004,11 @@ static void resolve_type_field_shape(OfortInterpreter *I, OfortTypeDef *td, int 
             free_value(&lv);
         }
         lower_bounds[d] = lower;
+        if (td->field_has_lower_bound[field][d] &&
+            !td->field_is_allocatable[field] && !td->field_is_pointer[field]) {
+            dims[d] -= lower - 1;
+            if (dims[d] < 0) dims[d] = 0;
+        }
     }
 }
 
@@ -15738,7 +15770,7 @@ static int read_values_from_file(OfortInterpreter *I, OfortUnitFile *entry, Ofor
 
     for (int i = 0; i < n->n_stmts; i++) {
         if (read_file_target(I, fp, n->stmts[i], tok, sizeof(tok)) != 0) {
-            status = 1;
+            status = feof(fp) ? -1 : 1;
             break;
         }
     }
@@ -18513,6 +18545,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             if (mod) {
                 for (int i = 0; i < mod->n_vars; i++) {
                     if (procedure_has_param_name(fn, mod->vars[i].name)) continue;
+                    if (module_name_is_host_associated(I, func, mod->vars[i].name)) continue;
                     OfortVar *mv = declare_var(I, mod->vars[i].name, copy_value(mod->vars[i].val));
                     copy_imported_var_attrs(mv, &mod->vars[i]);
                     mark_imported_module_var(I, mv, mod, i);
@@ -18567,6 +18600,13 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             /* Get result */
             OfortVar *rv = find_var(I, res_name);
             OfortValue result = rv ? copy_value(rv->val) : make_void_val();
+            /* An allocated pointer result owns its target directly rather
+               than naming a variable in another scope. Preserve its pointer
+               identity when its local result variable is destroyed. */
+            if (rv && rv->is_pointer && rv->pointer_associated &&
+                !rv->pointer_target[0] && !procedure_ref_name(&rv->val)) {
+                result.is_pointer_ref = 1;
+            }
             if (result.type == FVAL_DERIVED) {
                 for (int fi = 0; fi < result.v.dt.n_fields; fi++) {
                     OfortValue *field = &result.v.dt.fields[fi];
@@ -25392,6 +25432,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int decl_char_len = n->val_type == FVAL_CHARACTER ? eval_character_length(I, n) : 0;
         OfortVar *existing = find_var(I, n->name);
         OfortVar *existing_current = find_var_in_current_scope(I, n->name);
+        if (I->procedure_depth > 0 && existing_current &&
+            existing_current->is_imported_module_var && !n->bool_val) {
+            /* A procedure declaration hides a module entity of the same
+               name. Do not treat the imported placeholder as a bound dummy
+               or reuse its value, bounds, initialization, or SAVE state. */
+            existing = NULL;
+            existing_current = NULL;
+        }
         if (existing && existing == existing_current &&
             existing->val.type == FVAL_ARRAY && n->n_dims == 0 &&
             n->val_type != FVAL_VOID && n->type != FND_PARAMDECL &&
@@ -25673,8 +25721,6 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     existing->val.v.arr.allocated = 0;
                     existing->scalar_allocated = 0;
                     existing->is_initialized = 0;
-                } else if (n->intent != 2 && existing->val.type != FVAL_VOID) {
-                    existing->is_initialized = 1;
                 }
                 if (n->val_type == FVAL_CHARACTER)
                     existing->char_len = decl_char_len > 0 && decl_char_len < OFORT_MAX_STRLEN - 1 ?
@@ -25722,8 +25768,6 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
                 existing->scalar_allocated = 0;
                 existing->is_initialized = 0;
-            } else if (n->intent != 2 && existing->val.type != FVAL_VOID) {
-                existing->is_initialized = 1;
             }
             if (n->val_type == FVAL_CHARACTER)
                 existing->char_len = decl_char_len > 0 && decl_char_len < OFORT_MAX_STRLEN - 1 ?
@@ -25764,8 +25808,6 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             }
             if (n->intent == 2) {
                 existing->is_initialized = 0;
-            } else if (existing->val.type != FVAL_VOID) {
-                existing->is_initialized = 1;
             }
             if (n->val_type == FVAL_CHARACTER)
                 existing->char_len = decl_char_len > 0 && decl_char_len < OFORT_MAX_STRLEN - 1 ?
@@ -26258,6 +26300,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 slice_start = rhs.pointer_slice_start;
                 slice_end = rhs.pointer_slice_end;
                 slice_stride = rhs.pointer_slice_stride ? rhs.pointer_slice_stride : 1;
+            } else if (rhs.is_pointer_ref && rhs.type != FVAL_VOID) {
+                /* Allocated pointer function result with directly owned
+                   storage: the caller retains it without a dangling name. */
+                target_name[0] = '\0';
+                has_slice = 0;
+                slice_start = 0;
+                slice_end = 0;
+                slice_stride = 1;
             } else if (rhs.type == FVAL_VOID) {
                 free_value(&ptr->val);
                 ptr->val = make_void_val();
@@ -27078,8 +27128,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortValue *vals = eval_io_list(I, n, &nvals);
         char fmt_buf[OFORT_MAX_STRLEN];
         const char *fmt = write_format_string(I, n, fmt_buf, sizeof(fmt_buf));
-        format_output(I, fmt, vals, nvals);
-        flush_live_stdout_if_needed(I);
+        OfortUnitFile *output = find_unit_file(I, 6);
+        if (output) {
+            if (output->is_direct || !output->is_formatted)
+                ofort_error(I, "PRINT requires a sequential formatted output unit");
+            write_formatted_to_file(I, output->path, fmt, vals, nvals, 0);
+        } else {
+            format_output(I, fmt, vals, nvals);
+            flush_live_stdout_if_needed(I);
+        }
         for (int i = 0; i < nvals; i++) free_value(&vals[i]);
         free(vals);
         break;
@@ -27156,8 +27213,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     status = 0;
                 }
             } else {
-                write_namelist_to_stream(I, nml_name, NULL);
-                wrote_stdout = 1;
+                OfortUnitFile *entry = find_unit_file(I, 6);
+                if (entry) {
+                    FILE *fp = fopen(entry->path, "ab");
+                    if (!fp) ofort_error(I, "Cannot open '%s' for namelist writing", entry->path);
+                    write_namelist_to_stream(I, nml_name, fp);
+                    fclose(fp);
+                } else {
+                    write_namelist_to_stream(I, nml_name, NULL);
+                    wrote_stdout = 1;
+                }
                 status = 0;
             }
         } else if (n->children[0] &&
@@ -27254,8 +27319,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
             }
         } else {
-            format_output_with_advance(I, fmt, vals, nvals, n->no_advance);
-            wrote_stdout = 1;
+            OfortUnitFile *entry = find_unit_file(I, 6);
+            if (entry) {
+                if (entry->is_direct || !entry->is_formatted)
+                    ofort_error(I, "WRITE(*) requires a sequential formatted output unit");
+                write_formatted_to_file(I, entry->path, fmt, vals, nvals, n->no_advance);
+            } else {
+                format_output_with_advance(I, fmt, vals, nvals, n->no_advance);
+                wrote_stdout = 1;
+            }
             status = 0;
         }
         if (n->children[4] && n->children[4]->type == FND_IDENT) {
@@ -27319,7 +27391,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 int unit = (int)val_to_int(uv);
                 OfortUnitFile *entry = find_unit_file(I, unit);
                 free_value(&uv);
-                if (unit == 5) {
+                if (unit == 5 && !entry) {
                     status = read_values_from_stdin(I, n, n->bool_val);
                 } else {
                     if (!entry) entry = ensure_unit_file(I, unit, 0);
@@ -27356,9 +27428,21 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             break;
         }
         {
-            int status = read_values_from_stdin(I, n, n->bool_val);
+            OfortUnitFile *entry = find_unit_file(I, 5);
+            int status;
+            if (entry) {
+                if (entry->is_direct || !entry->is_formatted)
+                    ofort_error(I, "READ(*) requires a sequential formatted input unit");
+                status = read_values_from_file(I, entry, n);
+            } else {
+                status = read_values_from_stdin(I, n, n->bool_val);
+            }
             if (n->children[4] && n->children[4]->type == FND_IDENT) {
                 set_var(I, n->children[4]->name, make_integer(status));
+            }
+            if (n->children[6] && n->children[6]->type == FND_IDENT) {
+                set_var(I, n->children[6]->name,
+                        make_character(status == -1 ? "End of file" : ""));
             }
         }
         break;
@@ -29023,6 +29107,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortVar *arg_alias_var[OFORT_MAX_PARAMS] = {0};
         int actual_for_param[OFORT_MAX_PARAMS] = {0};
         int actual_dummy_index[OFORT_MAX_PARAMS];
+        int actual_initialized[OFORT_MAX_PARAMS];
         OfortFunc *func = find_func(I, n->name);
         OfortNode *fn = func ? func->node : NULL;
         for (int i = 0; i < OFORT_MAX_PARAMS; i++) actual_for_param[i] = i;
@@ -29052,6 +29137,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         for (int i = 0; i < nargs; i++) {
             int dummy_i = actual_dummy_index[i];
+            actual_initialized[i] = 1;
             args[i] = make_void_val();
             if (n->stmts[i]->type == FND_IDENT) {
                 OfortVar *actual = find_var(I, n->stmts[i]->name);
@@ -29060,6 +29146,33 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 }
             }
             arg_present[i] = 1;
+            if (fn && dummy_i >= 0 && dummy_i < fn->n_params &&
+                fn->param_values[dummy_i]) {
+                /* VALUE requires a value at the call site, not association. */
+                args[i] = eval_node(I, n->stmts[i]);
+                continue;
+            }
+            if (fn && dummy_i >= 0 && dummy_i < fn->n_params &&
+                (n->stmts[i]->type == FND_IDENT || n->stmts[i]->type == FND_MEMBER)) {
+                OfortNode *root = n->stmts[i];
+                while (root->type == FND_MEMBER && root->children[0])
+                    root = root->children[0];
+                OfortVar *actual = root->type == FND_IDENT ? find_var(I, root->name) : NULL;
+                if (actual) actual_initialized[i] = actual->is_initialized;
+                if (actual && !actual_initialized[i]) {
+                    /* A variable actual can be associated while undefined.
+                       Retain that status on the dummy for subsequent reads. */
+                    if (n->stmts[i]->type == FND_IDENT) {
+                        args[i] = copy_value(actual->val);
+                    } else {
+                        actual->is_initialized = 1;
+                        OfortValue *component = member_lvalue(I, n->stmts[i]);
+                        actual->is_initialized = 0;
+                        args[i] = component ? copy_value(*component) : make_void_val();
+                    }
+                    continue;
+                }
+            }
             if (0 && fn && I->fast_mode && i < fn->n_params && n->stmts[i]->type == FND_IDENT) {
                 OfortVar *actual = find_var(I, n->stmts[i]->name);
                 if (actual && actual->val.type == FVAL_ARRAY && array_has_packed_numeric(&actual->val)) {
@@ -29228,6 +29341,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             if (mod) {
                 for (int mi = 0; mi < mod->n_vars; mi++) {
                     if (procedure_has_param_name(fn, mod->vars[mi].name)) continue;
+                    if (module_name_is_host_associated(I, func, mod->vars[mi].name)) continue;
                     OfortVar *mv = declare_var(I, mod->vars[mi].name, copy_value(mod->vars[mi].val));
                     copy_imported_var_attrs(mv, &mod->vars[mi]);
                     mark_imported_module_var(I, mv, mod, mi);
@@ -29299,6 +29413,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             pv->intent = fn->param_intents[i];
             pv->is_value = fn->param_values[i];
             pv->is_optional = fn->param_optional[i];
+            if (i < nargs && arg_present[i] && actual_for_param[i] >= 0)
+                pv->is_initialized = actual_initialized[actual_for_param[i]];
             if (fn->param_intents[i] == 2 && !fn->param_allocatables[i]) {
                 pv->is_initialized = 0;
             }
