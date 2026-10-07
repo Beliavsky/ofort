@@ -13285,12 +13285,14 @@ static void check_selected_array_element(OfortInterpreter *I, OfortVar *var,
 static void copy_subscripted_recursive(OfortInterpreter *I, OfortValue *src, OfortValue *dst,
                                        OfortSubscriptSpec *specs, int nargs,
                                        int dim, int *subscripts, int *out_index,
-                                       OfortVar *var, int line, int *initialized) {
+                                       OfortVar *var, int line, int *initialized, OfortVar *mapped) {
     if (dim < 0) {
         int src_index = section_linear_index(src, subscripts, nargs);
         if (src_index < 0 || src_index >= src->v.arr.len)
             ofort_error(I, "Array section index out of bounds");
         check_selected_array_element(I, var, src_index, line, initialized);
+        if (mapped && var && array_element_is_initialized(var, src_index))
+            mark_tracked_array_element(mapped, *out_index);
         free_value(&dst->v.arr.data[*out_index]);
         dst->v.arr.data[*out_index] = array_element_value(src, src_index);
         (*out_index)++;
@@ -13298,12 +13300,13 @@ static void copy_subscripted_recursive(OfortInterpreter *I, OfortValue *src, Ofo
     }
     for (int pos = 0; pos < specs[dim].count; pos++) {
         subscripts[dim] = subscript_spec_value(&specs[dim], pos);
-        copy_subscripted_recursive(I, src, dst, specs, nargs, dim - 1, subscripts, out_index, var, line, initialized);
+        copy_subscripted_recursive(I, src, dst, specs, nargs, dim - 1, subscripts, out_index, var, line, initialized, mapped);
     }
 }
 
 static OfortValue eval_subscripted_array_checked(OfortInterpreter *I, OfortValue *array,
-                                                OfortNode *n, OfortVar *var, int *initialized) {
+                                                OfortNode *n, OfortVar *var, int *initialized,
+                                                OfortArrayInitialization **initialization) {
     int nargs = n->n_stmts;
     OfortSubscriptSpec specs[7];
     int result_dims[7];
@@ -13312,6 +13315,7 @@ static OfortValue eval_subscripted_array_checked(OfortInterpreter *I, OfortValue
     int subscripts[7] = {0};
     int out_index = 0;
     if (initialized) *initialized = 1;
+    if (initialization) *initialization = NULL;
 
     if (nargs == 1 && n->stmts[0] && n->stmts[0]->type == FND_MULTIPLE_SUBSCRIPT) {
         OfortNode *multi = n->stmts[0];
@@ -13373,7 +13377,14 @@ static OfortValue eval_subscripted_array_checked(OfortInterpreter *I, OfortValue
         result.kind = array->kind;
         copy_cstr(result.v.arr.elem_type_name, sizeof(result.v.arr.elem_type_name),
                   array->v.arr.elem_type_name);
-        copy_subscripted_recursive(I, array, &result, specs, rank, rank - 1, subscripts, &out_index, var, n->line, initialized);
+        OfortVar mapped = {0};
+        if (initialization) {
+            mapped.val = result;
+            prepare_array_initialization(I, &mapped);
+        }
+        copy_subscripted_recursive(I, array, &result, specs, rank, rank - 1, subscripts, &out_index, var, n->line, initialized,
+                                   initialization ? &mapped : NULL);
+        if (initialization) *initialization = mapped.array_initialization;
         return result;
     }
 
@@ -13401,13 +13412,20 @@ static OfortValue eval_subscripted_array_checked(OfortInterpreter *I, OfortValue
     result.kind = array->kind;
     copy_cstr(result.v.arr.elem_type_name, sizeof(result.v.arr.elem_type_name),
               array->v.arr.elem_type_name);
-    copy_subscripted_recursive(I, array, &result, specs, nargs, nargs - 1, subscripts, &out_index, var, n->line, initialized);
+    OfortVar mapped = {0};
+    if (initialization) {
+        mapped.val = result;
+        prepare_array_initialization(I, &mapped);
+    }
+    copy_subscripted_recursive(I, array, &result, specs, nargs, nargs - 1, subscripts, &out_index, var, n->line, initialized,
+                               initialization ? &mapped : NULL);
+    if (initialization) *initialization = mapped.array_initialization;
     free_subscript_specs(specs, nargs);
     return result;
 }
 
 static OfortValue eval_subscripted_array(OfortInterpreter *I, OfortValue *array, OfortNode *n) {
-    return eval_subscripted_array_checked(I, array, n, NULL, NULL);
+    return eval_subscripted_array_checked(I, array, n, NULL, NULL, NULL);
 }
 
 static int array_ref_scalar_linear_index(OfortInterpreter *I, OfortValue *array,
@@ -13424,7 +13442,7 @@ static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNo
             return array_element_value(&var->val, index);
         }
     }
-    return eval_subscripted_array_checked(I, &var->val, n, var, NULL);
+    return eval_subscripted_array_checked(I, &var->val, n, var, NULL, NULL);
 }
 
 static OfortValue eval_array_section_value(OfortInterpreter *I, OfortValue *array, OfortNode *n) {
@@ -18479,6 +18497,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         if (!args) ofort_error(I, "Out of memory");
         OfortFunc *pre_func = find_func(I, procedure_call_name[0] ? procedure_call_name : n->name);
         int param_uninitialized[OFORT_MAX_PARAMS] = {0};
+        OfortArrayInitialization *param_initialization[OFORT_MAX_PARAMS] = {0};
         for (int i = 0; i < nargs; i++) {
             /* Association does not read a variable actual. Preserve its
                undefined status on the dummy and check only if it is used.
@@ -18523,7 +18542,8 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                         } else {
                             int initialized;
                             args[i] = eval_subscripted_array_checked(I, &actual->val,
-                                                                    n->stmts[i], actual, &initialized);
+                                                                    n->stmts[i], actual, &initialized,
+                                                                    &param_initialization[dummy_i]);
                             param_uninitialized[dummy_i] = !initialized;
                         }
                     }
@@ -18723,6 +18743,14 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     if (param_uninitialized[i]) {
                         pv->is_initialized = 0;
                         pv->initialized_prefix_len = 0;
+                        if (fn->param_intents[i] != 2 && pv->val.type == FVAL_ARRAY &&
+                            param_initialization[i] &&
+                            param_initialization[i]->len == pv->val.v.arr.len) {
+                            pv->array_initialization = param_initialization[i];
+                            while (pv->initialized_prefix_len < pv->val.v.arr.len &&
+                                   array_element_is_initialized(pv, pv->initialized_prefix_len))
+                                pv->initialized_prefix_len++;
+                        }
                     }
                 } else if (i < nargs && n->stmts[i]->type == FND_IDENT) {
                     OfortVar *actual = find_var(I, n->stmts[i]->name);
@@ -29324,6 +29352,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int actual_for_param[OFORT_MAX_PARAMS] = {0};
         int actual_dummy_index[OFORT_MAX_PARAMS];
         int actual_initialized[OFORT_MAX_PARAMS];
+        OfortArrayInitialization *actual_initialization[OFORT_MAX_PARAMS] = {0};
         OfortFunc *func = find_func(I, n->name);
         OfortNode *fn = func ? func->node : NULL;
         for (int i = 0; i < OFORT_MAX_PARAMS; i++) actual_for_param[i] = i;
@@ -29401,7 +29430,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         if (args[i].type == FVAL_VOID)
                             args[i] = eval_subscripted_array_checked(I, &actual->val,
                                                                     n->stmts[i], actual,
-                                                                    &actual_initialized[i]);
+                                                                    &actual_initialized[i],
+                                                                    &actual_initialization[i]);
                         continue;
                     }
                 }
@@ -29669,6 +29699,15 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             pv->is_optional = fn->param_optional[i];
             if (i < nargs && arg_present[i] && actual_for_param[i] >= 0)
                 pv->is_initialized = actual_initialized[actual_for_param[i]];
+            if (i < nargs && arg_present[i] && actual_for_param[i] >= 0 &&
+                fn->param_intents[i] != 2 && !pv->is_initialized &&
+                pv->val.type == FVAL_ARRAY) {
+                OfortArrayInitialization *state = actual_initialization[actual_for_param[i]];
+                if (state && state->len == pv->val.v.arr.len) {
+                    pv->array_initialization = state;
+                    pv->initialized_prefix_len = 0;
+                }
+            }
             if (fn->param_intents[i] == 2 && !fn->param_allocatables[i]) {
                 pv->is_initialized = 0;
             }
