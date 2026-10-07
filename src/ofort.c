@@ -13900,7 +13900,8 @@ static void assign_subscripted_recursive(OfortInterpreter *I, OfortValue *dst, O
     }
 }
 
-static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs, OfortValue *rhs) {
+static void assign_array_ref_initialized(OfortInterpreter *I, OfortVar *var, OfortNode *lhs,
+                                         OfortValue *rhs, OfortArrayInitialization *initialization) {
     int nargs = lhs->n_stmts;
     OfortSubscriptSpec specs[7];
     int has_section = 0;
@@ -13949,10 +13950,29 @@ static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs,
                 subscripts[d] = subscript_spec_value(&specs[d], rem % specs[d].count);
                 rem /= specs[d].count;
             }
-            mark_tracked_array_element(var, section_linear_index(&var->val, subscripts, nargs));
+            if (!initialization ||
+                (i < initialization->len &&
+                 (initialization->bits[i / 8] & (1u << (i % 8)))))
+                mark_tracked_array_element(var, section_linear_index(&var->val, subscripts, nargs));
         }
     }
     free_subscript_specs(specs, nargs);
+}
+
+static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs, OfortValue *rhs) {
+    assign_array_ref_initialized(I, var, lhs, rhs, NULL);
+}
+
+static void restore_array_initialization(OfortVar *var, OfortArrayInitialization *state,
+                                         int initialized) {
+    var->is_initialized = initialized;
+    if (!initialized && var->val.type == FVAL_ARRAY) {
+        var->initialized_prefix_len = 0;
+        var->array_initialization = state && state->len == var->val.v.arr.len ? state : NULL;
+        while (var->initialized_prefix_len < var->val.v.arr.len &&
+               array_element_is_initialized(var, var->initialized_prefix_len))
+            var->initialized_prefix_len++;
+    }
 }
 
 static void assign_array_ref_value(OfortInterpreter *I, OfortValue *array, OfortNode *lhs, OfortValue *rhs) {
@@ -29754,6 +29774,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         int pointer_copyback_slice_end[OFORT_MAX_PARAMS] = {0};
         int pointer_copyback_slice_stride[OFORT_MAX_PARAMS] = {0};
         int param_copyback_initialized[OFORT_MAX_PARAMS] = {0};
+        OfortArrayInitialization *param_copyback_initialization[OFORT_MAX_PARAMS] = {0};
         OfortValue *sequence_before = NULL;
         if (!pointer_copyback_target) ofort_error(I, "Out of memory");
 
@@ -29829,6 +29850,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     (actual_node->type == FND_IDENT || actual_node->type == FND_MEMBER ||
                      actual_node->type == FND_FUNC_CALL || actual_node->type == FND_ARRAY_REF)) {
                     param_copyback_initialized[i] = pv->is_initialized;
+                    param_copyback_initialization[i] = pv->array_initialization;
                     if (actual_node->type == FND_IDENT) {
                         OfortVar *actual = find_var(I, actual_node->name);
                         if (actual && actual->is_pointer && pv->is_pointer) {
@@ -29969,11 +29991,21 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                                               actual->val.type == FVAL_ARRAY &&
                                               args[i].v.arr.len == actual->val.v.arr.len &&
                                               param_copyback_initialized[i]);
+                    if (I->strict_uninitialized && args[i].type == FVAL_ARRAY &&
+                        actual->val.type == FVAL_ARRAY &&
+                        args[i].v.arr.len == actual->val.v.arr.len)
+                        restore_array_initialization(actual, param_copyback_initialization[i],
+                                                     param_copyback_initialized[i]);
                     continue;
                 }
                 set_var(I, actual_node->name, copy_value(args[i]));
                 actual = find_var(I, actual_node->name);
-                if (actual) actual->is_initialized = param_copyback_initialized[i];
+                if (actual) {
+                    if (I->strict_uninitialized)
+                        restore_array_initialization(actual, param_copyback_initialization[i],
+                                                     param_copyback_initialized[i]);
+                    else actual->is_initialized = param_copyback_initialized[i];
+                }
             } else if (!arg_alias[i] && actual_node && actual_node->type == FND_MEMBER && fn->param_intents[i] != 1 &&
                        (args[i].type != FVAL_VOID || fn->param_allocatables[i] ||
                         fn->param_pointers[i]) &&
@@ -30014,13 +30046,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                        args[i].type != FVAL_VOID && !procedure_ref_name(&args[i])) {
                 /* Copying a defined dummy to an array element defines only
                    that element, not the other elements of the actual array. */
-                if (param_copyback_initialized[i] &&
+                if ((param_copyback_initialized[i] ||
+                     (I->strict_uninitialized && param_copyback_initialization[i])) &&
                     (actual_node->type == FND_FUNC_CALL ||
                      (actual_node->type == FND_ARRAY_REF && !actual_node->children[0]))) {
                     OfortVar *actual = find_var(I, actual_node->name);
                     if (actual && actual->val.type == FVAL_ARRAY && !actual->is_parameter) {
                         prepare_array_initialization(I, actual);
-                        assign_array_ref(I, actual, actual_node, &args[i]);
+                        assign_array_ref_initialized(I, actual, actual_node, &args[i],
+                                                     param_copyback_initialized[i] ? NULL :
+                                                     param_copyback_initialization[i]);
                         if (!I->strict_uninitialized) actual->is_initialized = 1;
                         continue;
                     }
