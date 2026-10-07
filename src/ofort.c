@@ -7445,6 +7445,17 @@ static OfortNode *parse_read_stmt(OfortInterpreter *I) {
                 } else if (str_eq_nocase(name, "iomsg")) {
                     n->children[6] = parse_expr(I);
                     if (n->n_children < 7) n->n_children = 7;
+                } else if (str_eq_nocase(name, "advance")) {
+                    if (check(I, FTOK_STRING_LIT)) {
+                        n->no_advance = str_eq_nocase(peek(I)->str_val, "no");
+                        advance(I);
+                    } else {
+                        n->children[9] = parse_expr(I);
+                        if (n->n_children < 10) n->n_children = 10;
+                    }
+                } else if (str_eq_nocase(name, "size")) {
+                    n->children[8] = parse_expr(I);
+                    if (n->n_children < 9) n->n_children = 9;
                 } else {
                     parse_expr(I);
                 }
@@ -12753,7 +12764,16 @@ static void set_numeric_array_kind(OfortValue *arr, int kind) {
     if (!is_numeric_type(arr->v.arr.elem_type) && arr->v.arr.elem_type != FVAL_LOGICAL) return;
     arr->kind = kind;
     if (arr->v.arr.data) {
-        for (int i = 0; i < arr->v.arr.len; i++) arr->v.arr.data[i].kind = kind;
+        for (int i = 0; i < arr->v.arr.len; i++) {
+            /* A zero kind identifies a deferred numeric element tag. Once
+             * the kind is assigned, array_element_value no longer supplies
+             * its default type, so materialize that type first. */
+            if (arr->v.arr.data[i].kind == 0 &&
+                can_defer_numeric_array_tags(arr->v.arr.elem_type)) {
+                arr->v.arr.data[i].type = arr->v.arr.elem_type;
+            }
+            arr->v.arr.data[i].kind = kind;
+        }
     }
 }
 
@@ -15314,69 +15334,174 @@ static void skip_to_end_record(FILE *fp) {
     }
 }
 
-static int read_next_string_token(const char **p, char *buf, int bufsize) {
-    int len = 0;
+/* Repetition and format state belong to one READ, not to a global lexer. */
+typedef struct {
+    const char *text;
+    int repetitions, repeated_status;
+    char repeated_token[1024];
+    int widths[1024], n_fields, field, reversion;
+    char descriptors[1024];
+} OfortStringInput;
 
-    while (**p && isspace((unsigned char)**p)) {
-        (*p)++;
-    }
-    if (!**p) {
-        return 0;
-    }
-    while (**p && !isspace((unsigned char)**p)) {
-        if (len < bufsize - 1) {
-            buf[len++] = **p;
+static int expand_input_format(const char **fmt, OfortStringInput *input, int depth) {
+    if (depth > 32) return 0;
+    while (**fmt) {
+        int repeat = 0, width = 0;
+        while (**fmt == ',' || isspace((unsigned char)**fmt)) ++*fmt;
+        if (**fmt == ')') { ++*fmt; return 1; }
+        if (!**fmt) break;
+        while (isdigit((unsigned char)**fmt)) {
+            if (repeat > 1024) return 0;
+            repeat = repeat * 10 + *(*fmt)++ - '0';
         }
-        (*p)++;
+        if (!repeat) repeat = 1;
+        if (**fmt == '(') {
+            int start = input->n_fields;
+            ++*fmt;
+            if (!expand_input_format(fmt, input, depth + 1)) return 0;
+            int count = input->n_fields - start;
+            if (depth == 1 && count) input->reversion = start;
+            for (int r = 1; r < repeat; r++) {
+                if (input->n_fields + count > 1024) return 0;
+                for (int j = 0; j < count; j++) {
+                    input->widths[input->n_fields] = input->widths[start + j];
+                    input->descriptors[input->n_fields++] = input->descriptors[start + j];
+                }
+            }
+            continue;
+        }
+        char desc = (char)toupper((unsigned char)*(*fmt)++);
+        if (!strchr("IFEDGAX", desc)) return 0;
+        while (isdigit((unsigned char)**fmt)) {
+            if (width > 1000000) return 0;
+            width = width * 10 + *(*fmt)++ - '0';
+        }
+        if (**fmt == '.') {
+            ++*fmt;
+            while (isdigit((unsigned char)**fmt)) ++*fmt;
+        }
+        if (desc == 'X') { width = repeat; repeat = 1; }
+        if (width <= 0) return 0;
+        for (int r = 0; r < repeat; r++) {
+            if (input->n_fields == 1024) return 0;
+            input->widths[input->n_fields] = width;
+            input->descriptors[input->n_fields++] = desc;
+        }
     }
-    buf[len] = '\0';
     return 1;
 }
 
-static int read_formatted_string_field(const char **fmtp, const char **textp,
-                                       char *buf, int bufsize) {
-    const char *f = *fmtp;
-    int repeat = 0;
-    int width = 0;
-    char desc;
-    int i;
-
-    while (*f == '(' || *f == ')' || *f == ',' || isspace((unsigned char)*f)) f++;
-    if (!*f) return 0;
-
-    while (isdigit((unsigned char)*f)) {
-        repeat = repeat * 10 + (*f - '0');
-        f++;
+/* 0: exhausted, 1: value, 2: null field, 3: slash terminator. */
+static int read_raw_string_token(const char **p, char *buf, int bufsize) {
+    int len = 0, depth = 0;
+    char quote = 0;
+    while (isspace((unsigned char)**p)) ++*p;
+    if (!**p) return 0;
+    if (**p == '/') return 3;
+    if (**p == ',') { ++*p; return 2; }
+    if (**p == '\'' || **p == '"') quote = *(*p)++;
+    while (**p) {
+        char c = **p;
+        if (quote) {
+            ++*p;
+            if (c == quote) {
+                if (**p != quote) break;
+                ++*p;
+            }
+        } else {
+            if (!depth && (isspace((unsigned char)c) || c == ',' || c == '/')) break;
+            if (c == '(') depth++;
+            if (c == ')') depth--;
+            ++*p;
+        }
+        if (len < bufsize - 1) buf[len++] = c;
     }
-    if (repeat <= 0) repeat = 1;
-
-    desc = (char)toupper((unsigned char)*f);
-    if (!desc) return 0;
-    f++;
-
-    if (desc == 'X') {
-        *textp += repeat;
-        *fmtp = f;
-        return read_formatted_string_field(fmtp, textp, buf, bufsize);
-    }
-
-    while (isdigit((unsigned char)*f)) {
-        width = width * 10 + (*f - '0');
-        f++;
-    }
-    if (*f == '.') {
-        f++;
-        while (isdigit((unsigned char)*f)) f++;
-    }
-    if (width <= 0) return 0;
-
-    for (i = 0; i < width && (*textp)[i] && i < bufsize - 1; i++) {
-        buf[i] = (*textp)[i];
-    }
-    buf[i] = '\0';
-    *textp += width;
-    *fmtp = f;
+    buf[len] = '\0';
+    while (isspace((unsigned char)**p)) ++*p;
+    if (**p == ',') ++*p;
     return 1;
+}
+
+static int read_next_string_token(OfortStringInput *input, char *buf, int bufsize) {
+    if (input->n_fields) {
+        for (int attempts = 0; attempts <= input->n_fields; attempts++) {
+            if (input->field == input->n_fields) {
+                while (*input->text && *input->text != '\n') input->text++;
+                if (*input->text) input->text++;
+                input->field = input->reversion;
+            }
+            if (!*input->text) return 0;
+            int field = input->field++, len = 0;
+            for (int j = 0; j < input->widths[field]; j++) {
+                char c = ' ';
+                if (*input->text && *input->text != '\n') c = *input->text++;
+                if (len < bufsize - 1) buf[len++] = c;
+            }
+            buf[len] = '\0';
+            if (input->descriptors[field] == 'X') continue;
+            if (input->descriptors[field] != 'A') {
+                int out = 0;
+                for (int j = 0; j < len; j++)
+                    if (!isspace((unsigned char)buf[j])) buf[out++] = buf[j];
+                buf[out] = '\0';
+                if (!out) copy_cstr(buf, bufsize, "0");
+            }
+            return 1;
+        }
+        return 0;
+    }
+    if (input->repetitions) {
+        input->repetitions--;
+        copy_cstr(buf, bufsize, input->repeated_token);
+        return input->repeated_status;
+    }
+    const char *p = input->text;
+    while (isspace((unsigned char)*p)) p++;
+    const char *digits = p;
+    int count = 0;
+    while (isdigit((unsigned char)*p)) {
+        if (count > 100000000) return 0;
+        count = count * 10 + *p++ - '0';
+    }
+    if (p != digits && *p == '*' && count > 0) {
+        p++;
+        int status;
+        if (!*p || *p == ',' || *p == '/' || isspace((unsigned char)*p)) {
+            status = 2;
+            buf[0] = '\0';
+            if (*p == ',') p++;
+        } else status = read_raw_string_token(&p, buf, bufsize);
+        input->text = p;
+        input->repetitions = count - 1;
+        input->repeated_status = status;
+        copy_cstr(input->repeated_token, sizeof(input->repeated_token), buf);
+        return status;
+    }
+    return read_raw_string_token(&input->text, buf, bufsize);
+}
+
+static int parse_complex_input(const char *token, double *re, double *im) {
+    char normalized[1024], *p, *end;
+    copy_cstr(normalized, sizeof(normalized), token);
+    for (p = normalized; *p; p++) if (*p == 'd' || *p == 'D') *p = 'e';
+    p = normalized;
+    while (isspace((unsigned char)*p)) p++;
+    if (*p != '(') return 0;
+    p++;
+    *re = strtod(p, &end);
+    if (end == p) return 0;
+    p = end;
+    while (isspace((unsigned char)*p)) p++;
+    if (*p != ',') return 0;
+    p++;
+    *im = strtod(p, &end);
+    if (end == p) return 0;
+    p = end;
+    while (isspace((unsigned char)*p)) p++;
+    if (*p != ')') return 0;
+    p++;
+    while (isspace((unsigned char)*p)) p++;
+    return !*p;
 }
 
 static void assign_token_to_value(OfortValue *dest, const char *token) {
@@ -15384,6 +15509,8 @@ static void assign_token_to_value(OfortValue *dest, const char *token) {
         dest->v.i = strtoll(token, NULL, 10);
     } else if (dest->type == FVAL_REAL || dest->type == FVAL_DOUBLE) {
         dest->v.r = strtod(token, NULL);
+    } else if (dest->type == FVAL_COMPLEX) {
+        parse_complex_input(token, &dest->v.cx.re, &dest->v.cx.im);
     } else if (dest->type == FVAL_CHARACTER) {
         free_value(dest);
         *dest = make_character(token);
@@ -15394,7 +15521,7 @@ static void assign_token_to_value(OfortValue *dest, const char *token) {
 
 static int token_valid_for_type(OfortValType type, const char *token);
 
-static int read_string_value(OfortInterpreter *I, const char **p, OfortValue *dest,
+static int read_string_value(OfortInterpreter *I, OfortStringInput *p, OfortValue *dest,
                              char *tok, int tok_size, int *item_index,
                              char *iomsg, size_t iomsg_size) {
     if (!dest) return 1;
@@ -15425,7 +15552,10 @@ static int read_string_value(OfortInterpreter *I, const char **p, OfortValue *de
     }
     {
         int item = ++(*item_index);
-        if (!read_next_string_token(p, tok, tok_size)) {
+        int input_status = read_next_string_token(p, tok, tok_size);
+        if (input_status == 2) return 0;
+        if (input_status == 3) return 2; /* Stop the entire input list. */
+        if (!input_status) {
             if (iomsg && iomsg_size) copy_cstr(iomsg, iomsg_size, "End of file");
             return -1;
         }
@@ -15532,7 +15662,7 @@ static int read_file_array_ref_target(OfortInterpreter *I, FILE *fp, OfortVar *v
 static int read_string_array_ref_recursive(OfortInterpreter *I, OfortValue *arr,
                                            OfortSubscriptSpec *specs, int nargs,
                                            int dim, int *subscripts,
-                                           const char **p, char *tok, int tok_size,
+                                           OfortStringInput *p, char *tok, int tok_size,
                                            int *item_index,
                                            char *iomsg, size_t iomsg_size) {
     if (dim < 0) {
@@ -15545,7 +15675,10 @@ static int read_string_array_ref_recursive(OfortInterpreter *I, OfortValue *arr,
         }
         {
             int item = ++(*item_index);
-            if (!read_next_string_token(p, tok, tok_size)) {
+            int input_status = read_next_string_token(p, tok, tok_size);
+            if (input_status == 2) return 0;
+            if (input_status == 3) return 2;
+            if (!input_status) {
                 if (iomsg && iomsg_size) copy_cstr(iomsg, iomsg_size, "End of file");
                 return -1;
             }
@@ -15568,7 +15701,7 @@ static int read_string_array_ref_recursive(OfortInterpreter *I, OfortValue *arr,
     return 0;
 }
 
-static int read_string_array_ref_target(OfortInterpreter *I, const char **p, OfortVar *v,
+static int read_string_array_ref_target(OfortInterpreter *I, OfortStringInput *p, OfortVar *v,
                                         OfortNode *target, char *tok, int tok_size,
                                         int *item_index,
                                         char *iomsg, size_t iomsg_size) {
@@ -15794,6 +15927,10 @@ static int token_valid_for_type(OfortValType type, const char *token) {
         (void)strtod(token, &endptr);
         return endptr != token && *endptr == '\0';
     }
+    if (type == FVAL_COMPLEX) {
+        double re, im;
+        return parse_complex_input(token, &re, &im);
+    }
     if (type == FVAL_LOGICAL) {
         return token[0] == 'T' || token[0] == 't' ||
                token[0] == 'F' || token[0] == 'f' ||
@@ -15974,7 +16111,7 @@ static int read_file_target(OfortInterpreter *I, FILE *fp, OfortNode *target, ch
     return 0;
 }
 
-static int read_string_target(OfortInterpreter *I, const char **p, OfortNode *target,
+static int read_string_target(OfortInterpreter *I, OfortStringInput *p, OfortNode *target,
                               char *tok, int tok_size, int *item_index,
                               char *iomsg, size_t iomsg_size) {
     if (target->type == FND_IMPLIED_DO) {
@@ -16033,7 +16170,10 @@ static int read_string_target(OfortInterpreter *I, const char **p, OfortNode *ta
                                                 item_index, iomsg, iomsg_size);
     }
 
-    if (read_next_string_token(p, tok, tok_size)) {
+    int input_status = read_next_string_token(p, tok, tok_size);
+    if (input_status == 2) return 0;
+    if (input_status == 3) return 2;
+    if (input_status) {
         int item = ++(*item_index);
         OfortValType target_type = read_target_scalar_type(I, target);
         if (!token_valid_for_type(target_type, tok)) {
@@ -16055,6 +16195,49 @@ static int read_values_from_file(OfortInterpreter *I, OfortUnitFile *entry, Ofor
     int status = 0;
     if (!fp) ofort_error(I, "Cannot open '%s' for reading", entry->path);
     fseek(fp, entry->stream_pos, SEEK_SET);
+
+    int no_advance = n->no_advance;
+    if (n->children[9]) {
+        OfortValue av = eval_node(I, n->children[9]);
+        no_advance = av.type == FVAL_CHARACTER && str_eq_nocase(av.v.s, "no");
+        free_value(&av);
+    }
+    if (no_advance && format_is_character_line_read(n->format_str) && n->n_stmts > 0) {
+        OfortNode *target = n->stmts[0];
+        OfortVar *v = target->type == FND_IDENT || target->type == FND_FUNC_CALL
+                    ? find_var(I, target->name)
+                    : target->type == FND_ARRAY_REF && target->children[0]
+                    ? find_var(I, target->children[0]->name) : NULL;
+        if (!v) ofort_error(I, "Unsupported nonadvancing CHARACTER target");
+        int width = v->char_len, transferred = 0;
+        const char *fmt = n->format_str;
+        while (*fmt && toupper((unsigned char)*fmt) != 'A') fmt++;
+        if (*fmt && isdigit((unsigned char)fmt[1])) width = atoi(fmt + 1);
+        if (width < 0) ofort_error(I, "Invalid nonadvancing input width");
+        char *line = malloc((size_t)width + 1);
+        if (!line) ofort_error(I, "Unable to allocate nonadvancing input buffer");
+        while (transferred < width) {
+            int c = fgetc(fp);
+            if (c == EOF) { status = -1; break; }
+            if (c == '\n' || c == '\r') {
+                if (c == '\r') {
+                    int next = fgetc(fp);
+                    if (next != '\n' && next != EOF) ungetc(next, fp);
+                }
+                status = -2;
+                break;
+            }
+            line[transferred++] = (char)c;
+        }
+        line[transferred] = '\0';
+        if (status != -1) assign_line_to_character_target(I, target, line);
+        free(line);
+        if (n->children[8] && n->children[8]->type == FND_IDENT)
+            set_var(I, n->children[8]->name, make_integer(transferred));
+        entry->stream_pos = (int)ftell(fp);
+        fclose(fp);
+        return status;
+    }
 
     if (n->n_stmts == 0) {
         if (!fgets(tok, sizeof(tok), fp)) status = -1;
@@ -16090,32 +16273,58 @@ static int read_values_from_file(OfortInterpreter *I, OfortUnitFile *entry, Ofor
 
 static int read_values_from_string(OfortInterpreter *I, const char *text, OfortNode *n,
                                    char *iomsg, size_t iomsg_size) {
-    const char *p = text ? text : "";
+    OfortStringInput input = {0};
+    input.text = text ? text : "";
     char tok[1024];
     int item_index = 0;
 
     if (format_is_character_line_read(n->format_str) && n->n_stmts > 0) {
-        assign_line_to_character_target(I, n->stmts[0], p);
+        assign_line_to_character_target(I, n->stmts[0], input.text);
         return 0;
     }
 
     if (n->format_str[0]) {
         const char *fmtp = n->format_str;
-        const char *textp = p;
-        for (int i = 0; i < n->n_stmts; i++) {
-            if (read_formatted_string_field(&fmtp, &textp, tok, sizeof(tok))) {
-                assign_token_to_read_target(I, n->stmts[i], tok);
-            }
+        if (!expand_input_format(&fmtp, &input, 0) || !input.n_fields) {
+            if (iomsg && iomsg_size) copy_cstr(iomsg, iomsg_size, "Unsupported input format");
+            return 1;
         }
-        return 0;
     }
 
     for (int i = 0; i < n->n_stmts; i++) {
-        int status = read_string_target(I, &p, n->stmts[i], tok, sizeof(tok),
+        int status = read_string_target(I, &input, n->stmts[i], tok, sizeof(tok),
                                         &item_index, iomsg, iomsg_size);
-        if (status) return status;
+        if (status) return status == 2 ? 0 : status;
     }
     return 0;
+}
+
+static int read_values_from_internal_file(OfortInterpreter *I, OfortValue *file,
+                                         OfortNode *n, char *iomsg, size_t iomsg_size) {
+    if (file->type == FVAL_CHARACTER)
+        return read_values_from_string(I, file->v.s, n, iomsg, iomsg_size);
+    size_t size = 1;
+    for (int i = 0; i < file->v.arr.len; i++) {
+        OfortValue record = array_element_value(file, i);
+        size += strlen(record.v.s ? record.v.s : "") + 1;
+        free_value(&record);
+    }
+    char *text = malloc(size), *p;
+    if (!text) ofort_error(I, "Unable to allocate internal input records");
+    p = text;
+    for (int i = 0; i < file->v.arr.len; i++) {
+        OfortValue record = array_element_value(file, i);
+        const char *value = record.v.s ? record.v.s : "";
+        size_t len = strlen(value);
+        memcpy(p, value, len);
+        p += len;
+        *p++ = '\n';
+        free_value(&record);
+    }
+    *p = '\0';
+    int status = read_values_from_string(I, text, n, iomsg, iomsg_size);
+    free(text);
+    return status;
 }
 
 static void namelist_emit(OfortInterpreter *I, FILE *fp, const char *text) {
@@ -26499,7 +26708,10 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
         if (n->kind > 0) {
             val.kind = n->kind;
-            if (val.type == FVAL_ARRAY && val.v.arr.data) {
+            if (val.type == FVAL_ARRAY &&
+                can_defer_numeric_array_tags(val.v.arr.elem_type)) {
+                set_numeric_array_kind(&val, n->kind);
+            } else if (val.type == FVAL_ARRAY && val.v.arr.data) {
                 for (int i = 0; i < val.v.arr.len; i++) {
                     val.v.arr.data[i].kind = n->kind;
                 }
@@ -27933,8 +28145,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             char iomsg[OFORT_MAX_STRLEN];
             iomsg[0] = '\0';
 
-            if (uv.type == FVAL_CHARACTER) {
-                status = read_values_from_string(I, uv.v.s ? uv.v.s : "", n, iomsg, sizeof(iomsg));
+            if (uv.type == FVAL_CHARACTER ||
+                (uv.type == FVAL_ARRAY && uv.v.arr.elem_type == FVAL_CHARACTER)) {
+                status = read_values_from_internal_file(I, &uv, n, iomsg, sizeof(iomsg));
                 free_value(&uv);
                 if (n->children[4] && n->children[4]->type == FND_IDENT) {
                     set_var(I, n->children[4]->name, make_integer(status));
@@ -27977,7 +28190,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     set_var(I, n->children[4]->name, make_integer(status));
                 }
                 if (n->children[6] && n->children[6]->type == FND_IDENT) {
-                    set_var(I, n->children[6]->name, make_character(status == -1 ? "End of file" : ""));
+                    set_var(I, n->children[6]->name,
+                            make_character(status == -1 ? "End of file" :
+                                           status == -2 ? "End of record" : ""));
                 }
             }
             break;
@@ -40563,7 +40778,4 @@ void ofort_reset(OfortInterpreter *interp) {
     clear_line_profile(interp);
     clear_procedure_profile(interp);
 }
-
-
-
 
