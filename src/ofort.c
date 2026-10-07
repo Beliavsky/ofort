@@ -11583,6 +11583,24 @@ static void mark_tracked_array_element(OfortVar *var, int index) {
         var->initialized_prefix_len++;
     var->is_initialized = state->count == state->len;
 }
+static void undefine_array_element(OfortInterpreter *I, OfortVar *var, int index) {
+    unsigned char bit;
+    if (!I->strict_uninitialized || !var || var->val.type != FVAL_ARRAY) return;
+    if (index < 0 || index >= var->val.v.arr.len) ofort_error(I, "Array index out of bounds");
+    if (var->is_initialized) {
+        var->is_initialized = 0;
+        var->initialized_prefix_len = var->val.v.arr.len;
+        var->array_initialization = NULL;
+    }
+    prepare_array_initialization(I, var);
+    bit = (unsigned char)(1u << (index % 8));
+    if (var->array_initialization->bits[index / 8] & bit) {
+        var->array_initialization->bits[index / 8] &= (unsigned char)~bit;
+        var->array_initialization->count--;
+    }
+    if (index < var->initialized_prefix_len) var->initialized_prefix_len = index;
+}
+
 static OfortArrayInitialization *copy_array_initialization(OfortInterpreter *I,
                                                           const OfortVar *actual) {
     OfortVar mapped = {0};
@@ -14541,7 +14559,18 @@ static int fill_random_number_array_section(OfortInterpreter *I, OfortVar *var, 
 
     if (I->fast_mode) I->fast_rng_state = rng_state;
 
-    var->is_initialized = 1;
+    prepare_array_initialization(I, var);
+    if (I->strict_uninitialized) {
+        int selected = subscript_spec_element_count(specs, nargs);
+        for (int i = 0; i < selected; i++) {
+            int rem = i;
+            for (int d = 0; d < nargs; d++) {
+                subscripts[d] = subscript_spec_value(&specs[d], rem % specs[d].count);
+                rem /= specs[d].count;
+            }
+            mark_tracked_array_element(var, section_linear_index(&var->val, subscripts, nargs));
+        }
+    } else var->is_initialized = 1;
     free_subscript_specs(specs, nargs);
     return 1;
 }
@@ -19608,7 +19637,7 @@ static void assign_elemental_actual(OfortInterpreter *I, OfortNode *actual_node,
         &arg_alias_var[arg_index]->val : &args[arg_index];
     if (!actual_node || value->type == FVAL_VOID) return;
     if (arg->type == FVAL_ARRAY) {
-        if (actual_node->type == FND_IDENT) {
+        if (actual_node->type == FND_IDENT || (actual_vars && actual_vars[arg_index])) {
             OfortVar *actual = arg_alias[arg_index] && arg_alias_var[arg_index] ?
                 arg_alias_var[arg_index] :
                 (actual_vars && actual_vars[arg_index] ? actual_vars[arg_index] : find_var(I, actual_node->name));
@@ -19625,7 +19654,9 @@ static void assign_elemental_actual(OfortInterpreter *I, OfortNode *actual_node,
             } else {
                 free_value(&elem);
             }
-            actual->is_initialized = 1;
+            prepare_array_initialization(I, actual);
+            mark_tracked_array_element(actual, elem_index);
+            if (!I->strict_uninitialized) actual->is_initialized = 1;
         }
         return;
     }
@@ -19648,8 +19679,10 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
     OfortVar **arg_alias_var) {
     int elem_count = 0;
     OfortVar *actual_vars[OFORT_MAX_PARAMS] = {0};
+    int *actual_indices[OFORT_MAX_PARAMS] = {0};
     if (!fn || !fn->is_elemental) return 0;
-    if (execute_fast_elemental_numeric_subroutine_call(I, call, func, fn, args, nargs,
+    if (!I->strict_uninitialized &&
+        execute_fast_elemental_numeric_subroutine_call(I, call, func, fn, args, nargs,
                                                        arg_alias, arg_alias_var)) {
         return 1;
     }
@@ -19667,6 +19700,46 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
         if (fn->param_intents[i] == 1 || !call->stmts[i]) continue;
         if (call->stmts[i]->type == FND_IDENT) {
             actual_vars[i] = find_var(I, call->stmts[i]->name);
+        } else if (call->stmts[i]->type == FND_FUNC_CALL ||
+                   (call->stmts[i]->type == FND_ARRAY_REF && !call->stmts[i]->children[0])) {
+            actual_vars[i] = find_var(I, call->stmts[i]->name);
+        }
+        OfortVar *actual = actual_vars[i];
+        OfortValue *arg = arg_alias[i] && arg_alias_var[i] ? &arg_alias_var[i]->val : &args[i];
+        if (actual && actual->val.type == FVAL_ARRAY && arg->type == FVAL_ARRAY) {
+            OfortNode *ref = call->stmts[i];
+            actual_indices[i] = (int *)malloc((size_t)elem_count * sizeof(int));
+            if (!actual_indices[i]) ofort_error(I, "Out of memory mapping elemental output");
+            if (ref->type == FND_IDENT) {
+                for (int j = 0; j < elem_count; j++) actual_indices[i][j] = j;
+            } else {
+                OfortSubscriptSpec specs[7];
+                int subscripts[7] = {0};
+                if (ref->n_stmts > 7) ofort_error(I, "Too many array dimensions");
+                for (int d = 0; d < ref->n_stmts; d++) {
+                    int extent = actual->val.v.arr.dims[d];
+                    int lower = actual->val.v.arr.lower_bounds[d];
+                    eval_subscript_spec(I, ref->stmts[d], lower, extent, &specs[d]);
+                }
+                if (subscript_spec_element_count(specs, ref->n_stmts) != elem_count)
+                    ofort_error(I, "Elemental output section size mismatch");
+                for (int j = 0; j < elem_count; j++) {
+                    int rem = j;
+                    for (int d = 0; d < ref->n_stmts; d++) {
+                        subscripts[d] = subscript_spec_value(&specs[d], rem % specs[d].count);
+                        rem /= specs[d].count;
+                    }
+                    int index = section_linear_index(&actual->val, subscripts, ref->n_stmts);
+                    if (index < 0 || index >= actual->val.v.arr.len)
+                        ofort_error(I, "Array section index out of bounds");
+                    actual_indices[i][j] = index;
+                }
+                free_subscript_specs(specs, ref->n_stmts);
+            }
+            if (fn->param_intents[i] == 2) {
+                for (int j = 0; j < elem_count; j++)
+                    undefine_array_element(I, actual, actual_indices[i][j]);
+            }
         }
     }
 
@@ -19686,6 +19759,8 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
             pv->intent = fn->param_intents[i];
             pv->is_value = fn->param_values[i];
             pv->is_optional = fn->param_optional[i];
+            if (i < nargs && actual_indices[i] && fn->param_intents[i] != 2)
+                pv->is_initialized = array_element_is_initialized(actual_vars[i], actual_indices[i][elem]);
             if (fn->param_intents[i] == 2 && !fn->param_allocatables[i]) {
                 pv->is_initialized = 0;
             }
@@ -19706,17 +19781,20 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
 
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             if (fn->param_intents[i] != 1 &&
-                (call->stmts[i]->type == FND_IDENT || call->stmts[i]->type == FND_MEMBER)) {
+                (call->stmts[i]->type == FND_IDENT || call->stmts[i]->type == FND_MEMBER ||
+                 call->stmts[i]->type == FND_FUNC_CALL || call->stmts[i]->type == FND_ARRAY_REF)) {
                 OfortVar *pv = find_var(I, fn->param_names[i]);
-                if (pv && pv->present)
+                if (pv && pv->present && (!I->strict_uninitialized || pv->is_initialized))
                     assign_elemental_actual(I, call->stmts[i], args, arg_alias,
-                                            arg_alias_var, actual_vars, i, elem, &pv->val);
+                                            arg_alias_var, actual_vars, i,
+                                            actual_indices[i] ? actual_indices[i][elem] : elem, &pv->val);
             }
         }
         store_saved_vars(I, func, I->current_scope);
         pop_scope(I);
         if (I->stopping) break;
     }
+    for (int i = 0; i < OFORT_MAX_PARAMS; i++) free(actual_indices[i]);
     return 1;
 }
 
