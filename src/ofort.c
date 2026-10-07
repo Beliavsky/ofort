@@ -31326,8 +31326,23 @@ unresolved_external_call_done:
                 }
                 ofort_error(I, "Attempting to deallocate unallocated component");
             }
+            /* Deallocation releases storage, not the component's declared
+               array type. ALLOCATE needs this descriptor on the next call. */
+            OfortValue unallocated = make_void_val();
+            if (target->type == FVAL_ARRAY) {
+                unallocated.type = FVAL_ARRAY;
+                unallocated.kind = target->kind;
+                memset(&unallocated.v.arr, 0, sizeof(unallocated.v.arr));
+                unallocated.v.arr.elem_type = target->v.arr.elem_type;
+                unallocated.v.arr.n_dims = target->v.arr.n_dims;
+                copy_cstr(unallocated.v.arr.elem_type_name,
+                          sizeof(unallocated.v.arr.elem_type_name),
+                          target->v.arr.elem_type_name);
+                for (int d = 0; d < unallocated.v.arr.n_dims && d < 7; d++)
+                    unallocated.v.arr.lower_bounds[d] = 1;
+            }
             free_value(target);
-            *target = make_void_val();
+            *target = unallocated;
             set_allocate_status(I, n, 0, "");
             break;
         }
