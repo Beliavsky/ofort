@@ -10972,15 +10972,17 @@ def test_fast_elemental_subroutine_bulk_copyback(tmp_path):
         encoding="utf-8",
     )
 
+    # Bulk numeric execution deliberately falls back while initialization
+    # checking is enabled. Exercise that optimization explicitly here.
     fast = subprocess.run(
-        [str(OFORT), "--fast", "--profile-procs", str(source)],
+        [str(OFORT), "--fast", "--no-check-uninitialized", "--profile-procs", str(source)],
         cwd=ROOT,
         text=True,
         capture_output=True,
         timeout=5,
     )
     fast_no_specialize = subprocess.run(
-        [str(OFORT), "--fast", "--no-specialize", "--profile-procs", str(source)],
+        [str(OFORT), "--fast", "--no-specialize", "--no-check-uninitialized", "--profile-procs", str(source)],
         cwd=ROOT,
         text=True,
         capture_output=True,
