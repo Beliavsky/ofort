@@ -12217,6 +12217,25 @@ static void pointer_section_assign_recursive(OfortInterpreter *I, OfortValue *ta
     }
 }
 
+static void refresh_pointer_var_value(OfortInterpreter *I, OfortVar *ptr) {
+    OfortValue updated;
+    if (!ptr || !ptr->is_pointer || !ptr->pointer_associated ||
+        !ptr->pointer_target[0] || ptr->pointer_has_slice == 3) return;
+    updated = pointer_referenced_value(I, ptr->pointer_target, ptr->pointer_has_slice,
+                                       ptr->pointer_slice_start, ptr->pointer_slice_end,
+                                       ptr->pointer_slice_stride);
+    if (updated.type == FVAL_ARRAY && ptr->val.type == FVAL_ARRAY &&
+        updated.v.arr.len == ptr->val.v.arr.len) {
+        updated.v.arr.n_dims = ptr->val.v.arr.n_dims;
+        for (int d = 0; d < ptr->val.v.arr.n_dims && d < 7; d++) {
+            updated.v.arr.dims[d] = ptr->val.v.arr.dims[d];
+            updated.v.arr.lower_bounds[d] = ptr->val.v.arr.lower_bounds[d];
+        }
+    }
+    free_value(&ptr->val);
+    ptr->val = updated;
+}
+
 static int write_through_pointer_var(OfortInterpreter *I, OfortVar *ptr, OfortValue *rhs) {
     OfortVar *target;
     if (!ptr || !ptr->is_pointer || !ptr->pointer_associated || !ptr->pointer_target[0]) return 0;
@@ -12283,10 +12302,7 @@ static int write_through_pointer_var(OfortInterpreter *I, OfortVar *ptr, OfortVa
                     free_value(&elem);
                 }
             }
-            free_value(&ptr->val);
-            ptr->val = pointer_referenced_value(I, ptr->pointer_target, ptr->pointer_has_slice,
-                                                ptr->pointer_slice_start, ptr->pointer_slice_end,
-                                                ptr->pointer_slice_stride);
+            refresh_pointer_var_value(I, ptr);
             target->is_initialized = 1;
             ptr->is_initialized = 1;
             return 1;
@@ -12309,10 +12325,7 @@ static int write_through_pointer_var(OfortInterpreter *I, OfortVar *ptr, OfortVa
                     free_value(&elem);
                 }
             }
-            free_value(&ptr->val);
-            ptr->val = pointer_referenced_value(I, ptr->pointer_target, ptr->pointer_has_slice,
-                                                ptr->pointer_slice_start, ptr->pointer_slice_end,
-                                                ptr->pointer_slice_stride);
+            refresh_pointer_var_value(I, ptr);
             target->is_initialized = 1;
             ptr->is_initialized = 1;
             return 1;
@@ -12336,10 +12349,7 @@ static int write_through_pointer_var(OfortInterpreter *I, OfortVar *ptr, OfortVa
                 free_value(&elem);
             }
         }
-        free_value(&ptr->val);
-        ptr->val = pointer_referenced_value(I, ptr->pointer_target, ptr->pointer_has_slice,
-                                            ptr->pointer_slice_start, ptr->pointer_slice_end,
-                                            ptr->pointer_slice_stride);
+        refresh_pointer_var_value(I, ptr);
         target->is_initialized = 1;
         ptr->is_initialized = 1;
         return 1;
@@ -12383,6 +12393,15 @@ static int write_through_pointer_var(OfortInterpreter *I, OfortVar *ptr, OfortVa
     ptr->val = copy_value(target->val);
     ptr->is_initialized = 1;
     return 1;
+}
+
+static void flush_pointer_var_value(OfortInterpreter *I, OfortVar *ptr) {
+    if (ptr && ptr->is_pointer && ptr->pointer_associated && ptr->pointer_target[0]) {
+        /* The writer refreshes the pointer cache, so its input must not alias it. */
+        OfortValue value = copy_value(ptr->val);
+        write_through_pointer_var(I, ptr, &value);
+        free_value(&value);
+    }
 }
 
 static int write_through_pointer_value(OfortInterpreter *I, OfortValue *ptr, OfortValue *rhs) {
@@ -13497,6 +13516,7 @@ static int array_ref_scalar_linear_index(OfortInterpreter *I, OfortValue *array,
                                          OfortNode *n, int *index_out);
 
 static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNode *n) {
+    refresh_pointer_var_value(I, var);
     if (I->strict_uninitialized && !var->is_initialized) {
         int index;
         if (array_ref_scalar_linear_index(I, &var->val, n, &index)) {
@@ -13713,6 +13733,16 @@ static int pointer_target_descriptor(OfortInterpreter *I, OfortNode *node,
     *slice_end = 0;
     *slice_stride = 1;
     if (node->type == FND_IDENT) {
+        OfortVar *var = find_var(I, node->name);
+        if (var && var->is_pointer && var->pointer_associated &&
+            var->pointer_target[0] && var->pointer_has_slice != 3) {
+            copy_cstr(name, name_size, var->pointer_target);
+            *has_slice = var->pointer_has_slice;
+            *slice_start = var->pointer_slice_start;
+            *slice_end = var->pointer_slice_end;
+            *slice_stride = var->pointer_slice_stride;
+            return 1;
+        }
         copy_cstr(name, name_size, node->name);
         return 1;
     }
@@ -13751,12 +13781,30 @@ static int pointer_target_descriptor(OfortInterpreter *I, OfortNode *node,
         }
         return 1;
     }
-    if (node->type == FND_FUNC_CALL && node->n_stmts == 1) {
-        OfortVar *var = find_var(I, node->name);
+    if ((node->type == FND_FUNC_CALL ||
+         (node->type == FND_ARRAY_REF && node->children[0] &&
+          node->children[0]->type == FND_IDENT)) && node->n_stmts == 1) {
+        const char *base_name = node->type == FND_FUNC_CALL ? node->name : node->children[0]->name;
+        OfortVar *var = find_var(I, base_name);
         OfortSubscriptRange range;
         if (!var || var->val.type != FVAL_ARRAY) return 0;
         eval_subscript_range(I, node->stmts[0], var->val.v.arr.lower_bounds[0], var->val.v.arr.len, &range);
-        copy_cstr(name, name_size, node->name);
+        if (var->is_pointer && var->pointer_associated && var->pointer_target[0] &&
+            var->pointer_has_slice != 3) {
+            OfortVar *target = find_var(I, var->pointer_target);
+            int lower = var->val.v.arr.lower_bounds[0];
+            int stride = var->pointer_has_slice ? var->pointer_slice_stride : 1;
+            int start = var->pointer_has_slice ? var->pointer_slice_start :
+                (target && target->val.type == FVAL_ARRAY ? target->val.v.arr.lower_bounds[0] : lower);
+            if (!stride) return 0;
+            copy_cstr(name, name_size, var->pointer_target);
+            *has_slice = var->pointer_has_slice == 2 ? 2 : 1;
+            *slice_start = start + (range.start - lower) * stride;
+            *slice_end = start + (range.end - lower) * stride;
+            *slice_stride = range.is_slice ? range.step * stride : 0;
+            return 1;
+        }
+        copy_cstr(name, name_size, base_name);
         *has_slice = 1;
         *slice_start = range.start;
         *slice_end = range.end;
@@ -13956,6 +14004,8 @@ static void assign_array_ref_initialized(OfortInterpreter *I, OfortVar *var, Ofo
     OfortSubscriptSpec specs[7];
     int has_section = 0;
 
+    refresh_pointer_var_value(I, var);
+
     for (int i = 0; i < nargs; i++) {
         int extent = i < var->val.v.arr.n_dims ? var->val.v.arr.dims[i] : var->val.v.arr.len;
         int lower = i < var->val.v.arr.n_dims ? var->val.v.arr.lower_bounds[i] : 1;
@@ -13977,11 +14027,13 @@ static void assign_array_ref_initialized(OfortInterpreter *I, OfortVar *var, Ofo
         if (assign_packed_array_element(&var->val, index, value)) {
             free_value(&value);
             mark_tracked_array_element(var, index);
+            flush_pointer_var_value(I, var);
             return;
         }
         free_value(&var->val.v.arr.data[index]);
         var->val.v.arr.data[index] = value;
         mark_tracked_array_element(var, index);
+        flush_pointer_var_value(I, var);
         return;
     }
 
@@ -14035,6 +14087,7 @@ static void assign_array_ref_initialized(OfortInterpreter *I, OfortVar *var, Ofo
         }
     }
     free_subscript_specs(specs, nargs);
+    flush_pointer_var_value(I, var);
 }
 
 static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs, OfortValue *rhs) {
@@ -18964,6 +19017,16 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 result = pointer_referenced_value(I, rv->pointer_target, rv->pointer_has_slice,
                                                   rv->pointer_slice_start, rv->pointer_slice_end,
                                                   rv->pointer_slice_stride);
+                /* Dereferencing supplies current values, but the function
+                   result retains its own pointer bounds and remapped shape. */
+                if (result.type == FVAL_ARRAY && rv->val.type == FVAL_ARRAY &&
+                    result.v.arr.len == rv->val.v.arr.len) {
+                    result.v.arr.n_dims = rv->val.v.arr.n_dims;
+                    for (int d = 0; d < rv->val.v.arr.n_dims && d < 7; d++) {
+                        result.v.arr.dims[d] = rv->val.v.arr.dims[d];
+                        result.v.arr.lower_bounds[d] = rv->val.v.arr.lower_bounds[d];
+                    }
+                }
                 result.is_pointer_ref = 1;
                 copy_cstr(result.pointer_target, sizeof(result.pointer_target), rv->pointer_target);
                 result.pointer_has_slice = rv->pointer_has_slice;
