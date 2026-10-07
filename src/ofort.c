@@ -5555,9 +5555,9 @@ static int expr_at_stop_token(OfortInterpreter *I) {
 
 static OfortNode *parse_power(OfortInterpreter *I) {
     OfortNode *left = parse_primary(I);
-    while (!expr_at_stop_token(I) && check(I, FTOK_POWER)) {
+    if (!expr_at_stop_token(I) && check(I, FTOK_POWER)) {
         advance(I);
-        OfortNode *right = parse_primary(I); /* right-associative */
+        OfortNode *right = parse_power(I); /* right-associative */
         OfortNode *n = alloc_node(I, FND_POWER);
         n->children[0] = left;
         n->children[1] = right;
@@ -17719,6 +17719,14 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 if (left.v.arr.len != right.v.arr.len)
                     ofort_error(I, "Array size mismatch in operation");
                 arr_op = copy_value(left);
+                if ((left.v.arr.elem_type == FVAL_REAL || left.v.arr.elem_type == FVAL_DOUBLE) &&
+                    (right.v.arr.elem_type == FVAL_REAL || right.v.arr.elem_type == FVAL_DOUBLE)) {
+                    int left_kind = value_declared_kind(&left);
+                    int right_kind = value_declared_kind(&right);
+                    int result_kind = left_kind > right_kind ? left_kind : right_kind;
+                    arr_op.v.arr.elem_type = result_kind == 8 ? FVAL_DOUBLE : FVAL_REAL;
+                    set_numeric_array_kind(&arr_op, result_kind);
+                }
                 if (arr_op.v.arr.real_data && right.v.arr.real_data) {
                     for (int i = 0; i < left.v.arr.len; i++) {
                         double a = left.v.arr.real_data[i];
@@ -18064,6 +18072,9 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
 
         /* Complex arithmetic */
         if (needs_complex_promotion(left, right)) {
+            int left_kind = left.type == FVAL_INTEGER ? 0 : value_declared_kind(&left);
+            int right_kind = right.type == FVAL_INTEGER ? 0 : value_declared_kind(&right);
+            int result_kind = left_kind > right_kind ? left_kind : right_kind;
             double lre, lim, rre, rim;
             if (left.type == FVAL_COMPLEX) { lre = left.v.cx.re; lim = left.v.cx.im; }
             else { lre = val_to_real(left); lim = 0; }
@@ -18091,11 +18102,17 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 default: re = 0; im = 0; break;
             }
             free_value(&left); free_value(&right);
-            return make_complex(re, im);
+            return make_complex_kind(re, im, result_kind);
         }
 
         /* Real/Double arithmetic */
         if (needs_real_promotion(left, right) || n->type == FND_POWER) {
+            /* A declared REAL(kind=8) may retain the REAL value tag. Use its
+               kind rather than relying solely on the DOUBLE tag. Integer
+               operands do not increase the kind of a real result. */
+            int left_kind = left.type == FVAL_INTEGER ? 0 : value_declared_kind(&left);
+            int right_kind = right.type == FVAL_INTEGER ? 0 : value_declared_kind(&right);
+            int result_kind = left_kind > right_kind ? left_kind : right_kind;
             double a = val_to_real(left), b = val_to_real(right);
             double res;
             switch (n->type) {
@@ -18108,7 +18125,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 default: res = 0; break;
             }
             free_value(&left); free_value(&right);
-            if (left.type == FVAL_DOUBLE || right.type == FVAL_DOUBLE)
+            if (result_kind == 8)
                 return make_double(res);
             /* For POWER with integer operands, return integer if both are integers */
             if (n->type == FND_POWER && left.type == FVAL_INTEGER && right.type == FVAL_INTEGER)
@@ -25412,6 +25429,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         else if (strcmp(ru, "REAL64") == 0) declare_var(I, local, make_integer(8));
                         else if (strcmp(ru, "REAL128") == 0) declare_var(I, local, make_integer(-1));
                         else if (strcmp(ru, "FILE_STORAGE_SIZE") == 0) declare_var(I, local, make_integer(8));
+                        else if (strcmp(ru, "INT8") == 0) declare_var(I, local, make_integer(1));
+                        else if (strcmp(ru, "INT16") == 0) declare_var(I, local, make_integer(2));
+                        else if (strcmp(ru, "INT32") == 0) declare_var(I, local, make_integer(4));
                         else if (strcmp(ru, "INT64") == 0) declare_var(I, local, make_integer(8));
                         else if (strcmp(ru, "LOGICAL8") == 0) declare_var(I, local, make_integer(1));
                         else if (strcmp(ru, "LOGICAL16") == 0) declare_var(I, local, make_integer(2));
@@ -25429,6 +25449,9 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                     declare_var(I, "real64", make_integer(8));
                     declare_var(I, "real128", make_integer(-1));
                     declare_var(I, "file_storage_size", make_integer(8));
+                    declare_var(I, "int8", make_integer(1));
+                    declare_var(I, "int16", make_integer(2));
+                    declare_var(I, "int32", make_integer(4));
                     declare_var(I, "int64", make_integer(8));
                     declare_var(I, "logical8", make_integer(1));
                     declare_var(I, "logical16", make_integer(2));
@@ -37857,7 +37880,30 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         if (nargs < 2) ofort_error(I, "DOT_PRODUCT requires 2 arguments");
         if (args[0].type != FVAL_ARRAY || args[1].type != FVAL_ARRAY)
             ofort_error(I, "DOT_PRODUCT requires arrays");
-        int len = args[0].v.arr.len < args[1].v.arr.len ? args[0].v.arr.len : args[1].v.arr.len;
+        if (args[0].v.arr.n_dims != 1 || args[1].v.arr.n_dims != 1 ||
+            args[0].v.arr.len != args[1].v.arr.len)
+            ofort_error(I, "DOT_PRODUCT requires rank-one arrays of the same size");
+        int len = args[0].v.arr.len;
+        if (args[0].v.arr.elem_type == FVAL_COMPLEX || args[1].v.arr.elem_type == FVAL_COMPLEX) {
+            double real_sum = 0.0, imaginary_sum = 0.0;
+            int left_kind = args[0].v.arr.elem_type == FVAL_INTEGER ? 0 : value_declared_kind(&args[0]);
+            int right_kind = args[1].v.arr.elem_type == FVAL_INTEGER ? 0 : value_declared_kind(&args[1]);
+            int result_kind = left_kind > right_kind ? left_kind : right_kind;
+            for (int i = 0; i < len; i++) {
+                OfortValue a = array_element_value(&args[0], i);
+                OfortValue b = array_element_value(&args[1], i);
+                double ar = a.type == FVAL_COMPLEX ? a.v.cx.re : val_to_real(a);
+                double ai = a.type == FVAL_COMPLEX ? a.v.cx.im : 0.0;
+                double br = b.type == FVAL_COMPLEX ? b.v.cx.re : val_to_real(b);
+                double bi = b.type == FVAL_COMPLEX ? b.v.cx.im : 0.0;
+                /* Fortran uses SUM(CONJG(VECTOR_A) * VECTOR_B). */
+                real_sum += ar*br + ai*bi;
+                imaginary_sum += ar*bi - ai*br;
+                free_value(&a);
+                free_value(&b);
+            }
+            return make_complex_kind(real_sum, imaginary_sum, result_kind);
+        }
         if (args[0].v.arr.int_data && args[1].v.arr.int_data &&
             args[0].v.arr.elem_type == FVAL_INTEGER && args[1].v.arr.elem_type == FVAL_INTEGER) {
             long long isum = 0;
