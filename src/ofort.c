@@ -443,7 +443,7 @@ static void skip_balanced_parens(OfortInterpreter *I);
 static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
                                            OfortFunc *func, OfortNode *fn,
                                            OfortValue *args, int nargs,
-                                           OfortValue *result_out);
+                                           OfortValue *result_out, const int *arg_uninitialized, OfortArrayInitialization **arg_initialization);
 
 static double ofort_monotonic_seconds(void) {
 #ifdef _WIN32
@@ -17630,7 +17630,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             if (func) {
                 OfortNode *fn = func->node;
                 OfortValue elemental_result;
-                if (execute_elemental_function_call(I, n, func, fn, args, 2, &elemental_result)) {
+                if (execute_elemental_function_call(I, n, func, fn, args, 2, &elemental_result, NULL, NULL)) {
                     free_value(&left);
                     free_value(&right);
                     return elemental_result;
@@ -18098,7 +18098,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         if (func) {
             OfortValue elemental_result;
             OfortNode *fn = func->node;
-            if (execute_elemental_function_call(I, n, func, fn, args, 2, &elemental_result)) {
+            if (execute_elemental_function_call(I, n, func, fn, args, 2, &elemental_result, NULL, NULL)) {
                 free_value(&left);
                 free_value(&right);
                 return elemental_result;
@@ -18141,7 +18141,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             if (func) {
                 OfortNode *fn = func->node;
                 OfortValue elemental_result;
-                if (execute_elemental_function_call(I, n, func, fn, args, 2, &elemental_result)) {
+                if (execute_elemental_function_call(I, n, func, fn, args, 2, &elemental_result, NULL, NULL)) {
                     free_value(&left);
                     free_value(&right);
                     return elemental_result;
@@ -18687,6 +18687,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                  str_eq_nocase(n->name, "size") || str_eq_nocase(n->name, "shape") ||
                  str_eq_nocase(n->name, "rank") || str_eq_nocase(n->name, "lbound") ||
                  str_eq_nocase(n->name, "ubound") || str_eq_nocase(n->name, "bit_size") ||
+                 str_eq_nocase(n->name, "is_contiguous") ||
                  str_eq_nocase(n->name, "storage_size") || str_eq_nocase(n->name, "huge") ||
                  str_eq_nocase(n->name, "tiny") || str_eq_nocase(n->name, "epsilon") ||
                  str_eq_nocase(n->name, "digits") || str_eq_nocase(n->name, "precision") ||
@@ -18831,7 +18832,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             }
             fn = func->node;
             OfortValue elemental_result;
-            if (execute_elemental_function_call(I, n, func, fn, args, nargs, &elemental_result)) {
+            if (execute_elemental_function_call(I, n, func, fn, args, nargs, &elemental_result, param_uninitialized, param_initialization)) {
                 free_call_args(args, nargs); args = NULL;
                 return elemental_result;
             }
@@ -19275,7 +19276,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             if (func && func->is_function) {
                 OfortValue result;
                 reorder_named_function_actuals(I, n, func->node, &args, &nargs);
-                if (!execute_elemental_function_call(I, n, func, func->node, args, nargs, &result)) {
+                if (!execute_elemental_function_call(I, n, func, func->node, args, nargs, &result, NULL, NULL)) {
                     result = execute_user_function_with_args(I, func, args, nargs);
                 }
                 free_call_args(args, nargs);
@@ -19676,7 +19677,7 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
                                              OfortFunc *func, OfortNode *fn,
                                              OfortValue *args, int nargs,
                                              int *arg_alias,
-    OfortVar **arg_alias_var) {
+    OfortVar **arg_alias_var, const int *actual_initialized, OfortArrayInitialization **actual_initialization) {
     int elem_count = 0;
     OfortVar *actual_vars[OFORT_MAX_PARAMS] = {0};
     int *actual_indices[OFORT_MAX_PARAMS] = {0};
@@ -19759,6 +19760,13 @@ static int execute_elemental_subroutine_call(OfortInterpreter *I, OfortNode *cal
             pv->intent = fn->param_intents[i];
             pv->is_value = fn->param_values[i];
             pv->is_optional = fn->param_optional[i];
+            if (I->strict_uninitialized && i < nargs && actual_initialized &&
+                !actual_initialized[i] && !fn->param_values[i] && fn->param_intents[i] != 2) {
+                OfortArrayInitialization *state = actual_initialization ? actual_initialization[i] : NULL;
+                pv->is_initialized = args[i].type == FVAL_ARRAY && state &&
+                    elem < state->len && state->bits[elem];
+                if (!pv->is_initialized) pv->initialized_prefix_len = 0;
+            }
             if (i < nargs && actual_indices[i] && fn->param_intents[i] != 2)
                 pv->is_initialized = array_element_is_initialized(actual_vars[i], actual_indices[i][elem]);
             if (fn->param_intents[i] == 2 && !fn->param_allocatables[i]) {
@@ -20389,11 +20397,19 @@ static int execute_fast_elemental_numeric_function_call(OfortInterpreter *I, Ofo
 static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
                                            OfortFunc *func, OfortNode *fn,
                                            OfortValue *args, int nargs,
-                                           OfortValue *result_out) {
+                                           OfortValue *result_out,
+                                           const int *arg_uninitialized,
+                                           OfortArrayInitialization **arg_initialization) {
     OfortValue *shape_arg = NULL;
     OfortValue result = make_void_val();
+    int has_uninitialized_input = 0;
     if (!fn || !fn->is_elemental) return 0;
-    if (execute_fast_elemental_numeric_function_call(I, func, fn, args, nargs, result_out)) {
+    if (I->strict_uninitialized && arg_uninitialized) {
+        for (int i = 0; i < nargs; i++)
+            if (arg_uninitialized[i]) has_uninitialized_input = 1;
+    }
+    if (!has_uninitialized_input &&
+        execute_fast_elemental_numeric_function_call(I, func, fn, args, nargs, result_out)) {
         return 1;
     }
     for (int i = 0; i < nargs; i++) {
@@ -20442,6 +20458,15 @@ static int execute_elemental_function_call(OfortInterpreter *I, OfortNode *call,
                     array_element_value(&args[i], elem) : copy_value(args[i]);
                 OfortVar *pv = declare_var(I, fn->param_names[i], actual);
                 pv->is_optional = fn->param_optional[i];
+                pv->intent = fn->param_intents[i];
+                pv->is_value = fn->param_values[i];
+                if (I->strict_uninitialized && arg_uninitialized &&
+                    arg_uninitialized[i] && !fn->param_values[i]) {
+                    OfortArrayInitialization *state = arg_initialization ? arg_initialization[i] : NULL;
+                    pv->is_initialized = args[i].type == FVAL_ARRAY && state &&
+                        elem < state->len && state->bits[elem];
+                    if (!pv->is_initialized) pv->initialized_prefix_len = 0;
+                }
             } else if (fn->param_optional[i]) {
                 declare_absent_optional_var(I, fn->param_names[i]);
             } else {
@@ -22203,6 +22228,19 @@ static int fast_scalar_expr_once(OfortInterpreter *I, OfortNode *n, double *valu
     return 1;
 }
 
+static int affine_expr_reads_loop_index(OfortNode *n, const char *loop_name,
+                                        const char *src_name) {
+    if (!n || is_loop_array_ref(n, src_name, loop_name)) return 0;
+    if (n->type == FND_IDENT && str_eq_nocase(n->name, loop_name)) return 1;
+    for (int i = 0; i < n->n_children; i++) {
+        if (affine_expr_reads_loop_index(n->children[i], loop_name, src_name)) return 1;
+    }
+    for (int i = 0; i < n->n_stmts; i++) {
+        if (affine_expr_reads_loop_index(n->stmts[i], loop_name, src_name)) return 1;
+    }
+    return 0;
+}
+
 static int fast_loop_array_affine_coeff(OfortInterpreter *I, OfortNode *n,
                                         const char *loop_name, const char *src_name,
                                         double *coef, double *constant) {
@@ -22300,6 +22338,10 @@ static int exec_fast_array_affine_loop(OfortInterpreter *I, OfortNode *n,
         src_ref = rhs;
     }
     if (!src_ref) return 0;
+    /* The coefficient probe must not evaluate expressions depending on the
+       loop index before the loop starts. Only source-array subscripts may
+       depend on it in this specialization. */
+    if (affine_expr_reads_loop_index(rhs, n->name, src_ref->name)) return 0;
     if (!fast_loop_array_affine_coeff(I, rhs, n->name, src_ref->name, &coef, &constant)) return 0;
 
     dst_var = find_var(I, lhs->name);
@@ -29786,7 +29828,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         if (!call_has_named_actuals(n, n->n_stmts) &&
             execute_elemental_subroutine_call(I, n, func, fn, args, nargs,
-                                              arg_alias, arg_alias_var)) {
+                                              arg_alias, arg_alias_var,
+                                              actual_initialized, actual_initialization)) {
             for (int i = 0; i < nargs; i++) free_value(&args[i]);
             free(args);
             break;
