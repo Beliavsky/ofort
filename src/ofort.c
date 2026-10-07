@@ -18823,7 +18823,10 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                 if (i < nargs && args[i].type != FVAL_VOID) {
                     OfortVar *pv = declare_var(I, fn->param_names[i], copy_value(args[i]));
                     pv->is_optional = fn->param_optional[i];
-                    if (param_uninitialized[i]) {
+                    pv->intent = fn->param_intents[i];
+                    pv->is_value = fn->param_values[i];
+                    if (param_uninitialized[i] ||
+                        (fn->param_intents[i] == 2 && !fn->param_allocatables[i])) {
                         pv->is_initialized = 0;
                         pv->initialized_prefix_len = 0;
                         if (fn->param_intents[i] != 2 && pv->val.type == FVAL_ARRAY &&
@@ -18878,6 +18881,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
             /* Get result */
             OfortVar *rv = find_var(I, res_name);
             OfortValue result = rv ? copy_value(rv->val) : make_void_val();
+            OfortArrayInitialization *copyback_initialization[OFORT_MAX_PARAMS] = {0};
             /* An allocated pointer result owns its target directly rather
                than naming a variable in another scope. Preserve its pointer
                identity when its local result variable is destroyed. */
@@ -18926,6 +18930,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                         (actual->type == FND_IDENT || actual->type == FND_FUNC_CALL ||
                          actual->type == FND_ARRAY_REF || actual->type == FND_MEMBER)) {
                         copyback_initialized[i] = pv->is_initialized;
+                        copyback_initialization[i] = pv->array_initialization;
                         free_value(&args[i]);
                         args[i] = copy_value(pv->val);
                     }
@@ -18945,13 +18950,19 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     if (!actual || args[i].type == FVAL_VOID) continue;
                     if (actual->type == FND_IDENT) {
                         OfortVar *target = set_var(I, actual->name, copy_value(args[i]));
-                        target->is_initialized = copyback_initialized[i];
-                        if (!target->is_initialized) target->initialized_prefix_len = 0;
-                    } else if (copyback_initialized[i] && actual->type == FND_FUNC_CALL) {
+                        restore_array_initialization(target, copyback_initialization[i],
+                                                     copyback_initialized[i]);
+                    } else if ((copyback_initialized[i] ||
+                                (I->strict_uninitialized && copyback_initialization[i])) &&
+                               (actual->type == FND_FUNC_CALL ||
+                                (actual->type == FND_ARRAY_REF && !actual->children[0]))) {
                         OfortVar *target = find_var(I, actual->name);
                         if (target && target->val.type == FVAL_ARRAY) {
                             prepare_array_initialization(I, target);
-                            assign_array_ref(I, target, actual, &args[i]);
+                            assign_array_ref_initialized(I, target, actual, &args[i],
+                                                         copyback_initialized[i] ? NULL :
+                                                         copyback_initialization[i],
+                                                         fn->param_intents[i] == 2);
                             if (!I->strict_uninitialized) target->is_initialized = 1;
                         }
                     } else if (copyback_initialized[i] && actual->type == FND_ARRAY_REF &&
