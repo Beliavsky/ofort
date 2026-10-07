@@ -5482,6 +5482,13 @@ static OfortNode *parse_primary(OfortInterpreter *I) {
 
         /* function call / array reference: ident( ... ) */
         while (check(I, FTOK_LPAREN)) {
+            /* Further parentheses act on the preceding reference/result.
+             * In particular, words(:)(2:4) must retain words(:) as the
+             * base of its elementwise substring reference. */
+            if (n->type != FND_IDENT) {
+                n = parse_array_ref_postfix(I, n);
+                continue;
+            }
             advance(I);
             /* check if this is a slice: ident(start:end) */
             /* Parse argument list */
@@ -13550,8 +13557,55 @@ static OfortValue eval_array_section(OfortInterpreter *I, OfortVar *var, OfortNo
     return eval_subscripted_array_checked(I, &var->val, n, var, NULL, NULL);
 }
 
+/* An additional range after a CHARACTER array reference selects a
+ * substring of each selected element, not another array section. */
+static OfortVar *character_array_substring_var(OfortInterpreter *I, OfortNode *n,
+                                             OfortNode **array_ref) {
+    OfortNode *base;
+    OfortVar *var = NULL;
+    if (!n || n->type != FND_ARRAY_REF || n->n_stmts != 1 ||
+        !n->stmts[0] || n->stmts[0]->type != FND_SLICE) return NULL;
+    base = n->children[0];
+    if (!base) return NULL;
+    if (base->type == FND_FUNC_CALL) {
+        var = find_var(I, base->name);
+    } else if (base->type == FND_ARRAY_REF && base->children[0] &&
+               base->children[0]->type == FND_IDENT) {
+        var = find_var(I, base->children[0]->name);
+    }
+    if (!var || var->val.type != FVAL_ARRAY ||
+        var->val.v.arr.elem_type != FVAL_CHARACTER) return NULL;
+    if (array_ref) *array_ref = base;
+    return var;
+}
+
 static OfortValue eval_array_section_value(OfortInterpreter *I, OfortValue *array, OfortNode *n) {
     int nargs = n->n_stmts;
+
+    if (array && array->type == FVAL_ARRAY &&
+        array->v.arr.elem_type == FVAL_CHARACTER &&
+        character_array_substring_var(I, n, NULL)) {
+        OfortSubscriptRange range;
+        int len = array_character_len(array);
+        eval_subscript_range(I, n->stmts[0], 1, len, &range);
+        if (range.step != 1 || range.start < 1 || range.end > len ||
+            range.start > range.end + 1)
+            ofort_error(I, "Character substring bounds out of range");
+        OfortValue result = copy_value(*array);
+        result.kind = range.count;
+        for (int i = 0; i < result.v.arr.len; i++) {
+            char *text = (char *)malloc((size_t)range.count + 1);
+            if (!text) ofort_error(I, "Out of memory");
+            if (range.count)
+                memcpy(text, array->v.arr.data[i].v.s + range.start - 1,
+                       (size_t)range.count);
+            text[range.count] = '\0';
+            free_value(&result.v.arr.data[i]);
+            result.v.arr.data[i] = make_character(text);
+            free(text);
+        }
+        return result;
+    }
 
     if (array && array->type == FVAL_CHARACTER) {
         int len = array->v.s ? (int)strlen(array->v.s) : 0;
@@ -13998,7 +14052,9 @@ static void assign_subscripted_recursive(OfortInterpreter *I, OfortValue *dst, O
             free_value(&value);
             return;
         }
-        if (dst->v.arr.elem_type != FVAL_CHARACTER)
+        if (dst->v.arr.elem_type == FVAL_CHARACTER)
+            value = resize_character_value(value, array_character_len(dst));
+        else
             value = coerce_assignment_value(I, "", dst->v.arr.elem_type, value);
         if (dst->kind > 0 && is_numeric_type(value.type)) value.kind = dst->kind;
         if (dst->v.arr.data && dst->v.arr.data[dst_index].kind > 0 && is_numeric_type(value.type))
@@ -14039,7 +14095,9 @@ static void assign_array_ref_initialized(OfortInterpreter *I, OfortVar *var, Ofo
         if (index < 0 || index >= var->val.v.arr.len)
             ofort_error(I, "Array index out of bounds");
         OfortValue value = copy_value(*rhs);
-        if (var->val.v.arr.elem_type != FVAL_CHARACTER)
+        if (var->val.v.arr.elem_type == FVAL_CHARACTER)
+            value = resize_character_value(value, array_character_len(&var->val));
+        else
             value = coerce_assignment_value(I, var->name, var->val.v.arr.elem_type, value);
         if (var->val.kind > 0 && is_numeric_type(value.type)) value.kind = var->val.kind;
         if (var->val.v.arr.data && var->val.v.arr.data[index].kind > 0 && is_numeric_type(value.type))
@@ -14148,7 +14206,9 @@ static void assign_array_ref_value(OfortInterpreter *I, OfortValue *array, Ofort
         if (index < 0 || index >= array->v.arr.len)
             ofort_error(I, "Array index out of bounds");
         OfortValue value = copy_value(*rhs);
-        if (array->v.arr.elem_type != FVAL_CHARACTER)
+        if (array->v.arr.elem_type == FVAL_CHARACTER)
+            value = resize_character_value(value, array_character_len(array));
+        else
             value = coerce_assignment_value(I, "", array->v.arr.elem_type, value);
         if (array->kind > 0 && is_numeric_type(value.type)) value.kind = array->kind;
         if (array->v.arr.data && array->v.arr.data[index].kind > 0 && is_numeric_type(value.type))
@@ -14171,6 +14231,71 @@ static void assign_array_ref_value(OfortInterpreter *I, OfortValue *array, Ofort
         assign_subscripted_recursive(I, array, rhs, specs, nargs, nargs - 1, subscripts, &rhs_index);
     }
     free_subscript_specs(specs, nargs);
+}
+
+static int assign_character_array_substrings(OfortInterpreter *I, OfortNode *lhs,
+                                             OfortValue *rhs) {
+    OfortNode *base = NULL;
+    OfortVar *var = character_array_substring_var(I, lhs, &base);
+    OfortSubscriptSpec specs[7];
+    OfortSubscriptRange range;
+    if (!var) return 0;
+    if (var->is_parameter) ofort_error(I, "Cannot assign to PARAMETER '%s'", var->name);
+    if (var->intent == 1) ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", var->name);
+    if (var->is_protected && !protected_assignment_allowed(I, var->name))
+        ofort_error(I, "Cannot assign to PROTECTED variable '%s'", var->name);
+    refresh_pointer_var_value(I, var);
+    int nargs = base->n_stmts;
+    if (nargs <= 0 || nargs > 7) ofort_error(I, "Invalid character array reference");
+    for (int d = 0; d < nargs; d++) {
+        int extent = d < var->val.v.arr.n_dims ? var->val.v.arr.dims[d] : var->val.v.arr.len;
+        int lower = d < var->val.v.arr.n_dims ? var->val.v.arr.lower_bounds[d] : 1;
+        eval_subscript_spec(I, base->stmts[d], lower, extent, &specs[d]);
+    }
+    int selected = subscript_spec_element_count(specs, nargs);
+    if (rhs->type == FVAL_ARRAY && rhs->v.arr.len != selected)
+        ofort_error(I, "Character substring array assignment shape mismatch");
+    int len = array_character_len(&var->val);
+    eval_subscript_range(I, lhs->stmts[0], 1, len, &range);
+    if (range.step != 1 || range.start < 1 || range.end > len ||
+        range.start > range.end + 1)
+        ofort_error(I, "Character substring bounds out of range");
+    prepare_array_initialization(I, var);
+    /* rhs is the already evaluated, independent assignment value. */
+    for (int i = 0; i < selected; i++) {
+        int rem = i, subscripts[7] = {0};
+        for (int d = 0; d < nargs; d++) {
+            subscripts[d] = subscript_spec_value(&specs[d], rem % specs[d].count);
+            rem /= specs[d].count;
+        }
+        int index = section_linear_index(&var->val, subscripts, nargs);
+        if (index < 0 || index >= var->val.v.arr.len)
+            ofort_error(I, "Array section index out of bounds");
+        if (I->where_mask) {
+            int take;
+            int mask_index = I->where_mask_index++;
+            if (I->where_mask->type == FVAL_ARRAY) {
+                OfortValue mask = array_element_value(I->where_mask, mask_index);
+                take = val_to_logical(mask);
+                free_value(&mask);
+            } else take = val_to_logical(*I->where_mask);
+            if (I->where_mask_invert) take = !take;
+            if (!take) continue;
+        }
+        OfortValue value = rhs->type == FVAL_ARRAY ? array_element_value(rhs, i) : copy_value(*rhs);
+        if (value.type != FVAL_CHARACTER)
+            ofort_error(I, "Character substring assignment requires CHARACTER values");
+        int source_len = value.v.s ? (int)strlen(value.v.s) : 0;
+        char *target = var->val.v.arr.data[index].v.s;
+        for (int j = 0; j < range.count; j++)
+            target[range.start - 1 + j] = j < source_len ? value.v.s[j] : ' ';
+        free_value(&value);
+        if (range.start == 1 && range.count == len) mark_tracked_array_element(var, index);
+    }
+    free_subscript_specs(specs, nargs);
+    if (!I->strict_uninitialized) var->is_initialized = 1;
+    flush_pointer_var_value(I, var);
+    return 1;
 }
 
 typedef struct {
@@ -27159,6 +27284,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             break;
         }
         OfortValue rhs = eval_node(I, n->children[1]);
+
+        if (assign_character_array_substrings(I, lhs, &rhs)) {
+            trace_assignment_value(I, lhs, rhs);
+            free_value(&rhs);
+            break;
+        }
 
         if (lhs->type == FND_IDENT) {
             /* Simple variable assignment */
@@ -40778,4 +40909,3 @@ void ofort_reset(OfortInterpreter *interp) {
     clear_line_profile(interp);
     clear_procedure_profile(interp);
 }
-
