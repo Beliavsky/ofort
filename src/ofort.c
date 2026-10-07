@@ -10728,8 +10728,6 @@ static void consume_elsewhere_stmt(OfortInterpreter *I) {
         if (!token_ident_upper(peek(I), "WHERE")) expect(I, FTOK_IDENT);
         advance(I);
     }
-    if (check(I, FTOK_LPAREN)) skip_balanced_parens(I);
-    if (check(I, FTOK_IDENT)) advance(I); /* optional construct name */
 }
 
 static OfortNode *parse_where_statement(OfortInterpreter *I) {
@@ -10754,15 +10752,29 @@ static OfortNode *parse_where_statement(OfortInterpreter *I) {
 
     skip_newlines(I);
     n->children[1] = parse_block_until_where_part(I);
-    if (check_elsewhere_stmt(I)) {
+    OfortNode *part = n;
+    while (check_elsewhere_stmt(I)) {
         consume_elsewhere_stmt(I);
+        OfortNode *next = NULL;
+        if (check(I, FTOK_LPAREN)) {
+            advance(I);
+            next = alloc_node(I, FND_WHERE);
+            next->line = peek(I)->line;
+            next->children[0] = parse_expr(I);
+            expect(I, FTOK_RPAREN);
+            next->n_children = 2;
+        }
+        if (check(I, FTOK_IDENT)) advance(I); /* optional construct name */
         skip_newlines(I);
-        n->children[2] = parse_block_until_where_part(I);
-        n->n_children = 3;
-        while (check_elsewhere_stmt(I)) {
-            consume_elsewhere_stmt(I);
-            skip_newlines(I);
-            parse_block_until_where_part(I);
+        OfortNode *body = parse_block_until_where_part(I);
+        part->n_children = 3;
+        if (next) {
+            next->children[1] = body;
+            part->children[2] = next;
+            part = next;
+        } else {
+            part->children[2] = body;
+            break;
         }
     }
     consume_end_named(I, "WHERE", n->name);
@@ -25175,13 +25187,16 @@ static void commit_forall_targets(OfortInterpreter *I, OfortForallTarget *target
     }
 }
 
-static void exec_forall_level(OfortInterpreter *I, OfortNode *n, int level,
-                             OfortForallTarget *targets, int n_targets) {
-    int child = level * 3;
-    OfortValue lv;
-    OfortValue uv;
-    OfortValue sv;
-    int lo, hi, step;
+typedef struct {
+    long long indices[OFORT_MAX_CHILDREN / 3];
+} OfortForallIteration;
+
+static void capture_forall_level(OfortInterpreter *I, OfortNode *n, int level,
+                                OfortForallIteration *current,
+                                const long long *lower, const long long *upper,
+                                const long long *stride,
+                                OfortForallIteration **iterations,
+                                size_t *count, size_t *capacity) {
     if (level >= n->n_params) {
         if (n->bool_val) {
             int mask_child = n->n_params * 3;
@@ -25190,29 +25205,73 @@ static void exec_forall_level(OfortInterpreter *I, OfortNode *n, int level,
             free_value(&mv);
             if (!take) return;
         }
-        for (int i = 0; i < n->n_stmts; i++) {
-            exec_node(I, n->stmts[i]);
-            if (I->returning || I->exiting || I->cycling || I->stopping || I->goto_active) break;
+        if (*count == *capacity) {
+            size_t new_capacity = *capacity ? *capacity * 2 : 64;
+            OfortForallIteration *grown = (OfortForallIteration *)realloc(
+                *iterations, new_capacity * sizeof(**iterations));
+            if (!grown) ofort_error(I, "Out of memory capturing FORALL iterations");
+            *iterations = grown;
+            *capacity = new_capacity;
         }
-        merge_forall_targets(I, targets, n_targets);
+        (*iterations)[(*count)++] = *current;
         return;
     }
-    lv = eval_node(I, n->children[child]);
-    uv = eval_node(I, n->children[child + 1]);
-    sv = eval_node(I, n->children[child + 2]);
-    lo = (int)val_to_int(lv);
-    hi = (int)val_to_int(uv);
-    step = (int)val_to_int(sv);
-    free_value(&lv);
-    free_value(&uv);
-    free_value(&sv);
-    if (step == 0) ofort_error(I, "FORALL stride cannot be zero");
-    for (int i = lo; step > 0 ? i <= hi : i >= hi; i += step) {
+    long long step = stride[level];
+    for (long long i = lower[level]; step > 0 ? i <= upper[level] : i >= upper[level];) {
+        current->indices[level] = i;
         set_var(I, n->param_names[level], make_integer(i));
-        exec_forall_level(I, n, level + 1, targets, n_targets);
-        restore_forall_targets_to_base(I, targets, n_targets);
+        capture_forall_level(I, n, level + 1, current, lower, upper, stride,
+                            iterations, count, capacity);
+        if (I->returning || I->exiting || I->cycling || I->stopping || I->goto_active) break;
+        if ((step > 0 && i > LLONG_MAX - step) ||
+            (step < 0 && i < LLONG_MIN - step)) break;
+        i += step;
+    }
+}
+
+static void execute_forall(OfortInterpreter *I, OfortNode *n) {
+    long long lower[OFORT_MAX_CHILDREN / 3];
+    long long upper[OFORT_MAX_CHILDREN / 3];
+    long long stride[OFORT_MAX_CHILDREN / 3];
+    OfortForallIteration current = {{0}};
+    OfortForallIteration *iterations = NULL;
+    size_t count = 0, capacity = 0;
+    for (int level = 0; level < n->n_params; level++) {
+        OfortValue lv = eval_node(I, n->children[level * 3]);
+        OfortValue uv = eval_node(I, n->children[level * 3 + 1]);
+        OfortValue sv = eval_node(I, n->children[level * 3 + 2]);
+        lower[level] = val_to_int(lv);
+        upper[level] = val_to_int(uv);
+        stride[level] = val_to_int(sv);
+        free_value(&lv);
+        free_value(&uv);
+        free_value(&sv);
+        if (!stride[level]) ofort_error(I, "FORALL stride cannot be zero");
+    }
+    /* Capture the header mask before any assignment changes its operands. */
+    capture_forall_level(I, n, 0, &current, lower, upper, stride,
+                        &iterations, &count, &capacity);
+    for (int statement = 0; statement < n->n_stmts && count; statement++) {
+        OfortForallTarget *targets = NULL;
+        OfortNode block = {0};
+        block.stmts = &n->stmts[statement];
+        block.n_stmts = 1;
+        int n_targets = collect_forall_targets(I, &block, &targets);
+        for (size_t iteration = 0; iteration < count; iteration++) {
+            for (int level = 0; level < n->n_params; level++)
+                set_var(I, n->param_names[level],
+                        make_integer(iterations[iteration].indices[level]));
+            exec_node(I, n->stmts[statement]);
+            merge_forall_targets(I, targets, n_targets);
+            restore_forall_targets_to_base(I, targets, n_targets);
+            if (I->returning || I->exiting || I->cycling || I->stopping || I->goto_active) break;
+        }
+        if (!I->returning && !I->exiting && !I->cycling && !I->stopping && !I->goto_active)
+            commit_forall_targets(I, targets, n_targets);
+        free_forall_targets(targets, n_targets);
         if (I->returning || I->exiting || I->cycling || I->stopping || I->goto_active) break;
     }
+    free(iterations);
 }
 
 static void exec_do_concurrent_level(OfortInterpreter *I, OfortNode *n, int level) {
@@ -25366,6 +25425,38 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         OfortValue *prev_mask = I->where_mask;
         int prev_invert = I->where_mask_invert;
         int prev_index = I->where_mask_index;
+        OfortValue otherwise = copy_value(mask);
+
+        if (mask.type == FVAL_ARRAY) {
+            if (prev_mask && prev_mask->type == FVAL_ARRAY &&
+                prev_mask->v.arr.len != mask.v.arr.len)
+                ofort_error(I, "Nested WHERE masks are not conformable");
+            for (int i = 0; i < mask.v.arr.len; i++) {
+                OfortValue element = array_element_value(&mask, i);
+                int selected = val_to_logical(element);
+                int enclosing = 1;
+                free_value(&element);
+                if (prev_mask) {
+                    element = prev_mask->type == FVAL_ARRAY
+                        ? array_element_value(prev_mask, i) : copy_value(*prev_mask);
+                    enclosing = val_to_logical(element);
+                    free_value(&element);
+                    if (prev_invert) enclosing = !enclosing;
+                }
+                free_value(&mask.v.arr.data[i]);
+                mask.v.arr.data[i] = make_logical(enclosing && selected);
+                free_value(&otherwise.v.arr.data[i]);
+                otherwise.v.arr.data[i] = make_logical(enclosing && !selected);
+            }
+        } else {
+            int selected = val_to_logical(mask);
+            int enclosing = prev_mask ? val_to_logical(*prev_mask) : 1;
+            if (prev_mask && prev_invert) enclosing = !enclosing;
+            free_value(&mask);
+            free_value(&otherwise);
+            mask = make_logical(enclosing && selected);
+            otherwise = make_logical(enclosing && !selected);
+        }
 
         I->where_mask = &mask;
         I->where_mask_invert = 0;
@@ -25373,8 +25464,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         exec_node(I, n->children[1]);
 
         if (n->n_children > 2 && n->children[2]) {
-            I->where_mask = &mask;
-            I->where_mask_invert = 1;
+            I->where_mask = &otherwise;
+            I->where_mask_invert = 0;
             I->where_mask_index = 0;
             exec_node(I, n->children[2]);
         }
@@ -25383,6 +25474,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         I->where_mask_invert = prev_invert;
         I->where_mask_index = prev_index;
         free_value(&mask);
+        free_value(&otherwise);
         break;
     }
 
@@ -31306,14 +31398,8 @@ unresolved_external_call_done:
     case FND_FORALL:
         {
             OfortForallTarget *targets = NULL;
-            int n_targets = collect_forall_targets(I, n, &targets);
-            exec_forall_level(I, n, 0, targets, n_targets);
-            if (!I->returning && !I->exiting && !I->cycling && !I->stopping && !I->goto_active) {
-                commit_forall_targets(I, targets, n_targets);
-            } else {
-                restore_forall_targets_to_base(I, targets, n_targets);
-            }
-            free_forall_targets(targets, n_targets);
+            (void)targets;
+            execute_forall(I, n);
         }
         break;
 
@@ -37891,6 +37977,8 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         int value_idx = intrinsic_arg_index(arg_names, nargs, "value");
         int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
         int mask_idx = intrinsic_arg_index(arg_names, nargs, "mask");
+        int back_idx = intrinsic_arg_index(arg_names, nargs, "back");
+        int back;
         OfortValue *array;
         OfortValue *value;
         OfortValue *mask = NULL;
@@ -37906,6 +37994,17 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         }
         if (array_idx >= nargs || value_idx >= nargs || args[array_idx].type != FVAL_ARRAY)
             ofort_error(I, "FINDLOC requires ARRAY and VALUE arguments");
+        if (mask_idx < 0 && dim_idx == 2 && nargs > 3 &&
+            (!arg_names || !arg_names[3][0]) &&
+            (args[3].type == FVAL_LOGICAL ||
+             (args[3].type == FVAL_ARRAY && args[3].v.arr.elem_type == FVAL_LOGICAL)))
+            mask_idx = 3;
+        if (back_idx < 0) {
+            int positional_back = dim_idx == 2 ? 5 : 4;
+            if (nargs > positional_back && (!arg_names || !arg_names[positional_back][0]))
+                back_idx = positional_back;
+        }
+        back = back_idx >= 0 && val_to_logical(args[back_idx]);
         array = &args[array_idx];
         value = &args[value_idx];
         if (mask_idx >= 0) mask = &args[mask_idx];
@@ -37965,7 +38064,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                         free_value(&elem);
                         if (eq) {
                             found_pos = pos + 1;
-                            break;
+                            if (!back) break;
                         }
                     }
                 }
@@ -38000,7 +38099,7 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                 free_value(&elem);
                 if (eq) {
                     found_index = i;
-                    break;
+                    if (!back) break;
                 }
             }
             for (int d = 0; d < nd; d++) {
@@ -38020,14 +38119,23 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
         int want_max = strcmp(upper, "MAXLOC") == 0;
         int dim_idx = intrinsic_arg_index(arg_names, nargs, "dim");
         int mask_idx = intrinsic_arg_index(arg_names, nargs, "mask");
+        int back_idx = intrinsic_arg_index(arg_names, nargs, "back");
+        int back;
         OfortValue *array;
         OfortValue *mask = NULL;
         if (nargs < 1 || args[0].type != FVAL_ARRAY)
             ofort_error(I, "%s requires an array argument", upper);
         array = &args[0];
         if (dim_idx < 0 && mask_idx < 0 && nargs >= 2 &&
-            (!arg_names || arg_names[1][0] == '\0') && args[1].type != FVAL_ARRAY)
-            dim_idx = 1;
+            (!arg_names || arg_names[1][0] == '\0')) {
+            if (args[1].type == FVAL_LOGICAL ||
+                (args[1].type == FVAL_ARRAY && args[1].v.arr.elem_type == FVAL_LOGICAL))
+                mask_idx = 1;
+            else dim_idx = 1;
+        }
+        if (mask_idx < 0 && dim_idx == 1 && nargs > 2 &&
+            (!arg_names || !arg_names[2][0]) && args[2].type == FVAL_LOGICAL)
+            mask_idx = 2;
         if (mask_idx < 0 && nargs >= 2) {
             for (int i = 1; i < nargs; i++) {
                 if (i != dim_idx && args[i].type == FVAL_ARRAY) {
@@ -38037,6 +38145,12 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             }
         }
         if (mask_idx >= 0) mask = &args[mask_idx];
+        if (back_idx < 0) {
+            int positional_back = dim_idx == 1 ? 4 : 3;
+            if (nargs > positional_back && (!arg_names || !arg_names[positional_back][0]))
+                back_idx = positional_back;
+        }
+        back = back_idx >= 0 && val_to_logical(args[back_idx]);
 
         if (dim_idx >= 0) {
             int dim = (int)val_to_int(args[dim_idx]);
@@ -38088,8 +38202,9 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                     }
                     if (include) {
                         OfortValue elem = array_element_value(array, idx);
-                        if (!found || (want_max ? values_compare_fortran(I, elem, best) > 0
-                                                : values_compare_fortran(I, elem, best) < 0)) {
+                        int comparison = found ? values_compare_fortran(I, elem, best) : 0;
+                        if (!found || (want_max ? comparison > 0 : comparison < 0) ||
+                            (back && comparison == 0)) {
                             free_value(&best);
                             best = copy_value(elem);
                             best_pos = pos + 1;
@@ -38185,11 +38300,10 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
             int rdims[1] = {nd};
             OfortValue result = make_array(FVAL_INTEGER, rdims, 1);
             int best_index = -1;
-            double best = 0.0;
+            OfortValue best = make_void_val();
             for (int i = 0; i < array->v.arr.len; i++) {
                 OfortValue mv = make_void_val();
                 OfortValue elem;
-                double v;
                 if (mask) {
                     int take;
                     if (mask->type == FVAL_ARRAY) {
@@ -38202,13 +38316,16 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                     if (!take) continue;
                 }
                 elem = array_element_value(array, i);
-                v = val_to_real(elem);
-                free_value(&elem);
-                if (best_index < 0 || (want_max ? v > best : v < best)) {
-                    best = v;
+                int comparison = best_index >= 0 ? values_compare_fortran(I, elem, best) : 0;
+                if (best_index < 0 || (want_max ? comparison > 0 : comparison < 0) ||
+                    (back && comparison == 0)) {
+                    free_value(&best);
+                    best = copy_value(elem);
                     best_index = i;
                 }
+                free_value(&elem);
             }
+            free_value(&best);
             for (int d = 0; d < nd; d++) {
                 int sub = 0;
                 if (best_index >= 0) {
@@ -38731,7 +38848,9 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                         if (src_i >= 0 && src_i < nrow) {
                             result.v.arr.data[idx] = array_element_value(array, src_i + j * nrow);
                         } else if (boundary) {
-                            result.v.arr.data[idx] = copy_value(*boundary);
+                            result.v.arr.data[idx] = boundary->type == FVAL_ARRAY
+                                                  ? array_element_value(boundary, j)
+                                                  : copy_value(*boundary);
                         } else {
                             result.v.arr.data[idx] = default_value(array->v.arr.elem_type, 1);
                         }
@@ -38751,7 +38870,9 @@ static OfortValue call_intrinsic(OfortInterpreter *I, const char *name, OfortVal
                         if (src_j >= 0 && src_j < ncol) {
                             result.v.arr.data[idx] = array_element_value(array, i + src_j * nrow);
                         } else if (boundary) {
-                            result.v.arr.data[idx] = copy_value(*boundary);
+                            result.v.arr.data[idx] = boundary->type == FVAL_ARRAY
+                                                  ? array_element_value(boundary, i)
+                                                  : copy_value(*boundary);
                         } else {
                             result.v.arr.data[idx] = default_value(array->v.arr.elem_type, 1);
                         }
