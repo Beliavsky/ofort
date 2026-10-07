@@ -12787,6 +12787,20 @@ static int eval_optional_dim_arg(OfortInterpreter *I, OfortNode *call, int nargs
     return dim;
 }
 
+static int optional_actual_is_absent(OfortInterpreter *I, OfortNode *actual_node,
+                                     OfortNode *fn, int dummy_index) {
+    OfortVar *actual;
+    if (!actual_node || actual_node->type != FND_IDENT) return 0;
+    actual = find_var(I, actual_node->name);
+    if (!actual) return 0;
+    if (actual->is_optional && !actual->present) return 1;
+    if (!fn || dummy_index < 0 || dummy_index >= fn->n_params ||
+        !fn->param_optional[dummy_index] || fn->param_allocatables[dummy_index] ||
+        fn->param_pointers[dummy_index] || !actual->is_allocatable) return 0;
+    return actual->val.type == FVAL_ARRAY ? !actual->val.v.arr.allocated :
+                                          !actual->scalar_allocated;
+}
+
 static OfortValue eval_inquiry_intrinsic_for_ident(OfortInterpreter *I, OfortNode *call, OfortVar *var) {
     const char *name = call ? call->name : "";
     OfortValue *val = var ? &var->val : NULL;
@@ -18610,6 +18624,13 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         int param_uninitialized[OFORT_MAX_PARAMS] = {0};
         OfortArrayInitialization *param_initialization[OFORT_MAX_PARAMS] = {0};
         for (int i = 0; i < nargs; i++) {
+            OfortNode *presence_fn = pre_func ? pre_func->node : NULL;
+            int presence_dummy = presence_fn && n->param_names[i][0]
+                ? procedure_dummy_index(presence_fn, n->param_names[i]) : i;
+            if (optional_actual_is_absent(I, n->stmts[i], presence_fn, presence_dummy)) {
+                args[i] = make_void_val();
+                continue;
+            }
             /* Association does not read a variable actual. Preserve its
                undefined status on the dummy and check only if it is used.
                VALUE arguments, expressions and statement functions still
@@ -29598,6 +29619,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
             int dummy_i = actual_dummy_index[i];
             actual_initialized[i] = 1;
             args[i] = make_void_val();
+            if (optional_actual_is_absent(I, n->stmts[i], fn, dummy_i)) continue;
             if (n->stmts[i]->type == FND_IDENT) {
                 OfortVar *actual = find_var(I, n->stmts[i]->name);
                 if (actual && actual->is_optional && !actual->present) {
@@ -29814,6 +29836,14 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         }
         for (int i = 0; fn && i < fn->n_params && i < nargs; i++) {
             int actual_i = actual_for_param[i];
+            if (actual_i >= 0 && actual_i < n->n_stmts &&
+                optional_actual_is_absent(I, n->stmts[actual_i], fn, i)) {
+                arg_present[i] = 0;
+                free_value(&args[i]);
+                args[i] = make_void_val();
+                arg_alias[i] = 0;
+                arg_alias_var[i] = NULL;
+            }
             if (!arg_present[i] || actual_i < 0) continue;
             if (procedure_param_may_be_defined(fn, i) &&
                 !actual_argument_is_definable(I, n->stmts[actual_i])) {
@@ -30011,7 +30041,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             int actual_i = actual_for_param[i];
             OfortNode *actual_node = (actual_i >= 0 && actual_i < n->n_stmts) ? n->stmts[actual_i] : NULL;
-            if (!actual_node && !arg_present[i]) continue;
+            if (!arg_present[i]) continue;
             if (!arg_alias[i] && fn->param_intents[i] != 1) {
                 if (procedure_ref_name(&args[i]) && !fn->param_pointers[i]) continue;
                 OfortVar *pv = find_var(I, fn->param_names[i]);
@@ -30093,7 +30123,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         for (int i = 0; i < fn->n_params && i < nargs; i++) {
             int actual_i = actual_for_param[i];
             OfortNode *actual_node = (actual_i >= 0 && actual_i < n->n_stmts) ? n->stmts[actual_i] : NULL;
-            if (!actual_node && !arg_present[i]) continue;
+            if (!arg_present[i]) continue;
             if (!arg_alias[i] && fn->param_intents[i] != 1 &&
                 fn->param_n_dims[i] > 0 &&
                 copy_array_element_sequence_back(I, actual_node, &args[i],
