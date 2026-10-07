@@ -11566,6 +11566,22 @@ static void mark_tracked_array_element(OfortVar *var, int index) {
         var->initialized_prefix_len++;
     var->is_initialized = state->count == state->len;
 }
+static OfortArrayInitialization *copy_array_initialization(OfortInterpreter *I,
+                                                          const OfortVar *actual) {
+    OfortVar mapped = {0};
+    if (!I->strict_uninitialized || actual->is_initialized || actual->val.type != FVAL_ARRAY)
+        return NULL;
+    mapped.val = actual->val;
+    mapped.initialized_prefix_len = actual->initialized_prefix_len;
+    prepare_array_initialization(I, &mapped);
+    if (actual->array_initialization) {
+        for (int i = mapped.initialized_prefix_len; i < actual->val.v.arr.len; i++) {
+            if (array_element_is_initialized(actual, i)) mark_tracked_array_element(&mapped, i);
+        }
+    }
+    return mapped.array_initialization;
+}
+
 static void error_uninitialized_var(OfortInterpreter *I, OfortVar *var, int line) {
     if (var && var->val.type == FVAL_ARRAY &&
         (var->initialized_prefix_len > 0 ||
@@ -18527,6 +18543,7 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
                     if (n->stmts[i]->type == FND_IDENT) {
                         args[i] = copy_value(actual->val);
                         param_uninitialized[dummy_i] = 1;
+                        param_initialization[dummy_i] = copy_array_initialization(I, actual);
                     } else {
                         /* Association needs storage, not its current value.
                            Subscripts are still evaluated normally. */
@@ -29448,6 +29465,7 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                        Retain that status on the dummy for subsequent reads. */
                     if (n->stmts[i]->type == FND_IDENT) {
                         args[i] = copy_value(actual->val);
+                        actual_initialization[i] = copy_array_initialization(I, actual);
                     } else {
                         actual->is_initialized = 1;
                         OfortValue *component = member_lvalue(I, n->stmts[i]);
