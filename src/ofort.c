@@ -226,6 +226,7 @@ struct OfortInterpreter {
     int warnings_enabled;
     int warn_empty_sequence;
     int warn_intrinsic_shadow;
+    int warn_function_side_effects;
     OfortStandardMode standard_mode;
     int fast_mode;
     int specialized_fast_paths;
@@ -2263,6 +2264,22 @@ static OfortFunc *register_func_with_module(OfortInterpreter *I, const char *nam
     const char *kind = is_function ? "function" : "subroutine";
     if (node && node->type == FND_STMT_FUNCTION) kind = "statement function";
     warn_intrinsic_shadow(I, node ? node->line : 0, kind, name);
+    if (I->warn_function_side_effects && node && str_eq_nocase(kind, "function")) {
+        int saved_warnings_enabled = I->warnings_enabled;
+        /* An explicit request enables this diagnostic even in fast mode;
+           the CLI disables the request itself when -w was supplied. */
+        I->warnings_enabled = 1;
+        for (int i = 0; i < node->n_params; i++) {
+            if (!node->param_values[i] &&
+                (node->param_intents[i] == 2 || node->param_intents[i] == 3)) {
+                ofort_warning(I, node->line,
+                              "warning: function '%s' has INTENT(%s) argument '%s'; consider using a subroutine",
+                              name, node->param_intents[i] == 2 ? "OUT" : "INOUT",
+                              node->param_names[i]);
+            }
+        }
+        I->warnings_enabled = saved_warnings_enabled;
+    }
     for (int i = 0; i < I->n_funcs; i++) {
         if (str_eq_nocase(I->funcs[i].name, name) &&
             str_eq_nocase(I->funcs[i].module_name, module_name ? module_name : "")) {
@@ -13901,7 +13918,8 @@ static void assign_subscripted_recursive(OfortInterpreter *I, OfortValue *dst, O
 }
 
 static void assign_array_ref_initialized(OfortInterpreter *I, OfortVar *var, OfortNode *lhs,
-                                         OfortValue *rhs, OfortArrayInitialization *initialization) {
+                                         OfortValue *rhs, OfortArrayInitialization *initialization,
+                                         int replace_initialization) {
     int nargs = lhs->n_stmts;
     OfortSubscriptSpec specs[7];
     int has_section = 0;
@@ -13942,6 +13960,34 @@ static void assign_array_ref_initialized(OfortInterpreter *I, OfortVar *var, Ofo
 
     int subscripts[7] = {0};
     int rhs_index = 0;
+    if (replace_initialization && I->strict_uninitialized && selected > 0) {
+        if (var->is_initialized) {
+            /* Start with every existing element defined, then undefine only
+               the OUT section. Its neighbors retain their definition status. */
+            var->is_initialized = 0;
+            var->initialized_prefix_len = var->val.v.arr.len;
+            var->array_initialization = NULL;
+        }
+        prepare_array_initialization(I, var);
+        for (int i = 0; i < selected; i++) {
+            int rem = i;
+            int index;
+            unsigned char bit;
+            for (int d = 0; d < nargs; d++) {
+                subscripts[d] = subscript_spec_value(&specs[d], rem % specs[d].count);
+                rem /= specs[d].count;
+            }
+            index = section_linear_index(&var->val, subscripts, nargs);
+            if (index < 0 || index >= var->val.v.arr.len)
+                ofort_error(I, "Array section index out of bounds");
+            bit = (unsigned char)(1u << (index % 8));
+            if (var->array_initialization->bits[index / 8] & bit) {
+                var->array_initialization->bits[index / 8] &= (unsigned char)~bit;
+                var->array_initialization->count--;
+            }
+            if (index < var->initialized_prefix_len) var->initialized_prefix_len = index;
+        }
+    }
     assign_subscripted_recursive(I, &var->val, rhs, specs, nargs, nargs - 1, subscripts, &rhs_index);
     if (var->array_initialization && !var->is_initialized) {
         for (int i = 0; i < selected; i++) {
@@ -13960,7 +14006,7 @@ static void assign_array_ref_initialized(OfortInterpreter *I, OfortVar *var, Ofo
 }
 
 static void assign_array_ref(OfortInterpreter *I, OfortVar *var, OfortNode *lhs, OfortValue *rhs) {
-    assign_array_ref_initialized(I, var, lhs, rhs, NULL);
+    assign_array_ref_initialized(I, var, lhs, rhs, NULL, 0);
 }
 
 static void restore_array_initialization(OfortVar *var, OfortArrayInitialization *state,
@@ -30055,7 +30101,8 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                         prepare_array_initialization(I, actual);
                         assign_array_ref_initialized(I, actual, actual_node, &args[i],
                                                      param_copyback_initialized[i] ? NULL :
-                                                     param_copyback_initialization[i]);
+                                                     param_copyback_initialization[i],
+                                                     fn->param_intents[i] == 2);
                         if (!I->strict_uninitialized) actual->is_initialized = 1;
                         continue;
                     }
@@ -39027,6 +39074,10 @@ void ofort_set_warnings_enabled(OfortInterpreter *interp, int enabled) {
     if (interp) {
         interp->warnings_enabled = enabled ? 1 : 0;
     }
+}
+
+void ofort_set_warn_function_side_effects(OfortInterpreter *interp, int enabled) {
+    if (interp) interp->warn_function_side_effects = enabled ? 1 : 0;
 }
 
 void ofort_set_warn_intrinsic_shadow(OfortInterpreter *interp, int enabled) {

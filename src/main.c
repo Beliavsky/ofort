@@ -4796,6 +4796,7 @@ static int is_trace_assign_immediate_line(const char *line) {
 
 static int g_implicit_typing = 0;
 static int g_warnings_enabled = 1;
+static int g_warnings_explicitly_suppressed = 0;
 static int g_warnings_as_errors = 0;
 static int g_time_detail = 0;
 static int g_fast_mode = 0;
@@ -4807,6 +4808,7 @@ static int g_check_uninitialized = 1;
 static int g_warn_unused = 1;
 static int g_warn_empty_sequence = 0;
 static int g_warn_intrinsic_shadow = 1;
+static int g_warn_function_side_effects = 0;
 static int g_no_logo = 0;
 static int g_init_integer_enabled = 0;
 static long long g_init_integer_value = 0;
@@ -4833,7 +4835,9 @@ static int warn_unused_repl_source_if_enabled(const char *source, int fast_mode,
 }
 
 static int warnings_should_fail(void) {
-    return g_warnings_enabled && g_warnings_as_errors;
+    return (g_warnings_enabled ||
+            (g_warn_function_side_effects && !g_warnings_explicitly_suppressed)) &&
+           g_warnings_as_errors;
 }
 
 static int warning_text_present(const char *warnings) {
@@ -4855,6 +4859,9 @@ static OfortInterpreter *create_ofort_interpreter(void) {
         ofort_set_warnings_enabled(interp, g_warnings_enabled);
         ofort_set_warn_empty_sequence(interp, g_warn_empty_sequence);
         ofort_set_warn_intrinsic_shadow(interp, g_warn_intrinsic_shadow);
+        ofort_set_warn_function_side_effects(interp,
+                                           g_warn_function_side_effects &&
+                                           !g_warnings_explicitly_suppressed);
         ofort_set_fast_mode(interp, g_fast_mode);
         ofort_set_specialized_fast_paths(interp, g_specialized_fast_paths);
         ofort_set_line_profile_enabled(interp, g_line_profile);
@@ -5477,7 +5484,75 @@ static int next_normalized_char(FILE *fp) {
     return c;
 }
 
+static int g_diff_first = 0;
+
+static char *read_comparison_line(FILE *fp, int *failed) {
+    size_t capacity = 128, length = 0;
+    char *line = (char *)malloc(capacity);
+    int c, seen = 0, pending_space = 0;
+    if (!line) { *failed = 1; return NULL; }
+    while ((c = next_normalized_char(fp)) != EOF) {
+        seen = 1;
+        if (c == '\n') break;
+        if (isspace((unsigned char)c)) {
+            if (length) pending_space = 1;
+            continue;
+        }
+        if (length + 3 > capacity) {
+            char *grown = (char *)realloc(line, capacity * 2);
+            if (!grown) { free(line); *failed = 1; return NULL; }
+            line = grown;
+            capacity *= 2;
+        }
+        if (pending_space) line[length++] = ' ';
+        pending_space = 0;
+        line[length++] = (char)c;
+    }
+    if (ferror(fp)) { free(line); *failed = 1; return NULL; }
+    if (!seen) { free(line); return NULL; }
+    line[length] = '\0';
+    return line;
+}
+
+static int files_equal_first_difference(const char *a_path, const char *b_path) {
+    FILE *a = fopen(a_path, "rb"), *b = fopen(b_path, "rb");
+    size_t line_number = 0;
+    int equal = 1;
+    if (!a || !b) {
+        if (a) fclose(a);
+        if (b) fclose(b);
+        fprintf(stderr, "Unable to open captured output for comparison\n");
+        return 0;
+    }
+    for (;;) {
+        int failed = 0;
+        char *left = read_comparison_line(a, &failed);
+        char *right = read_comparison_line(b, &failed);
+        line_number++;
+        if (failed) {
+            fprintf(stderr, "Unable to read captured output for comparison\n");
+            equal = 0;
+        } else if (!left && !right) {
+            free(left);
+            free(right);
+            break;
+        } else if (!left || !right || strcmp(left, right) != 0) {
+            fprintf(stderr, "First significant difference: output line %zu\n", line_number);
+            fprintf(stderr, "ofort:    %s\n", left ? left : "<end of output>");
+            fprintf(stderr, "gfortran: %s\n", right ? right : "<end of output>");
+            equal = 0;
+        }
+        free(left);
+        free(right);
+        if (!equal) break;
+    }
+    fclose(a);
+    fclose(b);
+    return equal;
+}
+
 static int files_equal_normalized(const char *a_path, const char *b_path) {
+    if (g_diff_first) return files_equal_first_difference(a_path, b_path);
     FILE *a = fopen(a_path, "rb");
     FILE *b = fopen(b_path, "rb");
     int ca;
@@ -5505,6 +5580,7 @@ static int files_equal_normalized(const char *a_path, const char *b_path) {
 }
 
 static void print_file_with_header(const char *header, const char *path) {
+    if (g_diff_first) return;
     FILE *fp = fopen(path, "rb");
     int c;
 
@@ -8859,7 +8935,8 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --load-run file.f90\n", program);
     fprintf(stderr, "       %s [-w] [--fast] [--no-specialize] [--time|--time-detail] [--profile-lines] [--implicit-typing|--no-implicit-typing] --check file.f90\n", program);
-    fprintf(stderr, "       %s --check-gfortran file.f90\n", program);
+    fprintf(stderr, "       %s --check-gfortran [--diff-first] file.f90\n", program);
+    fprintf(stderr, "       --diff-first ignores whitespace differences and reports only the first differing output line\n");
     fprintf(stderr, "       %s < file.f90\n", program);
     fprintf(stderr, "       --version prints the ofort version\n");
     fprintf(stderr, "       --nologo suppresses the interactive startup banner\n");
@@ -8887,6 +8964,8 @@ static void print_usage(const char *program) {
     fprintf(stderr, "       --no-warn-unused disables declared-but-unused variable warnings\n");
     fprintf(stderr, "       --warn-empty-sequence warns about out-of-bounds array elements passed as empty storage sequences (off by default; -w suppresses)\n");
     fprintf(stderr, "       --no-warn-intrinsic-shadow disables warnings for user names that shadow intrinsics\n");
+    fprintf(stderr, "       --warn-function-side-effects warns about function OUT/INOUT arguments (opt-in)\n");
+    fprintf(stderr, "       --no-warn-function-side-effects disables function side-effect warnings\n");
     fprintf(stderr, "       --check-uninitialized, --check-uninit rejects reads of declared variables before assignment (default)\n");
     fprintf(stderr, "       --no-check-uninitialized permits reads of otherwise uninitialized variables\n");
     fprintf(stderr, "       --init-int value initializes otherwise uninitialized INTEGER variables to value\n");
@@ -9005,6 +9084,7 @@ int main(int argc, char **argv) {
             g_implicit_typing = 0;
         } else if (strcmp(argv[i], "-w") == 0) {
             g_warnings_enabled = 0;
+            g_warnings_explicitly_suppressed = 1;
         } else if (strcmp(argv[i], "-Werror") == 0 ||
                    strcmp(argv[i], "--warn-error") == 0) {
             g_warnings_as_errors = 1;
@@ -9087,6 +9167,10 @@ int main(int argc, char **argv) {
             g_warn_unused = 0;
         } else if (strcmp(argv[i], "--no-warn-intrinsic-shadow") == 0) {
             g_warn_intrinsic_shadow = 0;
+        } else if (strcmp(argv[i], "--warn-function-side-effects") == 0) {
+            g_warn_function_side_effects = 1;
+        } else if (strcmp(argv[i], "--no-warn-function-side-effects") == 0) {
+            g_warn_function_side_effects = 0;
         } else if (strcmp(argv[i], "--check-uninitialized") == 0 ||
                    strcmp(argv[i], "--check-uninit") == 0) {
             g_check_uninitialized = 1;
@@ -9185,6 +9269,8 @@ int main(int argc, char **argv) {
             break;
         } else if (each_mode && strcmp(argv[i], "--check") == 0) {
             each_check = 1;
+        } else if (strcmp(argv[i], "--diff-first") == 0) {
+            g_diff_first = 1;
         } else if (strcmp(argv[i], "--check-gfortran") == 0) {
             if (!each_mode && !dep_mode && source_paths.count == 0 &&
                 i + 1 < argc && strcmp(argv[i + 1], "--") != 0 && argv[i + 1][0] != '-') {
@@ -9279,6 +9365,12 @@ int main(int argc, char **argv) {
                 }
             }
         }
+    }
+
+    if (g_diff_first && (each_mode || (!check_path && !check_gfortran_after))) {
+        fprintf(stderr, "--diff-first requires --check-gfortran and cannot be used with --each\n");
+        path_list_free(&source_paths);
+        return 2;
     }
 
     if (dep_mode && (load_path || syntax_check_path || check_path || source_paths.count == 0)) {
