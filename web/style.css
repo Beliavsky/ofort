@@ -4,7 +4,7 @@
 body { margin:0; color:var(--ink); font-family:'Space Grotesk',sans-serif; background:radial-gradient(ellipse at 90% 0%,#e4efd1,transparent 45%),repeating-linear-gradient(90deg,transparent 0 79px,#19342d04 79px 80px),var(--paper); }
 header { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px 24px; padding:12px 5vw; border-bottom:1px solid var(--line); }
 .header-copy p { margin:4px 0 0; font-size:12px; line-height:1.5; color:var(--muted); }
-header nav { display:flex; flex-wrap:wrap; gap:10px 20px; font-size:13px; }
+header nav { display:flex; flex-wrap:wrap; gap:12px 36px; font-size:13px; }
 header nav a { color:var(--ink); text-underline-offset:3px; }
 header nav a:hover { color:#12665c; }
 header nav a:focus-visible { outline:2px solid #8eac60; outline-offset:4px; }
