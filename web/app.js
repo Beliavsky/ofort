@@ -231,7 +231,7 @@ function send(payload) {
           }
           byId("variables").textContent = data.variables || "(no variables)";
           appendText("output", data.output);
-          appendText("errors", data.errors);
+          byId("errors").textContent = data.errors || "";
           byId("repl-hint").textContent = data.pending ? `Waiting for ${data.waiting === "continuation" ? "continued line" : "END " + data.waiting}.` : "Enter submits; Shift+Enter adds a line.";
           lastRun.source = data.source;
         } else {
