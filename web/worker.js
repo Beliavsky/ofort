@@ -32,7 +32,7 @@ function specificationGroup(source) {
 function sessionSource() {
   const groups = [[], [], [], []];
   for (const submission of accepted) groups[specificationGroup(submission)].push(submission);
-  const implicit = groups[1].length ? groups[1] : ["implicit none"];
+  const implicit = groups[1];
   return [...groups[0], ...implicit, ...groups[2], ...groups[3], ...pending].join("\n") + "\n";
 }
 

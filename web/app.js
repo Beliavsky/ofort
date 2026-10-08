@@ -12,7 +12,7 @@ let busy = false;
 let programSource = examples.hello;
 let commandHistory = [];
 let historyIndex = 0;
-let sessionBaseline = "implicit none\n";
+let sessionBaseline = "";
 let sourceDirty = false;
 let settingSource = false;
 let replayDraft = null;
@@ -131,7 +131,7 @@ byId("stop").addEventListener("click", () => {
   finish("Stopped");
   if (isRepl()) {
     appendText("errors", "Stopped. The REPL interpreter and temporary files were discarded.");
-    setSource("implicit none\n");
+    setSource("");
     byId("variables").textContent = "(no variables)";
   }
 });
@@ -149,6 +149,29 @@ byId("source").addEventListener("keydown", event => {
 byId("download").addEventListener("click", () => {
   let source = sourceText();
   if (isRepl()) {
+    // The interpreter disables implicit typing without visible boilerplate.
+    // Downloads retain an explicit declaration rule after USE/IMPORT lines.
+    const lines = source.split(/\r?\n/);
+    if (!lines.some(line => /^implicit\s+none\b/i.test(line.replace(/!.*/, "").trim()))) {
+      let insertion = 0;
+      let continuing = false;
+      for (; insertion < lines.length; insertion++) {
+        const code = lines[insertion].replace(/!.*/, "").trim();
+        if (!code) continue;
+        if (continuing) {
+          continuing = code.endsWith("&");
+          continue;
+        }
+        if (/^(use|import)\b/i.test(code)) {
+          continuing = code.endsWith("&");
+          continue;
+        }
+        if (/^program\s+[a-z]\w*\s*$/i.test(code)) continue;
+        break;
+      }
+      lines.splice(insertion, 0, "implicit none");
+      source = lines.join("\n");
+    }
     const statements = source.split(/\r?\n/).map(line => line.replace(/!.*/, "").trim()).filter(Boolean);
     const last = statements[statements.length - 1] || "";
     if (!/^end(?:\s+program(?:\s+[a-z]\w*)?)?\s*$/i.test(last))
@@ -226,7 +249,7 @@ function send(payload) {
     appendText("errors", "Stopped after 30 seconds. Partial output is unavailable; any REPL state and temporary files were discarded.");
     finish("Time limit reached");
     if (isRepl()) {
-      setSource("implicit none\n");
+      setSource("");
       byId("variables").textContent = "(no variables)";
     }
   }, 30000);
@@ -247,7 +270,7 @@ byId("mode").addEventListener("change", () => {
   byId("source-heading").textContent = repl ? "01 / SESSION SOURCE" : "01 / SOURCE";
   byId("source-description").textContent = repl ? "Persistent interpreter" : "Free-form Fortran";
   byId("run").innerHTML = repl ? 'Restart and run source <span>Ctrl + Enter</span>' : 'Run program <span>Ctrl + Enter</span>';
-  setSource(repl ? "implicit none\n" : programSource);
+  setSource(repl ? "" : programSource);
   byId("output").textContent = "";
   byId("errors").textContent = "";
   byId("variables").textContent = "(no variables)";
@@ -283,7 +306,7 @@ byId("clear-session").addEventListener("click", () => {
   if (busy) return;
   if (sourceDirty && !confirm("Discard the source edits and clear the session?")) return;
   finish("Session cleared");
-  setSource("implicit none\n");
+  setSource("");
   byId("output").textContent = "";
   byId("errors").textContent = "";
   byId("variables").textContent = "(no variables)";
