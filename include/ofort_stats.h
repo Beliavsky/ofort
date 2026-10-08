@@ -10,6 +10,8 @@ double ofort_stats_variance_r8(const double *x, int n);
 double ofort_stats_sd_r8(const double *x, int n);
 double ofort_stats_cov_r8(const double *x, const double *y, int n);
 double ofort_stats_cor_r8(const double *x, const double *y, int n);
+double ofort_stats_median_r8(const double *x, int n);
+double ofort_stats_moment_r8(const double *x, int n, int order, double center);
 
 #ifdef __cplusplus
 }

@@ -1,6 +1,13 @@
 #include "ofort_stats.h"
 
 #include <math.h>
+#include <stdlib.h>
+
+static int cmp_double_ascending(const void *a, const void *b) {
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    return (da > db) - (da < db);
+}
 
 double ofort_stats_mean_r8(const double *x, int n) {
     double sum = 0.0;
@@ -49,4 +56,25 @@ double ofort_stats_cor_r8(const double *x, const double *y, int n) {
     denom = sqrt(vx * vy);
     if (denom == 0.0 || isnan(denom)) return NAN;
     return c / denom;
+}
+
+double ofort_stats_median_r8(const double *x, int n) {
+    double *work;
+    double result;
+    if (!x || n <= 0) return NAN;
+    work = (double *)malloc((size_t)n * sizeof(*work));
+    if (!work) return NAN;
+    for (int i = 0; i < n; i++) work[i] = x[i];
+    qsort(work, (size_t)n, sizeof(*work), cmp_double_ascending);
+    if (n % 2) result = work[n / 2];
+    else result = 0.5 * (work[n / 2 - 1] + work[n / 2]);
+    free(work);
+    return result;
+}
+
+double ofort_stats_moment_r8(const double *x, int n, int order, double center) {
+    double sum = 0.0;
+    if (!x || n <= 0 || order < 0) return NAN;
+    for (int i = 0; i < n; i++) sum += pow(x[i] - center, (double)order);
+    return sum / (double)n;
 }

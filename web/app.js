@@ -8,12 +8,24 @@ const examples = {
 let worker = null;
 let timer = null;
 let lastRun = null;
-function finish(status) {
-  if (worker) worker.terminate();
-  worker = null;
+let busy = false;
+let programSource = examples.hello;
+let commandHistory = [];
+let historyIndex = 0;
+const isRepl = () => byId("mode").value === "repl";
+function finish(status, keepWorker = false) {
+  if (!keepWorker) {
+    if (worker) worker.terminate();
+    worker = null;
+  }
   clearTimeout(timer);
+  busy = false;
   byId("run").disabled = false;
   byId("stop").disabled = true;
+  byId("repl-submit").disabled = false;
+  byId("mode").disabled = false;
+  byId("fast").disabled = false;
+  byId("clear-session").disabled = false;
   byId("status").textContent = status;
 }
 byId("source").value = examples.hello;
@@ -26,8 +38,8 @@ const editor = typeof CodeMirror === "function" ? CodeMirror.fromTextArea(byId("
   indentWithTabs: false,
   lineWrapping: true,
   extraKeys: {
-    "Ctrl-Enter": () => { if (!worker) byId("run").click(); },
-    "Cmd-Enter": () => { if (!worker) byId("run").click(); },
+    "Ctrl-Enter": () => { if (!busy) byId("run").click(); },
+    "Cmd-Enter": () => { if (!busy) byId("run").click(); },
     "Tab": cm => {
       if (cm.somethingSelected()) cm.indentSelection("add");
       else cm.replaceSelection("    ", "end");
@@ -36,6 +48,17 @@ const editor = typeof CodeMirror === "function" ? CodeMirror.fromTextArea(byId("
   }
 }) : null;
 const sourceText = () => editor ? editor.getValue() : byId("source").value;
+function setSource(text) {
+  if (editor) editor.setValue(text);
+  else byId("source").value = text;
+}
+function appendText(id, text) {
+  if (!text) return;
+  const pane = byId(id);
+  const combined = pane.textContent + (pane.textContent ? "\n" : "") + text;
+  pane.textContent = combined.length > 1000000 ? "[Earlier output omitted]\n" + combined.slice(-1000000) : combined;
+  pane.scrollTop = pane.scrollHeight;
+}
 byId("clear-code").addEventListener("click", () => {
   if (editor) {
     const last = editor.lastLine();
@@ -61,51 +84,27 @@ byId("example").addEventListener("change", event => {
   if (event.target.value === "input") byId("stdin").value = "7\n";
 });
 byId("run").addEventListener("click", () => {
-  byId("output").textContent = "";
-  byId("errors").textContent = "";
-  byId("status").textContent = "Loading interpreter...";
-  byId("run").disabled = true;
-  byId("stop").disabled = false;
-  lastRun = {source:sourceText(), fast:byId("fast").checked, build:"Unavailable (interpreter not loaded)", status:"Running"};
-  const current = worker = new Worker("worker.js");
-  current.onmessage = ({data}) => {
-    if (worker !== current) return;
-    if (data.type === "status") {
-      byId("status").textContent = data.text;
-      if (data.build) lastRun.build = data.build;
-    }
-    if (data.type === "done") {
-      byId("output").textContent = data.output;
-      byId("errors").textContent = data.errors;
-      lastRun.status = data.ok ? "Finished" : "Failed";
-      finish(`${data.ok ? "Finished" : "Failed"} / ${data.seconds.toFixed(3)} s`);
-    }
-    if (data.type === "error") {
-      byId("errors").textContent = data.text;
-      lastRun.status = "Unable to run";
-      finish("Unable to run");
-    }
-  };
-  current.onerror = event => {
-    lastRun.status = "Unable to run";
-    byId("errors").textContent = event.message || "Unable to load the browser interpreter. Build it with python web/build.py first.";
-    finish("Unable to run");
-  };
-  current.postMessage({source:sourceText(), input:byId("stdin").value, fast:byId("fast").checked});
-  timer = setTimeout(() => {
-    lastRun.status = "Time limit reached";
-    byId("errors").textContent = "Stopped after the 30-second limit. Partial output is not available.";
-    finish("Time limit reached");
-  }, 30000);
+  if (busy) return;
+  if (isRepl()) send({type:"repl-submit", command:".run"});
+  else {
+    byId("output").textContent = "";
+    byId("errors").textContent = "";
+    send({source:sourceText()});
+  }
 });
 byId("stop").addEventListener("click", () => {
   if (lastRun) lastRun.status = "Stopped";
   finish("Stopped");
+  if (isRepl()) {
+    appendText("errors", "Stopped. The REPL interpreter and temporary files were discarded.");
+    setSource("implicit none\n");
+    byId("variables").textContent = "(no variables)";
+  }
 });
 byId("source").addEventListener("keydown", event => {
   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
     event.preventDefault();
-    if (!worker) byId("run").click();
+    if (!busy) byId("run").click();
   }
   if (event.key === "Tab") {
     event.preventDefault();
@@ -114,12 +113,134 @@ byId("source").addEventListener("keydown", event => {
   }
 });
 byId("download").addEventListener("click", () => {
-  const url = URL.createObjectURL(new Blob([sourceText()], {type:"text/plain"}));
+  let source = sourceText();
+  if (isRepl()) {
+    const statements = source.split(/\r?\n/).map(line => line.replace(/!.*/, "").trim()).filter(Boolean);
+    const last = statements[statements.length - 1] || "";
+    if (!/^end(?:\s+program(?:\s+[a-z]\w*)?)?\s*$/i.test(last))
+      source = source.trimEnd() + "\nend\n";
+  }
+  const url = URL.createObjectURL(new Blob([source], {type:"text/plain"}));
   const link = document.createElement("a");
   link.href = url;
-  link.download = "program.f90";
+  link.download = isRepl() ? "session.f90" : "program.f90";
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
+
+function send(payload) {
+  if (busy) return;
+  busy = true;
+  byId("status").textContent = worker ? "Running..." : "Loading interpreter...";
+  for (const id of ["run", "repl-submit", "mode", "fast", "clear-session"]) byId(id).disabled = true;
+  byId("stop").disabled = false;
+  lastRun = {source:sourceText(), fast:byId("fast").checked,
+    build:lastRun ? lastRun.build : "Unavailable (interpreter not loaded)", status:"Running"};
+  if (!worker) {
+    const current = worker = new Worker("worker.js");
+    current.onmessage = ({data}) => {
+      if (worker !== current) return;
+      if (data.type === "status") {
+        byId("status").textContent = data.text;
+        if (data.build) lastRun.build = data.build;
+      } else if (data.type === "done") {
+        if (data.repl) {
+          setSource(data.source);
+          byId("variables").textContent = data.variables || "(no variables)";
+          appendText("output", data.output);
+          appendText("errors", data.errors);
+          byId("repl-hint").textContent = data.pending ? `Waiting for ${data.waiting === "continuation" ? "continued line" : "END " + data.waiting}.` : "Enter submits; Shift+Enter adds a line.";
+          lastRun.source = data.source;
+        } else {
+          byId("output").textContent = data.output;
+          byId("errors").textContent = data.errors;
+        }
+        lastRun.status = data.ok ? "Finished" : "Failed";
+        finish(`${data.pending ? "Waiting for more code" : data.ok ? "Ready" : "Failed"} / ${data.seconds.toFixed(3)} s`, data.repl);
+        if (data.repl) byId("repl-command").focus();
+      } else if (data.type === "error") {
+        appendText("errors", data.text + "\nRebuild the browser interpreter with python web/build.py if its exports are missing.");
+        lastRun.status = "Unable to run";
+        finish("Unable to run");
+        if (isRepl()) byId("variables").textContent = "(session unavailable; Clear session to restart)";
+      }
+    };
+    current.onerror = event => {
+      if (worker !== current) return;
+      appendText("errors", event.message || "Unable to load interpreter. Run python web/build.py first.");
+      lastRun.status = "Unable to run";
+      finish("Unable to run");
+    };
+  }
+  worker.postMessage({...payload, input:byId("stdin").value, fast:byId("fast").checked});
+  timer = setTimeout(() => {
+    lastRun.status = "Time limit reached";
+    appendText("errors", "Stopped after 30 seconds. Partial output is unavailable; any REPL state and temporary files were discarded.");
+    finish("Time limit reached");
+    if (isRepl()) {
+      setSource("implicit none\n");
+      byId("variables").textContent = "(no variables)";
+    }
+  }, 30000);
+}
+
+byId("mode").addEventListener("change", () => {
+  const repl = isRepl();
+  if (repl) programSource = sourceText();
+  finish("Ready");
+  document.body.classList.toggle("repl-mode", repl);
+  for (const id of ["repl-entry", "variables-panel", "clear-session"]) byId(id).hidden = !repl;
+  byId("clear-code").hidden = repl;
+  byId("example").hidden = repl;
+  byId("source-heading").textContent = repl ? "01 / SESSION SOURCE" : "01 / SOURCE";
+  byId("source-description").textContent = repl ? "Persistent interpreter" : "Free-form Fortran";
+  byId("run").innerHTML = repl ? 'Run accumulated code <span>Ctrl + Enter</span>' : 'Run program <span>Ctrl + Enter</span>';
+  if (editor) editor.setOption("readOnly", repl);
+  else byId("source").readOnly = repl;
+  setSource(repl ? "implicit none\n" : programSource);
+  byId("output").textContent = "";
+  byId("errors").textContent = "";
+  byId("variables").textContent = "(no variables)";
+  byId("repl-command").value = "";
+  commandHistory = [];
+  historyIndex = 0;
+  if (editor) editor.refresh();
+  if (repl) send({type:"repl-init"});
+});
+
+byId("repl-submit").addEventListener("click", () => {
+  if (busy) return;
+  const command = byId("repl-command").value;
+  if (!command.trim()) return;
+  commandHistory.push(command);
+  historyIndex = commandHistory.length;
+  byId("repl-command").value = "";
+  send({type:"repl-submit", command});
+});
+
+byId("repl-command").addEventListener("keydown", event => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    byId("repl-submit").click();
+  } else if ((event.key === "ArrowUp" || event.key === "ArrowDown") && !event.target.value.includes("\n")) {
+    event.preventDefault();
+    historyIndex = Math.max(0, Math.min(commandHistory.length, historyIndex + (event.key === "ArrowUp" ? -1 : 1)));
+    event.target.value = commandHistory[historyIndex] || "";
+  }
+});
+
+byId("clear-session").addEventListener("click", () => {
+  if (busy) return;
+  finish("Session cleared");
+  setSource("implicit none\n");
+  byId("output").textContent = "";
+  byId("errors").textContent = "";
+  byId("variables").textContent = "(no variables)";
+  byId("repl-command").value = "";
+  byId("repl-hint").textContent = "Enter submits; Shift+Enter adds a line.";
+  commandHistory = [];
+  historyIndex = 0;
+  send({type:"repl-init"});
 });
 
 function reportBlock(text, language = "text") {
@@ -156,7 +277,7 @@ function updateReportNote() {
     : "Nothing is sent until you open GitHub. You will need a GitHub account to submit the issue.";
 }
 byId("report").addEventListener("click", () => {
-  if (worker) {
+  if (busy) {
     alert("Wait for the run to finish, or press Stop before reporting a bug.");
     return;
   }

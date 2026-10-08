@@ -47,3 +47,18 @@ dialog textarea { font-size:12px; line-height:1.6; }
 @keyframes reveal { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
 @media(max-width:760px) { .workspace { grid-template-columns:1fr; }header { padding:20px; }.badge { font-size:9px; }main { padding:25px 20px; }#source { min-height:330px; }button span { display:none; } }
 @media(prefers-reduced-motion:reduce) { .intro { animation:none; } }
+[hidden] { display:none !important; }
+body.repl-mode .workspace { grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) minmax(210px,.7fr); }
+body.repl-mode .editor-panel .CodeMirror { height:300px; }
+body.repl-mode #source { min-height:300px; }
+#repl-entry { border-top:1px solid var(--line); background:#edf2e866; padding:16px; }
+#repl-entry>label { font:11px var(--mono); color:var(--muted); }
+#repl-command { background:#fff; border:1px solid var(--line); border-radius:6px; margin:10px 0; padding:12px; min-height:65px; }
+.repl-entry-actions { display:flex; align-items:center; flex-wrap:wrap; gap:12px; }
+#repl-hint,.repl-help,.variables-note { font-size:11px; color:var(--muted); line-height:1.7; }
+.variables-note { margin:16px 20px; }
+#variables { max-height:550px; font-size:12px; }
+body.repl-mode #output { max-height:450px; }
+body.focus-mode.repl-mode .editor-panel .CodeMirror { height:max(300px,calc(100dvh - 370px)); }
+@media(max-width:1050px) { body.repl-mode .workspace { grid-template-columns:minmax(0,1.2fr) minmax(0,1fr); } #variables-panel { grid-column:1 / -1; } #variables { max-height:220px; } }
+@media(max-width:760px) { body.repl-mode .workspace { grid-template-columns:minmax(0,1fr); } #variables-panel { grid-column:auto; } }
