@@ -337,6 +337,9 @@ struct OfortInterpreter {
     char *cached_source_text;
     char *cached_processed_source;
     OfortNode *cached_ast;
+    int auto_declare_assignment;
+    OfortNode *auto_declare_node;
+    char auto_declaration[512];
 };
 
 /* â”€â”€ Forward declarations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
@@ -27395,10 +27398,60 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
         if (!I->where_mask && exec_fast_array_affine_assignment(I, n)) {
             break;
         }
-        if (!I->where_mask && exec_fast_scalar_numeric_assignment(I, n)) {
+        if (!I->where_mask && n != I->auto_declare_node && exec_fast_scalar_numeric_assignment(I, n)) {
             break;
         }
         OfortValue rhs = eval_node(I, n->children[1]);
+
+        if (n == I->auto_declare_node && lhs && lhs->type == FND_IDENT &&
+            !find_var(I, lhs->name)) {
+            const char *type_spec = NULL;
+            char spec[128];
+            int kind = value_declared_kind(&rhs);
+            switch (rhs.type) {
+            case FVAL_INTEGER:
+                if (kind == 4) type_spec = "integer";
+                else if (kind == 8) type_spec = "integer(kind=selected_int_kind(18))";
+                else if (kind == 16) type_spec = "integer(kind=selected_int_kind(38))";
+                else if (kind == 1) type_spec = "integer(kind=selected_int_kind(2))";
+                else if (kind == 2) type_spec = "integer(kind=selected_int_kind(4))";
+                break;
+            case FVAL_REAL:
+            case FVAL_DOUBLE:
+                if (kind == 4) type_spec = "real";
+                else if (kind == 8) type_spec = "real(kind=kind(1.0d0))";
+                break;
+            case FVAL_COMPLEX:
+                if (kind == 4) type_spec = "complex";
+                else if (kind == 8) type_spec = "complex(kind=kind(1.0d0))";
+                break;
+            case FVAL_LOGICAL:
+                if (kind == 4) type_spec = "logical";
+                break;
+            case FVAL_CHARACTER:
+                if (kind == 1) {
+                    snprintf(spec, sizeof(spec), "character(len=%zu)",
+                             rhs.v.s ? strlen(rhs.v.s) : (size_t)0);
+                    type_spec = spec;
+                }
+                break;
+            default:
+                break;
+            }
+            if (!type_spec) {
+                free_value(&rhs);
+                ofort_error(I, "Auto-declare requires a supported scalar RHS for '%s'; declare it explicitly", lhs->name);
+            }
+            snprintf(I->auto_declaration, sizeof(I->auto_declaration),
+                     "%s :: %s", type_spec, lhs->name);
+            OfortValue initial = default_value(rhs.type,
+                rhs.type == FVAL_CHARACTER && rhs.v.s ? (int)strlen(rhs.v.s) : 0);
+            initial.kind = kind;
+            OfortVar *created = declare_var(I, lhs->name, initial);
+            created->declared_type = rhs.type;
+            created->declared_kind = kind;
+            created->is_initialized = 0;
+        }
 
         if (assign_character_array_substrings(I, lhs, &rhs)) {
             trace_assignment_value(I, lhs, rhs);
@@ -39552,6 +39605,12 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
 
     /* Second pass: execute everything else */
     stage_start = ofort_monotonic_seconds();
+    interp->auto_declare_node = interp->auto_declare_assignment && interp->ast &&
+        interp->ast->type == FND_BLOCK && interp->ast->n_stmts == 1 &&
+        interp->ast->stmts[0] && interp->ast->stmts[0]->type == FND_ASSIGN &&
+        interp->ast->stmts[0]->children[0] &&
+        interp->ast->stmts[0]->children[0]->type == FND_IDENT
+        ? interp->ast->stmts[0] : NULL;
     if (interp->ast && interp->ast->type == FND_BLOCK) {
         for (int i = 0; i < interp->ast->n_stmts; i++) {
             OfortNode *s = interp->ast->stmts[i];
@@ -39575,6 +39634,21 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
         if (processed_source && processed_source != interp->cached_processed_source) free(processed_source);
         return rc;
     }
+}
+
+int ofort_execute_auto_declare(OfortInterpreter *interp, const char *source) {
+    if (!interp || !source) return -1;
+    interp->auto_declaration[0] = '\0';
+    interp->auto_declare_assignment = 1;
+    int result = ofort_execute(interp, source);
+    interp->auto_declare_assignment = 0;
+    interp->auto_declare_node = NULL;
+    if (result != 0) interp->auto_declaration[0] = '\0';
+    return result;
+}
+
+const char *ofort_get_auto_declaration(OfortInterpreter *interp) {
+    return interp ? interp->auto_declaration : "";
 }
 
 int ofort_check(OfortInterpreter *interp, const char *source) {

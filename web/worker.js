@@ -13,6 +13,8 @@ let position = 0;
 const stdout = [];
 const stderr = [];
 let queue = Promise.resolve();
+let autoDeclare = false;
+let inferredDeclaration = "";
 
 const getText = name => module.ccall(name, "string", ["number"], [interpreter]) || "";
 function specificationGroup(source) {
@@ -120,9 +122,11 @@ function trackConstruct(statement) {
   if (construct) blocks.push(construct);
 }
 
-function execute(source, output, errors) {
+function execute(source, output, errors, infer = false) {
+  inferredDeclaration = "";
   module.ccall("ofort_c_reset", null, ["number"], [interpreter]);
-  const result = module.ccall("ofort_c_execute", "number", ["number", "string"], [interpreter, source]);
+  const result = module.ccall(infer ? "ofort_execute_auto_declare" : "ofort_c_execute", "number", ["number", "string"], [interpreter, source]);
+  if (infer && result === 0) inferredDeclaration = getText("ofort_get_auto_declaration");
   const text = getText("ofort_get_output");
   if (text) output.push(text);
   const diagnostics = [getText("ofort_get_warnings"), result !== 0 ? getText("ofort_get_error") : ""].filter(Boolean).join("\n");
@@ -185,8 +189,14 @@ function replCommand(command, output, errors, fast) {
     logicalLine = "";
     if (blocks.length) continue;
     const source = pending.join("\n") + "\n";
-    ok = execute(source, output, errors);
-    if (ok) accepted.push(savedSubmission(pending));
+    ok = execute(source, output, errors, autoDeclare);
+    if (ok) {
+      if (inferredDeclaration) {
+        accepted.push(inferredDeclaration);
+        output.push("Auto-declared: " + inferredDeclaration);
+      }
+      accepted.push(savedSubmission(pending));
+    }
     clearPending();
     if (!ok) {
       errors.push("The submission was not added to source. Statements before a runtime error may already have changed state; Clear session starts over.");
@@ -197,6 +207,7 @@ function replCommand(command, output, errors, fast) {
 }
 
 async function handle(data) {
+  autoDeclare = Boolean(data.autoDeclare);
   stdout.length = 0;
   stderr.length = 0;
   const repl = data.type && data.type.startsWith("repl");

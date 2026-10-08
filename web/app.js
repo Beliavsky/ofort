@@ -24,6 +24,7 @@ function updateSourceControls() {
   byId("discard-edits").disabled = busy;
   byId("repl-submit").disabled = busy || sourceDirty;
   byId("repl-command").disabled = busy || sourceDirty;
+  byId("auto-declare").disabled = busy;
   if (editor) editor.setOption("readOnly", busy);
   else byId("source").readOnly = busy;
 }
@@ -218,7 +219,8 @@ function send(payload) {
       finish("Unable to run");
     };
   }
-  worker.postMessage({...payload, input:byId("stdin").value, fast:byId("fast").checked});
+  worker.postMessage({...payload, input:byId("stdin").value, fast:byId("fast").checked,
+    autoDeclare:isRepl() && byId("auto-declare").checked});
   timer = setTimeout(() => {
     lastRun.status = "Time limit reached";
     appendText("errors", "Stopped after 30 seconds. Partial output is unavailable; any REPL state and temporary files were discarded.");

@@ -312,6 +312,10 @@ void ofort_destroy(OfortInterpreter *interp);
 /* Execute Fortran source code. Returns 0 on success, -1 on error. */
 int ofort_execute(OfortInterpreter *interp, const char *source);
 
+/* REPL-only: infer a missing scalar target for one top-level assignment. */
+int ofort_execute_auto_declare(OfortInterpreter *interp, const char *source);
+const char *ofort_get_auto_declaration(OfortInterpreter *interp);
+
 /* Check syntax by lexing/parsing only. Returns 0 on success, -1 on error. */
 int ofort_check(OfortInterpreter *interp, const char *source);
 
