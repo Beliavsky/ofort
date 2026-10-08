@@ -338,6 +338,7 @@ struct OfortInterpreter {
     char *cached_processed_source;
     OfortNode *cached_ast;
     int auto_declare_assignment;
+    int auto_declare_constant;
     OfortNode *auto_declare_node;
     char auto_declaration[512];
 };
@@ -25363,6 +25364,48 @@ static OfortValue eval_allocate_mold_expr(OfortInterpreter *I, OfortNode *mold_e
 }
 
 /* Execute statement node */
+static int repl_constant_expression(OfortInterpreter *I, OfortNode *n) {
+    if (!n) return 0;
+    if (n->kind_expr && !repl_constant_expression(I, n->kind_expr)) return 0;
+    switch (n->type) {
+    case FND_IDENT: {
+        OfortVar *v = find_var(I, n->name);
+        return v && v->is_parameter;
+    }
+    case FND_INT_LIT: case FND_REAL_LIT: case FND_STRING_LIT:
+    case FND_LOGICAL_LIT: case FND_COMPLEX_LIT:
+    case FND_OR: case FND_AND: case FND_NOT: case FND_EQV: case FND_NEQV:
+    case FND_EQ: case FND_NEQ: case FND_LT: case FND_GT: case FND_LE: case FND_GE:
+    case FND_ADD: case FND_SUB: case FND_MUL: case FND_DIV: case FND_POWER:
+    case FND_NEGATE: case FND_CONCAT: case FND_CONDITIONAL:
+        break;
+    case FND_FUNC_CALL: {
+        static const char *const allowed[] = {
+            "kind", "selected_int_kind", "selected_real_kind", "int", "real",
+            "dble", "cmplx", "logical", "abs", "min", "max", "mod", "modulo",
+            "sign", "sqrt", "exp", "log", "log10", "sin", "cos", "tan",
+            "asin", "acos", "atan", "atan2", "floor", "ceiling", "nint",
+            "len", "len_trim", "trim", "adjustl", "adjustr", "repeat",
+            "achar", "iachar", "char", "ichar", "epsilon", "huge", "tiny",
+            "digits", "precision", "range", "radix", "merge"
+        };
+        int supported = 0;
+        if (find_var(I, n->name) || find_func(I, n->name)) return 0;
+        for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
+            if (str_eq_nocase(n->name, allowed[i])) { supported = 1; break; }
+        if (!supported) return 0;
+        break;
+    }
+    default:
+        return 0;
+    }
+    for (int i = 0; i < n->n_children; i++)
+        if (n->children[i] && !repl_constant_expression(I, n->children[i])) return 0;
+    for (int i = 0; i < n->n_stmts; i++)
+        if (n->stmts[i] && !repl_constant_expression(I, n->stmts[i])) return 0;
+    return 1;
+}
+
 static void exec_node(OfortInterpreter *I, OfortNode *n) {
     int profile_line = 0;
     double profile_start = 0.0;
@@ -27381,6 +27424,12 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
 
     case FND_ASSIGN: {
         OfortNode *lhs = n->children[0];
+        if (n == I->auto_declare_node && I->auto_declare_constant) {
+            if (find_var(I, lhs->name))
+                ofort_error(I, "Cannot redeclare '%s' with const", lhs->name);
+            if (!repl_constant_expression(I, n->children[1]))
+                ofort_error(I, "const requires a supported constant expression; use an explicit PARAMETER declaration for other expressions");
+        }
         if (lhs && lhs->type == FND_IDENT) {
             OfortVar *v = find_var(I, lhs->name);
             if (v && v->intent == 1) ofort_error(I, "Cannot assign to INTENT(IN) argument '%s'", lhs->name);
@@ -27443,7 +27492,16 @@ static void exec_node(OfortInterpreter *I, OfortNode *n) {
                 ofort_error(I, "Auto-declare requires a supported scalar RHS for '%s'; declare it explicitly", lhs->name);
             }
             snprintf(I->auto_declaration, sizeof(I->auto_declaration),
-                     "%s :: %s", type_spec, lhs->name);
+                     "%s%s :: %s", type_spec,
+                     I->auto_declare_constant ? ", parameter" : "", lhs->name);
+            if (I->auto_declare_constant) {
+                OfortVar *constant = declare_var(I, lhs->name, rhs);
+                constant->is_parameter = 1;
+                constant->declared_type = rhs.type;
+                constant->declared_kind = kind;
+                constant->is_initialized = 1;
+                break;
+            }
             OfortValue initial = default_value(rhs.type,
                 rhs.type == FVAL_CHARACTER && rhs.v.s ? (int)strlen(rhs.v.s) : 0);
             initial.kind = kind;
@@ -39611,6 +39669,8 @@ int ofort_execute(OfortInterpreter *interp, const char *source) {
         interp->ast->stmts[0]->children[0] &&
         interp->ast->stmts[0]->children[0]->type == FND_IDENT
         ? interp->ast->stmts[0] : NULL;
+    if (interp->auto_declare_constant && !interp->auto_declare_node)
+        ofort_error(interp, "const requires exactly one scalar name = expression");
     if (interp->ast && interp->ast->type == FND_BLOCK) {
         for (int i = 0; i < interp->ast->n_stmts; i++) {
             OfortNode *s = interp->ast->stmts[i];
@@ -39649,6 +39709,14 @@ int ofort_execute_auto_declare(OfortInterpreter *interp, const char *source) {
 
 const char *ofort_get_auto_declaration(OfortInterpreter *interp) {
     return interp ? interp->auto_declaration : "";
+}
+
+int ofort_execute_const(OfortInterpreter *interp, const char *source) {
+    if (!interp || !source) return -1;
+    interp->auto_declare_constant = 1;
+    int result = ofort_execute_auto_declare(interp, source);
+    interp->auto_declare_constant = 0;
+    return result;
 }
 
 int ofort_check(OfortInterpreter *interp, const char *source) {

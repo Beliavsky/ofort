@@ -22,7 +22,8 @@ def main():
                "ofort_c_set_fast_mode", "ofort_get_output", "ofort_get_error",
                "ofort_get_warnings", "ofort_web_build_info", "ofort_c_reset",
                "ofort_web_repl_create", "ofort_web_repl_variables",
-               "ofort_execute_auto_declare", "ofort_get_auto_declaration"]
+               "ofort_execute_auto_declare", "ofort_get_auto_declaration",
+               "ofort_execute_const"]
     command = [compiler, "-O2", "-Iinclude", "-DOFORT_MAX_MODULES=16",
                *["src/" + name for name in sources], "web/build_info.c", "web/repl.c",
                "-lm", "--no-entry", "-sMODULARIZE=1", "-sEXPORT_NAME=createOfortModule",

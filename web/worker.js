@@ -125,7 +125,7 @@ function trackConstruct(statement) {
 function execute(source, output, errors, infer = false) {
   inferredDeclaration = "";
   module.ccall("ofort_c_reset", null, ["number"], [interpreter]);
-  const result = module.ccall(infer ? "ofort_execute_auto_declare" : "ofort_c_execute", "number", ["number", "string"], [interpreter, source]);
+  const result = module.ccall(infer === "const" ? "ofort_execute_const" : infer ? "ofort_execute_auto_declare" : "ofort_c_execute", "number", ["number", "string"], [interpreter, source]);
   if (infer && result === 0) inferredDeclaration = getText("ofort_get_auto_declaration");
   const text = getText("ofort_get_output");
   if (text) output.push(text);
@@ -189,13 +189,16 @@ function replCommand(command, output, errors, fast) {
     logicalLine = "";
     if (blocks.length) continue;
     const source = pending.join("\n") + "\n";
-    ok = execute(source, output, errors, autoDeclare);
+    const constant = /^\s*const\b/i.test(source);
+    const assignment = constant ? source.replace(/^(\s*)const\b\s*/i, "$1") : source;
+    ok = execute(assignment, output, errors, constant ? "const" : autoDeclare);
     if (ok) {
       if (inferredDeclaration) {
-        accepted.push(inferredDeclaration);
-        output.push("Auto-declared: " + inferredDeclaration);
+        const declaration = constant ? inferredDeclaration + " = " + assignment.slice(assignment.indexOf("=") + 1).trim() : inferredDeclaration;
+        accepted.push(declaration);
+        output.push((constant ? "Declared constant: " : "Auto-declared: ") + declaration);
       }
-      accepted.push(savedSubmission(pending));
+      if (!constant) accepted.push(savedSubmission(pending));
     }
     clearPending();
     if (!ok) {

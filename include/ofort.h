@@ -314,6 +314,8 @@ int ofort_execute(OfortInterpreter *interp, const char *source);
 
 /* REPL-only: infer a missing scalar target for one top-level assignment. */
 int ofort_execute_auto_declare(OfortInterpreter *interp, const char *source);
+/* Infer a scalar PARAMETER from a single name = constant-expression. */
+int ofort_execute_const(OfortInterpreter *interp, const char *source);
 const char *ofort_get_auto_declaration(OfortInterpreter *interp);
 
 /* Check syntax by lexing/parsing only. Returns 0 on success, -1 on error. */
