@@ -33,11 +33,54 @@ function sessionSource() {
   const groups = [[], [], [], []];
   for (const submission of accepted) groups[specificationGroup(submission)].push(submission);
   const implicit = groups[1];
-  return [...groups[0], ...implicit, ...groups[2], ...groups[3], ...pending].join("\n") + "\n";
+  return [...groups[0], ...implicit, ...groups[2], ...groups[3], ...formatSubmission(pending)].join("\n") + "\n";
+}
+
+// Indent new constructs without inserting executable END statements.
+function formatSubmission(lines) {
+  const savedBlocks = blocks;
+  blocks = [];
+  let continued = false;
+  let logical = "";
+  const formatted = [];
+  try {
+    for (const line of lines) {
+      const code = codeWithoutStringsOrComments(line).trim().toLowerCase();
+      if (continued || /^&/.test(code)) {
+        formatted.push(line);
+      } else {
+        const closes = /^end(?:\s|$)|^end(?:do|if|where|forall|select|associate|block|type|interface|function|subroutine|module|program)\b/.test(code);
+        const branch = /^(else\b|elseif\b)/.test(code);
+        const depth = Math.max(0, blocks.length - (closes || branch ? 1 : 0));
+        formatted.push(line.trim() ? "    ".repeat(depth) + line.trimStart() : line);
+      }
+      if (!code) continue;
+      const part = continued ? code.replace(/^&\s*/, "") : code;
+      continued = part.endsWith("&");
+      logical += " " + (continued ? part.slice(0, -1) : part);
+      if (!continued) {
+        for (const statement of logical.split(";")) trackConstruct(statement);
+        logical = "";
+      }
+    }
+  } finally {
+    blocks = savedBlocks;
+  }
+  return formatted;
+}
+
+function suggestedEnds() {
+  if (continuing || !blocks.length) return [];
+  const ends = [];
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (blocks[i] !== "DO" && blocks[i] !== "IF") break;
+    ends.push("    ".repeat(i) + "end " + blocks[i].toLowerCase());
+  }
+  return ends;
 }
 
 function savedSubmission(lines) {
-  const source = lines.join("\n");
+  const source = formatSubmission(lines).join("\n");
   const code = lines.map(codeWithoutStringsOrComments).join(" ").replace(/&/g, " ").trim();
   if (!code || specificationGroup(source) !== 3 || code.includes(";")) return source;
   // Retain actual Fortran statements and constructs. Only the top-level
@@ -243,6 +286,7 @@ async function handle(data) {
       source:repl ? sessionSource() : undefined,
       variables:repl ? variables() : undefined,
       pending:repl && (blocks.length > 0 || continuing),
+      suggestedEnds:repl ? suggestedEnds() : [],
       waiting:continuing ? "continuation" : blocks[blocks.length - 1]});
   } catch (error) {
     self.postMessage({type:"error", text:[error.message, ...stderr].filter(Boolean).join("\n")});

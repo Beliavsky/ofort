@@ -17,6 +17,7 @@ let sourceDirty = false;
 let settingSource = false;
 let replayDraft = null;
 let replayNeedsCorrection = false;
+let blockEnds = [];
 const isRepl = () => byId("mode").value === "repl";
 function updateSourceControls() {
   sourceDirty = isRepl() && (replayNeedsCorrection || sourceText() !== sessionBaseline);
@@ -25,11 +26,17 @@ function updateSourceControls() {
   byId("repl-submit").disabled = busy || sourceDirty;
   byId("repl-command").disabled = busy || sourceDirty;
   byId("auto-declare").disabled = busy;
+  byId("auto-end").disabled = busy;
+  byId("finish-block").disabled = busy || sourceDirty || !blockEnds.length;
+  byId("finish-block").hidden = !isRepl() || !byId("auto-end").checked || !blockEnds.length;
+  byId("end-preview").hidden = !isRepl() || !byId("auto-end").checked || !blockEnds.length;
+  byId("suggested-ends").textContent = blockEnds.join("\n");
   if (editor) editor.setOption("readOnly", busy);
   else byId("source").readOnly = busy;
 }
 function finish(status, keepWorker = false) {
   if (!keepWorker) {
+    blockEnds = [];
     if (worker) worker.terminate();
     worker = null;
   }
@@ -80,6 +87,11 @@ if (editor) editor.on("change", sourceChanged);
 else byId("source").addEventListener("input", sourceChanged);
 byId("discard-edits").addEventListener("click", () => {
   if (!busy) setSource(sessionBaseline);
+});
+byId("auto-end").addEventListener("change", updateSourceControls);
+byId("finish-block").addEventListener("click", () => {
+  if (busy || sourceDirty || !blockEnds.length) return;
+  send({type:"repl-submit", command:blockEnds[0]});
 });
 function appendText(id, text) {
   if (!text) return;
@@ -204,6 +216,7 @@ function send(payload) {
         if (data.build) lastRun.build = data.build;
       } else if (data.type === "done") {
         if (data.repl) {
+          blockEnds = data.suggestedEnds || [];
           if (replayDraft !== null) {
             const draft = replayDraft;
             replayDraft = null;

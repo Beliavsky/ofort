@@ -57,6 +57,9 @@ body.repl-mode .workspace { grid-template-columns:minmax(0,1.2fr) minmax(0,1fr) 
 body.repl-mode .editor-panel .CodeMirror { height:300px; }
 body.repl-mode #source { min-height:300px; }
 #repl-entry { border-top:1px solid var(--line); background:#edf2e866; padding:16px; }
+#end-preview { border-top:1px dashed var(--line); background:#edf2e866; }
+#end-preview p { margin:10px 22px 4px; color:var(--muted); font-size:11px; }
+#suggested-ends { color:var(--muted); font-style:italic; padding-bottom:10px; max-height:150px; }
 #source-edits { display:flex; align-items:center; flex-wrap:wrap; gap:10px; padding:12px 16px; background:#fff0dc; color:#8a411f; font-size:12px; line-height:1.6; border-bottom:1px solid var(--line); }
 #discard-edits { padding:6px 10px; }
 #repl-entry>label { font:11px var(--mono); color:var(--muted); }
