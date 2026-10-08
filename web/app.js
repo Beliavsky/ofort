@@ -12,7 +12,19 @@ let busy = false;
 let programSource = examples.hello;
 let commandHistory = [];
 let historyIndex = 0;
+let sessionBaseline = "implicit none\n";
+let sourceDirty = false;
+let settingSource = false;
 const isRepl = () => byId("mode").value === "repl";
+function updateSourceControls() {
+  sourceDirty = isRepl() && sourceText() !== sessionBaseline;
+  byId("source-edits").hidden = !sourceDirty;
+  byId("discard-edits").disabled = busy;
+  byId("repl-submit").disabled = busy || sourceDirty;
+  byId("repl-command").disabled = busy || sourceDirty;
+  if (editor) editor.setOption("readOnly", busy);
+  else byId("source").readOnly = busy;
+}
 function finish(status, keepWorker = false) {
   if (!keepWorker) {
     if (worker) worker.terminate();
@@ -27,6 +39,7 @@ function finish(status, keepWorker = false) {
   byId("fast").disabled = false;
   byId("clear-session").disabled = false;
   byId("status").textContent = status;
+  updateSourceControls();
 }
 byId("source").value = examples.hello;
 const editor = typeof CodeMirror === "function" ? CodeMirror.fromTextArea(byId("source"), {
@@ -49,9 +62,21 @@ const editor = typeof CodeMirror === "function" ? CodeMirror.fromTextArea(byId("
 }) : null;
 const sourceText = () => editor ? editor.getValue() : byId("source").value;
 function setSource(text) {
+  settingSource = true;
   if (editor) editor.setValue(text);
   else byId("source").value = text;
+  if (isRepl()) sessionBaseline = text;
+  settingSource = false;
+  updateSourceControls();
 }
+function sourceChanged() {
+  if (!settingSource) updateSourceControls();
+}
+if (editor) editor.on("change", sourceChanged);
+else byId("source").addEventListener("input", sourceChanged);
+byId("discard-edits").addEventListener("click", () => {
+  if (!busy) setSource(sessionBaseline);
+});
 function appendText(id, text) {
   if (!text) return;
   const pane = byId(id);
@@ -85,7 +110,12 @@ byId("example").addEventListener("change", event => {
 });
 byId("run").addEventListener("click", () => {
   if (busy) return;
-  if (isRepl()) send({type:"repl-submit", command:".run"});
+  if (isRepl()) {
+    if (!confirm("Restart the interpreter and run the source from the beginning? Current values will be discarded. Random-number calls and file writes will run again.")) return;
+    byId("output").textContent = "";
+    byId("errors").textContent = "";
+    send({type:"repl-replay", source:sourceText()});
+  }
   else {
     byId("output").textContent = "";
     byId("errors").textContent = "";
@@ -133,6 +163,7 @@ function send(payload) {
   busy = true;
   byId("status").textContent = worker ? "Running..." : "Loading interpreter...";
   for (const id of ["run", "repl-submit", "mode", "fast", "clear-session"]) byId(id).disabled = true;
+  updateSourceControls();
   byId("stop").disabled = false;
   lastRun = {source:sourceText(), fast:byId("fast").checked,
     build:lastRun ? lastRun.build : "Unavailable (interpreter not loaded)", status:"Running"};
@@ -185,6 +216,10 @@ function send(payload) {
 }
 
 byId("mode").addEventListener("change", () => {
+  if (sourceDirty && !confirm("Discard the unapplied session source edits and leave REPL mode?")) {
+    byId("mode").value = "repl";
+    return;
+  }
   const repl = isRepl();
   if (repl) programSource = sourceText();
   finish("Ready");
@@ -194,9 +229,7 @@ byId("mode").addEventListener("change", () => {
   byId("example").hidden = repl;
   byId("source-heading").textContent = repl ? "01 / SESSION SOURCE" : "01 / SOURCE";
   byId("source-description").textContent = repl ? "Persistent interpreter" : "Free-form Fortran";
-  byId("run").innerHTML = repl ? 'Run accumulated code <span>Ctrl + Enter</span>' : 'Run program <span>Ctrl + Enter</span>';
-  if (editor) editor.setOption("readOnly", repl);
-  else byId("source").readOnly = repl;
+  byId("run").innerHTML = repl ? 'Restart and run source <span>Ctrl + Enter</span>' : 'Run program <span>Ctrl + Enter</span>';
   setSource(repl ? "implicit none\n" : programSource);
   byId("output").textContent = "";
   byId("errors").textContent = "";
@@ -209,7 +242,7 @@ byId("mode").addEventListener("change", () => {
 });
 
 byId("repl-submit").addEventListener("click", () => {
-  if (busy) return;
+  if (busy || sourceDirty) return;
   const command = byId("repl-command").value;
   if (!command.trim()) return;
   commandHistory.push(command);
@@ -231,6 +264,7 @@ byId("repl-command").addEventListener("keydown", event => {
 
 byId("clear-session").addEventListener("click", () => {
   if (busy) return;
+  if (sourceDirty && !confirm("Discard the source edits and clear the session?")) return;
   finish("Session cleared");
   setSource("implicit none\n");
   byId("output").textContent = "";

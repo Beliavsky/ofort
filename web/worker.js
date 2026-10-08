@@ -211,9 +211,19 @@ async function handle(data) {
     module.ccall("ofort_c_set_fast_mode", null, ["number", "number"], [interpreter, Number(data.fast)]);
     const start = performance.now();
     const output = [], errors = [];
-    const ok = data.type === "repl-init" ? true : repl
-      ? replCommand(data.command || "", output, errors, data.fast)
-      : execute(data.source, output, errors);
+    let ok;
+    if (data.type === "repl-replay") {
+      newInterpreter(true);
+      accepted = [];
+      clearPending();
+      module.ccall("ofort_c_set_fast_mode", null, ["number", "number"], [interpreter, Number(data.fast)]);
+      ok = replCommand(data.source || "", output, errors, data.fast);
+      if (!ok) errors.push("Replay failed in the new interpreter. The old state was discarded; displayed variables reflect the possibly partial new state.");
+    } else {
+      ok = data.type === "repl-init" ? true : repl
+        ? replCommand(data.command || "", output, errors, data.fast)
+        : execute(data.source, output, errors);
+    }
     self.postMessage({type:"done", repl, ok, seconds:(performance.now() - start)/1000,
       output:[...stdout, ...output].filter(Boolean).join("\n"),
       errors:[...errors, ...stderr].filter(Boolean).join("\n"),
