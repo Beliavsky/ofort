@@ -316,6 +316,8 @@ int ofort_execute(OfortInterpreter *interp, const char *source);
 int ofort_execute_auto_declare(OfortInterpreter *interp, const char *source);
 /* Infer a scalar PARAMETER from a single name = constant-expression. */
 int ofort_execute_const(OfortInterpreter *interp, const char *source);
+/* Parse an empty counted DO, infer its index, but do not execute the loop. */
+int ofort_auto_declare_do(OfortInterpreter *interp, const char *source);
 const char *ofort_get_auto_declaration(OfortInterpreter *interp);
 
 /* Check syntax by lexing/parsing only. Returns 0 on success, -1 on error. */

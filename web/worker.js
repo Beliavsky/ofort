@@ -228,6 +228,25 @@ function replCommand(command, output, errors, fast) {
     continuing = code.endsWith("&");
     logicalLine += " " + (continuing ? code.slice(0, -1) : code);
     if (continuing) continue;
+    if (autoDeclare && blocks.every(block => block === "DO" || block === "IF") &&
+        /^\s*(?:[a-z]\w*\s*:\s*)?do\s+(?:,\s*)?[a-z]\w*\s*=/i.test(logicalLine) &&
+        !logicalLine.includes(";")) {
+      module.ccall("ofort_c_reset", null, ["number"], [interpreter]);
+      const result = module.ccall("ofort_auto_declare_do", "number", ["number", "string"],
+        [interpreter, logicalLine + "\nend do\n"]);
+      if (result !== 0) {
+        errors.push(getText("ofort_get_error"));
+        // Remove only the rejected opener; an enclosing pending block remains.
+        pending.pop();
+        logicalLine = "";
+        return false;
+      }
+      const declaration = getText("ofort_get_auto_declaration");
+      if (declaration) {
+        accepted.push(declaration);
+        output.push("Auto-declared: " + declaration);
+      }
+    }
     for (const statement of logicalLine.split(";")) trackConstruct(statement);
     logicalLine = "";
     if (blocks.length) continue;

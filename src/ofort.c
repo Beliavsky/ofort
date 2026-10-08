@@ -39711,6 +39711,105 @@ const char *ofort_get_auto_declaration(OfortInterpreter *interp) {
     return interp ? interp->auto_declaration : "";
 }
 
+static int repl_integer_expression_kind(OfortInterpreter *I, OfortNode *n) {
+    if (!n) return 0;
+    switch (n->type) {
+    case FND_INT_LIT:
+        if (n->kind_expr) {
+            if (!repl_constant_expression(I, n->kind_expr)) return 0;
+            OfortValue kind_value = eval_node(I, n->kind_expr);
+            int kind = kind_value.type == FVAL_INTEGER ? (int)val_to_int(kind_value) : 0;
+            free_value(&kind_value);
+            return kind;
+        }
+        return n->kind > 0 ? n->kind : 4;
+    case FND_IDENT: {
+        OfortVar *v = find_var(I, n->name);
+        if (!v || v->val.type != FVAL_INTEGER) return 0;
+        return v->declared_kind > 0 ? v->declared_kind : value_declared_kind(&v->val);
+    }
+    case FND_NEGATE:
+        return repl_integer_expression_kind(I, n->children[0]);
+    case FND_ADD: case FND_SUB: case FND_MUL: case FND_DIV: case FND_POWER: {
+        int left = repl_integer_expression_kind(I, n->children[0]);
+        int right = repl_integer_expression_kind(I, n->children[1]);
+        if (!left || !right) return 0;
+        return n->type == FND_POWER ? left : (left > right ? left : right);
+    }
+    case FND_FUNC_CALL: {
+        if (find_var(I, n->name)) return 0;
+        OfortFunc *f = find_func(I, n->name);
+        if (f && f->node) {
+            if (f->node->val_type != FVAL_INTEGER || f->node->n_dims > 0 ||
+                f->node->kind_expr) return 0;
+            return f->node->kind > 0 ? f->node->kind : 4;
+        }
+        if (str_eq_nocase(n->name, "int") || str_eq_nocase(n->name, "nint")) {
+            if (n->n_stmts < 1) return 0;
+            if (n->n_stmts == 1) return 4;
+            if (n->n_stmts != 2 || !repl_constant_expression(I, n->stmts[1])) return 0;
+            OfortValue kv = eval_node(I, n->stmts[1]);
+            int kind = kv.type == FVAL_INTEGER ? (int)val_to_int(kv) : 0;
+            free_value(&kv);
+            return kind;
+        }
+        if (str_eq_nocase(n->name, "kind") || str_eq_nocase(n->name, "len") ||
+            str_eq_nocase(n->name, "selected_int_kind") ||
+            str_eq_nocase(n->name, "selected_real_kind")) return 4;
+        if (str_eq_nocase(n->name, "min") || str_eq_nocase(n->name, "max") ||
+            str_eq_nocase(n->name, "abs") || str_eq_nocase(n->name, "mod") ||
+            str_eq_nocase(n->name, "modulo") || str_eq_nocase(n->name, "sign")) {
+            int kind = 0;
+            for (int i = 0; i < n->n_stmts; i++) {
+                int arg_kind = repl_integer_expression_kind(I, n->stmts[i]);
+                if (!arg_kind) return 0;
+                if (arg_kind > kind) kind = arg_kind;
+            }
+            return kind;
+        }
+        return 0;
+    }
+    default:
+        return 0;
+    }
+}
+
+int ofort_auto_declare_do(OfortInterpreter *interp, const char *source) {
+    if (!interp || !source) return -1;
+    interp->auto_declaration[0] = '\0';
+    if (ofort_check(interp, source) != 0) return -1;
+    interp->source = source;
+    interp->check_mode = 0;
+    if (setjmp(interp->err_jmp) != 0) return -1;
+    if (!interp->ast || interp->ast->type != FND_BLOCK || interp->ast->n_stmts != 1 ||
+        !interp->ast->stmts[0] || interp->ast->stmts[0]->type != FND_DO_LOOP)
+        ofort_error(interp, "Auto-declare expects one counted DO opener");
+    OfortNode *loop = interp->ast->stmts[0];
+    if (find_var(interp, loop->name)) return 0;
+    int kind = 0;
+    for (int i = 0; i < 3; i++) {
+        int control_kind = repl_integer_expression_kind(interp, loop->children[i]);
+        if (!control_kind)
+            ofort_error(interp, "Cannot infer integer loop controls for '%s'; declare the loop variable explicitly", loop->name);
+        if (control_kind > kind) kind = control_kind;
+    }
+    const char *spec = NULL;
+    if (kind == 1) spec = "integer(kind=selected_int_kind(2))";
+    else if (kind == 2) spec = "integer(kind=selected_int_kind(4))";
+    else if (kind == 4) spec = "integer";
+    else if (kind == 8) spec = "integer(kind=selected_int_kind(18))";
+    else if (kind == 16) spec = "integer(kind=selected_int_kind(38))";
+    else ofort_error(interp, "Unsupported inferred loop-variable kind; declare '%s' explicitly", loop->name);
+    OfortValue value = make_integer_kind(0, kind);
+    OfortVar *v = declare_var(interp, loop->name, value);
+    v->declared_type = FVAL_INTEGER;
+    v->declared_kind = kind;
+    v->is_initialized = 0;
+    snprintf(interp->auto_declaration, sizeof(interp->auto_declaration),
+             "%s :: %s", spec, loop->name);
+    return 0;
+}
+
 int ofort_execute_const(OfortInterpreter *interp, const char *source) {
     if (!interp || !source) return -1;
     interp->auto_declare_constant = 1;
