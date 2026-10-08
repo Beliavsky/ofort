@@ -21,6 +21,21 @@ including GitHub Pages. Include the generated ofort.js and ofort.wasm in the
 deployment; they are ignored in the source repository. Serve .wasm files with
 the application/wasm MIME type. No server-side program execution is needed.
 
+## Automatic GitHub Pages deployment
+
+In the repository's **Settings > Pages**, select **GitHub Actions** as the
+source once. The `Deploy playground` workflow then builds and publishes `web`
+on every push to `main`. It can also be started manually from the Actions tab.
+
+The workflow installs Emscripten 6.0.11 and runs `python3 web/build.py`, so
+committed interpreter changes are included along with frontend changes.
+Generated `ofort.js` and `ofort.wasm` do not need to be committed. Manual
+copying to the `gh-pages` branch is no longer needed.
+
+Follow the deployment in the Actions tab, then open
+https://beliavsky.github.io/ofort/. If an already-open page shows the previous
+version, reload it with Ctrl+F5; this also restarts its interpreter worker.
+
 ## Initial scope
 
 - Free-form complete programs, examples, and source download.

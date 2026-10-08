@@ -1,0 +1,57 @@
+name: Deploy playground
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out ofort
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check out Emscripten SDK
+        uses: actions/checkout@v6
+        with:
+          repository: emscripten-core/emsdk
+          path: .emsdk
+
+      - name: Build browser interpreter
+        shell: bash
+        run: |
+          ./.emsdk/emsdk install 6.0.11
+          ./.emsdk/emsdk activate 6.0.11
+          source ./.emsdk/emsdk_env.sh
+          python3 web/build.py
+
+      - name: Upload playground
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
