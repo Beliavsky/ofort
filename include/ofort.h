@@ -33,7 +33,9 @@ extern "C" {
 #define OFORT_MAX_TOKENS    32768
 #define OFORT_MAX_CHILDREN  16
 #define OFORT_MAX_PARAMS    256
+#ifndef OFORT_MAX_MODULES
 #define OFORT_MAX_MODULES   256
+#endif
 #define OFORT_MAX_FIELDS    32
 
 typedef enum {
@@ -335,6 +337,7 @@ void ofort_set_warn_empty_sequence(OfortInterpreter *interp, int enabled);
 
 /* If disabled, suppress warnings when user names shadow intrinsic procedures. */
 void ofort_set_warn_intrinsic_shadow(OfortInterpreter *interp, int enabled);
+void ofort_set_warn_function_side_effects(OfortInterpreter *interp, int enabled);
 
 /* If enabled, use safe interpreter fast paths. */
 void ofort_set_fast_mode(OfortInterpreter *interp, int enabled);
@@ -409,6 +412,10 @@ int ofort_dump_variables(OfortInterpreter *interp, const char *const *names,
 /* Write declaration-style visible variable info to buf. If names is NULL or n_names is 0, lists all variables. */
 int ofort_dump_variable_info(OfortInterpreter *interp, const char *const *names,
                              int n_names, char *buf, size_t buf_size);
+
+/* Bounded visible-variable previews: at most six array elements, with unset
+   elements identified from initialization metadata without evaluating them. */
+int ofort_dump_variable_previews(OfortInterpreter *interp, char *buf, size_t buf_size);
 
 /* Write array shapes to buf. If names is NULL or n_names is 0, lists all visible arrays. */
 int ofort_dump_variable_shapes(OfortInterpreter *interp, const char *const *names,

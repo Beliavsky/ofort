@@ -15756,24 +15756,28 @@ static void assign_token_to_array_element(OfortValue *arr, int index, const char
     free_value(&tmp);
 }
 
-static int read_file_array_ref_recursive(OfortInterpreter *I, OfortValue *arr,
+static int read_file_array_ref_recursive(OfortInterpreter *I, OfortVar *var,
                                          OfortSubscriptSpec *specs, int nargs,
                                          int dim, int *subscripts,
                                          FILE *fp, char *tok, int tok_size) {
+    OfortValue *arr = &var->val;
     if (dim < 0) {
         int index = section_linear_index(arr, subscripts, nargs);
         if (index < 0 || index >= arr->v.arr.len)
             ofort_error(I, "Array section index out of bounds");
         if (arr->v.arr.elem_type == FVAL_DERIVED && arr->v.arr.data) {
-            return read_file_value(I, fp, &arr->v.arr.data[index], tok, tok_size);
+            int status = read_file_value(I, fp, &arr->v.arr.data[index], tok, tok_size);
+            if (!status) mark_tracked_array_element(var, index);
+            return status;
         }
         if (!read_next_token(fp, tok, tok_size)) return 1;
         assign_token_to_array_element(arr, index, tok);
+        mark_tracked_array_element(var, index);
         return 0;
     }
     for (int pos = 0; pos < specs[dim].count; pos++) {
         subscripts[dim] = subscript_spec_value(&specs[dim], pos);
-        if (read_file_array_ref_recursive(I, arr, specs, nargs, dim - 1,
+        if (read_file_array_ref_recursive(I, var, specs, nargs, dim - 1,
                                           subscripts, fp, tok, tok_size) != 0) {
             return 1;
         }
@@ -15792,23 +15796,29 @@ static int read_file_array_ref_target(OfortInterpreter *I, FILE *fp, OfortVar *v
         int lower = i < v->val.v.arr.n_dims ? v->val.v.arr.lower_bounds[i] : 1;
         eval_subscript_spec(I, target->stmts[i], lower, extent, &specs[i]);
     }
-    return read_file_array_ref_recursive(I, &v->val, specs, nargs, nargs - 1,
-                                         subscripts, fp, tok, tok_size);
+    prepare_array_initialization(I, v);
+    int status = read_file_array_ref_recursive(I, v, specs, nargs, nargs - 1,
+                                              subscripts, fp, tok, tok_size);
+    free_subscript_specs(specs, nargs);
+    return status;
 }
 
-static int read_string_array_ref_recursive(OfortInterpreter *I, OfortValue *arr,
+static int read_string_array_ref_recursive(OfortInterpreter *I, OfortVar *var,
                                            OfortSubscriptSpec *specs, int nargs,
                                            int dim, int *subscripts,
                                            OfortStringInput *p, char *tok, int tok_size,
                                            int *item_index,
                                            char *iomsg, size_t iomsg_size) {
+    OfortValue *arr = &var->val;
     if (dim < 0) {
         int index = section_linear_index(arr, subscripts, nargs);
         if (index < 0 || index >= arr->v.arr.len)
             ofort_error(I, "Array section index out of bounds");
         if (arr->v.arr.elem_type == FVAL_DERIVED && arr->v.arr.data) {
-            return read_string_value(I, p, &arr->v.arr.data[index], tok, tok_size,
-                                     item_index, iomsg, iomsg_size);
+            int status = read_string_value(I, p, &arr->v.arr.data[index], tok, tok_size,
+                                           item_index, iomsg, iomsg_size);
+            if (!status) mark_tracked_array_element(var, index);
+            return status;
         }
         {
             int item = ++(*item_index);
@@ -15826,11 +15836,12 @@ static int read_string_array_ref_recursive(OfortInterpreter *I, OfortValue *arr,
             }
         }
         assign_token_to_array_element(arr, index, tok);
+        mark_tracked_array_element(var, index);
         return 0;
     }
     for (int pos = 0; pos < specs[dim].count; pos++) {
         subscripts[dim] = subscript_spec_value(&specs[dim], pos);
-        int status = read_string_array_ref_recursive(I, arr, specs, nargs, dim - 1,
+        int status = read_string_array_ref_recursive(I, var, specs, nargs, dim - 1,
                                                      subscripts, p, tok, tok_size,
                                                      item_index, iomsg, iomsg_size);
         if (status) return status;
@@ -15851,9 +15862,12 @@ static int read_string_array_ref_target(OfortInterpreter *I, OfortStringInput *p
         int lower = i < v->val.v.arr.n_dims ? v->val.v.arr.lower_bounds[i] : 1;
         eval_subscript_spec(I, target->stmts[i], lower, extent, &specs[i]);
     }
-    return read_string_array_ref_recursive(I, &v->val, specs, nargs, nargs - 1,
-                                           subscripts, p, tok, tok_size,
-                                           item_index, iomsg, iomsg_size);
+    prepare_array_initialization(I, v);
+    int status = read_string_array_ref_recursive(I, v, specs, nargs, nargs - 1,
+                                                subscripts, p, tok, tok_size,
+                                                item_index, iomsg, iomsg_size);
+    free_subscript_specs(specs, nargs);
+    return status;
 }
 
 static int format_is_character_line_read(const char *fmt) {
@@ -19474,6 +19488,15 @@ static OfortValue eval_node(OfortInterpreter *I, OfortNode *n) {
         }
 
         if (is_intrinsic(n->name)) {
+            /* An array-valued function reference is an expression, not the
+               pointer result variable itself, for bound inquiries. */
+            if ((str_eq_nocase(n->name, "lbound") || str_eq_nocase(n->name, "ubound")) &&
+                nargs > 0 && args[0].type == FVAL_ARRAY &&
+                n->stmts[0]->type == FND_FUNC_CALL &&
+                !find_var(I, n->stmts[0]->name)) {
+                for (int d = 0; d < args[0].v.arr.n_dims; d++)
+                    args[0].v.arr.lower_bounds[d] = 1;
+            }
             OfortValue result = call_intrinsic(I, n->name, args, nargs, n->param_names);
             free_call_args(args, nargs); args = NULL;
             return result;
@@ -40082,9 +40105,53 @@ static void variable_shape_extents_string(const OfortVar *var, char *buf, size_t
     }
 }
 
+static void variable_value_preview(OfortInterpreter *interp, const OfortVar *var,
+                                   char *buf, int buf_size) {
+    buf[0] = '\0';
+    if (var->is_optional && !var->present) {
+        snprintf(buf, buf_size, "<absent>");
+    } else if (var->is_pointer && !var->pointer_associated) {
+        snprintf(buf, buf_size, "<unassociated>");
+    } else if (var->val.type == FVAL_ARRAY) {
+        const OfortValue *array = &var->val;
+        if (!array->v.arr.allocated) {
+            snprintf(buf, buf_size, "<unallocated>");
+            return;
+        }
+        append_to_buffer(buf, buf_size, "[");
+        int len = array->v.arr.len;
+        int shown = len > 6 ? 6 : len;
+        for (int i = 0; i < shown; i++) {
+            int index = len > 6 && i >= 3 ? len - 3 + i - 3 : i;
+            char element_buf[128];
+            if (i > 0) append_to_buffer(buf, buf_size, ", ");
+            if (len > 6 && i == 3) append_to_buffer(buf, buf_size, "..., ");
+            if (!array_element_is_initialized(var, index)) {
+                copy_cstr(element_buf, sizeof(element_buf), "<unset>");
+            } else if (array->v.arr.elem_type == FVAL_DERIVED) {
+                copy_cstr(element_buf, sizeof(element_buf), "<derived value>");
+            } else {
+                OfortValue element = array_element_value(array, index);
+                value_to_string(interp, element, element_buf, sizeof(element_buf));
+                free_value(&element);
+            }
+            append_to_buffer(buf, buf_size, element_buf);
+        }
+        append_to_buffer(buf, buf_size, "]");
+    } else if (var->is_allocatable && !var->scalar_allocated) {
+        snprintf(buf, buf_size, "<unallocated>");
+    } else if (!var->is_initialized) {
+        snprintf(buf, buf_size, "<unset>");
+    } else if (var->val.type == FVAL_DERIVED) {
+        snprintf(buf, buf_size, "<derived value>");
+    } else {
+        value_to_string(interp, var->val, buf, buf_size);
+    }
+}
+
 static int append_variable_info_line(OfortInterpreter *interp, const OfortVar *var,
                                      const char *missing_name, char *buf,
-                                     size_t buf_size, size_t *used) {
+                                     size_t buf_size, size_t *used, int preview) {
     char value_buf[OFORT_MAX_STRLEN];
     char shape_buf[128];
     int written;
@@ -40093,7 +40160,8 @@ static int append_variable_info_line(OfortInterpreter *interp, const OfortVar *v
     if (!var) {
         written = snprintf(buf + *used, buf_size - *used, "%s: undefined\n", missing_name ? missing_name : "");
     } else {
-        value_to_string(interp, var->val, value_buf, sizeof(value_buf));
+        if (preview) variable_value_preview(interp, var, value_buf, sizeof(value_buf));
+        else value_to_string(interp, var->val, value_buf, sizeof(value_buf));
         variable_shape_string(var, shape_buf, sizeof(shape_buf));
         written = snprintf(buf + *used, buf_size - *used, "%s %s%s: %s\n",
                            value_type_name_lower(variable_display_type(var)),
@@ -40108,8 +40176,8 @@ static int append_variable_info_line(OfortInterpreter *interp, const OfortVar *v
     return 1;
 }
 
-int ofort_dump_variable_info(OfortInterpreter *interp, const char *const *names,
-                             int n_names, char *buf, size_t buf_size) {
+static int dump_variable_info(OfortInterpreter *interp, const char *const *names,
+                              int n_names, char *buf, size_t buf_size, int preview) {
     size_t used = 0;
     int count = 0;
 
@@ -40120,7 +40188,7 @@ int ofort_dump_variable_info(OfortInterpreter *interp, const char *const *names,
         for (int i = 0; i < n_names; i++) {
             int rc;
             if (!names[i] || names[i][0] == '\0') continue;
-            rc = append_variable_info_line(interp, find_var(interp, names[i]), names[i], buf, buf_size, &used);
+            rc = append_variable_info_line(interp, find_var(interp, names[i]), names[i], buf, buf_size, &used, preview);
             if (rc < 0) return -1;
             count++;
             if (rc == 0) return count;
@@ -40144,7 +40212,7 @@ int ofort_dump_variable_info(OfortInterpreter *interp, const char *const *names,
             }
             if (duplicate) continue;
 
-            rc = append_variable_info_line(interp, &scope->vars[i], NULL, buf, buf_size, &used);
+            rc = append_variable_info_line(interp, &scope->vars[i], NULL, buf, buf_size, &used, preview);
             if (rc < 0) return -1;
             count++;
             if (rc == 0) return count;
@@ -40155,6 +40223,15 @@ int ofort_dump_variable_info(OfortInterpreter *interp, const char *const *names,
         snprintf(buf, buf_size, "(no variables)\n");
     }
     return count;
+}
+
+int ofort_dump_variable_info(OfortInterpreter *interp, const char *const *names,
+                             int n_names, char *buf, size_t buf_size) {
+    return dump_variable_info(interp, names, n_names, buf, buf_size, 0);
+}
+
+int ofort_dump_variable_previews(OfortInterpreter *interp, char *buf, size_t buf_size) {
+    return dump_variable_info(interp, NULL, 0, buf, buf_size, 1);
 }
 
 static int append_variable_shape_line(const OfortVar *var, const char *missing_name,
