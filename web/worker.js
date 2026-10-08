@@ -202,7 +202,6 @@ function replCommand(command, output, errors, fast) {
     }
     clearPending();
     if (!ok) {
-      errors.push("The submission was not added to source. Statements before a runtime error may already have changed state; Clear session starts over.");
       break;
     }
   }
