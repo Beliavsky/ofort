@@ -15,9 +15,11 @@ let historyIndex = 0;
 let sessionBaseline = "implicit none\n";
 let sourceDirty = false;
 let settingSource = false;
+let replayDraft = null;
+let replayNeedsCorrection = false;
 const isRepl = () => byId("mode").value === "repl";
 function updateSourceControls() {
-  sourceDirty = isRepl() && sourceText() !== sessionBaseline;
+  sourceDirty = isRepl() && (replayNeedsCorrection || sourceText() !== sessionBaseline);
   byId("source-edits").hidden = !sourceDirty;
   byId("discard-edits").disabled = busy;
   byId("repl-submit").disabled = busy || sourceDirty;
@@ -63,6 +65,7 @@ const editor = typeof CodeMirror === "function" ? CodeMirror.fromTextArea(byId("
 const sourceText = () => editor ? editor.getValue() : byId("source").value;
 function setSource(text) {
   settingSource = true;
+  replayNeedsCorrection = false;
   if (editor) editor.setValue(text);
   else byId("source").value = text;
   if (isRepl()) sessionBaseline = text;
@@ -160,6 +163,7 @@ byId("download").addEventListener("click", () => {
 
 function send(payload) {
   if (busy) return;
+  replayDraft = payload.type === "repl-replay" ? payload.source : null;
   busy = true;
   byId("status").textContent = worker ? "Running..." : "Loading interpreter...";
   for (const id of ["run", "repl-submit", "mode", "fast", "clear-session"]) byId(id).disabled = true;
@@ -176,7 +180,18 @@ function send(payload) {
         if (data.build) lastRun.build = data.build;
       } else if (data.type === "done") {
         if (data.repl) {
-          setSource(data.source);
+          if (replayDraft !== null) {
+            const draft = replayDraft;
+            replayDraft = null;
+            setSource(draft);
+            if (!data.ok || data.pending) {
+              sessionBaseline = data.source;
+              replayNeedsCorrection = true;
+              updateSourceControls();
+            }
+          } else {
+            setSource(data.source);
+          }
           byId("variables").textContent = data.variables || "(no variables)";
           appendText("output", data.output);
           appendText("errors", data.errors);
